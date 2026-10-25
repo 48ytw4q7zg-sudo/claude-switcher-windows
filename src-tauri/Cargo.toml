@@ -1,0 +1,70 @@
+[package]
+name = "claude-switcher"
+version = "0.1.0"
+description = "Claude Code local account switcher"
+authors = ["xiaojian"]
+edition = "2021"
+default-run = "claude-switcher"
+
+[lib]
+name = "claude_switcher_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+# macos-private-api 仅在 macOS 上实际生效（透明/无边框窗口），在 Windows/Linux 上为空；
+# 但 tauri-build 要求 tauri.conf.json 的 macOSPrivateApi 与该 feature 保持一致，故全局声明。
+tauri = { version = "2", features = [
+    "tray-icon",
+    "macos-private-api",
+    "image-png",
+    "image-ico",
+] }
+tauri-plugin-opener = "2"
+# 单实例：双击两次只留一个托盘图标，也避免并发写 store。
+tauri-plugin-single-instance = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "5"
+uuid = { version = "1", features = ["v4"] }
+sha2 = "0.10"
+urlencoding = "2"
+# C2：store/备份里的 keychain_password（OAuth blob，唯一明文 token）落盘加密用。
+aes-gcm = "0.10"
+rand = "0.8"
+base64 = "0.22"
+# HTTP：Claude OAuth usage/profile 与 Clash 控制器都走 reqwest（系统代理/环境变量代理、
+# JSON body 走 socket 而不是 argv，中文节点名不再跨编码传参）。
+reqwest = { version = "0.12", default-features = false, features = [
+    "blocking",
+    "json",
+    "rustls-tls",
+] }
+# 进程检测（Claude Code CLI 是否在运行）：跨平台取 exe 名与命令行，
+# 替代 Windows 上 PowerShell Get-CimInstance（慢、OEM 代码页乱码）。
+sysinfo = "0.33"
+
+# Windows：store 加密主密钥存到 Windows Credential Manager（与 macOS Keychain 对等）。
+# Claude Code 本身的 OAuth 凭据在 Windows 上是 ~/.claude/.credentials.json 文件，无需 keyring。
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+# 稳定地识别硬链接（同卷+同文件索引）与硬链接计数；std 对应方法仍 unstable。
+# Win32_System_IO：DeviceIoControl；Win32_System_Ioctl：FSCTL_GET_REPARSE_POINT
+# （reparse tag 精确识别）；Win32_System_WindowsProgramming：GetUserNameW。
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+    "Win32_System_Ioctl",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+] }
+# junction 是纯 API 调用，替代 cmd /C mklink /J（cmd 解析 % & ^ 出错、GBK 输出乱码）。
+junction = "1"
+
+[dev-dependencies]
+tempfile = "3"
