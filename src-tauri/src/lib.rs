@@ -115,6 +115,22 @@ struct RestoreResult {
 
 // ───────────────────────── 工具函数 ─────────────────────────
 
+/// 把会阻塞的工作丢进 `spawn_blocking`，命令本体保持 `async`。
+///
+/// Tauri 2 中非 `async` 命令跑在主线程上：里面任何阻塞调用（网络请求、
+/// 进程扫描、文件锁退避重试）都会让窗口卡成"未响应"。统一走这个包装，
+/// 不再逐个命令手写 `.await.map_err(...)`。
+///
+/// **不要用 `#[tauri::command(async)]` 直接包同步函数**：那会跑在 tokio 工作线程里，
+/// 其中调用 `reqwest::blocking` 有 panic 风险。
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, String> + Send + 'static,
+) -> Result<T, String> {
+    tauri::async_runtime::spawn_blocking(f)
+        .await
+        .map_err(|e| format!("后台任务失败: {e}"))?
+}
+
 fn string_field<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     let mut cur = value;
     for key in path {
@@ -145,9 +161,7 @@ fn get_platform() -> &'static str {
 /// 其中调用 `reqwest::blocking` 有 panic 风险。
 #[tauri::command]
 async fn get_status() -> Result<ClaudeStatus, String> {
-    tauri::async_runtime::spawn_blocking(get_status_blocking)
-        .await
-        .map_err(|e| format!("读取状态后台任务失败: {e}"))?
+    blocking(get_status_blocking).await
 }
 
 fn get_status_blocking() -> Result<ClaudeStatus, String> {
@@ -379,6 +393,7 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
         meta: usage::extract_meta(Some(&claude_json), keychain_password.as_deref()),
         claude_json,
         settings_json,
+        encrypted_auth_settings: None,
         keychain_password,
         clash: None,
         runtime: Some(runtime),
@@ -391,6 +406,9 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
     // 只记日志；UI 的 session_isolation 状态会提示"隔离未激活"，
     // 用户重新执行一次"切换"即可补上链接。
     store_data.current_profile_id = Some(profile_id.clone());
+    // 捕获新账号后必须清缓存：OAuth/本地用量缓存里可能还留着上一个账号的数据
+    // （token 指纹能防串号，但 projects 目录也换了，本地统计必须重算）。
+    usage::clear_caches();
     store_data.profiles.push(profile);
     store::save_store(&store_data)?;
     if let Err(e) = isolation::adopt_live_claude_local_state_for_profile(&profile_id)
@@ -403,8 +421,32 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
 
 // ───────────────────────── 新号向导 ─────────────────────────
 
+/// 新号向导里有阻塞操作（`kill_claude_code_processes` 含等待、Clash 切换与
+/// 节点健康检查、链接重试），必须离开主线程。
 #[tauri::command]
-fn prepare_new_account_login(
+async fn prepare_new_account_login(
+    name: String,
+    notes: Option<String>,
+    node: String,
+    timezone: Option<String>,
+    locale: Option<String>,
+    chrome_profile: Option<String>,
+) -> Result<PrepareNewAccountResult, String> {
+    blocking(move || {
+        prepare_new_account_login_blocking(
+            name,
+            notes,
+            node,
+            timezone,
+            locale,
+            chrome_profile,
+        )
+    })
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_new_account_login_blocking(
     name: String,
     notes: Option<String>,
     node: String,
@@ -510,7 +552,11 @@ fn prepare_new_account_login(
 }
 
 #[tauri::command]
-fn complete_new_account_login() -> Result<ProfileSummary, String> {
+async fn complete_new_account_login() -> Result<ProfileSummary, String> {
+    blocking(complete_new_account_login_blocking).await
+}
+
+fn complete_new_account_login_blocking() -> Result<ProfileSummary, String> {
     let mut store_data = store::load_store()?;
     let pending = store_data
         .pending_new_account
@@ -542,6 +588,7 @@ fn complete_new_account_login() -> Result<ProfileSummary, String> {
         meta: usage::extract_meta(Some(&claude_json), Some(&keychain_password)),
         claude_json,
         settings_json,
+        encrypted_auth_settings: None,
         keychain_password: Some(keychain_password),
         clash: Some(store::ProfileClashBinding {
             enabled: true,
@@ -557,6 +604,8 @@ fn complete_new_account_login() -> Result<ProfileSummary, String> {
         log_error(&format!("新号隔离链接激活失败（已保存登录态）: {e}"));
     }
     store_data.current_profile_id = Some(profile.id.clone());
+    // 新号登录完成 = 账号已变，缓存全部作废（否则用量/套餐显示的还是旧账号）。
+    usage::clear_caches();
     store_data.pending_new_account = None;
     store_data.profiles.push(profile);
     store::save_store(&store_data)?;
@@ -567,9 +616,7 @@ fn complete_new_account_login() -> Result<ProfileSummary, String> {
 /// 因此和 switch_profile 一样走 spawn_blocking。
 #[tauri::command]
 async fn cancel_pending_new_account_login() -> Result<Option<SwitchResult>, String> {
-    tauri::async_runtime::spawn_blocking(cancel_pending_new_account_login_blocking)
-        .await
-        .map_err(|e| format!("取消新号流程后台任务失败: {e}"))?
+    blocking(cancel_pending_new_account_login_blocking).await
 }
 
 fn cancel_pending_new_account_login_blocking() -> Result<Option<SwitchResult>, String> {
@@ -680,9 +727,7 @@ fn refresh_current_profile_snapshot(store_data: &mut Store, target_id: &str) -> 
 /// 否则窗口会卡成"未响应"、托盘事件也会被拖住。
 #[tauri::command]
 async fn switch_profile(id: String) -> Result<SwitchResult, String> {
-    tauri::async_runtime::spawn_blocking(move || switch_profile_blocking(id))
-        .await
-        .map_err(|e| format!("切换账号后台任务失败: {e}"))?
+    blocking(move || switch_profile_blocking(id)).await
 }
 
 fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
@@ -746,14 +791,34 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
     // 若因 Windows 文件锁导致链接激活失败而返回 Err，前端会显示"切换失败"，
     // 但磁盘上其实已经切过去了（UI 与实际状态相反）。降级为 warning，
     // 用户按提示重新执行一次"切换"即可补上链接。
+    let mut link_mode = String::new();
     match isolation::activate_profile_claude_local_state(&profile.id) {
-        Ok(items) => warnings.extend(items),
+        Ok(items) => {
+            warnings.extend(items);
+            link_mode = isolation::session_isolation_status(Some(&profile.id))
+                .map(|s| s.link_mode)
+                .unwrap_or_default();
+        }
         Err(e) => warnings.push(format!(
             "session 隔离链接激活失败（账号材料已切换成功，重新执行一次切换可补上）：{e}"
         )),
     }
+    // 记录切号结果与链接模式：排障时最需要的两条信息。
+    log_error(&format!(
+        "切号成功 → {}（链接模式：{}，Clash：{}）",
+        profile.name,
+        if link_mode.is_empty() { "未激活" } else { &link_mode },
+        clash_result
+            .as_ref()
+            .map(|c| format!("{}（{}）", c.node, if c.verified { "已确认" } else { "未确认" }))
+            .unwrap_or_else(|| "未绑定".to_string())
+    ));
 
     store_data.current_profile_id = Some(profile.id.clone());
+    // 切号成功 = 账号已变，立即作废全部缓存。
+    // token 指纹能防「拿新 token 查到旧账号」，但 projects 目录也换了，
+    // 本地用量统计（45s 缓存）同样必须重算——不清就会显示旧账号的用量。
+    usage::clear_caches();
     store_data.profiles[idx].last_switched_at = Some(Utc::now());
     store_data.profiles[idx].updated_at = Utc::now();
     store::save_store(&store_data)?;
@@ -775,25 +840,30 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
 /// 故同样走 spawn_blocking。
 #[tauri::command]
 async fn get_clash_status() -> Result<clash::ClashStatus, String> {
-    tauri::async_runtime::spawn_blocking(|| Ok(clash::clash_status_for_group(DEFAULT_CLASH_GROUP)))
-        .await
-        .map_err(|e| format!("读取 Clash 状态后台任务失败: {e}"))?
+    blocking(|| Ok(clash::clash_status_for_group(DEFAULT_CLASH_GROUP))).await
 }
 
 #[tauri::command]
 async fn get_claude_usage() -> Result<usage::ClaudeUsageSnapshot, String> {
-    tauri::async_runtime::spawn_blocking(usage::claude_usage_snapshot)
-        .await
-        .map_err(|e| format!("Claude 用量后台任务失败: {e}"))?
+    blocking(usage::claude_usage_snapshot).await
 }
 
+/// 直接发 Clash 请求（最长 8 秒），走 blocking 避免卡主线程。
 #[tauri::command]
-fn switch_clash_node(group: String, node: String) -> Result<clash::ClashSwitchResult, String> {
-    clash::switch_clash_node_internal(group.trim(), node.trim())
+async fn switch_clash_node(
+    group: String,
+    node: String,
+) -> Result<clash::ClashSwitchResult, String> {
+    blocking(move || clash::switch_clash_node_internal(group.trim(), node.trim())).await
 }
 
+/// 同上：内部是一次 Clash 请求。
 #[tauri::command]
-fn switch_profile_clash_node(id: String) -> Result<clash::ClashSwitchResult, String> {
+async fn switch_profile_clash_node(id: String) -> Result<clash::ClashSwitchResult, String> {
+    blocking(move || switch_profile_clash_node_blocking(id)).await
+}
+
+fn switch_profile_clash_node_blocking(id: String) -> Result<clash::ClashSwitchResult, String> {
     let store_data = store::load_store()?;
     let profile = store_data
         .profiles
@@ -1059,8 +1129,13 @@ fn list_backups() -> Result<Vec<BackupSummary>, String> {
     Ok(summaries)
 }
 
+/// 恢复流程里有 `claude_code_running()`（全进程扫描）与账号材料写入，走 blocking。
 #[tauri::command]
-fn restore_backup(id: String) -> Result<RestoreResult, String> {
+async fn restore_backup(id: String) -> Result<RestoreResult, String> {
+    blocking(move || restore_backup_blocking(id)).await
+}
+
+fn restore_backup_blocking(id: String) -> Result<RestoreResult, String> {
     let clean_id = id.trim();
     if clean_id.is_empty() {
         return Err("备份 id 不能为空".to_string());
@@ -1281,14 +1356,17 @@ fn get_logs_dir() -> Result<String, String> {
         .to_string())
 }
 
-/// 诊断信息（排障一页看全：路径、隔离状态、Clash、告警、进程检测）。
-/// 前端可整体复制给维护者。跑的是纯本地检查，无网络请求。
+/// 诊断信息：默认仅本地检查，不访问网络；`include_network=true` 时才查询
+/// Clash 控制器和 OAuth profile。这样断网时点诊断也不会卡住。
 #[tauri::command]
-fn get_diagnostic_info() -> Result<Value, String> {
+async fn get_diagnostic_info(include_network: Option<bool>) -> Result<Value, String> {
+    blocking(move || get_diagnostic_info_blocking(include_network.unwrap_or(false))).await
+}
+
+fn get_diagnostic_info_blocking(include_network: bool) -> Result<Value, String> {
     let status = get_status_blocking()?;
-    let clash_status = clash::clash_status_for_group(DEFAULT_CLASH_GROUP);
     let processes = processes::claude_code_processes();
-    Ok(json!({
+    let mut payload = json!({
         "platform": get_platform(),
         "claude_json_path": status.claude_json_path,
         "settings_json_path": status.settings_json_path,
@@ -1297,17 +1375,23 @@ fn get_diagnostic_info() -> Result<Value, String> {
         "profile_count": status.profile_count,
         "current_profile_id": status.current_profile_id,
         "session_isolation": status.session_isolation,
-        "clash": {
-            "controller": clash_status.controller,
-            "available": clash_status.available,
-            "now": clash_status.now,
-            "error": clash_status.error,
-        },
         "claude_code_processes": processes.iter()
             .map(|(pid, exe)| format!("{pid}: {exe}"))
             .collect::<Vec<_>>(),
         "warnings": status.warnings,
-    }))
+    });
+    if include_network {
+        let clash_status = clash::clash_status_for_group(DEFAULT_CLASH_GROUP);
+        payload["clash"] = json!({
+            "controller": clash_status.controller,
+            "available": clash_status.available,
+            "now": clash_status.now,
+            "error": clash_status.error,
+        });
+    } else {
+        payload["network"] = json!({ "included": false });
+    }
+    Ok(payload)
 }
 
 /// 一键打开 Windows「开发者设置」页（降级到 junction/硬链接时的引导）。
@@ -1354,13 +1438,28 @@ fn get_claude_config_dir() -> Result<String, String> {
     Ok(credentials::claude_dir()?.to_string_lossy().to_string())
 }
 
+/// 用户显式设置的覆盖路径。与「当前生效目录」分开返回，避免界面把默认路径
+/// 预填进输入框，用户一点保存就把默认行为永久固化。
+#[tauri::command]
+fn get_claude_config_dir_override() -> Result<Option<String>, String> {
+    let path = p::app_data_dir()?.join("claude-config-dir.txt");
+    Ok(fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty()))
+}
+
 /// 手动指定 Claude 配置目录（写入 `~/.claude-switcher/claude-config-dir.txt`）。
 /// 传空字符串表示清除覆盖、回到默认解析。
 ///
 /// 典型场景：用户在终端里 `$env:CLAUDE_CONFIG_DIR=D:\claude-alt`，但从开始菜单启动
 /// 本工具时读不到该变量——在这里指定一次即可让 GUI 启动也生效。
 #[tauri::command]
-fn set_claude_config_dir(path: String) -> Result<(), String> {
+async fn set_claude_config_dir(path: String) -> Result<String, String> {
+    blocking(move || set_claude_config_dir_blocking(path)).await
+}
+
+fn set_claude_config_dir_blocking(path: String) -> Result<String, String> {
     let override_file = p::app_data_dir()?.join("claude-config-dir.txt");
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -1368,12 +1467,20 @@ fn set_claude_config_dir(path: String) -> Result<(), String> {
         if override_file.exists() {
             fs::remove_file(&override_file).map_err(|e| format!("清除配置目录覆盖失败: {e}"))?;
         }
-        return Ok(());
+        return Ok("已恢复默认配置目录".to_string());
     }
     let dir = PathBuf::from(trimmed);
     if !dir.is_absolute() {
         return Err("请填写绝对路径（例如 D:\\claude-alt）".to_string());
     }
+    // 先校验新目录存在且可写，避免保存一个不可用路径让凭据写失败。
+    fs::create_dir_all(&dir).map_err(|e| format!("配置目录不可写: {e}"))?;
+    let probe = dir.join(".claude-switcher-write-test");
+    fs::write(&probe, b"ok").map_err(|e| format!("配置目录不可写: {e}"))?;
+    fs::remove_file(&probe).map_err(|e| format!("清理写入测试失败: {e}"))?;
+
+    // 不自动删除旧目录或旧链接：它们可能仍包含用户会话历史。切换目录前
+    // 保留现场，避免悬空链接指向不存在的位置；切换后重新激活账号隔离。
     fs::create_dir_all(p::app_data_dir()?).map_err(|e| e.to_string())?;
     // 只写路径本身，不带换行（读取端会 trim）。
     crate::fsx::write_atomically(&override_file, trimmed).map_err(|e| {
@@ -1381,7 +1488,9 @@ fn set_claude_config_dir(path: String) -> Result<(), String> {
             "保存配置目录覆盖失败: {}",
             crate::fsx::humanize_io_error(&e)
         )
-    })
+    })?;
+    usage::clear_caches();
+    Ok(format!("配置目录已设为：{}", dir.display()))
 }
 
 /// Run 注册表项的值名（固定，便于 UI 显示与排查）。
@@ -1406,17 +1515,17 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
         use winreg::enums::HKEY_CURRENT_USER;
         use winreg::RegKey;
 
-        let exe = std::env::current_exe().map_err(|e| format!("定位当前可执行文件失败: {e}"))?;
-        let run = match RegKey::predef(HKEY_CURRENT_USER).open_subkey(AUTOSTART_RUN_KEY) {
-            Ok(key) => key,
-            // 项不存在时创建（create_subkey 返回 (key, disposition)）。
-            Err(_) => RegKey::predef(HKEY_CURRENT_USER)
-                .create_subkey(AUTOSTART_RUN_KEY)
-                .map(|(key, _)| key)
-                .map_err(|e| format!("打开 Run 注册表项失败: {e}"))?,
-        };
+        // **必须用 create_subkey**：`open_subkey` 内部是 `KEY_READ` 只读句柄
+        // （winreg reg_key.rs:146），在它上面 set_value/delete_value 会返回
+        // 拒绝访问 (os error 5)。Run 项在 Windows 上一定存在，用 open_subkey
+        // 试探再 create 的写法永远走只读分支——自启开关会 100% 失败。
+        // create_subkey 用 KEY_ALL_ACCESS，项已存在时也能正常打开（reg_key.rs:241）。
+        let (run, _) = RegKey::predef(HKEY_CURRENT_USER)
+            .create_subkey(AUTOSTART_RUN_KEY)
+            .map_err(|e| format!("打开 Run 注册表项失败: {e}"))?;
 
         if enabled {
+            let exe = std::env::current_exe().map_err(|e| format!("定位当前可执行文件失败: {e}"))?;
             let value = format!("\"{}\" --autostart", exe.to_string_lossy());
             run.set_value(AUTOSTART_VALUE_NAME, &value)
                 .map_err(|e| format!("写入开机自启失败: {e}"))
@@ -1436,22 +1545,53 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
     }
 }
 
-/// 查询开机自启当前状态。
+/// 开机自启当前状态（三态，供 UI 精确显示）。
+#[derive(Debug, Clone, Serialize)]
+struct AutostartState {
+    /// Run 项是否存在（我们写没写过）。
+    registered: bool,
+    /// 是否在任务管理器「启动应用」里被用户禁用。
+    /// Windows 会把禁用状态存在 StartupApproved\Run 的二进制值里：
+    /// 首字节 0x02/0x03 表示启用，0x01/0x03 的其它组合表示禁用
+    /// （实测：启用=02，禁用=03；缺失=启用）。
+    disabled_by_user: bool,
+}
+
 #[tauri::command]
-fn get_autostart() -> bool {
+fn get_autostart() -> AutostartState {
     #[cfg(windows)]
     {
-        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
         use winreg::RegKey;
 
-        RegKey::predef(HKEY_CURRENT_USER)
+        let registered = RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey(AUTOSTART_RUN_KEY)
             .and_then(|key| key.get_value::<String, _>(AUTOSTART_VALUE_NAME))
-            .is_ok()
+            .is_ok();
+
+        // StartupApproved\Run 里与本值名对应的二进制：首字节 02=启用、03=禁用。
+        let disabled_by_user = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags(
+                "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run",
+                KEY_READ,
+            )
+            .and_then(|key| key.get_value::<Vec<u8>, _>(AUTOSTART_VALUE_NAME))
+            .ok()
+            .and_then(|bytes| bytes.first().copied())
+            .map(|first| first == 0x03)
+            .unwrap_or(false);
+
+        AutostartState {
+            registered,
+            disabled_by_user,
+        }
     }
     #[cfg(not(windows))]
     {
-        false
+        AutostartState {
+            registered: false,
+            disabled_by_user: false,
+        }
     }
 }
 
@@ -1539,6 +1679,7 @@ pub fn run() {
             open_developer_settings,
             open_logs_dir,
             get_claude_config_dir,
+            get_claude_config_dir_override,
             set_claude_config_dir,
             set_autostart,
             get_autostart,

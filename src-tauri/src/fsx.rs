@@ -119,18 +119,31 @@ fn resolve_if_link(path: &Path) -> std::path::PathBuf {
 }
 
 /// 清理本工具遗留的原子写临时文件（进程被杀会留下 `.<name>.tmp-<uuid>`）。
-/// 启动时调用一次，best-effort：只删本工具命名规则的残留，不碰别人的文件。
+///
+/// **只删修改时间超过 10 分钟的**：正在并发写入的临时文件可能刚创建几秒，
+/// 删掉它会让对方的 rename 失败（Windows 允许删除已打开的文件）。
+/// 10 分钟足以区分「残留」与「正在写」——本工具的写入都是毫秒级。
+/// best-effort：只删本工具命名规则的残留，不碰别人的文件。
 pub fn cleanup_stale_tmp_files(dir: &Path) -> usize {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
     };
+    let cutoff = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
     let mut removed = 0;
     for entry in entries.filter_map(|e| e.ok()) {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         // 形如 `.store.private.json.tmp-<32位hex>`。
-        if name.starts_with('.') && name.contains(".tmp-") && fs::remove_file(entry.path()).is_ok()
-        {
+        if !name.starts_with('.') || !name.contains(".tmp-") {
+            continue;
+        }
+        // 只清理陈旧的；拿不到 mtime 时保守跳过（不删）。
+        let is_stale = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .map(|mtime| mtime < cutoff)
+            .unwrap_or(false);
+        if is_stale && fs::remove_file(entry.path()).is_ok() {
             removed += 1;
         }
     }

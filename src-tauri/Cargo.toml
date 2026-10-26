@@ -4,6 +4,8 @@ version = "0.1.0"
 description = "Claude Code local account switcher"
 authors = ["xiaojian"]
 edition = "2021"
+# `slice::as_chunks` 等 API 需要 Rust 1.88+；显式声明，避免旧工具链报难懂的错。
+rust-version = "1.88"
 default-run = "claude-switcher"
 
 [lib]
@@ -72,7 +74,7 @@ windows-sys = { version = "0.59", features = [
 junction = "1"
 # 开机自启：直接写 HKCU\...\Run，替代 reg.exe 子进程（后者的错误信息是本地化
 # 字符串，中文系统上「删除一个不存在的值」会被误判成失败）。
-winreg = { version = "0.52", features = ["transactions"] }
+winreg = "0.52"
 
 [dev-dependencies]
 tempfile = "3"

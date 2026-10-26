@@ -251,10 +251,17 @@ pub fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
                 ..
             } => toggle_tray_popup(app, position),
             // 左键双击：直接打开主窗口（Windows 用户对托盘图标的习惯操作）。
+            // 先把用量弹窗关掉：双击的前两次 Click 已经把它打开又关上，
+            // 不显式隐藏的话主窗口与弹窗会同时可见。
             TrayIconEvent::DoubleClick {
                 button: MouseButton::Left,
                 ..
-            } => show_main_window(app),
+            } => {
+                if let Some(popup) = app.get_webview_window("tray-popup") {
+                    let _ = popup.hide();
+                }
+                show_main_window(app);
+            }
             _ => {}
         }
     });

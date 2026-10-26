@@ -45,10 +45,8 @@ fn is_claude_code_process(exe: Option<&str>, cmd: Option<&[String]>) -> bool {
     if exe_lower.contains("anthropicclaude") {
         return false;
     }
-    // Claude Desktop：MSIX / 应用商店安装（路径在 WindowsApps 下，无法用目录名判断）。
-    if exe_lower.contains("\\windowsapps\\") {
-        return false;
-    }
+    // （MSIX/WindowsApps 的排除移到 claude.exe 分支内：Store 版 Node 也在该目录，
+    // 全局排除会漏检用它跑的 npm 版 Claude Code。）
     // 本工具自身。
     if exe_lower.contains("claude-switcher") || exe_lower.contains("claude_switcher") {
         return false;
@@ -68,9 +66,21 @@ fn is_claude_code_process(exe: Option<&str>, cmd: Option<&[String]>) -> bool {
         .to_string();
 
     if exe_name == "claude.exe" || exe_name == "claude" {
+        // MSIX 排除**仅对 claude.exe 生效**：Microsoft Store 版 Node 也装在
+        // WindowsApps 下，用它跑 npm 版 Claude Code（node.exe + cli.js）必须
+        // 仍能命中——否则切号前的「结束 Claude Code」对这些用户静默失效。
+        // 而 Desktop 的可执行文件就叫 claude.exe 且在 MSIX 安装目录里，
+        // 用路径+文件名双重特征才能既排除 Desktop 又不伤 Store 版 Node。
+        let in_windowsapps = exe_lower.contains("\\windowsapps\\");
+        if in_windowsapps {
+            // WindowsApps 下的 claude.exe：Store 版 Claude Code CLI 并不存在
+            // （官方 CLI 不上架 Store），这里只会是 Desktop（Anthropic.Claude 包）。
+            return false;
+        }
         return true;
     }
 
+    // node / bun 宿主：不受 WindowsApps 排除影响（见上）。
     if matches!(exe_name.as_str(), "node.exe" | "node" | "bun.exe" | "bun") {
         if let Some(args) = cmd {
             return args.iter().any(|arg| {
@@ -277,7 +287,21 @@ mod tests {
                 r"C:\Program Files\WindowsApps\Anthropic.Claude_1.2.3\claude.exe",
                 None,
                 false,
-                "Desktop MSIX 安装（WindowsApps 目录）",
+                "Desktop MSIX 安装（WindowsApps + claude.exe 双特征）",
+            ),
+            (
+                r"C:\Program Files\WindowsApps\Node.JS.20.11\java.exe",
+                Some(vec![r"C:\WindowsApps\Node.JS.20.11\node.exe".into()]),
+                false,
+                "无关 Store 程序",
+            ),
+            // **Store 版 Node 跑 npm 版 Claude Code 必须命中**：
+            // WindowsApps 排除只针对 claude.exe，不能漏检 node + cli.js。
+            (
+                r"C:\Program Files\WindowsApps\Node.JS.20.11\node.exe",
+                Some(vec![r"C:\Users\A\node_modules\@anthropic-ai\claude-code\cli.js".into()]),
+                true,
+                "Store 版 Node 跑 npm 版 Claude Code（WindowsApps 不排除 node）",
             ),
             (
                 r"C:\Program Files\WindowsApps\Anthropic.Claude_1.2.3\claude.exe",

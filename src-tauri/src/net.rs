@@ -154,9 +154,10 @@ pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
 
 /// 统一的 HTTP 客户端构造。
 ///
-/// `no_proxy_when_local`：Clash 控制器是**本机服务**（127.0.0.1）。若用户设了
+/// `no_proxy_when_local`：Clash 控制器是本机服务（127.0.0.1）。若用户设了
 /// `HTTP_PROXY` 却没配 `NO_PROXY`，请求会被发去代理再绕回来，轻则变慢、重则连不上。
-/// 本机地址一律直连。
+/// **注意 `.no_proxy()` 对整个 client 生效**（不是只屏蔽回环地址）——
+/// 该 client 只用来访问本机控制器，所以正合适。
 fn http_client(
     timeout_secs: u64,
     no_proxy_when_local: bool,
@@ -166,7 +167,7 @@ fn http_client(
         .connect_timeout(Duration::from_secs(3))
         .user_agent("claude-code/2.1.0");
     if no_proxy_when_local {
-        // 仅对回环地址跳过代理；其它地址仍走系统/环境代理。
+        // 整个 client 不走代理（本机服务专用）。
         builder = builder.no_proxy();
     }
     builder
@@ -176,9 +177,9 @@ fn http_client(
 
 /// 把 Clash 配置里的控制器地址规范化成本机可连的形式。
 ///
-/// `external-controller` 常写成 `0.0.0.0:9090`、`:9090` 或 `[::]:9090`：
-/// 在 Windows 上 connect `0.0.0.0` 会直接失败（类 Unix 系统却可以），
-/// 因此统一改写成 `127.0.0.1:<port>`。
+/// `external-controller` 常写成 `0.0.0.0:9090`、`:9090`、`[::]:9090` 甚至无端口的
+/// `[::1]`：在 Windows 上 connect `0.0.0.0` 会直接失败（类 Unix 系统却可以），
+/// 因此把通配/空主机统一改写成 `127.0.0.1`，端口缺失时补 9097。
 fn normalize_controller(raw: &str) -> String {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -195,19 +196,27 @@ fn normalize_controller(raw: &str) -> String {
         return with_scheme;
     };
 
-    // rest 形如 "0.0.0.0:9097" / ":9097" / "[::]:9097" / "127.0.0.1:9097"。
-    let (host, port) = match rest.rsplit_once(':') {
-        Some((h, p)) => (h, p),
-        None => (rest, ""),
+    // 拆 host 与 port。IPv6 形如 `[::1]` / `[::]:9097`（方括号套住地址），
+    // 只在最后一个 `:` 位于右方括号**之后**时才当端口分隔，否则 `[::1]`
+    // 会被误拆成 host="[" port=":1]"。
+    let (host, port) = match rest.rfind(':') {
+        Some(idx) if idx > rest.rfind(']').unwrap_or(0) => {
+            (&rest[..idx], &rest[idx + 1..])
+        }
+        _ => (rest, ""),
     };
     let host_clean = host.trim_matches(|c| c == '[' || c == ']');
     let is_wildcard = host_clean.is_empty() || host_clean == "0.0.0.0" || host_clean == "::";
+    let effective_port = if port.is_empty() {
+        "9097"
+    } else {
+        port
+    };
     if is_wildcard {
-        return if port.is_empty() {
-            "http://127.0.0.1".to_string()
-        } else {
-            format!("http://127.0.0.1:{port}")
-        };
+        return format!("http://127.0.0.1:{effective_port}");
+    }
+    if port.is_empty() {
+        return format!("http://{host_clean}:{effective_port}");
     }
     format!("http://{host_clean}:{port}")
 }

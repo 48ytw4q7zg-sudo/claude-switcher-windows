@@ -78,10 +78,25 @@ struct UsageRecord {
 }
 
 /// OAuth 缓存：TTL 内直接返回缓存值，托盘每分钟刷新不再打满 OAuth 请求。
+///
+/// **`token_fp` 是必须的**：早期版本只看是否过期，不看 token。切号后
+/// `apply_oauth_profile` 拿新账号的 token 去查，返回的却是旧账号的邮箱和套餐
+/// （profile TTL 6 小时），5 小时/7 天额度也会错 90 秒——界面显示的是上一个
+/// 账号的数据。缓存里放 token 指纹，指纹不符就不算命中。
+/// 指纹只在进程内比较，不落盘，也不存 token 本身。
 #[derive(Debug, Clone)]
 struct CachedOauthValue {
     fetched_at: DateTime<Utc>,
     value: Value,
+    token_fp: u64,
+}
+
+/// token 指纹（进程内比较用，不落盘、不存 token 本身）。
+fn token_fingerprint(token: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    token.hash(&mut hasher);
+    hasher.finish()
 }
 
 static OAUTH_USAGE_CACHE: OnceLock<Mutex<Option<CachedOauthValue>>> = OnceLock::new();
@@ -89,6 +104,33 @@ static OAUTH_PROFILE_CACHE: OnceLock<Mutex<Option<CachedOauthValue>>> = OnceLock
 /// OAuth usage TTL：90 秒（托盘 60s 刷新 + 弹窗 30s 刷新命中缓存，不叠加请求）。
 const OAUTH_USAGE_TTL_SECS: i64 = 90;
 const OAUTH_PROFILE_TTL_SECS: i64 = 6 * 3600;
+
+/// 主动清空所有缓存：切号 / 新号登录完成 / 清除凭据后必须调用。
+///
+/// 只靠 token 指纹能防「显示别的账号」，但切号后 projects 目录也换了，
+/// 本地用量统计（`LOCAL_USAGE_CACHE`，45 秒）同样是旧账号的。切号是低频操作，
+/// 直接全清最稳妥，也最符合用户预期。
+pub fn clear_caches() {
+    // 三个缓存的 value 类型不同，逐个清（不能用同一个迭代器）。
+    if let Ok(mut guard) = OAUTH_USAGE_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *guard = None;
+    }
+    if let Ok(mut guard) = OAUTH_PROFILE_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *guard = None;
+    }
+    if let Ok(mut guard) = LOCAL_USAGE_CACHE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+    {
+        *guard = None;
+    }
+}
 
 fn number_field(value: &Value, key: &str) -> u64 {
     value.get(key).and_then(|v| v.as_u64()).unwrap_or(0)
@@ -109,8 +151,19 @@ fn collect_jsonl_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Resul
     let entries = fs::read_dir(dir).map_err(|e| format!("读取 Claude 日志目录失败: {e}"))?;
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
-        // entry.file_type 使用目录项已有的信息，避免每个路径再做一次 is_dir 系统调用。
-        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+        // entry.file_type 用目录项自带信息，省掉每项一次 is_dir 系统调用；
+        // 但它**不跟随链接**，符号链接/junction 目录会被误判为非目录而漏掉。
+        // 遇到 reparse point 时回退到 metadata()（跟随链接）再判断。
+        let is_dir = match entry.file_type() {
+            Ok(kind) if kind.is_symlink() => entry
+                .path()
+                .metadata()
+                .map(|m| m.is_dir())
+                .unwrap_or(false),
+            Ok(kind) => kind.is_dir(),
+            Err(_) => false,
+        };
+        if is_dir {
             collect_jsonl_files(&entry.path(), files)?;
         } else if entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
             files.push(entry.path());
@@ -213,11 +266,15 @@ fn cached_oauth_endpoint(
     access_token: &str,
     ttl_secs: i64,
 ) -> Result<Value, String> {
-    // 快路径：TTL 内直接返回缓存，连请求都不发（原来是无条件先打 OAuth）。
+    let token_fp = token_fingerprint(access_token);
+    // 快路径：TTL 内**且 token 指纹匹配**才返回缓存。
+    // 只判 TTL 会切号后仍返回上一个账号的数据（见 CachedOauthValue 注释）。
     {
         let guard = cache.lock().expect("OAuth 缓存锁中毒");
         if let Some(cached) = guard.as_ref() {
-            if Utc::now() - cached.fetched_at < Duration::seconds(ttl_secs) {
+            if cached.token_fp == token_fp
+                && Utc::now() - cached.fetched_at < Duration::seconds(ttl_secs)
+            {
                 return Ok(cached.value.clone());
             }
         }
@@ -237,7 +294,10 @@ fn cached_oauth_endpoint(
                 std::thread::sleep(StdDuration::from_millis(100));
                 if let Ok(guard) = cache.lock() {
                     if let Some(cached) = guard.as_ref() {
-                        if Utc::now() - cached.fetched_at < Duration::seconds(ttl_secs) {
+                        // 同样要核对 token 指纹，否则等来的是别的账号的数据。
+                        if cached.token_fp == token_fp
+                            && Utc::now() - cached.fetched_at < Duration::seconds(ttl_secs)
+                        {
                             return Ok(cached.value.clone());
                         }
                     }
@@ -266,17 +326,23 @@ fn cached_oauth_endpoint(
                 *guard = Some(CachedOauthValue {
                     fetched_at: Utc::now(),
                     value: value.clone(),
+                    token_fp,
                 });
             }
             Ok(value)
         }
         Err(error) => {
             // 请求失败时放宽到 5×TTL 的陈旧缓存，避免完全无数据。
+            // 但**必须核对 token 指纹**：否则断网期间切号，会把上一个账号的
+            // 陈旧数据当成当前账号的返回。
             let stale = cache
                 .lock()
                 .ok()
                 .and_then(|guard| guard.clone())
-                .filter(|cached| Utc::now() - cached.fetched_at < Duration::seconds(ttl_secs * 5))
+                .filter(|cached| {
+                    cached.token_fp == token_fp
+                        && Utc::now() - cached.fetched_at < Duration::seconds(ttl_secs * 5)
+                })
                 .map(|cached| cached.value);
             stale.ok_or(error)
         }

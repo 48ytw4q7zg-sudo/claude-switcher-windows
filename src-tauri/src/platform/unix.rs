@@ -37,8 +37,9 @@ pub fn current_username() -> Result<String, String> {
 }
 
 /// Unix：本工具数据目录按 0o700 收敛一次（创建时）。
-pub fn secure_app_data_dir(dir: &Path) {
-    let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+/// Unix：本工具数据目录按 0o700 收敛。返回是否成功（调用方据此写加固标记）。
+pub fn secure_app_data_dir(dir: &Path) -> bool {
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).is_ok()
 }
 
 /// Unix：std 的 symlink 判定即足够。

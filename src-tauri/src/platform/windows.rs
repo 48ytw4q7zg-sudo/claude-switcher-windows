@@ -71,29 +71,35 @@ pub fn current_username() -> Result<String, String> {
     Ok(trimmed.to_string())
 }
 
-/// 只把 `~/.claude-switcher` 收敛为当前用户完全控制（创建目录时执行一次，
-/// 子项继承 ACL），绝不逐文件 icacls、绝不动 Claude Code 自己的文件
-/// （`~/.claude.json` / `settings.json` / `.credentials.json` 都继承用户目录 ACL，
-/// 官方本来就是这么存的）。
+/// 把 `~/.claude-switcher` 收敛为「当前用户 + SYSTEM」完全控制（子项继承），
+/// 绝不逐文件 icacls、绝不动 Claude Code 自己的文件。
 ///
-/// 顺序固定为「先授权、再断继承」：单独执行 `/inheritance:r` 会把文件锁成谁都读不了。
-/// icacls 失败不影响主流程——目录位于用户 profile 下，默认 ACL 已是当前用户私有。
-pub fn secure_app_data_dir(dir: &Path) {
+/// 返回 `true` 表示 icacls 执行成功，调用方据此决定是否写「已加固」标记——
+/// 失败时不能写标记，否则永远不会重试。
+///
+/// 三个容易踩的坑：
+/// 1. **顺序**：先授权再断继承。单独执行 `/inheritance:r` 会把文件锁成谁都读不了。
+/// 2. **SYSTEM 必须写 SID**：icacls 的 `*` 前缀表示「后面是数字 SID」，
+///    `*SYSTEM:` 不是合法 SID、会解析失败（整条命令连同授权一起失败）。
+///    SYSTEM 的真实 SID 是 `S-1-5-18`。
+/// 3. **当前用户不能少**：只授 SYSTEM 会把当前用户也摘掉，连清理目录都做不了
+///    （实测会 Access denied）。两者都要授。
+pub fn secure_app_data_dir(dir: &Path) -> bool {
     let Some(username) = username_for_icacls() else {
-        return;
+        return false;
     };
     let path = dir.to_string_lossy().to_string();
-    // 先授予当前用户与 SYSTEM，再断继承。
-    // **必须保留 SYSTEM**：只断继承后仅剩当前用户的话，Windows Defender、
-    // 备份软件、以及某些索引服务会读不到这个目录，表现为扫描报错或备份缺失。
     // 用同一个 icacls 进程一次做完，避免出现「已断继承但还没授权」的中间态。
     let output = silent_command("icacls")
         .arg(&path)
         .args(["/grant:r", &format!("{username}:(OI)(CI)F")])
-        .args(["/grant:r", "*SYSTEM:(OI)(CI)F"])
+        .args(["/grant:r", "*S-1-5-18:(OI)(CI)F"])
         .args(["/inheritance:r"])
         .output();
-    let _ = output;
+    match output {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
 }
 
 /// icacls 的受托人参数：优先用 SID（`*S-1-5-…`，微软账号/中文用户名/本地化环境都稳），

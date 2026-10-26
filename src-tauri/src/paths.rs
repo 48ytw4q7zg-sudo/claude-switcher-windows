@@ -22,6 +22,11 @@ pub fn home_dir() -> Result<PathBuf, String> {
 }
 
 /// `~/.claude.json`（注意在 home，不在 .claude 里；CLAUDE_CONFIG_DIR 不影响它）。
+///
+/// **已实证**（2026-10-26，claude 2.1.310，Windows）：设置 CLAUDE_CONFIG_DIR 后
+/// 运行 claude，`.claude.json` 仍在用户主目录读写、不会搬到配置目录——
+/// 与官方文档「凭据在 CLAUDE_CONFIG_DIR 下、全局配置在 home」一致。
+/// 曾有第三方分析称它会跟随，实测不成立，勿改。
 pub fn claude_json_path() -> Result<PathBuf, String> {
     Ok(home_dir()?.join(".claude.json"))
 }
@@ -95,22 +100,28 @@ pub fn clash_config_candidates() -> Result<Vec<PathBuf>, String> {
     ])
 }
 
-/// 确保工具目录存在。**只在目录刚创建时**做一次 ACL 收敛（子项继承），
-/// 不再逐文件 icacls，也绝不动 Claude Code 自己文件的 ACL。
+/// 确保工具目录存在，并在**首次创建或老目录升级**时做一次 ACL 收敛。
+///
+/// 为什么不能只在「目录刚创建时」做：早期版本创建过的目录永远不会被收紧，
+/// 最需要升级的老用户反而被跳过。用 `~/.claude-switcher/.acl-hardened` 作为
+/// 一次性迁移标记——标记存在且 ACL 已设置成功就不再重复执行。
+///
+/// 注意顺序：`secure_app_data_dir` 成功才写标记；失败不写，下次启动会重试。
 pub fn ensure_app_dirs() -> Result<(), String> {
     let data_dir = app_data_dir()?;
-    let needs_secure = !data_dir.exists();
     fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-    if needs_secure {
-        imp::secure_app_data_dir(&data_dir);
-        // 一次性迁移标记：早期版本创建过的目录永远不会被「不存在时」的分支收紧，
-        // 用一个标记文件记录「已按新策略设置过 ACL」，避免老用户漏掉这次收敛。
-        let marker = data_dir.join(".acl-hardened");
-        if !marker.exists() {
-            imp::secure_app_data_dir(&data_dir);
+
+    let marker = data_dir.join(".acl-hardened");
+    let needs_hardening = !marker.exists();
+    if needs_hardening {
+        if imp::secure_app_data_dir(&data_dir) {
+            // 只有 ACL 真正设置成功才落标记，失败则下次重试。
             let _ = fs::write(&marker, b"acl hardened\n");
+        } else {
+            crate::log_error("ACL 加固失败（icacls 执行出错），下次启动将重试");
         }
     }
+
     for dir in [
         backups_dir()?,
         session_profiles_dir()?,
@@ -119,7 +130,16 @@ pub fn ensure_app_dirs() -> Result<(), String> {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
     // 清理上次进程被杀留下的原子写临时文件（`.xxx.tmp-<uuid>`）。
-    let _ = crate::fsx::cleanup_stale_tmp_files(&data_dir);
-    let _ = crate::fsx::cleanup_stale_tmp_files(&backups_dir()?);
+    cleanup_tmp_once();
     Ok(())
+}
+
+/// 进程内只执行一次的 tmp 清理（`Once`）：避免每次 `ensure_app_dirs` 都删一遍，
+/// 把正在并发写入的临时文件误删（Windows 允许删除已打开的文件，随后的 rename 会失败）。
+fn cleanup_tmp_once() {
+    static CLEANUP_ONCE: std::sync::Once = std::sync::Once::new();
+    CLEANUP_ONCE.call_once(|| {
+        let _ = crate::fsx::cleanup_stale_tmp_files(&app_data_dir().unwrap_or_default());
+        let _ = crate::fsx::cleanup_stale_tmp_files(&backups_dir().unwrap_or_default());
+    });
 }

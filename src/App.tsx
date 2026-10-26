@@ -460,7 +460,9 @@ function App() {
   const [newAccountStep, setNewAccountStep] = useState('等待确认');
   const [platform, setPlatform] = useState<Platform>(detectPlatformFromUA);
   const [autostart, setAutostart] = useState(false);
+  const [autostartDisabled, setAutostartDisabled] = useState(false);
   const [claudeConfigDir, setClaudeConfigDir] = useState('');
+  const [claudeConfigOverride, setClaudeConfigOverride] = useState('');
 
   const credentialLabel = platform === 'windows' ? '凭据文件' : 'Keychain';
   const credentialFullText = platform === 'windows' ? '.credentials.json 登录态' : '钥匙串登录态';
@@ -470,12 +472,21 @@ function App() {
     invoke<Platform>('get_platform')
       .then((next) => setPlatform(next))
       .catch(() => undefined);
-    // 开机自启当前状态（仅 Windows 有意义）。
-    invoke<boolean>('get_autostart')
-      .then((next) => setAutostart(next))
+    // 开机自启当前状态（仅 Windows 有意义）。返回三态：注册与否 + 是否被用户在
+    // 任务管理器禁用——只看 Run 值会把「已禁用」误显示成开启。
+    invoke<{ registered: boolean; disabled_by_user: boolean }>('get_autostart')
+      .then((next) => {
+        setAutostart(next.registered && !next.disabled_by_user);
+        setAutostartDisabled(next.disabled_by_user);
+      })
       .catch(() => undefined);
     invoke<string>('get_claude_config_dir')
       .then((next) => setClaudeConfigDir(next))
+      .catch(() => undefined);
+    // 覆盖框初始为空（而不是预填解析后的目录）：否则用户一点保存，
+    // 就会把默认路径固化成覆盖文件，之后再改环境变量也不再跟随。
+    invoke<Option<string>>('get_claude_config_dir_override')
+      .then((next) => setClaudeConfigOverride(next ?? ''))
       .catch(() => undefined);
   }, []);
 
@@ -765,10 +776,15 @@ function App() {
       await invoke('open_data_dir');
     });
 
-  /// 收集诊断信息并复制到剪贴板（纯本地检查，不发任何网络请求）。
+  const [includeNetwork, setIncludeNetwork] = useState(false);
+
+  /// 收集诊断信息并复制到剪贴板。默认只做本地检查（不发网络请求），
+  /// 勾选后再查 Clash 与 OAuth——断网时也不会卡住界面。
   const copyDiagnostics = () =>
     run(null, async () => {
-      const info = await invoke<Record<string, unknown>>('get_diagnostic_info');
+      const info = await invoke<Record<string, unknown>>('get_diagnostic_info', {
+        includeNetwork,
+      });
       const text = JSON.stringify(info, null, 2);
       try {
         await navigator.clipboard.writeText(text);
@@ -1256,15 +1272,21 @@ function App() {
             打开本工具数据目录
           </button>
           <div className="link-mode-row">
-            <span>Claude 配置目录</span>
+            <span>Claude 配置目录（当前生效）</span>
             <code title="凭据、settings.json、projects 都在这个目录下">{claudeConfigDir}</code>
           </div>
+          {claudeConfigOverride && (
+            <div className="link-mode-row">
+              <span>已指定覆盖</span>
+              <code>{claudeConfigOverride}</code>
+            </div>
+          )}
           <label className="work-note">
-            指定 Claude 配置目录（留空 = 跟随 CLAUDE_CONFIG_DIR / 默认 ~/.claude）
+            指定 Claude 配置目录（留空保存 = 清除覆盖，跟随 CLAUDE_CONFIG_DIR / 默认 ~/.claude）
             <div className="node-bind">
               <input
-                value={claudeConfigDir}
-                onChange={(event) => setClaudeConfigDir(event.target.value)}
+                value={claudeConfigOverride}
+                onChange={(event) => setClaudeConfigOverride(event.target.value)}
                 placeholder="例如 D:\claude-alt（留空恢复默认）"
                 disabled={!!busy}
               />
@@ -1272,10 +1294,16 @@ function App() {
                 className="ghost"
                 onClick={() =>
                   run('bind', async () => {
-                    await invoke('set_claude_config_dir', { path: claudeConfigDir });
-                    const next = await invoke<string>('get_claude_config_dir');
+                    const message = await invoke<string>('set_claude_config_dir', {
+                      path: claudeConfigOverride,
+                    });
+                    const [next, override] = await Promise.all([
+                      invoke<string>('get_claude_config_dir'),
+                      invoke<Option<string>>('get_claude_config_dir_override'),
+                    ]);
                     setClaudeConfigDir(next);
-                    return `Claude 配置目录已设为：${next}`;
+                    setClaudeConfigOverride(override ?? '');
+                    return message;
                   })
                 }
                 disabled={!!busy}
@@ -1299,6 +1327,16 @@ function App() {
             <FileText />
             打开日志目录
           </button>
+          <label className="link-mode-row" style={{ cursor: 'pointer' }}>
+            <span>诊断时包含网络检查（Clash / OAuth）</span>
+            <input
+              type="checkbox"
+              checked={includeNetwork}
+              onChange={(event) => setIncludeNetwork(event.target.checked)}
+              disabled={!!busy}
+              style={{ width: 16, height: 16, flex: '0 0 auto' }}
+            />
+          </label>
           <button
             className="ghost wide"
             onClick={copyDiagnostics}
@@ -1330,6 +1368,12 @@ function App() {
               <Power />
               {autostart ? '关闭开机自启' : '开启开机自启'}
             </button>
+            {autostartDisabled && (
+              <div className="inline-warning">
+                启动项已在 Windows 任务管理器（「启动应用」）中被禁用，本工具无法代为恢复。
+                请打开 任务管理器 → 启动应用，把 Claude Switcher 设为「已启用」。
+              </div>
+            )}
           )}
         </div>
       </section>

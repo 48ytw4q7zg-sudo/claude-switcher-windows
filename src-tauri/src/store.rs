@@ -45,6 +45,10 @@ pub struct StoredProfile {
     pub last_switched_at: Option<DateTime<Utc>>,
     pub claude_json: Value,
     pub settings_json: Option<Value>,
+    /// 认证类 settings 字段（apiKeyHelper 和 AUTH_ENV_KEYS）单独 AES-GCM 加密保存。
+    /// 这样既不把密钥以明文留在 store，也不会在保存快照时把原配置删掉。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub encrypted_auth_settings: Option<String>,
     pub keychain_password: Option<String>,
     pub meta: ProfileMeta,
     #[serde(default)]
@@ -422,6 +426,13 @@ pub fn load_store() -> Result<Store, String> {
                 .map_err(|e| format!("解密账号「{}」的凭据失败: {e}", profile.name))?;
             profile.keychain_password = Some(plain);
         }
+        if let Some(enc) = profile.encrypted_auth_settings.take() {
+            let auth: Value = serde_json::from_str(&decrypt_secret(&enc).map_err(|e| {
+                format!("解密账号「{}」的认证配置失败: {e}", profile.name)
+            })?)
+            .map_err(|e| format!("认证配置 JSON 解析失败: {e}"))?;
+            restore_auth_settings(&mut profile.settings_json, Some(auth));
+        }
         if profile.runtime.is_none() {
             profile.runtime = Some(default_runtime_for_profile(
                 &profile.name,
@@ -432,20 +443,25 @@ pub fn load_store() -> Result<Store, String> {
     Ok(store)
 }
 
-/// 从 settings_json 里清除认证类 env（`AUTH_ENV_KEYS` 列出的那些明文密钥），
-/// 以及会覆盖 OAuth 的 `apiKeyHelper`。
-///
-/// 与 `accounts::scrub_auth_from_settings` 的区别：那个用于「新号登录前清空 live」，
-/// 会把整个空 settings 收敛成 `None`；这个只做「脱敏」，保留其余配置原样。
-fn scrub_auth_env_from_settings(settings: Value) -> Option<Value> {
-    let mut obj = match settings {
-        Value::Object(map) => map,
-        _ => return None,
+/// 将 settings_json 拆成「可明文保存的其余配置」与「需要加密的认证字段」。
+/// 认证字段完整保留为 JSON 后交给 encrypt_secret，加载时再原样合并回去。
+pub fn split_auth_settings(settings: Option<Value>) -> (Option<Value>, Option<Value>) {
+    let Some(Value::Object(mut obj)) = settings else {
+        return (None, None);
     };
-    obj.remove("apiKeyHelper");
+    let mut auth = serde_json::Map::new();
+    if let Some(value) = obj.remove("apiKeyHelper") {
+        auth.insert("apiKeyHelper".to_string(), value);
+    }
     if let Some(env) = obj.get_mut("env").and_then(|v| v.as_object_mut()) {
+        let mut auth_env = serde_json::Map::new();
         for key in AUTH_ENV_KEYS {
-            env.remove(*key);
+            if let Some(value) = env.remove(*key) {
+                auth_env.insert((*key).to_string(), value);
+            }
+        }
+        if !auth_env.is_empty() {
+            auth.insert("env".to_string(), Value::Object(auth_env));
         }
     }
     if obj
@@ -456,10 +472,45 @@ fn scrub_auth_env_from_settings(settings: Value) -> Option<Value> {
     {
         obj.remove("env");
     }
-    if obj.is_empty() {
-        return None;
+    let plain = if obj.is_empty() { None } else { Some(Value::Object(obj)) };
+    let secret = if auth.is_empty() { None } else { Some(Value::Object(auth)) };
+    (plain, secret)
+}
+
+/// 把解密后的认证字段合并回 settings，供切号/恢复时写回。
+///
+/// `env` 要做**深度合并**：拆分后明文部分可能仍有非认证键（TZ 等），
+/// 认证部分也带一个只含认证键的 env 块——整块覆盖会把明文侧的键丢掉。
+/// 顶层其它键（apiKeyHelper 等）直接覆盖即可（拆分时必然从明文侧移除过）。
+pub fn restore_auth_settings(settings: &mut Option<Value>, auth: Option<Value>) {
+    let Some(Value::Object(auth)) = auth else { return };
+    let mut target = settings.take().unwrap_or_else(|| serde_json::json!({}));
+    if !target.is_object() {
+        target = serde_json::json!({});
     }
-    Some(Value::Object(obj))
+    let obj = target.as_object_mut().expect("settings 已确保为 object");
+
+    let auth_env = auth.get("env").and_then(|v| v.as_object()).cloned();
+    for (key, value) in auth {
+        if key == "env" {
+            continue;
+        }
+        obj.insert(key, value);
+    }
+    if let Some(auth_env) = auth_env {
+        let env = obj
+            .entry("env".to_string())
+            .or_insert_with(|| serde_json::json!({}));
+        if !env.is_object() {
+            *env = serde_json::json!({});
+        }
+        if let Some(env_obj) = env.as_object_mut() {
+            for (key, value) in auth_env {
+                env_obj.insert(key, value);
+            }
+        }
+    }
+    *settings = Some(target);
 }
 
 pub fn save_store(store: &Store) -> Result<(), String> {
@@ -474,11 +525,17 @@ pub fn save_store(store: &Store) -> Result<(), String> {
                 .map_err(|e| format!("加密账号「{}」的凭据失败: {e}", profile.name))?;
             profile.keychain_password = Some(enc);
         }
-        // settings_json 里可能残留认证类 env（ANTHROPIC_API_KEY 等）——这些同样是
-        // 明文密钥，不能因为「只加密 keychain_password」就留在 store 里。
-        // 落盘前统一清除；不影响切换功能（auth env 本来就会让切号失效）。
-        if let Some(settings) = profile.settings_json.take() {
-            profile.settings_json = scrub_auth_env_from_settings(settings);
+        // 认证字段加密而非删除：保留原配置，切号/恢复时完整还原。
+        let (plain_settings, secret_settings) =
+            split_auth_settings(profile.settings_json.take());
+        profile.settings_json = plain_settings;
+        if let Some(secret) = secret_settings {
+            profile.encrypted_auth_settings = Some(
+                encrypt_secret(&secret.to_string())
+                    .map_err(|e| format!("加密账号「{}」的认证配置失败: {e}", profile.name))?,
+            );
+        } else {
+            profile.encrypted_auth_settings = None;
         }
     }
 
@@ -552,9 +609,9 @@ mod tests {
         assert_eq!(us.chrome_profile, None);
     }
 
-    /// settings_json 落盘前必须脱敏：认证 env 与 apiKeyHelper 不能以明文留在 store。
+    /// 认证字段拆分后：明文部分不再含密钥，加密部分完整保留原配置。
     #[test]
-    fn save_store_scrubs_auth_env_from_settings() {
+    fn split_auth_settings_separates_secrets() {
         let settings = serde_json::json!({
             "env": {
                 "ANTHROPIC_API_KEY": "sk-ant-secret",
@@ -563,35 +620,58 @@ mod tests {
             },
             "permissions": { "defaultMode": "bypassPermissions" }
         });
-        let scrubbed = scrub_auth_env_from_settings(settings).expect("不应被清成 None");
-        assert!(scrubbed["env"].get("ANTHROPIC_API_KEY").is_none());
-        assert_eq!(scrubbed["env"]["TZ"], "Africa/Lagos");
-        assert_eq!(scrubbed["env"]["CUSTOM_KEEP"], "1");
-        assert!(scrubbed["permissions"]["defaultMode"] == "bypassPermissions");
+        let (plain, secret) = split_auth_settings(Some(settings));
+        let plain = plain.expect("非敏感配置必须保留");
+        assert!(plain["env"].get("ANTHROPIC_API_KEY").is_none());
+        assert_eq!(plain["env"]["TZ"], "Africa/Lagos");
+        assert_eq!(plain["env"]["CUSTOM_KEEP"], "1");
+        assert_eq!(plain["permissions"]["defaultMode"], "bypassPermissions");
+
+        let secret = secret.expect("认证字段必须被拆出（而非删除）");
+        assert_eq!(secret["env"]["ANTHROPIC_API_KEY"], "sk-ant-secret");
     }
 
     #[test]
-    fn scrub_auth_env_drops_apikey_helper() {
+    fn split_auth_settings_all_secret_yields_none_plain() {
         let settings = serde_json::json!({
             "apiKeyHelper": "/path/to/helper",
             "env": { "ANTHROPIC_AUTH_TOKEN": "tok" }
         });
-        // 这个用例里删完认证项后 settings 已空，脱敏结果应为 None（不写回文件）。
-        assert!(scrub_auth_env_from_settings(settings).is_none());
+        let (plain, secret) = split_auth_settings(Some(settings));
+        assert!(plain.is_none(), "全是认证字段时明文部分为空");
+        let secret = secret.expect("认证字段不能丢");
+        assert_eq!(secret["apiKeyHelper"], "/path/to/helper");
+        assert_eq!(secret["env"]["ANTHROPIC_AUTH_TOKEN"], "tok");
     }
 
+    /// 拆分再合并必须无损往返：切号/恢复时认证配置要原样写回。
     #[test]
-    fn scrub_auth_env_keeps_non_sensitive_settings() {
+    fn split_then_restore_roundtrips_auth_settings() {
         let settings = serde_json::json!({
             "apiKeyHelper": "/path/to/helper",
             "env": { "ANTHROPIC_AUTH_TOKEN": "tok", "TZ": "UTC" },
             "permissions": { "defaultMode": "bypassPermissions" }
         });
-        let scrubbed = scrub_auth_env_from_settings(settings).expect("非敏感配置必须保留");
-        assert!(scrubbed.get("apiKeyHelper").is_none());
-        assert!(scrubbed["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
-        assert_eq!(scrubbed["env"]["TZ"], "UTC");
-        assert_eq!(scrubbed["permissions"]["defaultMode"], "bypassPermissions");
+        let (plain, secret) = split_auth_settings(Some(settings));
+        let mut merged = plain;
+        restore_auth_settings(&mut merged, secret);
+        let merged = merged.expect("合并结果不应为 None");
+        assert_eq!(merged["apiKeyHelper"], "/path/to/helper");
+        assert_eq!(merged["env"]["ANTHROPIC_AUTH_TOKEN"], "tok");
+        assert_eq!(merged["env"]["TZ"], "UTC");
+        assert_eq!(merged["permissions"]["defaultMode"], "bypassPermissions");
+    }
+
+    #[test]
+    fn split_auth_settings_handles_empty_and_non_object() {
+        assert_eq!(split_auth_settings(None), (None, None));
+        let (plain, secret) = split_auth_settings(Some(serde_json::json!("string")));
+        assert!(plain.is_none());
+        assert!(secret.is_none());
+        // 无认证字段时 secret 为 None（不产生空加密块）。
+        let (plain, secret) = split_auth_settings(Some(serde_json::json!({ "env": { "TZ": "UTC" } })));
+        assert!(secret.is_none());
+        assert_eq!(plain.unwrap()["env"]["TZ"], "UTC");
     }
 
     #[test]
