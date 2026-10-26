@@ -1570,14 +1570,16 @@ fn get_autostart() -> AutostartState {
             .is_ok();
 
         // StartupApproved\Run 里与本值名对应的二进制：首字节 02=启用、03=禁用。
+        // 注意 winreg 0.52 的 FromRegValue 没为 Vec<u8> 实现（只支持 String/u32 等），
+        // 二进制值必须走 get_raw_value 拿原始 bytes。
         let disabled_by_user = RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey_with_flags(
                 "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run",
                 KEY_READ,
             )
-            .and_then(|key| key.get_value::<Vec<u8>, _>(AUTOSTART_VALUE_NAME))
+            .and_then(|key| key.get_raw_value(AUTOSTART_VALUE_NAME))
             .ok()
-            .and_then(|bytes| bytes.first().copied())
+            .and_then(|raw| raw.bytes.first().copied())
             .map(|first| first == 0x03)
             .unwrap_or(false);
 

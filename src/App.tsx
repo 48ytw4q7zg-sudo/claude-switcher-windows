@@ -485,7 +485,8 @@ function App() {
       .catch(() => undefined);
     // 覆盖框初始为空（而不是预填解析后的目录）：否则用户一点保存，
     // 就会把默认路径固化成覆盖文件，之后再改环境变量也不再跟随。
-    invoke<Option<string>>('get_claude_config_dir_override')
+    // Rust 的 Option<String> 序列化成 TS 是 string | null。
+    invoke<string | null>('get_claude_config_dir_override')
       .then((next) => setClaudeConfigOverride(next ?? ''))
       .catch(() => undefined);
   }, []);
@@ -1299,7 +1300,7 @@ function App() {
                     });
                     const [next, override] = await Promise.all([
                       invoke<string>('get_claude_config_dir'),
-                      invoke<Option<string>>('get_claude_config_dir_override'),
+                      invoke<string | null>('get_claude_config_dir_override'),
                     ]);
                     setClaudeConfigDir(next);
                     setClaudeConfigOverride(override ?? '');
@@ -1347,33 +1348,35 @@ function App() {
             复制诊断信息
           </button>
           {platform === 'windows' && (
-            <button
-              className="ghost wide"
-              onClick={() =>
-                run('autostart', async () => {
-                  const next = !autostart;
-                  try {
-                    await invoke('set_autostart', { enabled: next });
-                  } catch (err) {
-                    // 后端失败时不改 UI 状态，避免显示与实际注册表不一致。
-                    throw err;
-                  }
-                  setAutostart(next);
-                  return next ? '已开启开机自启' : '已关闭开机自启';
-                })
-              }
-              disabled={!!busy || platform !== 'windows'}
-              title="写入 HKCU\...\Run 注册表项，仅对当前用户生效"
-            >
-              <Power />
-              {autostart ? '关闭开机自启' : '开启开机自启'}
-            </button>
-            {autostartDisabled && (
-              <div className="inline-warning">
-                启动项已在 Windows 任务管理器（「启动应用」）中被禁用，本工具无法代为恢复。
-                请打开 任务管理器 → 启动应用，把 Claude Switcher 设为「已启用」。
-              </div>
-            )}
+            <>
+              <button
+                className="ghost wide"
+                onClick={() =>
+                  run('autostart', async () => {
+                    const next = !autostart;
+                    try {
+                      await invoke('set_autostart', { enabled: next });
+                    } catch (err) {
+                      // 后端失败时不改 UI 状态，避免显示与实际注册表不一致。
+                      throw err;
+                    }
+                    setAutostart(next);
+                    return next ? '已开启开机自启' : '已关闭开机自启';
+                  })
+                }
+                disabled={!!busy || platform !== 'windows'}
+                title="写入 HKCU\...\Run 注册表项，仅对当前用户生效"
+              >
+                <Power />
+                {autostart ? '关闭开机自启' : '开启开机自启'}
+              </button>
+              {autostartDisabled && (
+                <div className="inline-warning">
+                  启动项已在 Windows 任务管理器（「启动应用」）中被禁用，本工具无法代为恢复。
+                  请打开 任务管理器 → 启动应用，把 Claude Switcher 设为「已启用」。
+                </div>
+              )}
+            </>
           )}
         </div>
       </section>
