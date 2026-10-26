@@ -37,12 +37,17 @@ urlencoding = "2"
 aes-gcm = "0.10"
 rand = "0.8"
 base64 = "0.22"
-# HTTP：Claude OAuth usage/profile 与 Clash 控制器都走 reqwest（系统代理/环境变量代理、
-# JSON body 走 socket 而不是 argv，中文节点名不再跨编码传参）。
+# HTTP：Claude OAuth usage/profile 与 Clash 控制器都走 reqwest。
+# - system-proxy：读 Windows 注册表里的系统代理（Clash Verge「系统代理」开关就是它），
+#   以及 HTTP_PROXY/HTTPS_PROXY 环境变量。**这是默认特性**，但我们关了 default-features，
+#   必须显式加回来，否则只认环境变量。
+# - rustls-tls-native-roots：信任 Windows 证书库（而非仅内置 Mozilla 根证书）。
+#   装了会做 HTTPS 检查的杀软、或公司代理注入根证书的机器上必须用它。
 reqwest = { version = "0.12", default-features = false, features = [
     "blocking",
     "json",
-    "rustls-tls",
+    "system-proxy",
+    "rustls-tls-native-roots",
 ] }
 # 进程检测（Claude Code CLI 是否在运行）：跨平台取 exe 名与命令行，
 # 替代 Windows 上 PowerShell Get-CimInstance（慢、OEM 代码页乱码）。
@@ -65,6 +70,9 @@ windows-sys = { version = "0.59", features = [
 ] }
 # junction 是纯 API 调用，替代 cmd /C mklink /J（cmd 解析 % & ^ 出错、GBK 输出乱码）。
 junction = "1"
+# 开机自启：直接写 HKCU\...\Run，替代 reg.exe 子进程（后者的错误信息是本地化
+# 字符串，中文系统上「删除一个不存在的值」会被误判成失败）。
+winreg = { version = "0.52", features = ["transactions"] }
 
 [dev-dependencies]
 tempfile = "3"

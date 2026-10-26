@@ -61,8 +61,12 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       # cfg 门控下的 dead_code 只在目标平台编译时才暴露（例如 Windows-only 的
-      # junction/icacls 代码、unix-only 的 keychain 代码），显式按 target 各跑一遍。
+      # junction/icacls 代码、unix-only 的 keychain 代码）。macOS runner 的 host 是
+      # aarch64-apple-darwin、target 是 x86_64-apple-darwin，两者不同才需要再跑一遍；
+      # Windows runner 的 host 就是 x86_64-pc-windows-msvc，与 target 相同，上面的
+      # 「Rust clippy」已经覆盖，重复跑只是浪费。
       - name: Rust clippy (target)
+        if: runner.os == 'macOS'
         working-directory: src-tauri
         run: cargo clippy --target ${{ matrix.target }} --all-targets -- -D warnings
 

@@ -106,8 +106,12 @@ pub fn link_path(target: &Path, live: &Path, label: &str) -> Result<(), String> 
 }
 
 /// 删除 live 处的隔离链接。Unix：remove_file。
-/// Windows：先按文件删（文件符号链接/硬链接），失败再按目录删
-/// （目录符号链接/junction；remove_dir 只移除 reparse point，不删目标内容）。
+/// Windows：目录链接（符号链接/junction）直接 `remove_dir`——它只移除 reparse point，
+/// 不删目标内容；文件链接走 `remove_file`。
+///
+/// 早期实现是先试 `remove_file` 失败再 `remove_dir`，而 `retry_locked` 把
+/// ERROR_ACCESS_DENIED(5) 也当成可重试——对 junction 调 remove_file 常返回 5，
+/// 于是每个目录链接都要白等约 1.3 秒（6 次退避）才降级。这里按类型直接分支。
 pub fn remove_link(live: &Path) -> Result<(), String> {
     #[cfg(unix)]
     {
@@ -115,6 +119,16 @@ pub fn remove_link(live: &Path) -> Result<(), String> {
     }
     #[cfg(windows)]
     {
+        use std::os::windows::fs::FileTypeExt;
+        // 先看链接自身类型（不跟随），避免对目录链接走文件删除路径。
+        let is_dir_link = fs::symlink_metadata(live)
+            .map(|m| m.file_type().is_symlink_dir())
+            .unwrap_or(false);
+        if is_dir_link {
+            // junction 也归到这里：symlink_metadata 对 junction 报 is_symlink()=true。
+            return crate::fsx::remove_dir_with_retry(live)
+                .map_err(|e| format!("移除旧链接失败: {}", crate::fsx::humanize_io_error(&e)));
+        }
         match crate::fsx::remove_file_with_retry(live) {
             Ok(()) => Ok(()),
             Err(_) => crate::fsx::remove_dir_with_retry(live)

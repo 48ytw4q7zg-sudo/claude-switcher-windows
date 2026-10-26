@@ -24,7 +24,8 @@
 4. 从开始菜单打开 **Claude Switcher**。
 5. **先保存当前账号**：在「保存当前账号」面板输入名称（如「Claude 主号」），点「保存快照」。前提：你已经在 Claude Code 中登录过至少一个账号。
 6. **切换账号**：在「账号快照」里点对应卡片的「切换」。提示重启正在运行的 Claude Code 会话。
-7. **托盘用法**：点桌面右下角托盘的彩色图标可弹出用量窗口；**右键**托盘图标有「打开主窗口 / 刷新用量 / 退出 Claude Switcher」。
+7. **托盘用法**：点桌面右下角托盘的彩色图标可弹出用量窗口；**双击**图标直接打开主窗口；**右键**托盘图标有「打开主窗口 / 刷新用量 / 退出 Claude Switcher」。
+   > Windows 11 默认会把新装的托盘图标收进「^」溢出区。想一直看到它：右键任务栏 → 任务栏设置 → 打开「其他系统托盘图标」/「选择哪些图标显示在任务栏上」→ 找到 Claude Switcher → 打开。
 8. 主窗口点 **X** 只是**隐藏到托盘**，不会退出；要彻底退出请用托盘右键菜单或主窗口「退出」按钮。
 9. （可选）在「数据位置」面板点「开启开机自启」，电脑重启后自动运行（只影响当前 Windows 用户）。
 10. （可选）「一键新号」向导：选节点 → 准备环境 → 手动打开 Claude Code 完成 OAuth → 回到本工具点「登录完成后保存」。
@@ -41,8 +42,9 @@ cd claude-switcher-windows
 # 2. 前端依赖
 npm ci
 
-# 3. 若报 `linker link.exe not found`，把 MSVC 的 bin 加进 PATH（按实际 VS 路径改）
-$env:Path = "C:\Program Files\Microsoft Visual Studio\18\Community\VC\Tools\MSVC\14.51.36231\bin\Hostx64\x64;$env:Path"
+# 3. 若报 `linker link.exe not found`，把 MSVC 的 bin 加进 PATH（版本号随机器而异）
+$msvc = Get-ChildItem "C:\Program Files*\Microsoft Visual Studio\*\*\VC\Tools\MSVC" -Directory | Sort-Object Name -Descending | Select-Object -First 1
+$env:Path = "$($msvc.FullName)\bin\Hostx64\x64;$env:USERPROFILE\.cargo\bin;$env:Path"
 $env:Path = "$env:USERPROFILE\.cargo\bin;$env:Path"
 
 # 4. 质量门禁（与 CI 相同）
@@ -145,19 +147,22 @@ lib.rs（命令层）
 | 文件隔离 | symlink | symlink → 硬链接（同卷同索引识别） |
 | 权限收敛 | `chmod 600` | 只在 `%USERPROFILE%\.claude-switcher` 创建时执行一次 icacls（当前用户 SID、先授权再断继承、子项继承），不动 Claude 自己的文件 |
 | 网络请求 | `curl` | `reqwest` + rustls（无黑窗、无 PATH 依赖、读系统代理） |
-| 托盘弹窗 | 图标下方弹出 | 图标上方弹出，按点击坐标所在显示器 + 工作区夹紧，失焦 300ms 防抖 |
+| 托盘弹窗 | 图标下方弹出 | 图标上方弹出，按点击坐标所在显示器 + 工作区夹紧，失焦 500ms 防抖，双击图标打开主窗口 |
 | 打开数据目录 | `open` | `explorer`（spawn，忽略非零退出码） |
 
 ### 本仓库额外增强
 
 - 单实例（避免双开并发写 store）
-- 关窗到托盘 + 右键退出 + 开机自启（`HKCU\...\Run`）
+- 关窗到托盘 + 右键退出 + 开机自启（`HKCU\...\Run`，带 `--autostart` 静默启动参数）
 - Clash 控制器 / secret / 代理端口手动覆盖；默认端口 9097 → 9090 真实探测
-- 用量 TTL 缓存 + 并发 in-flight 合并 + 网络异常时的超时预算控制
-- 链接模式显示与开发者模式引导
-- 原子写入、文件锁重试、悬空链接识别、路径归一化（`\\?\` 前缀 / 大小写 / 8.3 短名）
+- 用量 TTL 缓存 + 并发 in-flight 合并 + 本地快照 45 秒缓存
+- 链接模式显示与开发者模式一键引导（`ms-settings:developers`）
+- 手动指定 Claude 配置目录（解决 GUI 启动读不到终端环境变量的问题）
+- 原子写入、文件锁重试（32/33 退避、5 只重试一次）、悬空链接识别、路径归一化（`\\?\` 前缀 / 大小写 / 8.3 短名 / 正斜杠统一）
+- 读 JSON 自动处理 UTF-8 BOM 与 UTF-16（记事本改过的 settings.json 不会让界面打不开）
 - 事务回滚顺序「先凭据后 JSON」；账号材料已切换后链接激活失败降级为 warning（避免「显示失败、实际已切」）
-- 新增单元测试：链接识别、悬空链接、路径归一化、原子写入、merge/scrub 逻辑、Windows 反斜杠 `subagents` 过滤等
+- 本机日志（`~/.claude-switcher/logs/`，1MB 滚动）+ panic hook + 诊断信息一键复制
+- 新增单元测试：链接识别、悬空链接、路径归一化、原子写入、merge/scrub 逻辑、BOM/UTF-16 解码、进程匹配表格、Windows 反斜杠 `subagents` 过滤等
 
 ## 隐私与安全
 
@@ -168,9 +173,22 @@ lib.rs（命令层）
 
 ## 构建与发布
 
-- `CI`：push / PR 时在 macOS 与 Windows 上跑前端构建、`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`（含按 target 各跑一遍）、`cargo test --lib`、Tauri build。
+- `CI`：push / PR 时在 macOS 与 Windows 上跑前端构建、`cargo fmt --check`、
+  `cargo clippy --all-targets -- -D warnings`、`cargo test --lib`、Tauri build。
+  （macOS runner 的 host 与 target 不同，会额外按 target 再跑一遍 clippy；
+  Windows runner 两者相同，不重复。）
 - `Windows Build`：手动触发或打 `v*` tag，产出 MSI / NSIS。
 - 未配置代码签名证书；首次运行安装包会有 SmartScreen 提示，属预期。
+  有条件可接 Azure Trusted Signing 或自持证书消除该提示。
+
+## 出处与许可
+
+- 本仓库是 [VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher)（macOS 版）
+  的 Windows 迁移版，迁移基线 commit [`6897984`](https://github.com/VallierDev/claude-switcher/commit/68979843313a0cb7da3cda32765184436ba9598e)。
+- **上游仓库未声明许可证**（无 LICENSE 文件）。若上游后续补充许可，本仓库的许可
+  应与之对齐；在此之前请联系上游作者确认授权范围。
+- 涉及 Anthropic / Claude Code 的商标与名称归其权利人所有。本工具只在本地操作
+  Claude Code 已生成的文件，不修改、不分发任何 Anthropic 专有代码。
 
 ## 致谢
 

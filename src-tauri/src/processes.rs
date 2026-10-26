@@ -20,22 +20,47 @@ use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::platform::imp;
 
-/// 是否为 Claude Code CLI 进程（按上文规则精确匹配）。
+/// 是否为 Claude Code CLI 进程（精确匹配，宁漏勿误杀）。
+///
+/// **黑名单（优先级最高）**——命中任意一条直接排除：
+/// - Claude Desktop：路径含 `anthropicclaude`；或 MSIX 安装（`WindowsApps` 目录）；
+///   或 Electron 子进程（命令行带 `--type=`，如 `--type=renderer`）。
+///   Desktop 是 Electron 应用，主程序与子进程都可能叫 `claude.exe`，
+///   误杀会连带干掉用户的桌面客户端。
+/// - 本工具自身（`claude-switcher` / `claude_switcher`）。
+/// - VS Code 等编辑器打开 `claude-code-notes` 目录、终端里敲 `claude-code` 字样：
+///   这些都不是「exe 名等于 claude」，本来就不会命中白名单。
+///
+/// **白名单**——满足其一才算 Claude Code CLI：
+/// 1. exe 文件名等于 `claude.exe` / `claude`（原生安装，以及 npm 包的 `bin/claude.exe`）；
+/// 2. 宿主是 `node` / `bun` 且命令行含 `@anthropic-ai/claude-code`（老版 npm 安装走 cli.js）。
 fn is_claude_code_process(exe: Option<&str>, cmd: Option<&[String]>) -> bool {
     let Some(exe_path) = exe else {
         return false;
     };
     let exe_lower = exe_path.to_lowercase();
 
-    // Claude Desktop 的安装路径通常含 AnthropicClaude（AppData\Local\AnthropicClaude）。
+    // ── 黑名单 ──
+    // Claude Desktop：标准安装目录。
     if exe_lower.contains("anthropicclaude") {
+        return false;
+    }
+    // Claude Desktop：MSIX / 应用商店安装（路径在 WindowsApps 下，无法用目录名判断）。
+    if exe_lower.contains("\\windowsapps\\") {
         return false;
     }
     // 本工具自身。
     if exe_lower.contains("claude-switcher") || exe_lower.contains("claude_switcher") {
         return false;
     }
+    // Electron 子进程：Desktop 的 renderer/gpu/utility 进程都带 `--type=`。
+    if let Some(args) = cmd {
+        if args.iter().any(|arg| arg.starts_with("--type=")) {
+            return false;
+        }
+    }
 
+    // ── 白名单 ──
     let exe_name = exe_lower
         .rsplit(['\\', '/'])
         .next()
@@ -155,10 +180,18 @@ fn terminate_pid(pid: &str, force: bool) -> Result<(), String> {
         .output()
         .map_err(|e| format!("结束 Claude Code 进程失败: {e}"))?;
     if force && !output.status.success() {
-        // 强杀阶段进程可能恰好已退出（taskkill 128），不算失败。
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("not found") && !stderr.contains("找不到") {
-            return Err(format!("强制结束 Claude Code 进程失败: {}", stderr.trim()));
+        // **用退出码判断，不要匹配 stderr 文案**：taskkill 在中文系统上输出的是
+        // GBK 编码的「没有找到进程」，`from_utf8_lossy` 会乱码，字符串匹配基本失效。
+        // 约定：128 = ERROR_WAIT_NO_CHILDREN / 进程不存在，属幂等成功。
+        //      其它非零 = 真的失败（权限不足等）。
+        const TASKKILL_PROCESS_NOT_FOUND: i32 = 128;
+        let code = output.status.code().unwrap_or(-1);
+        if code != TASKKILL_PROCESS_NOT_FOUND {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(format!(
+                "强制结束 Claude Code 进程失败（退出码 {code}）: {}",
+                stderr.trim()
+            ));
         }
     }
     Ok(())
@@ -182,4 +215,122 @@ fn terminate_pid(pid: &str, force: bool) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 进程匹配表格测试：覆盖 npm / 原生安装、Claude Desktop（标准安装 / MSIX /
+    /// Electron 子进程）、以及「编辑器打开 claude-code 目录」这类误杀场景。
+    #[test]
+    fn claude_code_process_matching_table() {
+        // (exe 路径, 命令行, 是否应判定为 Claude Code, 场景说明)
+        let cases: Vec<(&str, Option<Vec<String>>, bool, &str)> = vec![
+            // ── 应命中（Claude Code CLI）──
+            (
+                r"C:\Users\A\AppData\Local\claude\claude.exe",
+                None,
+                true,
+                "原生安装 claude.exe",
+            ),
+            (
+                r"C:\Users\A\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\bin\claude.exe",
+                None,
+                true,
+                "npm 包的 bin/claude.exe",
+            ),
+            (
+                "node.exe",
+                Some(vec![
+                    r"C:\npm\node_modules\@anthropic-ai\claude-code\cli.js".into(),
+                ]),
+                true,
+                "node 跑 cli.js（老 npm 安装）",
+            ),
+            (
+                "node.exe",
+                Some(vec!["@anthropic-ai/claude-code/dist/cli.js".into()]),
+                true,
+                "node + 正斜杠路径",
+            ),
+            (
+                "bun.exe",
+                Some(vec![r"@anthropic-ai\claude-code\bin\cli.js".into()]),
+                true,
+                "bun 跑 cli.js",
+            ),
+            // ── 必须排除（Claude Desktop；误杀会干掉用户的桌面客户端）──
+            (
+                r"C:\Users\A\AppData\Local\AnthropicClaude\app.exe",
+                None,
+                false,
+                "Desktop 标准安装（目录名含 AnthropicClaude）",
+            ),
+            (
+                r"C:\Users\A\AppData\Local\AnthropicClaude\claude.exe",
+                None,
+                false,
+                "Desktop 主程序也叫 claude.exe",
+            ),
+            (
+                r"C:\Program Files\WindowsApps\Anthropic.Claude_1.2.3\claude.exe",
+                None,
+                false,
+                "Desktop MSIX 安装（WindowsApps 目录）",
+            ),
+            (
+                r"C:\Program Files\WindowsApps\Anthropic.Claude_1.2.3\claude.exe",
+                Some(vec!["--type=renderer".into()]),
+                false,
+                "Electron 渲染子进程（--type=renderer）",
+            ),
+            (
+                r"C:\somewhere\claude.exe",
+                Some(vec!["--type=gpu-process".into()]),
+                false,
+                "Electron GPU 子进程",
+            ),
+            // ── 必须排除（本工具自身与无关进程）──
+            (
+                r"C:\Users\A\AppData\Local\Programs\Claude-Switcher.exe",
+                None,
+                false,
+                "本工具自身",
+            ),
+            (
+                r"C:\Users\A\AppData\Roaming\Code\Code.exe",
+                Some(vec![r"code.exe C:\work\claude-code-notes".into()]),
+                false,
+                "VS Code 打开 claude-code 目录",
+            ),
+            (
+                r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
+                Some(vec!["claude-code".into()]),
+                false,
+                "PowerShell 命令行含关键词",
+            ),
+            (r"C:\Windows\explorer.exe", None, false, "完全无关进程"),
+            (
+                "node.exe",
+                Some(vec![r"C:\app\server.js".into()]),
+                false,
+                "node 跑别的脚本（不含 @anthropic-ai/claude-code）",
+            ),
+        ];
+
+        let mut failures = Vec::new();
+        for (exe, cmd, expect, desc) in cases {
+            let got = is_claude_code_process(Some(exe), cmd.as_deref());
+            if got != expect {
+                failures.push(format!("  FAIL: {desc} (expect={expect}, got={got})"));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "进程匹配表格测试失败 {} 例:\n{}",
+            failures.len(),
+            failures.join("\n")
+        );
+    }
 }

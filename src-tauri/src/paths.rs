@@ -103,6 +103,13 @@ pub fn ensure_app_dirs() -> Result<(), String> {
     fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
     if needs_secure {
         imp::secure_app_data_dir(&data_dir);
+        // 一次性迁移标记：早期版本创建过的目录永远不会被「不存在时」的分支收紧，
+        // 用一个标记文件记录「已按新策略设置过 ACL」，避免老用户漏掉这次收敛。
+        let marker = data_dir.join(".acl-hardened");
+        if !marker.exists() {
+            imp::secure_app_data_dir(&data_dir);
+            let _ = fs::write(&marker, b"acl hardened\n");
+        }
     }
     for dir in [
         backups_dir()?,
@@ -111,5 +118,8 @@ pub fn ensure_app_dirs() -> Result<(), String> {
     ] {
         fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     }
+    // 清理上次进程被杀留下的原子写临时文件（`.xxx.tmp-<uuid>`）。
+    let _ = crate::fsx::cleanup_stale_tmp_files(&data_dir);
+    let _ = crate::fsx::cleanup_stale_tmp_files(&backups_dir()?);
     Ok(())
 }

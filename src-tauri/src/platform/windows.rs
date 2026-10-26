@@ -83,10 +83,14 @@ pub fn secure_app_data_dir(dir: &Path) {
         return;
     };
     let path = dir.to_string_lossy().to_string();
-    // 用同一个 icacls 进程先 grant 再断继承，避免中间态。
+    // 先授予当前用户与 SYSTEM，再断继承。
+    // **必须保留 SYSTEM**：只断继承后仅剩当前用户的话，Windows Defender、
+    // 备份软件、以及某些索引服务会读不到这个目录，表现为扫描报错或备份缺失。
+    // 用同一个 icacls 进程一次做完，避免出现「已断继承但还没授权」的中间态。
     let output = silent_command("icacls")
         .arg(&path)
         .args(["/grant:r", &format!("{username}:(OI)(CI)F")])
+        .args(["/grant:r", "*SYSTEM:(OI)(CI)F"])
         .args(["/inheritance:r"])
         .output();
     let _ = output;
@@ -225,15 +229,22 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
     }
 }
 
-/// 路径规范化比较键：解析 `\\?\` / `\\?\UNC\` 前缀、把 8.3 短名展开成长名、
-/// 统一小写、去尾分隔符。
+/// 路径规范化比较键：把 `/` 统一成 `\`、解析 `\\?\` / `\\?\UNC\` 前缀、
+/// 把 8.3 短名展开成长名、统一小写、去尾分隔符。
+///
 /// Windows 路径大小写不敏感、还可能出现 `C:\PROGRA~1\` 这类 8.3 短名，
 /// 直接字面比较会把「指向当前隔离目录」误判成「指向别处」。
+///
+/// **必须先统一分隔符**：隔离目录列表里有 `"plugins/data"`，`Path::join` 之后得到
+/// 的是 `...\plugins/data`（混合分隔符）；而 junction / `read_link` 返回的是反斜杠。
+/// 不先 `/` → `\` 的话 `is_linked_to` 比较必然失败，表现为每次切号都重建链接、
+/// 或误报「已指向其他隔离目录」。
 pub fn normalize_path(path: &Path) -> PathBuf {
     let raw = path.to_string_lossy().to_string();
     // 先把 8.3 短名展开（best-effort：失败就用原串继续）。
     let expanded = long_path_name(&raw).unwrap_or(raw);
-    let mut text = expanded;
+    // 统一分隔符：正斜杠 → 反斜杠（Windows 接受两者，但比较前必须一致）。
+    let mut text = expanded.replace('/', "\\");
     const VERBATIM: &str = r"\\?\";
     const VERBATIM_UNC: &str = r"\\?\UNC\";
     if text.starts_with(VERBATIM_UNC) {
@@ -273,19 +284,29 @@ pub fn create_junction(target: &Path, live: &Path) -> io::Result<()> {
     junction::create(target, live)
 }
 
-/// 重试 Windows 文件锁（ERROR_SHARING_VIOLATION 32 / ERROR_ACCESS_DENIED 5 /
-/// ERROR_LOCK_VIOLATION 33）：Claude Code、VS Code 监视器或索引器短暂持有句柄时
-/// rename/删除会失败，短退避重试通常即可通过。
+/// 重试 Windows 文件锁：共享冲突 32 / 锁冲突 33 通常是杀软、索引器短暂持有句柄，
+/// 适合短退避；权限拒绝 5 多半是持久权限问题，最多只再试一次，避免每个失败操作白等。
 pub fn retry_locked<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     let mut last = None;
+    let mut access_denied_retries = 0;
     for attempt in 0..6u64 {
         match f() {
             Ok(value) => return Ok(value),
-            Err(e) if matches!(e.raw_os_error(), Some(5 | 32 | 33)) => {
+            Err(e) => {
+                let retryable = match e.raw_os_error() {
+                    Some(32 | 33) => true,
+                    Some(5) => {
+                        access_denied_retries += 1;
+                        access_denied_retries <= 1
+                    }
+                    _ => false,
+                };
+                if !retryable {
+                    return Err(e);
+                }
                 last = Some(e);
                 std::thread::sleep(StdDuration::from_millis(60 * (attempt + 1)));
             }
-            Err(e) => return Err(e),
         }
     }
     Err(last.unwrap())
@@ -294,6 +315,26 @@ pub fn retry_locked<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `whoami /user` 的真实输出是「表头 + 分隔线 + 数据行」三行，
+    /// SID 在第三列；测试用本机实机抓到的格式（中文 Windows 同样输出 ASCII 表头）。
+    #[test]
+    fn extract_sid_parses_real_whoami_output() {
+        let real = "User Name              SID\n====================== ============================================\nwin-20260303ofa\\administrator S-1-5-21-3215687269-4097961639-2251065674-500\n";
+        assert_eq!(
+            extract_sid(real).as_deref(),
+            Some("S-1-5-21-3215687269-4097961639-2251065674-500")
+        );
+    }
+
+    #[test]
+    fn extract_sid_handles_plain_and_garbage() {
+        assert_eq!(extract_sid("S-1-5-18").as_deref(), Some("S-1-5-18"));
+        assert_eq!(extract_sid("no sid here").as_deref(), None);
+        // 分段数不足 3 的不算合法 SID。
+        assert_eq!(extract_sid("S-1").as_deref(), None);
+        assert_eq!(extract_sid("").as_deref(), None);
+    }
 
     #[test]
     fn normalize_path_strips_verbatim_and_case() {
@@ -328,5 +369,17 @@ mod tests {
     #[test]
     fn long_path_name_skips_paths_without_tilde() {
         assert!(long_path_name(r"C:\Users\Bob\.claude").is_none());
+    }
+
+    /// `plugins/data` 这类含正斜杠的隔离目录名：`Path::join` 后是混合分隔符，
+    /// 必须与反斜杠写法判为等价，否则每次切号都重建链接。
+    #[test]
+    fn normalize_path_handles_forward_slash_in_join() {
+        let joined =
+            Path::new(r"C:\Users\Bob\.claude-switcher\session-profiles\p1").join("plugins/data");
+        let backslash =
+            Path::new(r"C:\Users\Bob\.claude-switcher\session-profiles\p1\plugins\data");
+        assert_eq!(normalize_path(&joined), normalize_path(backslash));
+        assert!(paths_equivalent(&joined, backslash));
     }
 }

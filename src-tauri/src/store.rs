@@ -151,31 +151,43 @@ pub struct ProfileSummary {
     pub is_current: bool,
 }
 
+/// 新账号的默认运行时绑定（时区 / 语言 / Chrome Profile）。
+///
+/// 只保留**明确无误**的地区关键词映射，其余一律留空让用户自己填：
+/// - 早前版本用 `contains("us")` / `contains("38")` 做子串判断，
+///   `russia`、`austria`、`Japan38` 都会被误判成美国区；
+/// - `Profile 4` / `Profile 35` 是上游作者自己机器上的 Chrome Profile 编号，
+///   对其它用户毫无意义，照抄只会把账号绑到错误的浏览器 profile。
+///
+/// 时区/语言只是 Claude Code 的运行时提示，猜错的代价高于留空。
 pub fn default_runtime_for_profile(name: &str, node: Option<&str>) -> ProfileRuntimeBinding {
     let haystack = format!(
         "{} {}",
         name.to_lowercase(),
         node.unwrap_or("").to_lowercase()
     );
-    if haystack.contains("尼") || haystack.contains("nigeria") || haystack.contains("南非") {
-        ProfileRuntimeBinding {
+    // 尼日利亚/南非区：明确的非洲节点关键词。
+    if haystack.contains("nigeria") || haystack.contains("尼日") || haystack.contains("南非") {
+        return ProfileRuntimeBinding {
             timezone: Some("Africa/Lagos".to_string()),
             locale: Some("en_US.UTF-8".to_string()),
-            chrome_profile: Some("Profile 4".to_string()),
-        }
-    } else if haystack.contains("美") || haystack.contains("us") || haystack.contains("38") {
-        ProfileRuntimeBinding {
-            timezone: Some("America/Los_Angeles".to_string()),
-            locale: Some("en_US.UTF-8".to_string()),
-            chrome_profile: Some("Profile 35".to_string()),
-        }
-    } else {
-        ProfileRuntimeBinding {
+            chrome_profile: None,
+        };
+    }
+    // 美国区：只认明确写法，不做 `us` / 数字子串猜测。
+    if haystack.contains("united states")
+        || haystack.contains("usa")
+        || haystack.contains("美国")
+        || haystack.contains("洛杉")
+        || haystack.contains("los angeles")
+    {
+        return ProfileRuntimeBinding {
             timezone: Some("America/Los_Angeles".to_string()),
             locale: Some("en_US.UTF-8".to_string()),
             chrome_profile: None,
-        }
+        };
     }
+    ProfileRuntimeBinding::default()
 }
 
 // ───────────────────────── store 加密主密钥 ─────────────────────────
@@ -238,8 +250,23 @@ fn read_store_key_raw(username: &str) -> Result<Option<String>, String> {
     ))
 }
 
+/// 进程内的密钥创建锁。
+/// 首次运行时托盘刷新线程与命令线程可能同时发现「没有密钥」并各生成一把，
+/// 后写入的覆盖先写入的——先加密的数据从此解不开。用 Mutex 串行化，
+/// 持锁后再读一次，第二个线程就会拿到第一个线程写好的密钥。
+static STORE_KEY_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// **加密路径专用**：读现有密钥，缺失才生成 32B 新密钥写入凭据存储。
 fn load_or_create_store_key() -> Result<[u8; 32], String> {
+    // 快路径：不加锁读一次，命中就直接返回（绝大多数调用走这里）。
+    if let Some(key) = read_store_key()? {
+        return Ok(key);
+    }
+
+    // 慢路径：持锁后再读一次，避免并发铸钥互相覆盖。
+    let _guard = STORE_KEY_CREATE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     if let Some(key) = read_store_key()? {
         return Ok(key);
     }
@@ -405,6 +432,36 @@ pub fn load_store() -> Result<Store, String> {
     Ok(store)
 }
 
+/// 从 settings_json 里清除认证类 env（`AUTH_ENV_KEYS` 列出的那些明文密钥），
+/// 以及会覆盖 OAuth 的 `apiKeyHelper`。
+///
+/// 与 `accounts::scrub_auth_from_settings` 的区别：那个用于「新号登录前清空 live」，
+/// 会把整个空 settings 收敛成 `None`；这个只做「脱敏」，保留其余配置原样。
+fn scrub_auth_env_from_settings(settings: Value) -> Option<Value> {
+    let mut obj = match settings {
+        Value::Object(map) => map,
+        _ => return None,
+    };
+    obj.remove("apiKeyHelper");
+    if let Some(env) = obj.get_mut("env").and_then(|v| v.as_object_mut()) {
+        for key in AUTH_ENV_KEYS {
+            env.remove(*key);
+        }
+    }
+    if obj
+        .get("env")
+        .and_then(|v| v.as_object())
+        .map(|env| env.is_empty())
+        .unwrap_or(false)
+    {
+        obj.remove("env");
+    }
+    if obj.is_empty() {
+        return None;
+    }
+    Some(Value::Object(obj))
+}
+
 pub fn save_store(store: &Store) -> Result<(), String> {
     paths::ensure_app_dirs()?;
     let path = paths::store_path()?;
@@ -416,6 +473,12 @@ pub fn save_store(store: &Store) -> Result<(), String> {
             let enc = encrypt_keychain_field(&plain)
                 .map_err(|e| format!("加密账号「{}」的凭据失败: {e}", profile.name))?;
             profile.keychain_password = Some(enc);
+        }
+        // settings_json 里可能残留认证类 env（ANTHROPIC_API_KEY 等）——这些同样是
+        // 明文密钥，不能因为「只加密 keychain_password」就留在 store 里。
+        // 落盘前统一清除；不影响切换功能（auth env 本来就会让切号失效）。
+        if let Some(settings) = profile.settings_json.take() {
+            profile.settings_json = scrub_auth_env_from_settings(settings);
         }
     }
 
@@ -459,6 +522,76 @@ mod tests {
     fn store_default_telemetry_is_disable() {
         let store = Store::default();
         assert_eq!(store.telemetry_mode, TelemetryMode::DisableTelemetry);
+    }
+
+    /// 地区启发式不能误判：`russia` / `austria` 含 "us" 子串、`Japan38` 含 "38"，
+    /// 早期版本会把它们全绑到美国时区。现在这些必须落到「不猜」的默认值。
+    #[test]
+    fn default_runtime_does_not_misfire_on_substrings() {
+        for name in ["russia-node", "austria", "Japan38", "sydney", "frankfurt"] {
+            let runtime = default_runtime_for_profile(name, None);
+            assert_eq!(
+                runtime.timezone, None,
+                "「{name}」不应被猜出时区（子串误判）"
+            );
+            assert_eq!(
+                runtime.chrome_profile, None,
+                "「{name}」不应被绑到别人的 Chrome Profile"
+            );
+        }
+    }
+
+    #[test]
+    fn default_runtime_matches_explicit_regions() {
+        let ng = default_runtime_for_profile("尼日", Some("Nigeria-1"));
+        assert_eq!(ng.timezone.as_deref(), Some("Africa/Lagos"));
+        let us = default_runtime_for_profile("美国号", None);
+        assert_eq!(us.timezone.as_deref(), Some("America/Los_Angeles"));
+        // 都不应写死 Chrome Profile。
+        assert_eq!(ng.chrome_profile, None);
+        assert_eq!(us.chrome_profile, None);
+    }
+
+    /// settings_json 落盘前必须脱敏：认证 env 与 apiKeyHelper 不能以明文留在 store。
+    #[test]
+    fn save_store_scrubs_auth_env_from_settings() {
+        let settings = serde_json::json!({
+            "env": {
+                "ANTHROPIC_API_KEY": "sk-ant-secret",
+                "TZ": "Africa/Lagos",
+                "CUSTOM_KEEP": "1"
+            },
+            "permissions": { "defaultMode": "bypassPermissions" }
+        });
+        let scrubbed = scrub_auth_env_from_settings(settings).expect("不应被清成 None");
+        assert!(scrubbed["env"].get("ANTHROPIC_API_KEY").is_none());
+        assert_eq!(scrubbed["env"]["TZ"], "Africa/Lagos");
+        assert_eq!(scrubbed["env"]["CUSTOM_KEEP"], "1");
+        assert!(scrubbed["permissions"]["defaultMode"] == "bypassPermissions");
+    }
+
+    #[test]
+    fn scrub_auth_env_drops_apikey_helper() {
+        let settings = serde_json::json!({
+            "apiKeyHelper": "/path/to/helper",
+            "env": { "ANTHROPIC_AUTH_TOKEN": "tok" }
+        });
+        // 这个用例里删完认证项后 settings 已空，脱敏结果应为 None（不写回文件）。
+        assert!(scrub_auth_env_from_settings(settings).is_none());
+    }
+
+    #[test]
+    fn scrub_auth_env_keeps_non_sensitive_settings() {
+        let settings = serde_json::json!({
+            "apiKeyHelper": "/path/to/helper",
+            "env": { "ANTHROPIC_AUTH_TOKEN": "tok", "TZ": "UTC" },
+            "permissions": { "defaultMode": "bypassPermissions" }
+        });
+        let scrubbed = scrub_auth_env_from_settings(settings).expect("非敏感配置必须保留");
+        assert!(scrubbed.get("apiKeyHelper").is_none());
+        assert!(scrubbed["env"].get("ANTHROPIC_AUTH_TOKEN").is_none());
+        assert_eq!(scrubbed["env"]["TZ"], "UTC");
+        assert_eq!(scrubbed["permissions"]["defaultMode"], "bypassPermissions");
     }
 
     #[test]

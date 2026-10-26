@@ -109,14 +109,38 @@ fn collect_jsonl_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Resul
     let entries = fs::read_dir(dir).map_err(|e| format!("读取 Claude 日志目录失败: {e}"))?;
     for entry in entries {
         let entry = entry.map_err(|e| e.to_string())?;
-        let path = entry.path();
-        if path.is_dir() {
-            collect_jsonl_files(&path, files)?;
-        } else if path.extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
-            files.push(path);
+        // entry.file_type 使用目录项已有的信息，避免每个路径再做一次 is_dir 系统调用。
+        if entry.file_type().map(|kind| kind.is_dir()).unwrap_or(false) {
+            collect_jsonl_files(&entry.path(), files)?;
+        } else if entry.path().extension().and_then(|ext| ext.to_str()) == Some("jsonl") {
+            files.push(entry.path());
         }
     }
     Ok(())
+}
+
+/// 本地日志聚合结果也做短 TTL 缓存：托盘每 60 秒、弹窗每 30 秒调用时，
+/// 不需要反复把近 30 天的 jsonl 全部逐行读一遍。45 秒覆盖同一轮界面刷新，
+/// 又足够快地看到新日志。文件级增量解析留作后续优化，当前不牺牲正确性。
+const LOCAL_USAGE_TTL: StdDuration = StdDuration::from_secs(45);
+static LOCAL_USAGE_CACHE: OnceLock<Mutex<Option<(std::time::Instant, ClaudeUsageSnapshot)>>> =
+    OnceLock::new();
+
+pub fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
+    let cache = LOCAL_USAGE_CACHE.get_or_init(|| Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((at, snapshot)) = guard.as_ref() {
+            if at.elapsed() < LOCAL_USAGE_TTL {
+                return Ok(snapshot.clone());
+            }
+        }
+    }
+
+    let snapshot = claude_usage_snapshot_uncached()?;
+    if let Ok(mut guard) = cache.lock() {
+        *guard = Some((std::time::Instant::now(), snapshot.clone()));
+    }
+    Ok(snapshot)
 }
 
 /// 跳过子代理日志与探针文件；Windows 路径分隔符是 `\`，
@@ -341,7 +365,7 @@ fn update_latest(target: &mut Option<DateTime<Utc>>, timestamp: DateTime<Utc>) {
     }
 }
 
-pub fn claude_usage_snapshot() -> Result<ClaudeUsageSnapshot, String> {
+fn claude_usage_snapshot_uncached() -> Result<ClaudeUsageSnapshot, String> {
     let now = Utc::now();
     let session_window = Duration::hours(5);
     let weekly_window = Duration::days(7);

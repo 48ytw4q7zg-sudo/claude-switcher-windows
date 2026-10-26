@@ -19,7 +19,7 @@ const POPUP_HEIGHT: f64 = 410.0;
 /// 弹窗因失焦隐藏后的防抖窗口：Windows 上点托盘图标会先让弹窗失焦隐藏，
 /// 随后 Click 事件到达——没有防抖时 toggle 会把刚隐藏的弹窗又打开，
 /// 表现为「点图标想关却关不掉」。
-const POPUP_REOPEN_DEBOUNCE: StdDuration = StdDuration::from_millis(300);
+const POPUP_REOPEN_DEBOUNCE: StdDuration = StdDuration::from_millis(500);
 
 static POPUP_HIDDEN_AT: Mutex<Option<Instant>> = Mutex::new(None);
 
@@ -158,7 +158,7 @@ pub fn toggle_tray_popup(app: &AppHandle, tray_position: PhysicalPosition<f64>) 
             });
             let _ = position_tray_popup(&window, tray_position);
         }
-        Err(error) => eprintln!("[claude-switcher] 创建托盘弹窗失败: {error}"),
+        Err(error) => crate::log_error(&format!("创建托盘弹窗失败: {error}")),
     }
 }
 
@@ -228,7 +228,7 @@ pub fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
         // Windows 习惯：右键托盘出菜单（打开主窗 / 刷新 / 退出）。
         // 菜单构建失败不阻断托盘初始化（托盘本体已经可用），只打日志。
         if let Err(error) = build_tray_menu_owned(&app_handle, tray) {
-            eprintln!("[claude-switcher] 构建托盘菜单失败: {error}");
+            crate::log_error(&format!("构建托盘菜单失败: {error}"));
         }
     }
 
@@ -242,14 +242,20 @@ pub fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
     });
 
     app.on_tray_icon_event(|app, event| {
-        if let TrayIconEvent::Click {
-            button: MouseButton::Left,
-            button_state: MouseButtonState::Up,
-            position,
-            ..
-        } = event
-        {
-            toggle_tray_popup(app, position);
+        match event {
+            // 左键单击：切换用量弹窗。
+            TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                position,
+                ..
+            } => toggle_tray_popup(app, position),
+            // 左键双击：直接打开主窗口（Windows 用户对托盘图标的习惯操作）。
+            TrayIconEvent::DoubleClick {
+                button: MouseButton::Left,
+                ..
+            } => show_main_window(app),
+            _ => {}
         }
     });
 

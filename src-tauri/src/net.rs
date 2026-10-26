@@ -93,13 +93,7 @@ pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(|s| {
-                if s.starts_with("http://") || s.starts_with("https://") {
-                    s.to_string()
-                } else {
-                    format!("http://{s}")
-                }
-            });
+            .map(normalize_controller);
         let secret = override_cfg
             .secret
             .as_deref()
@@ -124,18 +118,15 @@ pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
         let Ok(Some(value)) = crate::jsonio::read_yaml_optional(path) else {
             continue;
         };
+        // normalize_controller 会把 0.0.0.0 / :: / 空主机统一改写成 127.0.0.1
+        // （Windows 上 connect 0.0.0.0 必然失败）。
         let controller = value
             .get("external-controller")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned)
             .filter(|s| !s.trim().is_empty())
+            .map(|raw| normalize_controller(&raw))
             .unwrap_or_else(probe_default_controller);
-        let controller = if controller.starts_with("http://") || controller.starts_with("https://")
-        {
-            controller
-        } else {
-            format!("http://{controller}")
-        };
         let secret = value
             .get("secret")
             .and_then(|v| v.as_str())
@@ -161,16 +152,67 @@ pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
     }
 }
 
-fn http_client(timeout_secs: u64) -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
+/// 统一的 HTTP 客户端构造。
+///
+/// `no_proxy_when_local`：Clash 控制器是**本机服务**（127.0.0.1）。若用户设了
+/// `HTTP_PROXY` 却没配 `NO_PROXY`，请求会被发去代理再绕回来，轻则变慢、重则连不上。
+/// 本机地址一律直连。
+fn http_client(
+    timeout_secs: u64,
+    no_proxy_when_local: bool,
+) -> Result<reqwest::blocking::Client, String> {
+    let mut builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .connect_timeout(Duration::from_secs(3))
-        .user_agent("claude-code/2.1.0")
+        .user_agent("claude-code/2.1.0");
+    if no_proxy_when_local {
+        // 仅对回环地址跳过代理；其它地址仍走系统/环境代理。
+        builder = builder.no_proxy();
+    }
+    builder
         .build()
         .map_err(|e| format!("初始化 HTTP 客户端失败: {e}"))
 }
 
-/// Clash RESTful API 调用。
+/// 把 Clash 配置里的控制器地址规范化成本机可连的形式。
+///
+/// `external-controller` 常写成 `0.0.0.0:9090`、`:9090` 或 `[::]:9090`：
+/// 在 Windows 上 connect `0.0.0.0` 会直接失败（类 Unix 系统却可以），
+/// 因此统一改写成 `127.0.0.1:<port>`。
+fn normalize_controller(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return probe_default_controller();
+    }
+    // 补协议头，便于后续按 host:port 拆解。
+    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+        trimmed.to_string()
+    } else {
+        format!("http://{trimmed}")
+    };
+    let Some(rest) = with_scheme.strip_prefix("http://") else {
+        // https:// 的控制器按原样返回（用户显式指定，不做猜测）。
+        return with_scheme;
+    };
+
+    // rest 形如 "0.0.0.0:9097" / ":9097" / "[::]:9097" / "127.0.0.1:9097"。
+    let (host, port) = match rest.rsplit_once(':') {
+        Some((h, p)) => (h, p),
+        None => (rest, ""),
+    };
+    let host_clean = host.trim_matches(|c| c == '[' || c == ']');
+    let is_wildcard = host_clean.is_empty() || host_clean == "0.0.0.0" || host_clean == "::";
+    if is_wildcard {
+        return if port.is_empty() {
+            "http://127.0.0.1".to_string()
+        } else {
+            format!("http://127.0.0.1:{port}")
+        };
+    }
+    format!("http://{host_clean}:{port}")
+}
+
+/// Clash RESTful API 调用。控制器是本机服务，故走 no_proxy。
 pub fn clash_api(method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
     let cfg = detect_clash_runtime_config();
     let url = format!(
@@ -178,7 +220,7 @@ pub fn clash_api(method: &str, path: &str, body: Option<Value>) -> Result<Value,
         cfg.controller.trim_end_matches('/'),
         path.trim_start_matches('/')
     );
-    let client = http_client(8)?;
+    let client = http_client(8, true)?;
     let request = match method {
         "GET" => client.get(&url),
         "PUT" => client.put(&url),
@@ -240,9 +282,17 @@ fn oauth_get(
         .timeout(timeout)
         .connect_timeout(Duration::from_secs(3))
         .user_agent("claude-code/2.1.0");
-    if let Some(proxy) = proxy {
-        builder =
-            builder.proxy(reqwest::Proxy::all(proxy).map_err(|e| format!("代理配置失败: {e}"))?);
+    match proxy {
+        Some(proxy) => {
+            builder = builder
+                .proxy(reqwest::Proxy::all(proxy).map_err(|e| format!("代理配置失败: {e}"))?);
+        }
+        None => {
+            // 「直连」这一步必须显式 no_proxy：reqwest 默认会探测系统/环境代理，
+            // 那样用户设了 HTTP_PROXY 时第一次尝试根本不是直连，代理回退分支
+            // 也就失去意义（两次都走同一个代理）。
+            builder = builder.no_proxy();
+        }
     }
     let client = builder
         .build()

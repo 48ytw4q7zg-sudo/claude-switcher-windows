@@ -6,11 +6,13 @@ import {
   Activity,
   BarChart3,
   CheckCircle2,
+  ClipboardCopy,
   Clock,
   Database,
   ExternalLink,
   EyeOff,
   FileKey,
+  FileText,
   Fingerprint,
   History,
   Loader2,
@@ -458,6 +460,7 @@ function App() {
   const [newAccountStep, setNewAccountStep] = useState('等待确认');
   const [platform, setPlatform] = useState<Platform>(detectPlatformFromUA);
   const [autostart, setAutostart] = useState(false);
+  const [claudeConfigDir, setClaudeConfigDir] = useState('');
 
   const credentialLabel = platform === 'windows' ? '凭据文件' : 'Keychain';
   const credentialFullText = platform === 'windows' ? '.credentials.json 登录态' : '钥匙串登录态';
@@ -470,6 +473,9 @@ function App() {
     // 开机自启当前状态（仅 Windows 有意义）。
     invoke<boolean>('get_autostart')
       .then((next) => setAutostart(next))
+      .catch(() => undefined);
+    invoke<string>('get_claude_config_dir')
+      .then((next) => setClaudeConfigDir(next))
       .catch(() => undefined);
   }, []);
 
@@ -757,6 +763,20 @@ function App() {
   const openDataDir = () =>
     run(null, async () => {
       await invoke('open_data_dir');
+    });
+
+  /// 收集诊断信息并复制到剪贴板（纯本地检查，不发任何网络请求）。
+  const copyDiagnostics = () =>
+    run(null, async () => {
+      const info = await invoke<Record<string, unknown>>('get_diagnostic_info');
+      const text = JSON.stringify(info, null, 2);
+      try {
+        await navigator.clipboard.writeText(text);
+        return '诊断信息已复制到剪贴板';
+      } catch {
+        // 剪贴板不可用（权限/非 HTTPS）时退回显示，让用户手动复制。
+        return `剪贴板不可用，请手动复制：\n${text}`;
+      }
     });
 
   const applyTelemetryMode = (mode: TelemetryMode) => {
@@ -1213,14 +1233,80 @@ function App() {
           </div>
           {platform === 'windows' && status?.session_isolation.degraded && (
             <div className="inline-warning">
-              Windows 未开启「开发者模式」时目录/文件链接会降级为 Junction / 硬链接：硬链接模式下
-              Claude Code 若用「写临时文件再改名」更新 config.json，隔离可能被悄悄解除。
-              建议在 设置 → 系统 → 开发者选项 里打开开发者模式后，重新点一次「切换」以恢复符号链接。
+              <div>
+                Windows 未开启「开发者模式」时目录/文件链接会降级为 Junction / 硬链接：硬链接模式下
+                Claude Code 若用「写临时文件再改名」更新 config.json，隔离可能被悄悄解除。
+                建议打开开发者模式后，重新点一次「切换」以恢复符号链接。
+              </div>
+              <button
+                className="ghost wide"
+                onClick={() =>
+                  run(null, async () => {
+                    await invoke('open_developer_settings');
+                  })
+                }
+                disabled={!!busy}
+              >
+                打开 Windows 开发者设置
+              </button>
             </div>
           )}
           <button className="ghost wide" onClick={openDataDir} disabled={!!busy}>
             <ExternalLink />
             打开本工具数据目录
+          </button>
+          <div className="link-mode-row">
+            <span>Claude 配置目录</span>
+            <code title="凭据、settings.json、projects 都在这个目录下">{claudeConfigDir}</code>
+          </div>
+          <label className="work-note">
+            指定 Claude 配置目录（留空 = 跟随 CLAUDE_CONFIG_DIR / 默认 ~/.claude）
+            <div className="node-bind">
+              <input
+                value={claudeConfigDir}
+                onChange={(event) => setClaudeConfigDir(event.target.value)}
+                placeholder="例如 D:\claude-alt（留空恢复默认）"
+                disabled={!!busy}
+              />
+              <button
+                className="ghost"
+                onClick={() =>
+                  run('bind', async () => {
+                    await invoke('set_claude_config_dir', { path: claudeConfigDir });
+                    const next = await invoke<string>('get_claude_config_dir');
+                    setClaudeConfigDir(next);
+                    return `Claude 配置目录已设为：${next}`;
+                  })
+                }
+                disabled={!!busy}
+              >
+                保存
+              </button>
+            </div>
+          </label>
+          <button
+            className="ghost wide"
+            onClick={() =>
+              run(null, async () => {
+                const dir = await invoke<string>('get_logs_dir');
+                await invoke('open_logs_dir');
+                return `日志目录：${dir}`;
+              })
+            }
+            disabled={!!busy || platform !== 'windows'}
+            title="发布版不显示控制台，排错请查看日志文件"
+          >
+            <FileText />
+            打开日志目录
+          </button>
+          <button
+            className="ghost wide"
+            onClick={copyDiagnostics}
+            disabled={!!busy}
+            title="把诊断信息复制到剪贴板（排障时发给维护者）"
+          >
+            <ClipboardCopy />
+            复制诊断信息
           </button>
           {platform === 'windows' && (
             <button

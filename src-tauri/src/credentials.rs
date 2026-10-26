@@ -125,10 +125,36 @@ pub fn remove_legacy_credentials_file() -> Result<(), String> {
 
 // ───────────────────────── 路径 ─────────────────────────
 
-/// Claude 配置目录：`CLAUDE_CONFIG_DIR` → `USERPROFILE` → `dirs::home_dir()`。
+/// 手动指定 Claude 配置目录的覆盖文件：`~/.claude-switcher/claude-config-dir.txt`，
+/// 内容是**一行路径**。
+///
+/// 为什么需要它：从开始菜单 / 开机自启启动的 GUI 程序**读不到**用户在终端里
+/// `$env:CLAUDE_CONFIG_DIR=...` 临时设置的环境变量（只能看到系统/用户级变量）。
+/// 用户设了该变量却从开始菜单启动本工具时，凭据会被写进 Claude Code 不读的位置，
+/// 切号表面成功实际无效。这个文件让用户在界面里指定一次，永久生效。
+fn manual_config_dir_override() -> Option<PathBuf> {
+    let path = crate::paths::app_data_dir()
+        .ok()?
+        .join("claude-config-dir.txt");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(trimmed))
+}
+
+/// Claude 配置目录解析优先级：
+/// 1. 手动指定文件 `~/.claude-switcher/claude-config-dir.txt`（GUI 启动也能生效）；
+/// 2. 环境变量 `CLAUDE_CONFIG_DIR`（终端启动时生效）；
+/// 3. `~/.claude`。
+///
 /// 官方支持 CLAUDE_CONFIG_DIR 重定向配置位置；不跟随会导致「切号写进了
 /// Claude Code 不读的位置」，表面成功实际无效。
 pub fn claude_dir() -> Result<PathBuf, String> {
+    if let Some(dir) = manual_config_dir_override() {
+        return Ok(dir);
+    }
     if let Some(dir) = std::env::var_os("CLAUDE_CONFIG_DIR") {
         let trimmed = dir.to_string_lossy().trim().to_string();
         if !trimmed.is_empty() {

@@ -35,6 +35,8 @@ mod usage;
 
 use std::collections::BTreeMap;
 use std::fs;
+use std::io;
+use std::path::PathBuf;
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -135,8 +137,20 @@ fn get_platform() -> &'static str {
 
 // ───────────────────────── 状态 ─────────────────────────
 
+/// Tauri 2 中非 async 命令跑在主线程上。`get_status` 里有 OAuth profile 请求
+/// （最长数秒）、凭据存储读取和目录遍历，网络不好时会把窗口卡成"未响应"。
+/// 因此对外暴露 async 壳，实际工作丢进 `spawn_blocking`。
+///
+/// 注意：不要用 `#[tauri::command(async)]` 直接包同步函数——那会跑在 tokio 工作线程里，
+/// 其中调用 `reqwest::blocking` 有 panic 风险。
 #[tauri::command]
-fn get_status() -> Result<ClaudeStatus, String> {
+async fn get_status() -> Result<ClaudeStatus, String> {
+    tauri::async_runtime::spawn_blocking(get_status_blocking)
+        .await
+        .map_err(|e| format!("读取状态后台任务失败: {e}"))?
+}
+
+fn get_status_blocking() -> Result<ClaudeStatus, String> {
     p::ensure_app_dirs()?;
     let store_data = store::load_store()?;
     let claude_json = read_json_optional(p::claude_json_path()?)?;
@@ -382,7 +396,7 @@ fn capture_current_profile(name: String, notes: Option<String>) -> Result<Profil
     if let Err(e) = isolation::adopt_live_claude_local_state_for_profile(&profile_id)
         .and_then(|_| isolation::activate_profile_claude_local_state(&profile_id))
     {
-        eprintln!("[claude-switcher] 账号快照已保存，但本地状态接管失败: {e}");
+        log_error(&format!("账号快照已保存，但本地状态接管失败: {e}"));
     }
     Ok(summary)
 }
@@ -540,7 +554,7 @@ fn complete_new_account_login() -> Result<ProfileSummary, String> {
     // 链接激活失败不阻断保存：登录态已就绪是用户关心的结果，
     // 链接未激活会由 get_status 的 session_isolation 状态显示，重新切换一次即可补上。
     if let Err(e) = isolation::activate_profile_claude_local_state(&profile.id) {
-        eprintln!("[claude-switcher] 新号隔离链接激活失败（已保存登录态）: {e}");
+        log_error(&format!("新号隔离链接激活失败（已保存登录态）: {e}"));
     }
     store_data.current_profile_id = Some(profile.id.clone());
     store_data.pending_new_account = None;
@@ -549,8 +563,16 @@ fn complete_new_account_login() -> Result<ProfileSummary, String> {
     Ok(summary)
 }
 
+/// 内部会触发一次完整切号（含进程结束等待、Clash 请求、链接重试），
+/// 因此和 switch_profile 一样走 spawn_blocking。
 #[tauri::command]
-fn cancel_pending_new_account_login() -> Result<Option<SwitchResult>, String> {
+async fn cancel_pending_new_account_login() -> Result<Option<SwitchResult>, String> {
+    tauri::async_runtime::spawn_blocking(cancel_pending_new_account_login_blocking)
+        .await
+        .map_err(|e| format!("取消新号流程后台任务失败: {e}"))?
+}
+
+fn cancel_pending_new_account_login_blocking() -> Result<Option<SwitchResult>, String> {
     let mut store_data = store::load_store()?;
     if store_data.pending_new_account.is_none() {
         return Err("没有待取消的新号登录流程".to_string());
@@ -561,8 +583,8 @@ fn cancel_pending_new_account_login() -> Result<Option<SwitchResult>, String> {
     // 原来的顺序是先清 pending 再切——一旦切号失败，pending 就永久丢了，
     // 用户既回不到旧账号也重启不了新号流程。
     if let Some(id) = current_id.clone() {
-        // 临时保留 pending 供 switch 内部逻辑参考，切成功后再清。
-        match switch_profile(id) {
+        // 走同步实现：本命令自身也是 spawn_blocking 里的同步逻辑（见下方）。
+        match switch_profile_blocking(id) {
             Ok(result) => {
                 let mut after = store::load_store()?;
                 after.pending_new_account = None;
@@ -653,8 +675,17 @@ fn refresh_current_profile_snapshot(store_data: &mut Store, target_id: &str) -> 
     warnings
 }
 
+/// 切号流程里有阻塞操作（杀进程等待约 1.2s、Clash 切换 250ms sleep、
+/// 链接操作最多 1.3s 退避重试、Clash 请求最长 8s），必须离开主线程，
+/// 否则窗口会卡成"未响应"、托盘事件也会被拖住。
 #[tauri::command]
-fn switch_profile(id: String) -> Result<SwitchResult, String> {
+async fn switch_profile(id: String) -> Result<SwitchResult, String> {
+    tauri::async_runtime::spawn_blocking(move || switch_profile_blocking(id))
+        .await
+        .map_err(|e| format!("切换账号后台任务失败: {e}"))?
+}
+
+fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
     let mut store_data = store::load_store()?;
     if !store_data.profiles.iter().any(|p| p.id == id) {
         return Err("找不到这个账号快照".to_string());
@@ -740,9 +771,13 @@ fn switch_profile(id: String) -> Result<SwitchResult, String> {
 
 // ───────────────────────── Clash ─────────────────────────
 
+/// 探测默认控制器（每端口最长 1 秒）+ 请求最长 8 秒，跑在主线程会卡 UI，
+/// 故同样走 spawn_blocking。
 #[tauri::command]
-fn get_clash_status() -> Result<clash::ClashStatus, String> {
-    Ok(clash::clash_status_for_group(DEFAULT_CLASH_GROUP))
+async fn get_clash_status() -> Result<clash::ClashStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| Ok(clash::clash_status_for_group(DEFAULT_CLASH_GROUP)))
+        .await
+        .map_err(|e| format!("读取 Clash 状态后台任务失败: {e}"))?
 }
 
 #[tauri::command]
@@ -968,9 +1003,7 @@ fn list_backups() -> Result<Vec<BackupSummary>, String> {
     let mut summaries: Vec<BackupSummary> = entries
         .filter_map(|entry| entry.ok())
         .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json")
-        })
+        .filter(|path| path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("json"))
         .filter_map(|path| {
             let file_name = path
                 .file_name()
@@ -980,14 +1013,18 @@ fn list_backups() -> Result<Vec<BackupSummary>, String> {
             let raw = match fs::read_to_string(&path) {
                 Ok(raw) => raw,
                 Err(e) => {
-                    eprintln!("[claude-switcher] list_backups: 跳过坏备份「{file_name}」(读取失败): {e}");
+                    log_error(&format!(
+                        "list_backups: 跳过坏备份「{file_name}」(读取失败): {e}"
+                    ));
                     return None;
                 }
             };
             let value: Value = match serde_json::from_str(&raw) {
                 Ok(value) => value,
                 Err(e) => {
-                    eprintln!("[claude-switcher] list_backups: 跳过坏备份「{file_name}」(JSON 解析失败): {e}");
+                    log_error(&format!(
+                        "list_backups: 跳过坏备份「{file_name}」(JSON 解析失败): {e}"
+                    ));
                     return None;
                 }
             };
@@ -1196,56 +1233,201 @@ fn hide_main_window_cmd(app: tauri::AppHandle) {
     }
 }
 
-/// 开机自启开关（Windows 写注册表 Run 项；其它平台 no-op）。
+// ───────────────────────── 日志与诊断 ─────────────────────────
+
+/// 发布版（`windows_subsystem = "windows"`）里 stderr 被丢弃，`eprintln!`
+/// 无处可去。把关键错误同时落到 `~/.claude-switcher/logs/claude-switcher.log`
+/// （追加写入，带时间戳），排障才有线索。写日志失败绝不影响主流程。
+pub fn log_error(message: &str) {
+    let line = format!("[{}] {}\n", Utc::now().format("%Y-%m-%d %H:%M:%S"), message);
+    if let Ok(dir) = p::app_data_dir() {
+        let logs = dir.join("logs");
+        if fs::create_dir_all(&logs).is_ok() {
+            use std::io::Write;
+            if let Ok(mut file) = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(logs.join("claude-switcher.log"))
+            {
+                let _ = file.write_all(line.as_bytes());
+                // 简单滚动：超过 1MB 时截断保留后半，避免无限增长。
+                if let Ok(meta) = file.metadata() {
+                    if meta.len() > 1_048_576 {
+                        let _ = rotate_log(&logs);
+                    }
+                }
+            }
+        }
+    }
+    eprintln!("[claude-switcher] {message}");
+}
+
+fn rotate_log(logs: &std::path::Path) -> io::Result<()> {
+    use std::io::Write;
+    let path = logs.join("claude-switcher.log");
+    let content = fs::read(&path)?;
+    // 保留后半（约 512KB），头部丢弃。
+    let keep = &content[content.len() / 2..];
+    let mut file = fs::File::create(&path)?;
+    file.write_all(keep)
+}
+
+/// 日志目录路径（前端「打开日志」用）。
+#[tauri::command]
+fn get_logs_dir() -> Result<String, String> {
+    Ok(p::app_data_dir()?
+        .join("logs")
+        .to_string_lossy()
+        .to_string())
+}
+
+/// 诊断信息（排障一页看全：路径、隔离状态、Clash、告警、进程检测）。
+/// 前端可整体复制给维护者。跑的是纯本地检查，无网络请求。
+#[tauri::command]
+fn get_diagnostic_info() -> Result<Value, String> {
+    let status = get_status_blocking()?;
+    let clash_status = clash::clash_status_for_group(DEFAULT_CLASH_GROUP);
+    let processes = processes::claude_code_processes();
+    Ok(json!({
+        "platform": get_platform(),
+        "claude_json_path": status.claude_json_path,
+        "settings_json_path": status.settings_json_path,
+        "data_dir": status.data_dir,
+        "credentials_json_exists": status.credentials_json_exists,
+        "profile_count": status.profile_count,
+        "current_profile_id": status.current_profile_id,
+        "session_isolation": status.session_isolation,
+        "clash": {
+            "controller": clash_status.controller,
+            "available": clash_status.available,
+            "now": clash_status.now,
+            "error": clash_status.error,
+        },
+        "claude_code_processes": processes.iter()
+            .map(|(pid, exe)| format!("{pid}: {exe}"))
+            .collect::<Vec<_>>(),
+        "warnings": status.warnings,
+    }))
+}
+
+/// 一键打开 Windows「开发者设置」页（降级到 junction/硬链接时的引导）。
+#[tauri::command]
+fn open_developer_settings() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        platform::imp::silent_command("explorer")
+            .arg("ms-settings:developers")
+            .spawn()
+            .map_err(|e| format!("打开开发者设置失败: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("仅 Windows 支持打开开发者设置".to_string())
+    }
+}
+
+/// 打开日志目录（资源管理器）。
+#[tauri::command]
+fn open_logs_dir() -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let dir = p::app_data_dir()?.join("logs");
+        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+        platform::imp::silent_command("explorer")
+            .arg(dir)
+            .spawn()
+            .map_err(|e| format!("打开日志目录失败: {e}"))?;
+        Ok(())
+    }
+    #[cfg(not(windows))]
+    {
+        Err("仅 Windows 支持打开日志目录".to_string())
+    }
+}
+
+// ───────────────────────── Claude 配置目录覆盖 ─────────────────────────
+
+/// 当前生效的 Claude 配置目录（解析后的绝对路径）。
+#[tauri::command]
+fn get_claude_config_dir() -> Result<String, String> {
+    Ok(credentials::claude_dir()?.to_string_lossy().to_string())
+}
+
+/// 手动指定 Claude 配置目录（写入 `~/.claude-switcher/claude-config-dir.txt`）。
+/// 传空字符串表示清除覆盖、回到默认解析。
+///
+/// 典型场景：用户在终端里 `$env:CLAUDE_CONFIG_DIR=D:\claude-alt`，但从开始菜单启动
+/// 本工具时读不到该变量——在这里指定一次即可让 GUI 启动也生效。
+#[tauri::command]
+fn set_claude_config_dir(path: String) -> Result<(), String> {
+    let override_file = p::app_data_dir()?.join("claude-config-dir.txt");
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        // 清除覆盖：文件不存在也算成功（幂等）。
+        if override_file.exists() {
+            fs::remove_file(&override_file).map_err(|e| format!("清除配置目录覆盖失败: {e}"))?;
+        }
+        return Ok(());
+    }
+    let dir = PathBuf::from(trimmed);
+    if !dir.is_absolute() {
+        return Err("请填写绝对路径（例如 D:\\claude-alt）".to_string());
+    }
+    fs::create_dir_all(p::app_data_dir()?).map_err(|e| e.to_string())?;
+    // 只写路径本身，不带换行（读取端会 trim）。
+    crate::fsx::write_atomically(&override_file, trimmed).map_err(|e| {
+        format!(
+            "保存配置目录覆盖失败: {}",
+            crate::fsx::humanize_io_error(&e)
+        )
+    })
+}
+
+/// Run 注册表项的值名（固定，便于 UI 显示与排查）。
+#[cfg(windows)]
+const AUTOSTART_VALUE_NAME: &str = "ClaudeSwitcher";
+/// HKCU 下开机自启的标准位置。
+#[cfg(windows)]
+const AUTOSTART_RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+/// 开机自启开关（Windows 写 HKCU Run 项；其它平台不支持）。
+///
+/// 用 `winreg` 直接操作注册表，替代早前的 `reg.exe` 子进程——后者的错误信息是
+/// 本地化字符串（中文系统是「系统找不到指定的值」），靠字符串匹配判断
+/// 「删除一个不存在的值」几乎必然失效。
+///
+/// 写入的值带 `--autostart` 参数，启动时据此判断是否静默运行（只留托盘、不弹主窗口）。
 /// 说明：这是增强项，上游 macOS 版没有对应功能。
 #[tauri::command]
 fn set_autostart(enabled: bool) -> Result<(), String> {
     #[cfg(windows)]
     {
-        // HKCU\Software\Microsoft\Windows\CurrentVersion\Run 值名固定，
-        // 指向当前可执行文件（Tauri 打包后即安装目录里的 exe）。
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+
         let exe = std::env::current_exe().map_err(|e| format!("定位当前可执行文件失败: {e}"))?;
-        let value = format!("\"{}\"", exe.to_string_lossy());
-        let (verb, args): (&str, Vec<String>) = if enabled {
-            (
-                "add",
-                vec![
-                    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run".into(),
-                    "/v".into(),
-                    "ClaudeSwitcher".into(),
-                    "/t".into(),
-                    "REG_SZ".into(),
-                    "/d".into(),
-                    value,
-                    "/f".into(),
-                ],
-            )
-        } else {
-            (
-                "delete",
-                vec![
-                    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run".into(),
-                    "/v".into(),
-                    "ClaudeSwitcher".into(),
-                    "/f".into(),
-                ],
-            )
+        let run = match RegKey::predef(HKEY_CURRENT_USER).open_subkey(AUTOSTART_RUN_KEY) {
+            Ok(key) => key,
+            // 项不存在时创建（create_subkey 返回 (key, disposition)）。
+            Err(_) => RegKey::predef(HKEY_CURRENT_USER)
+                .create_subkey(AUTOSTART_RUN_KEY)
+                .map(|(key, _)| key)
+                .map_err(|e| format!("打开 Run 注册表项失败: {e}"))?,
         };
-        // 走统一的静默子进程封装（CREATE_NO_WINDOW），不闪黑窗。
-        let output = platform::imp::silent_command("reg")
-            .arg(verb)
-            .args(&args)
-            .output()
-            .map_err(|e| format!("调用 reg 失败: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            // 删除一个不存在的值也返回非零，这属于幂等成功。
-            if !enabled && (stderr.contains("unable to find") || stderr.is_empty()) {
-                return Ok(());
+
+        if enabled {
+            let value = format!("\"{}\" --autostart", exe.to_string_lossy());
+            run.set_value(AUTOSTART_VALUE_NAME, &value)
+                .map_err(|e| format!("写入开机自启失败: {e}"))
+        } else {
+            // delete_value 对不存在的值返回 NotFound——这正是幂等成功。
+            match run.delete_value(AUTOSTART_VALUE_NAME) {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(format!("删除开机自启失败: {e}")),
             }
-            return Err(format!("设置开机自启失败: {}", stderr.trim()));
         }
-        Ok(())
     }
     #[cfg(not(windows))]
     {
@@ -1254,18 +1436,18 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
     }
 }
 
+/// 查询开机自启当前状态。
 #[tauri::command]
 fn get_autostart() -> bool {
     #[cfg(windows)]
     {
-        platform::imp::silent_command("reg")
-            .arg("query")
-            .arg("HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run")
-            .arg("/v")
-            .arg("ClaudeSwitcher")
-            .output()
-            .map(|out| out.status.success())
-            .unwrap_or(false)
+        use winreg::enums::HKEY_CURRENT_USER;
+        use winreg::RegKey;
+
+        RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey(AUTOSTART_RUN_KEY)
+            .and_then(|key| key.get_value::<String, _>(AUTOSTART_VALUE_NAME))
+            .is_ok()
     }
     #[cfg(not(windows))]
     {
@@ -1275,7 +1457,26 @@ fn get_autostart() -> bool {
 
 // ───────────────────────── 启动 ─────────────────────────
 
+/// 安装 panic hook：把 panic 信息写进本机日志（发布版 stderr 被丢弃），
+/// 否则崩溃后用户只看到程序消失、排查毫无线索。
+fn install_panic_hook() {
+    std::panic::set_hook(Box::new(|info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| info.payload().downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "<非字符串 panic>".to_string());
+        let location = info
+            .location()
+            .map(|l| format!("{}:{}", l.file(), l.line()))
+            .unwrap_or_else(|| "<未知位置>".to_string());
+        log_error(&format!("PANIC at {location}: {payload}"));
+    }));
+}
+
 pub fn run() {
+    install_panic_hook();
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // 单实例：双击两次只留一个托盘图标，也避免并发写 store。
@@ -1293,11 +1494,18 @@ pub fn run() {
         })
         .setup(|app| {
             if let Err(error) = tray::install_tray_handlers(app) {
-                eprintln!("[claude-switcher] 初始化托盘失败: {error}");
+                log_error(&format!("初始化托盘失败: {error}"));
             }
-            // 首次启动显示主窗口（tauri.conf.json 里 visible:false + 这里 show，
-            // 保证托盘已就绪再出现窗口）。
-            tray::show_main_window(app.handle());
+            // 开机自启时带 `--autostart` 参数：静默运行，只留托盘图标、不弹主窗口
+            // （开机就弹窗口是很恼人的体验）。手动启动才显示主窗口。
+            let is_autostart = std::env::args().any(|arg| arg == "--autostart");
+            if is_autostart {
+                let _ = app.get_webview_window("main").map(|w| w.hide());
+            } else {
+                // tauri.conf.json 里 visible:false + 这里 show，
+                // 保证托盘已就绪再出现窗口。
+                tray::show_main_window(app.handle());
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -1326,6 +1534,12 @@ pub fn run() {
             show_main_window_cmd,
             quit_app_cmd,
             hide_main_window_cmd,
+            get_logs_dir,
+            get_diagnostic_info,
+            open_developer_settings,
+            open_logs_dir,
+            get_claude_config_dir,
+            set_claude_config_dir,
             set_autostart,
             get_autostart,
         ])
