@@ -1,0 +1,19 @@
+# 统一换行行为：仓库内一律 LF，避免不同机器 core.autocrlf 造成 diff 噪声
+# 与 cargo fmt --check 结果不一致。
+* text=auto eol=lf
+
+# Windows 脚本必须是 CRLF（PowerShell 5.1 对 LF 的 .ps1 解析有问题）。
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# 二进制资源：不要让 git 尝试换行转换。
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.icns binary
+*.ttf binary
+*.woff binary
+*.woff2 binary

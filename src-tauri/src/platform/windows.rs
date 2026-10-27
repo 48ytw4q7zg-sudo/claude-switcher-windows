@@ -142,15 +142,20 @@ pub fn is_under_user_profile(path: &Path) -> bool {
     if profile.is_empty() {
         return false;
     }
-    let profile_norm = normalize_path(Path::new(profile));
+    is_under(Path::new(profile), path)
+}
+
+/// `path` 是否位于 `profile` 目录内（含等于）。
+///
+/// 注意 `C:\Users\A` 与 `C:\Users\AB` 的前缀陷阱：朴素
+/// `starts_with("C:\\Users\\A")` 会把后者也判为在目录内。这里要求分隔符紧跟。
+pub fn is_under(profile: &Path, path: &Path) -> bool {
+    let profile_norm = normalize_path(profile);
     let path_norm = normalize_path(path);
     if profile_norm == path_norm {
         return true;
     }
-    let Some(prefix) = profile_norm.to_str() else {
-        return false;
-    };
-    let Some(candidate) = path_norm.to_str() else {
+    let (Some(prefix), Some(candidate)) = (profile_norm.to_str(), path_norm.to_str()) else {
         return false;
     };
     let prefix = prefix.trim_end_matches('\\');
@@ -444,5 +449,42 @@ mod tests {
             Path::new(r"C:\Users\Bob\.claude-switcher\session-profiles\p1\plugins\data");
         assert_eq!(normalize_path(&joined), normalize_path(backslash));
         assert!(paths_equivalent(&joined, backslash));
+    }
+
+    /// is_under 的前缀陷阱：`C:\Users\A` 目录**不**包含 `C:\Users\AB`。
+    #[test]
+    fn is_under_rejects_sibling_prefix() {
+        let profile = Path::new(r"C:\Users\A");
+        assert!(!is_under(profile, Path::new(r"C:\Users\AB\file.txt")));
+        assert!(is_under(profile, Path::new(r"C:\Users\A\file.txt")));
+        assert!(is_under(
+            profile,
+            Path::new(r"C:\Users\A\.claude\.credentials.json")
+        ));
+        // profile 本身算「在目录内」。
+        assert!(is_under(profile, profile));
+    }
+
+    /// is_under 对大小写、`\\?\` 前缀、尾部分隔符都应判为在目录内。
+    #[test]
+    fn is_under_tolerates_case_verbatim_and_trailing_sep() {
+        let profile = Path::new(r"C:\Users\Bob");
+        assert!(is_under(profile, Path::new(r"c:\users\BOB\.claude")));
+        assert!(is_under(profile, Path::new(r"\\?\C:\Users\Bob\.claude")));
+        assert!(is_under(profile, Path::new(r"C:\Users\Bob\.claude\")));
+    }
+
+    /// profile 之外的路径（例如数据盘）判为不在目录内。
+    #[test]
+    fn is_under_rejects_other_drives() {
+        let profile = Path::new(r"C:\Users\Bob");
+        assert!(!is_under(
+            profile,
+            Path::new(r"D:\claude-alt\.credentials.json")
+        ));
+        assert!(!is_under(
+            profile,
+            Path::new(r"\\server\share\.credentials.json")
+        ));
     }
 }

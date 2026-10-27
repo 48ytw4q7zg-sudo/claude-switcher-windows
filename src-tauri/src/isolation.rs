@@ -47,19 +47,36 @@ pub const LOCAL_STATE_DIRS: &[&str] = &[
 /// 2. **任一项取消失败即中止**：失败后仍删目录会让链接悬空（原因从"误删"变成
 ///    "锁文件"），不如不删、保留现场让用户处理。
 /// 3. **config.json 单独处理**：它是文件（硬链接兜底），判定方式和目录不同。
+///
+/// 返回被移除的链接名列表（调用方记日志，排障时能看到到底动了哪几个）。
 pub fn deactivate_profile(profile_id: &str) -> Result<Vec<String>, String> {
+    deactivate_in(
+        &crate::credentials::claude_dir()?,
+        &paths::session_profiles_dir()?.join(profile_id),
+    )
+}
+
+/// [`deactivate_profile`] 的可测试版本：根目录由参数传入，
+/// 测试里用临时目录即可覆盖，不需要动全局环境变量或真实 `~/.claude`。
+///
+/// - `claude_root`：`~/.claude` 的等价目录。
+/// - `profile_root`：`~/.claude-switcher/session-profiles/<id>` 的等价目录。
+pub fn deactivate_in(
+    claude_root: &std::path::Path,
+    profile_root: &std::path::Path,
+) -> Result<Vec<String>, String> {
     let mut removed = Vec::new();
     for name in LOCAL_STATE_DIRS {
-        let live = paths::claude_local_dir(name)?;
-        let target = paths::profile_claude_local_dir(profile_id, name)?;
+        let live = claude_root.join(name);
+        let target = profile_root.join(name);
         if links::is_linked_to(&live, &target) {
             links::remove_link(&live).map_err(|e| format!("移除 {name} 隔离链接失败: {e}"))?;
             removed.push((*name).to_string());
         }
     }
-    // config.json：目录型链接走 is_linked_to，硬链接走 same_file（is_linked_to 已含）。
-    let live_cfg = paths::claude_config_json_path()?;
-    let target_cfg = paths::profile_claude_config_json_path(profile_id)?;
+    // config.json：文件，硬链接兜底也由 is_linked_to 覆盖。
+    let live_cfg = claude_root.join("config.json");
+    let target_cfg = profile_root.join("config.json");
     if links::is_linked_to(&live_cfg, &target_cfg) {
         links::remove_link(&live_cfg).map_err(|e| format!("移除 config.json 隔离链接失败: {e}"))?;
         removed.push("config.json".to_string());
@@ -389,11 +406,19 @@ pub fn activate_profile_claude_config(profile_id: &str) -> Result<Vec<String>, S
 
 // ───────────────────────── 组合入口 ─────────────────────────
 
+/// 会话目录在 `LOCAL_STATE_DIRS` 里的名字。
+/// 接管/激活对它用专用函数（`adopt_live_sessions_for_profile` /
+/// `activate_profile_sessions`），所以组合入口要按名字排除，
+/// 而不是 `.skip(1)`——依赖「projects 排第一」将来调整顺序就静默漏处理。
+pub const SESSIONS_DIR_NAME: &str = "projects";
+
 pub fn adopt_live_claude_local_state_for_profile(profile_id: &str) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
     warnings.extend(adopt_live_sessions_for_profile(profile_id)?);
-    // projects 已在上面单独处理，这里跳过它。
-    for name in LOCAL_STATE_DIRS.iter().skip(1) {
+    for name in LOCAL_STATE_DIRS
+        .iter()
+        .filter(|name| **name != SESSIONS_DIR_NAME)
+    {
         warnings.extend(adopt_live_claude_dir_for_profile(profile_id, name)?);
     }
     warnings.extend(adopt_live_claude_config_for_profile(profile_id)?);
@@ -403,8 +428,10 @@ pub fn adopt_live_claude_local_state_for_profile(profile_id: &str) -> Result<Vec
 pub fn activate_profile_claude_local_state(profile_id: &str) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
     warnings.extend(activate_profile_sessions(profile_id)?);
-    // projects 已在上面单独处理，这里跳过它。
-    for name in LOCAL_STATE_DIRS.iter().skip(1) {
+    for name in LOCAL_STATE_DIRS
+        .iter()
+        .filter(|name| **name != SESSIONS_DIR_NAME)
+    {
         warnings.extend(activate_profile_claude_dir(profile_id, name)?);
     }
     warnings.extend(activate_profile_claude_config(profile_id)?);
@@ -446,4 +473,103 @@ pub fn session_isolation_status(
         link_mode: mode.label().to_string(),
         degraded: mode.needs_developer_mode_hint(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    /// 建一个目录 junction（Windows）或符号链接（Unix）指向 target。
+    /// **Windows 的 junction 要求 live 的父目录已存在**，否则报
+    /// 「系统找不到指定的路径」(os error 3)，所以先建父目录。
+    fn make_link(target: &Path, live: &Path) {
+        if let Some(parent) = live.parent() {
+            fs::create_dir_all(parent).expect("创建 live 父目录失败");
+        }
+        #[cfg(windows)]
+        {
+            crate::platform::imp::create_junction(target, live).expect("创建 junction 失败");
+        }
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(target, live).expect("创建 symlink 失败");
+        }
+    }
+
+    /// 场景：claude_root 下有指向本账号的 junction、指向别处的 junction、普通目录。
+    /// 只有指向本账号的应被移除；目标目录本身不能被删。
+    #[test]
+    fn deactivate_in_only_removes_links_to_this_profile() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        let profile_root = dir.path().join("profile");
+
+        let my_projects = profile_root.join("projects");
+        fs::create_dir_all(&my_projects).unwrap();
+        make_link(&my_projects, &claude_root.join("projects"));
+
+        // 指向别处（模拟用户自建 junction）：必须保留。
+        let elsewhere = dir.path().join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        make_link(&elsewhere, &claude_root.join("user-projects"));
+
+        // 普通目录（非链接）：必须保留。
+        fs::create_dir_all(claude_root.join("telemetry")).unwrap();
+
+        let removed = deactivate_in(&claude_root, &profile_root).expect("deactivate 失败");
+        assert_eq!(removed, vec!["projects".to_string()]);
+
+        assert!(!links::path_is_link(&claude_root.join("projects")));
+        assert!(links::path_is_link(&claude_root.join("user-projects")));
+        assert!(claude_root.join("user-projects").exists());
+        assert!(claude_root.join("telemetry").is_dir());
+        // 只删链接，目标目录保留。
+        assert!(my_projects.exists());
+    }
+
+    /// 没有任何链接时返回空列表，且不动任何东西。
+    #[test]
+    fn deactivate_in_noop_without_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        let profile_root = dir.path().join("profile");
+        fs::create_dir_all(&claude_root).unwrap();
+        fs::create_dir_all(&profile_root).unwrap();
+        let removed = deactivate_in(&claude_root, &profile_root).unwrap();
+        assert!(removed.is_empty());
+    }
+
+    /// 全部 LOCAL_STATE_DIRS + config.json 都被正确移除。
+    #[test]
+    fn deactivate_in_removes_all_state_dirs_and_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        let profile_root = dir.path().join("profile");
+
+        for name in LOCAL_STATE_DIRS {
+            let target = profile_root.join(name);
+            fs::create_dir_all(&target).unwrap();
+            make_link(&target, &claude_root.join(name));
+        }
+        let target_cfg = profile_root.join("config.json");
+        fs::write(&target_cfg, "{}").unwrap();
+        make_link(&target_cfg, &claude_root.join("config.json"));
+
+        let mut removed = deactivate_in(&claude_root, &profile_root).unwrap();
+        removed.sort();
+        let mut expected: Vec<String> = LOCAL_STATE_DIRS.iter().map(|s| s.to_string()).collect();
+        expected.push("config.json".to_string());
+        expected.sort();
+        assert_eq!(removed, expected);
+
+        for name in LOCAL_STATE_DIRS {
+            assert!(
+                !links::path_is_link(&claude_root.join(name)),
+                "{name} 应已移除"
+            );
+        }
+        assert!(!links::path_is_link(&claude_root.join("config.json")));
+    }
 }

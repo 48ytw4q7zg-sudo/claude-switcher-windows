@@ -125,6 +125,17 @@ h2 {
   background: rgba(240, 216, 204, 0.55);
 }
 
+/* 破坏性主按钮（删除会话历史）：占满一行、红色实底，视觉上明确区分于安全选项。 */
+.danger.wide {
+  width: 100%;
+  color: #f8f0dc;
+  background: #8a2f24;
+}
+
+.danger.wide:hover:not(:disabled) {
+  background: #6e221f;
+}
+
 .link-mode-row {
   display: flex;
   align-items: center;

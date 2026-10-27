@@ -734,17 +734,21 @@ function App() {
   };
 
   const remove = (id: string, label: string) => {
-    if (!window.confirm(`删除账号快照「${label}」？这不会删除 Claude Code 当前登录。`)) return;
-    // 二次确认会话历史。**问法反过来问**：window.confirm 的默认焦点在「确定」上，
-    // 用户连按回车就走确定——所以「确定」必须是安全选项（保留会话历史），
-    // 破坏性的「一并删除」由用户显式点取消触发。
-    const withSessions = !window.confirm(
-      `删除「${label}」的快照时，是否保留它的会话历史？\n\n` +
-        '· 点「确定」= 保留会话历史（推荐，可回收磁盘空间时再手动清理）\n' +
-        '· 点「取消」= 一并删除会话历史（不可恢复，可能释放大量磁盘空间）',
-    );
+    // 弹三选项确认框。破坏性选项必须由用户显式点击触发——
+    // 不能用 window.confirm（它的「取消」/Esc 在习惯上表示"放弃整个操作"，
+    // 而删除会话历史恰恰是最不该由 Esc 触发的动作）。
+    setDeleteTarget({ id, label });
+  };
+
+  const confirmDelete = (withSessions: boolean) => {
+    const target = deleteTarget;
+    setDeleteTarget(null);
+    if (!target) return;
     run('delete', async () => {
-      await invoke('delete_profile', { id, deleteSessions: withSessions });
+      await invoke('delete_profile', { id: target.id, deleteSessions: withSessions });
+      // 无论成功失败都刷新列表：快照删除成功但目录清理失败时，
+      // 账号实际已不在列表里，不刷新会让界面与磁盘不一致。
+      await load().catch(() => undefined);
       return withSessions ? '账号快照与会话历史已删除' : '账号快照已删除（会话历史保留）';
     });
   };
@@ -786,6 +790,8 @@ function App() {
     });
 
   const [includeNetwork, setIncludeNetwork] = useState(false);
+  // 删除账号的三选项确认（label 用于展示，id 用于执行）。
+  const [deleteTarget, setDeleteTarget] = useState<{ id: string; label: string } | null>(null);
 
   /// 收集诊断信息并复制到剪贴板。默认只做本地检查（不发网络请求），
   /// 勾选后再查 Clash 与 OAuth——断网时也不会卡住界面。
@@ -887,6 +893,35 @@ function App() {
             ))}
           </div>
           <button onClick={() => setActionWarnings([])}>关闭</button>
+        </div>
+      )}
+
+      {deleteTarget && (
+        <div className="modal-scrim" role="presentation">
+          <section className="prepare-modal" role="dialog" aria-modal="true" aria-labelledby="delete-title">
+            <div className="modal-title" id="delete-title">
+              <Trash2 />
+              <div>
+                <strong>删除账号快照「{deleteTarget.label}」</strong>
+                <span>这不会删除 Claude Code 当前的登录态。</span>
+              </div>
+            </div>
+            <p className="telemetry-intro">
+              请选择删除范围。会话历史包含该账号的 projects 会话记录，可能占用大量磁盘空间；
+              删除后<strong>不可恢复</strong>。
+            </p>
+            <div className="modal-actions">
+              <button className="ghost" onClick={() => setDeleteTarget(null)}>
+                取消
+              </button>
+              <button className="primary" onClick={() => confirmDelete(false)}>
+                仅删除快照
+              </button>
+              <button className="danger wide" onClick={() => confirmDelete(true)}>
+                同时删除会话历史
+              </button>
+            </div>
+          </section>
         </div>
       )}
 

@@ -994,9 +994,16 @@ fn delete_profile_blocking(id: String, delete_sessions: bool) -> Result<(), Stri
         }
         // 取消隔离链接。只删指向该账号的链接，且任一项失败即中止——
         // 失败后仍删目录会让链接悬空（原因从"误删"变成"锁文件"），不如保留现场。
-        isolation::deactivate_profile(&id).map_err(|e| {
+        let removed = isolation::deactivate_profile(&id).map_err(|e| {
             format!("删除会话历史前取消隔离链接失败，已中止（未删除任何数据）：{e}")
         })?;
+        if !removed.is_empty() {
+            log_info(&format!(
+                "已移除账号 {} 的隔离链接：{}",
+                id.chars().take(8).collect::<String>(),
+                removed.join(", ")
+            ));
+        }
     }
 
     // ── 正式删除 ──
@@ -1008,7 +1015,11 @@ fn delete_profile_blocking(id: String, delete_sessions: bool) -> Result<(), Stri
     if was_current {
         store_data.current_profile_id = None;
     }
-    store::save_store(&store_data)?;
+    // 注意：取消链接发生在此之前。若这里 save_store 失败，live 链接已移除但
+    // 快照还在——下次对该账号「切换」会重新激活链接，可接受；
+    // 但错误信息要说明，否则用户会以为状态完好。
+    store::save_store(&store_data)
+        .map_err(|e| format!("保存 store 失败（隔离链接已取消，下次切换该账号会重建）：{e}"))?;
 
     if has_sessions {
         fs::remove_dir_all(&sessions_dir).map_err(|e| {
