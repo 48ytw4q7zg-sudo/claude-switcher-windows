@@ -32,3 +32,6 @@ claude-switcher-windows.tar.gz
 
 # Lockfiles that are environment-specific
 src-tauri/gen/out/
+
+# 发布脚本下载产物的临时目录
+release-assets/
