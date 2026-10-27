@@ -541,6 +541,91 @@ mod tests {
         assert!(removed.is_empty());
     }
 
+    /// config.json 的真实降级形态是**硬链接**（文件不能 junction），
+    /// 移除后 live 名消失、目标数据保留（另一名字仍然有效）。
+    #[test]
+    fn deactivate_in_removes_hard_linked_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        let profile_root = dir.path().join("profile");
+        fs::create_dir_all(&claude_root).unwrap();
+        fs::create_dir_all(&profile_root).unwrap();
+
+        let target_cfg = profile_root.join("config.json");
+        fs::write(&target_cfg, "{\"k\":1}").unwrap();
+        let live_cfg = claude_root.join("config.json");
+        fs::hard_link(&target_cfg, &live_cfg).unwrap();
+
+        let removed = deactivate_in(&claude_root, &profile_root).expect("deactivate 失败");
+        assert_eq!(removed, vec!["config.json".to_string()]);
+        assert!(!live_cfg.exists(), "live 名应被移除");
+        // 硬链接只删一个名字，profile 里的数据必须还在。
+        assert_eq!(fs::read_to_string(&target_cfg).unwrap(), "{\"k\":1}");
+    }
+
+    /// 悬空 junction（目标已被删除）仍应被识别并移除。
+    #[cfg(windows)]
+    #[test]
+    fn deactivate_in_removes_dangling_junction() {
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        let profile_root = dir.path().join("profile");
+        let my_projects = profile_root.join("projects");
+        fs::create_dir_all(&my_projects).unwrap();
+        make_link(&my_projects, &claude_root.join("projects"));
+        // 目标消失 → live 变悬空链接。
+        fs::remove_dir_all(&my_projects).unwrap();
+
+        let removed = deactivate_in(&claude_root, &profile_root).expect("悬空链接也应可移除");
+        assert_eq!(removed, vec!["projects".to_string()]);
+        assert!(!links::path_is_link(&claude_root.join("projects")));
+    }
+
+    /// 某一项取消失败 → 整体返回 Err，且**后续链接不动**（保现场让用户排障）。
+    /// Windows：对 junction 本身开一个「不允许删除」的句柄，remove_dir 必然失败。
+    #[cfg(windows)]
+    #[test]
+    fn deactivate_in_aborts_and_keeps_other_links_when_removal_fails() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let claude_root = dir.path().join("claude");
+        let profile_root = dir.path().join("profile");
+
+        // projects = 被锁住的 junction（移除会失败）；telemetry = 正常 junction（必须保留）。
+        let my_projects = profile_root.join("projects");
+        let my_telemetry = profile_root.join("telemetry");
+        fs::create_dir_all(&my_projects).unwrap();
+        fs::create_dir_all(&my_telemetry).unwrap();
+        make_link(&my_projects, &claude_root.join("projects"));
+        make_link(&my_telemetry, &claude_root.join("telemetry"));
+
+        // 不带 FILE_SHARE_DELETE 打开 reparse point 自身 → remove_dir 报共享冲突。
+        // 目录句柄必须带 FILE_FLAG_BACKUP_SEMANTICS，否则 CreateFile 直接拒。
+        let lock = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
+            .open(claude_root.join("projects"))
+            .expect("打开 junction 句柄失败");
+
+        let err = deactivate_in(&claude_root, &profile_root).unwrap_err();
+        assert!(err.contains("projects"), "错误应指明失败项: {err}");
+        // 失败项与后续项都必须原样保留。
+        assert!(links::path_is_link(&claude_root.join("projects")));
+        assert!(links::path_is_link(&claude_root.join("telemetry")));
+        assert!(my_projects.exists());
+        assert!(my_telemetry.exists());
+
+        // 解锁后重跑应全部成功。
+        drop(lock);
+        let removed = deactivate_in(&claude_root, &profile_root).expect("解锁后应可移除");
+        assert_eq!(removed.len(), 2);
+    }
+
     /// 全部 LOCAL_STATE_DIRS + config.json 都被正确移除。
     #[test]
     fn deactivate_in_removes_all_state_dirs_and_config() {

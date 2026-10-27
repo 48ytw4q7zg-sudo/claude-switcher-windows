@@ -85,6 +85,32 @@ pub struct ProfileMeta {
     pub rate_limit_tier: Option<String>,
 }
 
+/// Claude Desktop 桌面版（`%APPDATA%\Claude`）的账号快照元数据。
+///
+/// 与 `StoredProfile`（Claude Code CLI）并列存在：CLI 接管 `~/.claude` 下的
+/// OAuth/会话状态，Desktop 快照则是对整个 `%APPDATA%\Claude` 目录的递归拷贝。
+/// 磁盘上的真实快照在 `app_data_dir()/desktop-accounts/<id>`，这里只登记索引。
+///
+/// 全部可选/新字段都带 `#[serde(default)]`：旧 store JSON 没有 `desktop_profiles`
+/// 字段时仍能正常反序列化（向后兼容）。
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct DesktopProfile {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub notes: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+    #[serde(default)]
+    pub last_switched_at: Option<DateTime<Utc>>,
+    /// 相对 `app_data_dir()` 的快照目录路径，如 `desktop-accounts/<id>`。
+    pub snapshot_rel: String,
+    #[serde(default)]
+    pub size_bytes: u64,
+    #[serde(default)]
+    pub meta: Option<Value>,
+}
+
 /// 遥测去关联模式（三态，前后端契约里序列化成 camelCase 字符串）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -117,6 +143,9 @@ pub struct Store {
     pub pending_new_account: Option<PendingNewAccount>,
     #[serde(default = "default_telemetry_mode")]
     pub telemetry_mode: TelemetryMode,
+    /// Claude Desktop 桌面版账号快照列表（旧 store 无此字段时反序列化为空）。
+    #[serde(default)]
+    pub desktop_profiles: Vec<DesktopProfile>,
 }
 
 impl Default for Store {
@@ -126,6 +155,7 @@ impl Default for Store {
             current_profile_id: None,
             pending_new_account: None,
             telemetry_mode: default_telemetry_mode(),
+            desktop_profiles: Vec::new(),
         }
     }
 }
@@ -589,6 +619,24 @@ mod tests {
     fn store_default_telemetry_is_disable() {
         let store = Store::default();
         assert_eq!(store.telemetry_mode, TelemetryMode::DisableTelemetry);
+    }
+
+    /// 旧版 store JSON（无 desktop_profiles 字段）必须能照常反序列化——
+    /// 这是迁移 desktop.rs 时对老用户 store 的非破坏承诺。
+    #[test]
+    fn store_deserializes_without_desktop_profiles_field() {
+        let old_json = r#"{
+            "profiles": [],
+            "current_profile_id": null
+        }"#;
+        let store: Store = serde_json::from_str(old_json).expect("旧 store JSON 应能解析");
+        assert!(
+            store.desktop_profiles.is_empty(),
+            "缺字段时 desktop_profiles 必须默认空列表"
+        );
+        // 新结构序列化后必须带上该字段（即使为空），保证落盘格式稳定。
+        let value = serde_json::to_value(&store).expect("序列化 store 成功");
+        assert!(value.get("desktop_profiles").is_some());
     }
 
     /// 地区启发式不能误判：`russia` / `austria` 含 "us" 子串、`Japan38` 含 "38"，

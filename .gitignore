@@ -35,3 +35,8 @@ src-tauri/gen/out/
 
 # 发布脚本下载产物的临时目录
 release-assets/
+
+# 本地验证/构建临时输出（不提交）
+clippy*.txt
+tauri-build.txt
+verify-and-push.sh

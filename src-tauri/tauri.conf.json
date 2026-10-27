@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Claude Switcher",
-  "version": "0.1.0",
-  "identifier": "cn.xiaojian.claude-switcher",
+  "productName": "ClaudeSwitcher",
+  "version": "0.2.0",
+  "identifier": "io.github.48ytw4q7zg-sudo.claude-switcher",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",
@@ -36,6 +36,8 @@
   },
   "bundle": {
     "active": true,
+    "publisher": "48ytw4q7zg-sudo",
+    "copyright": "Copyright (c) 2026 48ytw4q7zg-sudo",
     "targets": "all",
     "windows": {
       "webviewInstallMode": {

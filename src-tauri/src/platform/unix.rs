@@ -42,7 +42,8 @@ pub fn secure_app_data_dir(dir: &Path) -> bool {
 }
 
 /// Unix：单个文件按 0o600 收敛（凭据类文件，配置目录被改到 home 外时用）。
-#[allow(dead_code)] // 调用方在 Windows cfg 分支内；unix 保留同签名实现供 API 对齐。
+/// 调用方在 Windows cfg 分支内；unix 保留同签名实现供 API 对齐。
+#[allow(dead_code)]
 pub fn secure_private_file(path: &Path) -> bool {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).is_ok()
 }
@@ -90,8 +91,9 @@ pub fn paths_equivalent(a: &Path, b: &Path) -> bool {
     normalize_path(a) == normalize_path(b)
 }
 
-#[allow(dead_code)] // 同上：仅 Windows 路径调用，stub 供 API 对齐。
 /// Unix 上 create_junction 不会被调用（目录直接 symlink）；提供 stub 以对齐 API。
+/// 仅 Windows 路径调用，stub 供 API 对齐。
+#[allow(dead_code)]
 pub fn create_junction(_target: &Path, _live: &Path) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -102,4 +104,82 @@ pub fn create_junction(_target: &Path, _live: &Path) -> io::Result<()> {
 /// Unix 无 Windows 式共享冲突；直接执行一次。
 pub fn retry_locked<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     f()
+}
+
+// ==================== Windows 专有系统查询的 unix 占位 ====================
+//
+// 与 windows.rs 保持同名 API（见 docs/backend-interfaces.md）。本仓库主交付是
+// Windows 版，unix 下这些系统状态查询无对应物；返回 Err 以保证整箱编译通过，
+// 业务侧在 Windows 分支外不会真正调用。
+
+/// 与 windows.rs 同形的网卡信息结构体（unix 占位，仅用于类型对齐）。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AdapterInfo {
+    pub name: String,
+    pub description: String,
+    pub status: String,
+    pub if_index: u32,
+    #[serde(default)]
+    pub ipv4: Vec<String>,
+    #[serde(default)]
+    pub ipv6: Vec<String>,
+}
+
+pub fn list_adapters() -> Result<Vec<AdapterInfo>, String> {
+    Err("该平台暂不支持 list_adapters".to_string())
+}
+
+pub fn ipv6_bindings() -> Result<Vec<(String, bool)>, String> {
+    Err("该平台暂不支持 ipv6_bindings".to_string())
+}
+
+pub fn set_ipv6_all_disabled() -> Result<(), String> {
+    Err("该平台暂不支持 set_ipv6_all_disabled".to_string())
+}
+
+pub fn current_timezone_id() -> Result<String, String> {
+    Err("该平台暂不支持 current_timezone_id".to_string())
+}
+
+pub fn set_timezone_id(_id: &str) -> Result<(), String> {
+    Err("该平台暂不支持 set_timezone_id".to_string())
+}
+
+pub fn current_culture() -> Result<String, String> {
+    Err("该平台暂不支持 current_culture".to_string())
+}
+
+pub fn current_home_location_geo() -> Result<u32, String> {
+    Err("该平台暂不支持 current_home_location_geo".to_string())
+}
+
+pub fn set_culture_and_location(_culture: &str, _geo_id: u32) -> Result<(), String> {
+    Err("该平台暂不支持 set_culture_and_location".to_string())
+}
+
+pub fn register_logon_task(
+    _name: &str,
+    _exe: &str,
+    _args: &str,
+    _highest: bool,
+) -> Result<(), String> {
+    Err("该平台暂不支持 register_logon_task".to_string())
+}
+
+pub fn delete_task(_name: &str) -> Result<(), String> {
+    Err("该平台暂不支持 delete_task".to_string())
+}
+
+pub fn task_exists(_name: &str) -> Result<bool, String> {
+    Err("该平台暂不支持 task_exists".to_string())
+}
+
+pub fn start_detached(program: &str, args: &[&str]) -> Result<(), String> {
+    let _ = (program, args);
+    Err("该平台暂不支持 start_detached".to_string())
+}
+
+pub fn kill_processes_by_names(names: &[&str]) -> Result<Vec<String>, String> {
+    let _ = names;
+    Err("该平台暂不支持 kill_processes_by_names".to_string())
 }

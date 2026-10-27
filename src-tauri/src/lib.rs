@@ -19,18 +19,30 @@
 //! 迁移基线：上游 VallierDev/claude-switcher commit `6897984`。
 
 mod accounts;
+mod appconfig;
+mod checks;
 mod clash;
 mod credentials;
+mod desktop;
+mod diagnostics;
+mod egress;
+mod export;
 mod fsx;
+mod guard;
 mod isolation;
 mod jsonio;
+mod keep;
 mod links;
 mod net;
 mod paths;
 mod platform;
 mod processes;
+mod region;
+mod rules;
 mod store;
+mod stun;
 mod tray;
+mod update;
 mod usage;
 
 use std::collections::BTreeMap;
@@ -72,6 +84,8 @@ struct ClaudeStatus {
     current_profile_name: Option<String>,
     pending_new_account: Option<PendingNewAccount>,
     telemetry_mode: TelemetryMode,
+    /// 残留的切换事务日志（上次切换中断）；有值时前端提示用户按备份回滚。
+    pending_switch: Option<SwitchJournal>,
     warnings: Vec<String>,
 }
 
@@ -113,6 +127,82 @@ struct RestoreResult {
     warnings: Vec<String>,
 }
 
+/// 切换事务日志：记录「正在切换到谁、做到哪步、备份在哪」。
+/// 正常完成即删除；进程中途崩溃/被杀时残留，下次启动 `get_status` 会报出来，
+/// 用户可按备份 id 回滚（restore_backup），而不是面对半切换状态猜。
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct SwitchJournal {
+    target_id: String,
+    step: String,
+    backup_id: Option<String>,
+    started_at: DateTime<Utc>,
+}
+
+fn write_switch_journal(journal: &SwitchJournal) {
+    let Ok(path) = paths::switch_journal_path() else {
+        return;
+    };
+    if let Ok(text) = serde_json::to_string_pretty(journal) {
+        // 写日志失败不能阻断切换本身（记日志是旁路）。
+        let _ = fsx::write_atomically(&path, &text);
+    }
+}
+
+fn clear_switch_journal() {
+    if let Ok(path) = paths::switch_journal_path() {
+        let _ = fsx::remove_file_with_retry(&path);
+    }
+}
+
+/// 启动/刷新时读取残留的切换事务日志（无残留返回 None）。
+fn read_switch_journal() -> Option<SwitchJournal> {
+    let path = paths::switch_journal_path().ok()?;
+    let raw = fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+/// 切换前预检：目标快照可解密、凭据存储可写、磁盘可写。
+/// 任一硬性项失败即中止（此时还没动任何数据，是最后的无损放弃点）。
+fn preflight_switch(store_data: &Store, id: &str) -> Result<Vec<String>, String> {
+    let mut notes = Vec::new();
+
+    let profile = store_data
+        .profiles
+        .iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| "找不到这个账号快照".to_string())?;
+
+    // 1. 目标快照的加密凭据必须现在就能解开——切到一半才发现密钥丢失，
+    //    会留下「JSON 已换、凭据没换」的错配态。
+    if let Some(encrypted) = profile.keychain_password.as_deref() {
+        if encrypted.starts_with(store::ENC_PREFIX) {
+            store::decrypt_secret(encrypted).map_err(|e| {
+                format!("预检失败：目标快照的凭据无法解密（{e}）。请先恢复 store 加密密钥再切换")
+            })?;
+        }
+    }
+
+    // 2. 凭据文件目录可写（实际写入在事务内，这里只探目录）。
+    let claude_dir = credentials::claude_dir()?;
+    if !claude_dir.exists() {
+        fs::create_dir_all(&claude_dir).map_err(|e| format!("预检失败：无法创建配置目录: {e}"))?;
+    }
+    let probe = claude_dir.join(".claude-switcher-write-probe");
+    fs::write(&probe, b"probe").map_err(|e| format!("预检失败：配置目录不可写: {e}"))?;
+    let _ = fs::remove_file(&probe);
+
+    // 3. Claude Code 在跑只是提示（切换仍允许，重启后生效），
+    //    放在 warnings 而不是阻断——用户可能就是想切完再重启。
+    if processes::claude_code_running() {
+        notes.push(
+            "检测到 Claude Code 仍在运行，切换不会作用于已运行的会话，请切换后重启 Claude Code"
+                .to_string(),
+        );
+    }
+
+    Ok(notes)
+}
+
 // ───────────────────────── 工具函数 ─────────────────────────
 
 /// 把会阻塞的工作丢进 `spawn_blocking`，命令本体保持 `async`。
@@ -149,6 +239,37 @@ fn get_platform() -> &'static str {
     } else {
         "linux"
     }
+}
+
+/// 应用内版本检查（GitHub Releases latest）。网络请求，走 blocking 壳。
+/// 失败静默返回说明文本，不弹错、不阻塞主线程。
+#[tauri::command]
+async fn check_for_update() -> Result<update::UpdateCheckResult, String> {
+    blocking(|| Ok(update::check_for_update_blocking())).await
+}
+
+/// 快照加密导出（Argon2id + AES-GCM，单文件 CSBK1）。口令 ≥8 位。
+#[tauri::command]
+async fn export_store_encrypted(
+    dest: String,
+    password: String,
+) -> Result<export::ExportResult, String> {
+    blocking(move || {
+        export::export_store_encrypted_blocking(PathBuf::from(dest).as_path(), &password)
+    })
+    .await
+}
+
+/// 快照加密导入：口令解密 + 校验 store 形状 + 原子替换（先备份现有 store）。
+#[tauri::command]
+async fn import_store_encrypted(
+    src: String,
+    password: String,
+) -> Result<export::ImportResult, String> {
+    blocking(move || {
+        export::import_store_encrypted_blocking(PathBuf::from(src).as_path(), &password)
+    })
+    .await
 }
 
 // ───────────────────────── 状态 ─────────────────────────
@@ -232,6 +353,16 @@ fn get_status_blocking(offline: bool) -> Result<ClaudeStatus, String> {
         );
     }
 
+    // 残留的切换事务日志 = 上次切换中断；提示用户用备份回滚。
+    let pending_switch = read_switch_journal();
+    if let Some(journal) = &pending_switch {
+        warnings.push(format!(
+            "检测到上次切换未完成（目标 {}，步骤 {}）——可用「备份与恢复」回滚到切换前备份",
+            journal.target_id.chars().take(8).collect::<String>(),
+            journal.step
+        ));
+    }
+
     Ok(ClaudeStatus {
         claude_json_exists: p::claude_json_path()?.exists(),
         settings_json_exists: settings_json.is_some(),
@@ -253,6 +384,7 @@ fn get_status_blocking(offline: bool) -> Result<ClaudeStatus, String> {
         pending_new_account: store_data.pending_new_account.clone(),
         current_profile_id: store_data.current_profile_id,
         telemetry_mode: store_data.telemetry_mode,
+        pending_switch,
         warnings,
     })
 }
@@ -742,16 +874,33 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
     if !store_data.profiles.iter().any(|p| p.id == id) {
         return Err("找不到这个账号快照".to_string());
     }
-    let mut warnings = Vec::new();
-
-    if processes::claude_code_running() {
-        warnings.push(
-            "检测到 Claude Code 仍在运行，切换不会作用于已运行的会话，请切换后重启 Claude Code"
-                .to_string(),
-        );
-    }
+    // 预检：目标快照可解密 / 配置目录可写 / Claude Code 在跑只提示。
+    // 通过后才开始动数据（此后每步都有备份/日志可回滚）。
+    let mut warnings = preflight_switch(&store_data, &id)?;
 
     let backup = create_backup_with_label(&format!("before-switch-to-{id}"))?;
+    // 切换事务日志：从「备份已建」起记录——此刻备份是回滚点，
+    // 之后任何中断都能按 backup_id 恢复。备份失败则什么都没改，不需要日志。
+    write_switch_journal(&SwitchJournal {
+        target_id: id.clone(),
+        step: "backup-created".to_string(),
+        backup_id: Some(backup.id.clone()),
+        started_at: Utc::now(),
+    });
+    // 跨身份保留：切换前把 keep-in-workspace.txt 列出的相对路径收进暂存（默认关闭）。
+    // 与上游一致：暂存失败（含上次还原残留的唯一副本）直接中止切换，不覆盖。
+    let keep_base = credentials::claude_dir()?;
+    let keep_report = keep::stage_keep(&keep_base)?;
+    if keep_report.count > 0 {
+        warnings.push(format!("跨身份保留：已暂存 {} 项", keep_report.count));
+    }
+    warnings.extend(
+        keep_report
+            .warnings
+            .into_iter()
+            .map(|w| format!("跨身份保留：{w}")),
+    );
+
     warnings.extend(refresh_current_profile_snapshot(&mut store_data, &id));
     if let Some(current_id) = store_data.current_profile_id.as_deref() {
         warnings.extend(isolation::adopt_live_claude_local_state_for_profile(
@@ -810,6 +959,22 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
             "session 隔离链接激活失败（账号材料已切换成功，重新执行一次切换可补上）：{e}"
         )),
     }
+    // 跨身份保留：把暂存文件合并回新账号目录。此刻账号材料已切成功，合并失败不回滚
+    // （否则 UI 显示失败、磁盘已切，状态相反），保留暂存并提示手动恢复。
+    match keep::merge_keep(&keep_base) {
+        Ok(report) => {
+            if report.count > 0 {
+                warnings.push(format!("跨身份保留：已合并 {} 项到新账号", report.count));
+            }
+            warnings.extend(
+                report
+                    .warnings
+                    .into_iter()
+                    .map(|w| format!("跨身份保留：{w}")),
+            );
+        }
+        Err(e) => warnings.push(format!("跨身份保留合并失败（暂存已保留，可手动恢复）：{e}")),
+    }
     // 记录切号结果与链接模式：排障时最需要的两条信息。
     // 账号名只记 id 前 8 位（隐私：日志可能被用户直接贴给别人排障）。
     // 用 chars().take() 而不是字节切片，id 含非 ASCII 时不会 panic。
@@ -839,6 +1004,8 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
     store_data.profiles[idx].last_switched_at = Some(Utc::now());
     store_data.profiles[idx].updated_at = Utc::now();
     store::save_store(&store_data)?;
+    // 事务正常完成：清掉切换日志（残留日志 = 上次切换中断的信号）。
+    clear_switch_journal();
 
     Ok(SwitchResult {
         switched_to: profile.name,
@@ -1842,6 +2009,201 @@ fn get_autostart() -> AutostartState {
     }
 }
 
+// ───── 环境安检 / 地区 / 保镖 / 规则 / 桌面版 / 诊断 ─────
+
+/// 14 项安全检查（逐项 ok / warn / fail + 详情）。
+#[tauri::command]
+async fn run_security_checks() -> Result<Vec<checks::CheckItem>, String> {
+    blocking(|| Ok(checks::run_checks_blocking())).await
+}
+
+/// 一键修复（拉起代理 / 锁时区 / 关 IPv6 / 写规则 / 注册保镖），并复测。
+#[tauri::command]
+async fn run_security_fix() -> Result<checks::FixReport, String> {
+    blocking(|| Ok(checks::run_fix_blocking())).await
+}
+
+/// 探测当前出口（IP / 国家 / IANA 时区 / ASN org）。
+#[tauri::command]
+async fn detect_egress() -> Result<egress::EgressInfo, String> {
+    blocking(egress::detect_egress_blocking).await
+}
+
+/// 地区锁定结果（set-region）。
+#[derive(Debug, Clone, Serialize)]
+pub struct RegionLockReport {
+    pub plan: region::RegionPlan,
+    pub applied: bool,
+    /// 应用后回读的当前 Home Location GeoId（best-effort，仅在 apply 时读取）。
+    pub current_geo: Option<u32>,
+    pub message: String,
+}
+
+/// set-region：按当前出口重锁国家 / 时区 / 区域格式；`apply=true` 时立即改系统时区与区域。
+#[tauri::command]
+async fn lock_region(apply: bool) -> Result<RegionLockReport, String> {
+    blocking(move || {
+        let info = egress::detect_egress_blocking()?;
+        let plan = region::plan_for_egress(&info.country, &info.iana_tz);
+        appconfig::update(|c| {
+            c.country_target = Some(plan.country.clone());
+            c.tz_target = Some(plan.windows_tz.clone());
+            c.locale_target = Some(plan.locale.clone());
+            c.last_egress_ip = Some(info.ip.clone());
+        })?;
+        let mut current_geo = None;
+        if apply {
+            platform::imp::set_timezone_id(&plan.windows_tz)?;
+            platform::imp::set_culture_and_location(&plan.locale, plan.geo_id)?;
+            // 回读 Home Location 验证（best-effort，失败不阻断）。
+            current_geo = platform::imp::current_home_location_geo().ok();
+        }
+        Ok(RegionLockReport {
+            plan,
+            applied: apply,
+            current_geo,
+            message: if apply {
+                "已按出口锁定并应用时区/区域格式".to_string()
+            } else {
+                "已按出口锁定目标（未改动系统）".to_string()
+            },
+        })
+    })
+    .await
+}
+
+/// set-client：安装后更换代理客户端。
+#[tauri::command]
+fn set_client(mode: String) -> Result<(), String> {
+    const ALLOWED: [&str; 7] = [
+        "clash-verge",
+        "sing-box",
+        "clashx",
+        "surge",
+        "wireguard",
+        "other",
+        "auto",
+    ];
+    let m = mode.trim().to_lowercase();
+    if !ALLOWED.contains(&m.as_str()) {
+        return Err(format!("未知客户端，可选：{}", ALLOWED.join("/")));
+    }
+    appconfig::update(|c| c.proxy_mode = Some(m.clone()))?;
+    Ok(())
+}
+
+/// 保镖安装状态。
+#[derive(Debug, Clone, Serialize)]
+pub struct GuardStatusReport {
+    pub installed: bool,
+}
+
+#[tauri::command]
+fn guard_status() -> GuardStatusReport {
+    GuardStatusReport {
+        installed: guard::guard_installed(),
+    }
+}
+
+/// 手动执行一次保镖巡检（kill-switch），返回本轮判定（前端「立即检测」按钮）。
+#[tauri::command]
+async fn guard_run_tick() -> Result<guard::GuardTick, String> {
+    blocking(|| Ok(guard::guard_tick())).await
+}
+
+#[tauri::command]
+async fn install_guard_cmd() -> Result<(), String> {
+    blocking(guard::install_guard).await
+}
+
+#[tauri::command]
+async fn uninstall_guard_cmd() -> Result<(), String> {
+    blocking(guard::uninstall_guard).await
+}
+
+/// Clash 当前模式（rule / global / direct）。
+#[tauri::command]
+async fn get_clash_mode() -> Result<String, String> {
+    blocking(rules::clash_mode).await
+}
+
+/// 按当前模式写 / 清规则（Script.js 托管块），并验证、失败回滚。
+#[tauri::command]
+async fn ensure_clash_rules() -> Result<rules::RulesReport, String> {
+    blocking(rules::ensure_rules).await
+}
+
+/// 设置 WebRTC 策略（proxy / reject）。
+#[tauri::command]
+fn set_webrtc_policy(policy: String) -> Result<(), String> {
+    let p = policy.trim().to_lowercase();
+    if p != "proxy" && p != "reject" {
+        return Err("WebRTC 策略仅支持 proxy / reject".to_string());
+    }
+    appconfig::update(|c| c.webrtc_policy = Some(p.clone()))?;
+    Ok(())
+}
+
+// ── Claude Desktop 桌面版 ──
+
+#[tauri::command]
+fn list_desktop_profiles_cmd() -> Vec<store::DesktopProfile> {
+    desktop::list_desktop_profiles()
+}
+
+#[tauri::command]
+async fn capture_desktop_profile_cmd(
+    name: String,
+    notes: Option<String>,
+) -> Result<store::DesktopProfile, String> {
+    blocking(move || desktop::capture_desktop_profile(&name, notes)).await
+}
+
+#[tauri::command]
+async fn switch_desktop_profile_cmd(id: String) -> Result<Vec<String>, String> {
+    blocking(move || desktop::switch_desktop_profile(&id)).await
+}
+
+#[tauri::command]
+async fn delete_desktop_profile_cmd(id: String, also_files: bool) -> Result<(), String> {
+    blocking(move || desktop::delete_desktop_profile(&id, also_files)).await
+}
+
+#[tauri::command]
+async fn rename_desktop_profile_cmd(
+    id: String,
+    name: String,
+) -> Result<store::DesktopProfile, String> {
+    blocking(move || desktop::rename_desktop_profile(&id, &name)).await
+}
+
+// ── 隐私 / 诊断工具 ──
+
+#[tauri::command]
+async fn open_safe_cmd(url: String) -> Result<String, String> {
+    blocking(move || diagnostics::open_safe(&url)).await
+}
+
+#[tauri::command]
+async fn close_safe_cmd(id: String) -> Result<(), String> {
+    blocking(move || diagnostics::close_safe(&id)).await
+}
+
+#[tauri::command]
+async fn diagnose_proxy_cmd(proxy_url: String) -> Result<Value, String> {
+    blocking(move || diagnostics::diagnose_proxy(&proxy_url)).await
+}
+
+#[tauri::command]
+async fn system_fingerprint_cmd() -> Result<diagnostics::SystemFingerprint, String> {
+    blocking(|| Ok(diagnostics::system_fingerprint())).await
+}
+
+#[tauri::command]
+async fn cli_info_cmd() -> Result<diagnostics::CliInfo, String> {
+    blocking(|| Ok(diagnostics::cli_info())).await
+}
+
 // ───────────────────────── 启动 ─────────────────────────
 
 /// 安装 panic hook：把 panic 信息写进本机日志（发布版 stderr 被丢弃），
@@ -1864,6 +2226,13 @@ fn install_panic_hook() {
 
 pub fn run() {
     install_panic_hook();
+
+    // 保镖/时区看门狗常驻模式：由计划任务（ClaudeBodyguard，AtLogOn）以 `--guard` 拉起，
+    // 进入后不初始化 GUI，10 秒巡检循环（代理内核/TUN 丢失即杀 Claude，fail-closed）。
+    if std::env::args().any(|a| a == "--guard") {
+        guard::run_guard_loop();
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         // 单实例：双击两次只留一个托盘图标，也避免并发写 store。
@@ -1898,6 +2267,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_platform,
             get_status,
+            check_for_update,
+            export_store_encrypted,
+            import_store_encrypted,
             set_telemetry_mode,
             list_profiles,
             capture_current_profile,
@@ -1930,6 +2302,31 @@ pub fn run() {
             set_claude_config_dir,
             set_autostart,
             get_autostart,
+            // 环境安检 / 地区 / 保镖 / 规则
+            run_security_checks,
+            run_security_fix,
+            detect_egress,
+            lock_region,
+            set_client,
+            guard_status,
+            guard_run_tick,
+            install_guard_cmd,
+            uninstall_guard_cmd,
+            get_clash_mode,
+            ensure_clash_rules,
+            set_webrtc_policy,
+            // Claude Desktop 桌面版
+            list_desktop_profiles_cmd,
+            capture_desktop_profile_cmd,
+            switch_desktop_profile_cmd,
+            delete_desktop_profile_cmd,
+            rename_desktop_profile_cmd,
+            // 隐私 / 诊断
+            open_safe_cmd,
+            close_safe_cmd,
+            diagnose_proxy_cmd,
+            system_fingerprint_cmd,
+            cli_info_cmd,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Claude Switcher");

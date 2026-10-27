@@ -380,6 +380,335 @@ pub fn retry_locked<T>(mut f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
     Err(last.unwrap())
 }
 
+// ==================== 系统查询 / 配置（隐藏 PowerShell + ConvertTo-Json） ====================
+//
+// 这一组是 YOURSJEYO 功能迁移的平台层契约（见 docs/backend-interfaces.md）。
+// 所有 Windows 系统状态查询统一走 `run_ps`（隐藏 powershell.exe + EncodedCommand），
+// 再交给独立的 `parse_xxx` 反序列化——「命令调用」与「输出解析」分离，parse 函数
+// 可做纯表驱动单测；ConvertTo-Json 的枚举值（如 Status="Up"）不随 UI 语言本地化。
+
+use base64::engine::general_purpose::STANDARD as BASE64;
+use base64::Engine as _;
+
+/// 网卡信息（含虚拟网卡）。前端安检仪表盘直接消费。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct AdapterInfo {
+    /// 接口别名（如 "Mihomo TUN" / "以太网"）。
+    pub name: String,
+    /// InterfaceDescription（驱动描述，通常英文，如 "Wintun Userspace Tunnel"）。
+    pub description: String,
+    /// "Up" / "Disabled" / "Disconnected" 等枚举名（ToString 不随 UI 语言本地化）。
+    pub status: String,
+    pub if_index: u32,
+    /// `#[serde(default)]`：PS 5.1 对空数组/ null 的序列化偶有出入，缺省按空 Vec 容错。
+    #[serde(default)]
+    pub ipv4: Vec<String>,
+    #[serde(default)]
+    pub ipv6: Vec<String>,
+}
+
+/// 把 Rust 字符串转成 PowerShell 单引号字面量内容（单引号翻倍转义）。
+/// 所有注入 PowerShell 脚本的用户/配置串都必须过这里，杜绝引号注入。
+fn ps_single_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
+
+/// 用隐藏 PowerShell 执行一段脚本，返回 stdout（去尾换行）。
+///
+/// - `-EncodedCommand`：脚本以 UTF-16LE 做 Base64，彻底绕开命令行引号、中文、
+///   `-Command` 参数拆分等坑。
+/// - `CREATE_NO_WINDOW`（来自 silent_command）：托盘常驻时不闪黑窗。
+/// - 脚本头强制 `[Console]::OutputEncoding = UTF8`：否则中文网卡名在 OEM 代码页
+///   （中文系统为 GBK）下会被 Rust 按 UTF-8 lossy 读成乱码。
+/// - 非零退出码转 Err，stderr/stdout 一并带回便于排错。
+fn run_ps(script: &str) -> Result<String, String> {
+    let wrapped = format!(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n\
+         $OutputEncoding = [System.Text.Encoding]::UTF8\n\
+         {script}"
+    );
+    let wide: Vec<u8> = wrapped.encode_utf16().flat_map(u16::to_le_bytes).collect();
+    let encoded = BASE64.encode(&wide);
+    let out = silent_command("powershell.exe")
+        .args([
+            "-NoProfile",
+            "-NonInteractive",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-EncodedCommand",
+            &encoded,
+        ])
+        .output()
+        .map_err(|e| format!("启动 powershell.exe 失败: {e}"))?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        return Err(format!(
+            "PowerShell 失败(退出码={:?}): stderr={} stdout={}",
+            out.status.code(),
+            stderr.trim_end(),
+            stdout.trim_end()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// 全部网卡（含虚拟网卡）。
+pub fn list_adapters() -> Result<Vec<AdapterInfo>, String> {
+    let script = "\
+$ips = Get-NetIPAddress -AddressFamily IPv4,IPv6 -ErrorAction SilentlyContinue
+@(Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object {
+    $idx = $_.ifIndex
+    [PSCustomObject]@{
+        name = $_.Name
+        description = $_.InterfaceDescription
+        status = $_.Status.ToString()
+        if_index = [uint32]$idx
+        ipv4 = @($ips | Where-Object { $_.InterfaceIndex -eq $idx -and $_.AddressFamily -eq 'IPv4' } | Select-Object -ExpandProperty IPAddress)
+        ipv6 = @($ips | Where-Object { $_.InterfaceIndex -eq $idx -and $_.AddressFamily -eq 'IPv6' } | Select-Object -ExpandProperty IPAddress)
+    }
+}) | ConvertTo-Json -Depth 3";
+    let json = run_ps(script)?;
+    parse_adapters(&json)
+}
+
+/// 解析 `list_adapters` 的 ConvertTo-Json 输出（兼容数组与单对象两种形态）。
+fn parse_adapters(json: &str) -> Result<Vec<AdapterInfo>, String> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| format!("网卡列表 JSON 解析失败: {e}; 原文: {trimmed}"))?;
+    match value {
+        serde_json::Value::Array(arr) => serde_json::from_value(serde_json::Value::Array(arr))
+            .map_err(|e| format!("网卡列表结构不符: {e}")),
+        serde_json::Value::Object(_) => {
+            let one: AdapterInfo =
+                serde_json::from_value(value).map_err(|e| format!("单块网卡结构不符: {e}"))?;
+            Ok(vec![one])
+        }
+        serde_json::Value::Null => Ok(Vec::new()),
+        other => Err(format!("网卡列表顶层应为数组/对象, 实为: {other}")),
+    }
+}
+
+/// ms_tcpip6（IPv6）绑定状态：(网卡名, 是否已启用)。
+pub fn ipv6_bindings() -> Result<Vec<(String, bool)>, String> {
+    let script = "\
+@(Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | ForEach-Object {
+    [PSCustomObject]@{ name = $_.Name; enabled = [bool]$_.Enabled }
+}) | ConvertTo-Json";
+    let json = run_ps(script)?;
+    parse_ipv6_bindings(&json)
+}
+
+#[derive(serde::Deserialize)]
+struct BindingItem {
+    name: String,
+    enabled: bool,
+}
+
+/// 解析 `ipv6_bindings` 的 ConvertTo-Json 输出（兼容数组与单对象）。
+fn parse_ipv6_bindings(json: &str) -> Result<Vec<(String, bool)>, String> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| format!("IPv6 绑定 JSON 解析失败: {e}; 原文: {trimmed}"))?;
+    let items: Vec<BindingItem> =
+        match value {
+            serde_json::Value::Array(arr) => serde_json::from_value(serde_json::Value::Array(arr))
+                .map_err(|e| format!("IPv6 绑定结构不符: {e}"))?,
+            serde_json::Value::Object(_) => vec![serde_json::from_value(value)
+                .map_err(|e| format!("单条 IPv6 绑定结构不符: {e}"))?],
+            serde_json::Value::Null => Vec::new(),
+            other => return Err(format!("IPv6 绑定顶层应为数组/对象, 实为: {other}")),
+        };
+    Ok(items.into_iter().map(|b| (b.name, b.enabled)).collect())
+}
+
+/// 关闭所有网卡的 IPv6 绑定（Disable-NetAdapterBinding，需要管理员）。
+pub fn set_ipv6_all_disabled() -> Result<(), String> {
+    run_ps(
+        "Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction SilentlyContinue | \
+         Where-Object { $_.Enabled } | Disable-NetAdapterBinding -Confirm:$false | Out-Null",
+    )?;
+    Ok(())
+}
+
+/// 当前 Windows 时区 ID（如 "Eastern Standard Time"）。
+pub fn current_timezone_id() -> Result<String, String> {
+    let json = run_ps("(Get-TimeZone).Id | ConvertTo-Json")?;
+    parse_timezone_id(&json)
+}
+
+fn parse_timezone_id(json: &str) -> Result<String, String> {
+    let trimmed = json.trim();
+    let id: String = serde_json::from_str(trimmed)
+        .map_err(|e| format!("时区 ID 解析失败: {e}; 原文: {trimmed}"))?;
+    let id = id.trim().to_string();
+    if id.is_empty() {
+        return Err("时区 ID 为空".to_string());
+    }
+    Ok(id)
+}
+
+/// 设置 Windows 时区（Set-TimeZone，需要管理员）。
+pub fn set_timezone_id(id: &str) -> Result<(), String> {
+    run_ps(&format!("Set-TimeZone -Id {}", ps_single_quote(id)))?;
+    Ok(())
+}
+
+/// 当前用户区域格式（culture，如 "en-US"，Get-Culture）。
+pub fn current_culture() -> Result<String, String> {
+    let json = run_ps("(Get-Culture).Name | ConvertTo-Json")?;
+    parse_culture(&json)
+}
+
+fn parse_culture(json: &str) -> Result<String, String> {
+    let trimmed = json.trim();
+    let name: String = serde_json::from_str(trimmed)
+        .map_err(|e| format!("culture 解析失败: {e}; 原文: {trimmed}"))?;
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err("culture 为空".to_string());
+    }
+    Ok(name)
+}
+
+/// 当前用户 Home Location GeoId（Get-WinHomeLocation）。
+pub fn current_home_location_geo() -> Result<u32, String> {
+    let json = run_ps("(Get-WinHomeLocation).GeoId | ConvertTo-Json")?;
+    parse_home_location_geo(&json)
+}
+
+fn parse_home_location_geo(json: &str) -> Result<u32, String> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Err("Home Location GeoId 为空".to_string());
+    }
+    serde_json::from_str(trimmed).map_err(|e| format!("GeoId 解析失败: {e}; 原文: {trimmed}"))
+}
+
+/// 设置区域格式 + Home Location（Set-Culture 下次登录生效；Set-WinHomeLocation 即时）。
+pub fn set_culture_and_location(culture: &str, geo_id: u32) -> Result<(), String> {
+    run_ps(&format!(
+        "Set-Culture -CultureInfo {}; Set-WinHomeLocation -GeoId {}",
+        ps_single_quote(culture),
+        geo_id
+    ))?;
+    Ok(())
+}
+
+/// 注册「登录时触发」的计划任务（AtLogOn，Interactive 登录类型无需存密码）。
+/// highest=true 时以最高权限运行（RunLevel=Highest，注册需管理员）。
+pub fn register_logon_task(name: &str, exe: &str, args: &str, highest: bool) -> Result<(), String> {
+    let run_level = if highest { "Highest" } else { "Limited" };
+    let script = format!(
+        "$ErrorActionPreference='Stop'\n\
+         $a = New-ScheduledTaskAction -Execute {exe} -Argument {args}\n\
+         $t = New-ScheduledTaskTrigger -AtLogOn\n\
+         $principal = New-ScheduledTaskPrincipal -UserId \"$env:USERDOMAIN\\$env:USERNAME\" \
+         -LogonType Interactive -RunLevel {level}\n\
+         Register-ScheduledTask -TaskName {name} -Action $a -Trigger $t -Principal $principal -Force | Out-Null",
+        exe = ps_single_quote(exe),
+        args = ps_single_quote(args),
+        level = run_level,
+        name = ps_single_quote(name),
+    );
+    run_ps(&script)?;
+    Ok(())
+}
+
+/// 删除计划任务（不存在视为成功）。
+pub fn delete_task(name: &str) -> Result<(), String> {
+    let quoted = ps_single_quote(name);
+    run_ps(&format!(
+        "if (Get-ScheduledTask -TaskName {q} -ErrorAction SilentlyContinue) {{ \
+         Unregister-ScheduledTask -TaskName {q} -Confirm:$false }}",
+        q = quoted
+    ))?;
+    Ok(())
+}
+
+/// 计划任务是否存在。
+pub fn task_exists(name: &str) -> Result<bool, String> {
+    let json = run_ps(&format!(
+        "@(Get-ScheduledTask -TaskName {} -ErrorAction SilentlyContinue).Count -gt 0 | ConvertTo-Json",
+        ps_single_quote(name)
+    ))?;
+    parse_task_exists(&json)
+}
+
+fn parse_task_exists(json: &str) -> Result<bool, String> {
+    let trimmed = json.trim();
+    serde_json::from_str(trimmed).map_err(|e| format!("task_exists 解析失败: {e}; 原文: {trimmed}"))
+}
+
+/// 无窗口、不等待地启动一个进程（detached，stdio 全部丢弃）。
+pub fn start_detached(program: &str, args: &[&str]) -> Result<(), String> {
+    use std::os::windows::process::CommandExt;
+    const DETACHED_PROCESS: u32 = 0x0000_0008;
+    std::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .creation_flags(CREATE_NO_WINDOW | DETACHED_PROCESS)
+        .spawn()
+        .map_err(|e| format!("无窗口启动 {program} 失败: {e}"))?;
+    Ok(())
+}
+
+/// 按可执行名强制结束一批进程（如 ["Claude","claude"]），返回被结束的进程描述。
+pub fn kill_processes_by_names(names: &[&str]) -> Result<Vec<String>, String> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let name_list = names
+        .iter()
+        .map(|n| ps_single_quote(n))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "@(Get-Process -Name {names} -ErrorAction SilentlyContinue | ForEach-Object {{\n\
+         $d = \"$($_.ProcessName) (PID $($_.Id))\"\n\
+         Stop-Process -Id $_.Id -Force -ErrorAction SilentlyContinue\n\
+         $d\n\
+         }}) | ConvertTo-Json",
+        names = name_list
+    );
+    let json = run_ps(&script)?;
+    parse_killed(&json)
+}
+
+fn parse_killed(json: &str) -> Result<Vec<String>, String> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| format!("被结束进程 JSON 解析失败: {e}; 原文: {trimmed}"))?;
+    match value {
+        serde_json::Value::Array(arr) => Ok(arr
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .collect()),
+        serde_json::Value::String(s) => {
+            if s.is_empty() {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![s])
+            }
+        }
+        serde_json::Value::Null => Ok(Vec::new()),
+        other => Err(format!("被结束进程顶层应为数组/字符串, 实为: {other}")),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,5 +815,153 @@ mod tests {
             profile,
             Path::new(r"\\server\share\.credentials.json")
         ));
+    }
+
+    // ---- 系统查询 parse 函数的表驱动单测（真实 ConvertTo-Json 样例） ----
+
+    #[test]
+    fn ps_single_quote_escapes_internal_quotes() {
+        assert_eq!(
+            ps_single_quote(r"C:\Program Files\Claude\Claude.exe"),
+            r"'C:\Program Files\Claude\Claude.exe'"
+        );
+        // 单引号必须翻倍转义。
+        assert_eq!(ps_single_quote("O'Brien"), "'O''Brien'");
+    }
+
+    #[test]
+    fn parse_adapters_handles_array_single_and_empty() {
+        // 真实 Get-NetAdapter | ConvertTo-Json -Depth 3 样例（含中文网卡名 + TUN 网卡）。
+        let array = r#"[
+          {
+            "name": "以太网",
+            "description": "Intel(R) Ethernet Connection (16) I219-V",
+            "status": "Up",
+            "if_index": 12,
+            "ipv4": [ "192.168.1.10" ],
+            "ipv6": [ "fe80::1" ]
+          },
+          {
+            "name": "Mihomo TUN",
+            "description": "Wintun Userspace Tunnel",
+            "status": "Up",
+            "if_index": 21,
+            "ipv4": [ "198.18.0.1" ],
+            "ipv6": []
+          }
+        ]"#;
+        let adapters = parse_adapters(array).expect("数组样例应解析成功");
+        assert_eq!(adapters.len(), 2);
+        assert_eq!(adapters[0].name, "以太网");
+        assert_eq!(adapters[0].status, "Up");
+        assert_eq!(adapters[0].if_index, 12);
+        assert_eq!(adapters[0].ipv4, vec!["192.168.1.10".to_string()]);
+        assert_eq!(adapters[0].ipv6, vec!["fe80::1".to_string()]);
+        assert_eq!(adapters[1].description, "Wintun Userspace Tunnel");
+        assert!(adapters[1].ipv6.is_empty());
+
+        // 单对象形态（@() 未生效或手动拼的单块）也必须能解析。
+        let single = r#"{
+          "name": "Mihomo TUN",
+          "description": "Wintun Userspace Tunnel",
+          "status": "Disconnected",
+          "if_index": 21,
+          "ipv4": [ "198.18.0.1" ],
+          "ipv6": []
+        }"#;
+        let one = parse_adapters(single).expect("单对象样例应解析成功");
+        assert_eq!(one.len(), 1);
+        assert_eq!(one[0].status, "Disconnected");
+
+        // 空输出 / null 视为无网卡，不报错。
+        assert!(parse_adapters("").unwrap().is_empty());
+        assert!(parse_adapters("null").unwrap().is_empty());
+        // 非数组/对象顶层应报错。
+        assert!(parse_adapters("123").is_err());
+    }
+
+    #[test]
+    fn parse_ipv6_bindings_handles_array_single_and_empty() {
+        let array = r#"[
+          { "name": "以太网", "enabled": false },
+          { "name": "Mihomo TUN", "enabled": false }
+        ]"#;
+        let b = parse_ipv6_bindings(array).unwrap();
+        assert_eq!(
+            b,
+            vec![
+                ("以太网".to_string(), false),
+                ("Mihomo TUN".to_string(), false)
+            ]
+        );
+
+        let single = r#"{ "name": "以太网", "enabled": true }"#;
+        assert_eq!(
+            parse_ipv6_bindings(single).unwrap(),
+            vec![("以太网".to_string(), true)]
+        );
+
+        assert!(parse_ipv6_bindings("").unwrap().is_empty());
+        assert!(parse_ipv6_bindings("null").unwrap().is_empty());
+    }
+
+    #[test]
+    fn parse_timezone_id_reads_json_string() {
+        assert_eq!(
+            parse_timezone_id(r#""Eastern Standard Time""#).unwrap(),
+            "Eastern Standard Time"
+        );
+        // ConvertTo-Json 输出可能带尾随空白/换行。
+        assert_eq!(
+            parse_timezone_id("  \"Tokyo Standard Time\"\n").unwrap(),
+            "Tokyo Standard Time"
+        );
+        assert!(parse_timezone_id("").is_err());
+        assert!(parse_timezone_id("\"\"").is_err());
+    }
+
+    #[test]
+    fn parse_culture_reads_json_string() {
+        assert_eq!(parse_culture(r#""en-US""#).unwrap(), "en-US");
+        assert_eq!(parse_culture(r#""zh-CN""#).unwrap(), "zh-CN");
+        assert!(parse_culture("\"\"").is_err());
+    }
+
+    #[test]
+    fn parse_home_location_geo_reads_number() {
+        assert_eq!(parse_home_location_geo("244").unwrap(), 244);
+        assert_eq!(parse_home_location_geo("  244\n").unwrap(), 244);
+        assert!(parse_home_location_geo("").is_err());
+        assert!(parse_home_location_geo("\"abc\"").is_err());
+    }
+
+    #[test]
+    fn parse_task_exists_reads_bool() {
+        assert!(parse_task_exists("true").unwrap());
+        assert!(!parse_task_exists("false").unwrap());
+        assert!(parse_task_exists("  true  ").unwrap());
+        assert!(parse_task_exists("null").is_err());
+    }
+
+    #[test]
+    fn parse_killed_handles_array_string_and_empty() {
+        let array = r#"["Claude (PID 1234)", "claude (PID 5678)"]"#;
+        let k = parse_killed(array).unwrap();
+        assert_eq!(
+            k,
+            vec![
+                "Claude (PID 1234)".to_string(),
+                "claude (PID 5678)".to_string()
+            ]
+        );
+
+        // 单字符串形态（未包数组时 ConvertTo-Json 的输出）。
+        assert_eq!(
+            parse_killed(r#""Claude (PID 1234)""#).unwrap(),
+            vec!["Claude (PID 1234)".to_string()]
+        );
+
+        assert!(parse_killed("").unwrap().is_empty());
+        assert!(parse_killed("null").unwrap().is_empty());
     }
 }

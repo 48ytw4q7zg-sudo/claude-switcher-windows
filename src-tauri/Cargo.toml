@@ -1,12 +1,19 @@
 [package]
 name = "claude-switcher"
-version = "0.1.0"
-description = "Claude Code local account switcher"
-authors = ["xiaojian"]
+version = "0.2.0"
+description = "Claude Code local account switcher (Windows)"
+authors = ["48ytw4q7zg-sudo"]
 edition = "2021"
 # `slice::as_chunks` 等 API 需要 Rust 1.88+；显式声明，避免旧工具链报难懂的错。
 rust-version = "1.88"
 default-run = "claude-switcher"
+
+# C-5：默认 release 配置产物 14MB+；lto + 单 codegen unit + 去符号显著减小体积。
+# 不要加 panic = "abort"：spawn_blocking 的 JoinError 依赖 unwind，panic hook 也要。
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "symbols"
 
 [lib]
 name = "claude_switcher_lib"
@@ -37,6 +44,8 @@ sha2 = "0.10"
 urlencoding = "2"
 # C2：store/备份里的 keychain_password（OAuth blob，唯一明文 token）落盘加密用。
 aes-gcm = "0.10"
+# 快照加密导出/导入的口令派生（Argon2id）。
+argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
 # HTTP：Claude OAuth usage/profile 与 Clash 控制器都走 reqwest。

@@ -56,6 +56,12 @@ pub fn store_path() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("store.private.json"))
 }
 
+/// 切换事务日志：记录进行中的切换目标/步骤/备份 id；
+/// 正常完成后删除，启动时发现残留即提示用户回滚。
+pub fn switch_journal_path() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join("switch-journal.json"))
+}
+
 pub fn backups_dir() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("backups"))
 }
