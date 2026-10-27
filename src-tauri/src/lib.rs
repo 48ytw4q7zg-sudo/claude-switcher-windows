@@ -975,6 +975,31 @@ fn delete_profile_blocking(id: String, delete_sessions: bool) -> Result<(), Stri
     let mut store_data = store::load_store()?;
     // 必须在 retain 之前判断，否则删完就查不到了。
     let was_current = store_data.current_profile_id.as_deref() == Some(id.as_str());
+    if !store_data.profiles.iter().any(|p| p.id == id) {
+        return Err("找不到这个账号快照".to_string());
+    }
+
+    // ── 预检：删会话历史是有破坏性的多步操作，先确认前提再动任何东西 ──
+    // 顺序：先预检 → 取消链接 → 删目录 → 删快照。
+    // 反过来（先删快照）会出现「快照已删、会话没删成」的半完成状态。
+    let sessions_dir = p::session_profiles_dir()?.join(&id);
+    let has_sessions = delete_sessions && sessions_dir.exists();
+    if has_sessions {
+        if processes::claude_code_running() {
+            return Err(
+                "Claude Code 正在运行，无法安全删除会话历史（目录里的文件被占用，\
+                 Windows 上会删一半失败并留下半截目录）。请先退出 Claude Code 再试。"
+                    .to_string(),
+            );
+        }
+        // 取消隔离链接。只删指向该账号的链接，且任一项失败即中止——
+        // 失败后仍删目录会让链接悬空（原因从"误删"变成"锁文件"），不如保留现场。
+        isolation::deactivate_profile(&id).map_err(|e| {
+            format!("删除会话历史前取消隔离链接失败，已中止（未删除任何数据）：{e}")
+        })?;
+    }
+
+    // ── 正式删除 ──
     let before = store_data.profiles.len();
     store_data.profiles.retain(|p| p.id != id);
     if store_data.profiles.len() == before {
@@ -984,52 +1009,22 @@ fn delete_profile_blocking(id: String, delete_sessions: bool) -> Result<(), Stri
         store_data.current_profile_id = None;
     }
     store::save_store(&store_data)?;
-    // 可选清理会话历史：目录可能很大（GB 级），只在用户显式勾选时删除。
-    // **若是当前账号，必须先移除 live 隔离链接**：直接 remove_dir_all 会让
-    // ~/.claude/projects 等变成悬空链接，Claude Code 随后读写会报错。
-    if delete_sessions {
-        let dir = p::session_profiles_dir()?.join(&id);
-        if dir.exists() {
-            if was_current {
-                unlink_isolation_for_profile(&id);
-            }
-            match fs::remove_dir_all(&dir) {
-                Ok(()) => log_info(&format!(
-                    "已删除账号 {} 的会话历史（{}）",
-                    id.chars().take(8).collect::<String>(),
-                    dir.to_string_lossy()
-                )),
-                Err(e) => log_error(&format!("删除会话历史失败（可手动删除）: {e}")),
-            }
-        }
+
+    if has_sessions {
+        fs::remove_dir_all(&sessions_dir).map_err(|e| {
+            format!(
+                "删除会话历史失败（快照已删除，可手动删除 {}）：{}",
+                sessions_dir.to_string_lossy(),
+                fsx::humanize_io_error(&e)
+            )
+        })?;
+        log_info(&format!(
+            "已删除账号 {} 的会话历史（{}）",
+            id.chars().take(8).collect::<String>(),
+            sessions_dir.to_string_lossy()
+        ));
     }
     Ok(())
-}
-
-/// 移除当前账号在 `~/.claude` 下的全部隔离链接（projects、telemetry、config.json 等）。
-/// best-effort：逐个删，失败继续，最终由用户重登或重新切换来恢复。
-fn unlink_isolation_for_profile(profile_id: &str) {
-    for name in [
-        "projects",
-        "telemetry",
-        "file-history",
-        "shell-snapshots",
-        "cache",
-        "debug",
-        "plugins/data",
-    ] {
-        if let Ok(live) = paths::claude_local_dir(name) {
-            if links::path_is_link(&live) {
-                let _ = links::remove_link(&live);
-            }
-        }
-    }
-    if let Ok(live) = paths::claude_config_json_path() {
-        if links::path_is_link(&live) {
-            let _ = links::remove_link(&live);
-        }
-    }
-    let _ = profile_id;
 }
 
 #[tauri::command]
@@ -1570,6 +1565,13 @@ fn set_claude_config_dir_blocking(path: String) -> Result<String, String> {
         // 清回默认目录后同样要重建隔离链接，否则 projects 仍指向旧目录
         // 的隔离目录（内容还在，但路径是旧配置目录下的 live 链接）。
         rebuild_isolation_after_config_switch(&mut warnings);
+        // 凭据不对称提示：默认目录里的登录态可能是旧的（甚至不存在），
+        // 而当前选中账号的凭据还留在原目录。至少要让用户知道该看哪里。
+        warnings.push(
+            "已切回默认配置目录（~/.claude）。该目录下的登录态可能与此前不同；\
+             若 Claude Code 显示未登录或账号不对，请在本工具里重新选择对应快照。"
+                .to_string(),
+        );
         return Ok(with_warnings(
             "已恢复默认配置目录（~/.claude）；隔离链接已按当前目录重建".to_string(),
             &warnings,
@@ -1630,7 +1632,9 @@ fn set_claude_config_dir_blocking(path: String) -> Result<String, String> {
         );
     }
     if let (Some(plain), None) = (&old_credentials, &new_credentials) {
-        // 先写覆盖文件再写凭据：万一凭据写失败，用户只需再执行一次即可。
+        // 先写覆盖文件：之后 credentials::claude_dir() 就解析到新目录，
+        // 统一走 write_password 才能带上 secure_private_file 权限收敛
+        // （直接用 write_atomically 会绕过，迁移完的凭据文件继承数据盘根 ACL）。
         fs::create_dir_all(p::app_data_dir()?).map_err(|e| e.to_string())?;
         crate::fsx::write_atomically(&override_file, trimmed).map_err(|e| {
             format!(
@@ -1638,12 +1642,7 @@ fn set_claude_config_dir_blocking(path: String) -> Result<String, String> {
                 crate::fsx::humanize_io_error(&e)
             )
         })?;
-        crate::fsx::write_atomically(&dir.join(".credentials.json"), plain).map_err(|e| {
-            format!(
-                "迁移凭据到新目录失败: {}",
-                crate::fsx::humanize_io_error(&e)
-            )
-        })?;
+        credentials::write_password(plain).map_err(|e| format!("迁移凭据到新目录失败: {e}"))?;
         // 隔离链接重建：新目录的 projects 等要重新指向当前账号的隔离目录，
         // 否则用户会以为切号生效了、实际 Claude Code 读的是空目录。
         rebuild_isolation_after_config_switch(&mut warnings);

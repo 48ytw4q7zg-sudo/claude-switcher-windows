@@ -735,12 +735,13 @@ function App() {
 
   const remove = (id: string, label: string) => {
     if (!window.confirm(`删除账号快照「${label}」？这不会删除 Claude Code 当前登录。`)) return;
-    // 二次确认会话历史。默认按钮（确定）是**仅删快照**这个安全选项，
-    // 破坏性的「一并删除会话历史」必须由用户显式选择。
-    const withSessions = window.confirm(
-      `删除「${label}」时，是否同时删除它的会话历史？\n\n` +
-        '· 点「确定」= 一并删除（不可恢复，可能释放大量磁盘空间）\n' +
-        '· 点「取消」= 只删快照、保留会话历史',
+    // 二次确认会话历史。**问法反过来问**：window.confirm 的默认焦点在「确定」上，
+    // 用户连按回车就走确定——所以「确定」必须是安全选项（保留会话历史），
+    // 破坏性的「一并删除」由用户显式点取消触发。
+    const withSessions = !window.confirm(
+      `删除「${label}」的快照时，是否保留它的会话历史？\n\n` +
+        '· 点「确定」= 保留会话历史（推荐，可回收磁盘空间时再手动清理）\n' +
+        '· 点「取消」= 一并删除会话历史（不可恢复，可能释放大量磁盘空间）',
     );
     run('delete', async () => {
       await invoke('delete_profile', { id, deleteSessions: withSessions });

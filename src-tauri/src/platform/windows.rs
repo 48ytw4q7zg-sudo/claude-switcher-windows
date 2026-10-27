@@ -130,6 +130,10 @@ pub fn secure_private_file(path: &Path) -> bool {
 
 /// 路径是否位于用户 profile 目录内（`%USERPROFILE%` 下）。
 /// 凭据文件在 profile 内时继承私有 ACL，无需额外收敛。
+///
+/// 复用 `normalize_path`（处理 `\\?\` 前缀、大小写、尾分隔符、8.3 短名），
+/// 不自己做字符串前缀比较——误判的后果只是对 profile 内路径多做一次 icacls，
+/// 但复用同一套逻辑更一致，也不会漏掉短名这类真实场景。
 pub fn is_under_user_profile(path: &Path) -> bool {
     let Ok(profile) = std::env::var("USERPROFILE") else {
         return false;
@@ -138,13 +142,22 @@ pub fn is_under_user_profile(path: &Path) -> bool {
     if profile.is_empty() {
         return false;
     }
-    let profile_lower = profile.to_lowercase().replace('/', "\\");
-    let path_lower = path.to_string_lossy().to_lowercase().replace('/', "\\");
-    let profile_norm = profile_lower.trim_end_matches('\\');
-    path_lower == profile_norm
-        || path_lower.starts_with(&format!("{profile_norm}\\"))
+    let profile_norm = normalize_path(Path::new(profile));
+    let path_norm = normalize_path(path);
+    if profile_norm == path_norm {
+        return true;
+    }
+    let Some(prefix) = profile_norm.to_str() else {
+        return false;
+    };
+    let Some(candidate) = path_norm.to_str() else {
+        return false;
+    };
+    let prefix = prefix.trim_end_matches('\\');
+    candidate
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.starts_with('\\'))
 }
-
 
 /// icacls 的受托人参数：优先用 SID（`*S-1-5-…`，微软账号/中文用户名/本地化环境都稳），
 /// 拿不到再退回 `USERDOMAIN\USERNAME`。

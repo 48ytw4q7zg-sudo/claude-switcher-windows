@@ -25,6 +25,48 @@ pub struct SessionIsolationStatus {
     pub degraded: bool,
 }
 
+/// 账号本地状态目录名单（`~/.claude/<name>`）。
+///
+/// **唯一定义处**：接管、激活、取消激活三处都从这里取，避免改一份漏另外两份
+/// 造成「接管了 6 个目录、激活时只处理 5 个」的不一致。
+pub const LOCAL_STATE_DIRS: &[&str] = &[
+    "projects",
+    "telemetry",
+    "file-history",
+    "shell-snapshots",
+    "cache",
+    "debug",
+    "plugins/data",
+];
+
+/// 取消某账号的全部 live 隔离链接（删除会话历史前调用）。
+///
+/// 三个安全约束：
+/// 1. **只删指向该账号隔离目录的链接**——用 `is_linked_to` 判断，用户自己用
+///    `mklink /J` 建的其它重定向不受影响。
+/// 2. **任一项取消失败即中止**：失败后仍删目录会让链接悬空（原因从"误删"变成
+///    "锁文件"），不如不删、保留现场让用户处理。
+/// 3. **config.json 单独处理**：它是文件（硬链接兜底），判定方式和目录不同。
+pub fn deactivate_profile(profile_id: &str) -> Result<Vec<String>, String> {
+    let mut removed = Vec::new();
+    for name in LOCAL_STATE_DIRS {
+        let live = paths::claude_local_dir(name)?;
+        let target = paths::profile_claude_local_dir(profile_id, name)?;
+        if links::is_linked_to(&live, &target) {
+            links::remove_link(&live).map_err(|e| format!("移除 {name} 隔离链接失败: {e}"))?;
+            removed.push((*name).to_string());
+        }
+    }
+    // config.json：目录型链接走 is_linked_to，硬链接走 same_file（is_linked_to 已含）。
+    let live_cfg = paths::claude_config_json_path()?;
+    let target_cfg = paths::profile_claude_config_json_path(profile_id)?;
+    if links::is_linked_to(&live_cfg, &target_cfg) {
+        links::remove_link(&live_cfg).map_err(|e| format!("移除 config.json 隔离链接失败: {e}"))?;
+        removed.push("config.json".to_string());
+    }
+    Ok(removed)
+}
+
 fn backup_label(label: &str) -> String {
     label
         .chars()
@@ -350,14 +392,8 @@ pub fn activate_profile_claude_config(profile_id: &str) -> Result<Vec<String>, S
 pub fn adopt_live_claude_local_state_for_profile(profile_id: &str) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
     warnings.extend(adopt_live_sessions_for_profile(profile_id)?);
-    for name in [
-        "telemetry",
-        "file-history",
-        "shell-snapshots",
-        "cache",
-        "debug",
-        "plugins/data",
-    ] {
+    // projects 已在上面单独处理，这里跳过它。
+    for name in LOCAL_STATE_DIRS.iter().skip(1) {
         warnings.extend(adopt_live_claude_dir_for_profile(profile_id, name)?);
     }
     warnings.extend(adopt_live_claude_config_for_profile(profile_id)?);
@@ -367,14 +403,8 @@ pub fn adopt_live_claude_local_state_for_profile(profile_id: &str) -> Result<Vec
 pub fn activate_profile_claude_local_state(profile_id: &str) -> Result<Vec<String>, String> {
     let mut warnings = Vec::new();
     warnings.extend(activate_profile_sessions(profile_id)?);
-    for name in [
-        "telemetry",
-        "file-history",
-        "shell-snapshots",
-        "cache",
-        "debug",
-        "plugins/data",
-    ] {
+    // projects 已在上面单独处理，这里跳过它。
+    for name in LOCAL_STATE_DIRS.iter().skip(1) {
         warnings.extend(activate_profile_claude_dir(profile_id, name)?);
     }
     warnings.extend(activate_profile_claude_config(profile_id)?);

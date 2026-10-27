@@ -80,6 +80,24 @@
 | 路径归一化 | `platform::windows::normalize_path` | `platform::*normalize_path*`（4 例，含 8.3 短名、正斜杠） | 已验证 |
 | 凭据字段加密 | `store::split_auth_settings` / `restore_auth_settings` | `store::split_auth_settings_*`（4 例往返） | 已验证 |
 | 文件编码兼容 | `jsonio::read_text_lossy_bom` | `jsonio::*`（8 例 BOM/UTF-16/多文档 YAML） | 已验证 |
+| Clash 控制器地址归一化 | `net::normalize_controller` | `net::controller_normalization_table`（11 例，含 IPv6） | 已验证 |
+| 删除账号的链接清理 | `isolation::deactivate_profile` | 无直接测试 | 待验证 |
+| 配置目录迁移 | `lib::set_claude_config_dir` | 无直接测试 | 待验证 |
+| 凭据文件权限收敛 | `platform::secure_private_file` | 无直接测试 | 待验证（需数据盘实机） |
+
+## 3.1 已知未实现 / 下一阶段
+
+按审查建议记录，尚未实现：
+
+| 项 | 说明 |
+| --- | --- |
+| **配置目录目录级加固** | 现在只对凭据文件做文件级 `secure_private_file`；更完整做法是对数据盘上的配置目录做一次 `(OI)(CI)` 目录级加固 + 标记文件，覆盖 `projects`、`settings.json`（可能含 API key）。临时文件在 rename 前仍短暂继承目录 ACL 的窗口也靠这步消除。 |
+| **快照加密导出/导入** | 单文件格式（魔数 + Argon2id + salt + nonce + AES-GCM），口令 ≥8 位；导出时用口令重新封装（Credential Manager 主密钥不能跨机器迁移）。 |
+| **Claude Code 只读体检** | `where claude` 取 PATH 顺序 + 版本 + 安装方式识别 + 多份并存告警，放进诊断页。 |
+| **切换前预检** | 凭据可写 / 快照可解密 / Claude Code 已退出 / 链接能力 / 磁盘空间，任一失败即阻止切换。 |
+| **切换事务日志** | `switch-journal.json` 记录目标 id、当前步骤、备份 id；启动时发现未完成事务提示回滚。 |
+| **账号卡片体积显示** | 后台统计 `session-profiles/<id>` 体积并缓存约 5 分钟。 |
+| **集成测试目录** | 目前只有单元测试；账号切换/备份恢复/隔离链接的全链路集成测试待补。 |
 
 ## 4. 上游升级差异审查流程
 
