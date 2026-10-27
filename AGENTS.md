@@ -5,7 +5,8 @@
 ## 这是什么
 
 Windows 版 Claude Code CLI 账号切换器（Tauri 2 + Rust + React）。
-上游是 macOS Swift 项目，基线 commit 见 [`docs/upstream-baseline.md`](docs/upstream-baseline.md)。
+上游是 macOS 桌面应用（**同为 Tauri 2 + Rust + React**，非 Swift），
+基线 commit 与功能映射见 [`docs/upstream-baseline.md`](docs/upstream-baseline.md)。
 **不是** YOURSJEYO/claude-switcher（那是 Claude 桌面版环境管理器，已明确不移植）。
 
 ## 构建与验证命令

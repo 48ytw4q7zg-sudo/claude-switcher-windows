@@ -102,6 +102,50 @@ pub fn secure_app_data_dir(dir: &Path) -> bool {
     }
 }
 
+/// 把单个**文件**收敛为「当前用户 + SYSTEM」完全控制（断继承）。
+///
+/// 用途：配置目录被用户改到数据盘（`D:\claude-alt`）时，凭据文件继承的是盘符根
+/// 目录的 ACL（常给 Users 读取、Authenticated Users 修改），同机其他本地账户
+/// 可能读到 OAuth 凭据。默认位置 `%USERPROFILE%\.claude` 继承用户目录私有 ACL，
+/// 不需要这一步。
+///
+/// 与 `secure_app_data_dir` 同样遵守「先授权再断继承」和「SYSTEM 用 SID」。
+/// best-effort：失败只返回 false，调用方记日志，不阻断写凭据本身。
+pub fn secure_private_file(path: &Path) -> bool {
+    let Some(username) = username_for_icacls() else {
+        return false;
+    };
+    let path_text = path.to_string_lossy().to_string();
+    let output = silent_command("icacls")
+        .arg(&path_text)
+        .args(["/grant:r", &format!("{username}:F")])
+        .args(["/grant:r", "*S-1-5-18:F"])
+        .args(["/inheritance:r"])
+        .output();
+    match output {
+        Ok(out) => out.status.success(),
+        Err(_) => false,
+    }
+}
+
+/// 路径是否位于用户 profile 目录内（`%USERPROFILE%` 下）。
+/// 凭据文件在 profile 内时继承私有 ACL，无需额外收敛。
+pub fn is_under_user_profile(path: &Path) -> bool {
+    let Ok(profile) = std::env::var("USERPROFILE") else {
+        return false;
+    };
+    let profile = profile.trim();
+    if profile.is_empty() {
+        return false;
+    }
+    let profile_lower = profile.to_lowercase().replace('/', "\\");
+    let path_lower = path.to_string_lossy().to_lowercase().replace('/', "\\");
+    let profile_norm = profile_lower.trim_end_matches('\\');
+    path_lower == profile_norm
+        || path_lower.starts_with(&format!("{profile_norm}\\"))
+}
+
+
 /// icacls 的受托人参数：优先用 SID（`*S-1-5-…`，微软账号/中文用户名/本地化环境都稳），
 /// 拿不到再退回 `USERDOMAIN\USERNAME`。
 /// 环境变量不可用时直接放弃（best-effort）。

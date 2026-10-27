@@ -36,10 +36,22 @@ pub fn current_username() -> Result<String, String> {
     whoami.ok_or_else(|| "无法确定当前系统用户名（$USER 与 whoami 均失败）".to_string())
 }
 
-/// Unix：本工具数据目录按 0o700 收敛一次（创建时）。
-/// Unix：本工具数据目录按 0o700 收敛。返回是否成功（调用方据此写加固标记）。
+/// Unix：本工具数据目录按 0o700 收敛（创建时）。返回是否成功。
 pub fn secure_app_data_dir(dir: &Path) -> bool {
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).is_ok()
+}
+
+/// Unix：单个文件按 0o600 收敛（凭据类文件，配置目录被改到 home 外时用）。
+pub fn secure_private_file(path: &Path) -> bool {
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).is_ok()
+}
+
+/// Unix：路径是否在 home 下（home 内默认私有，无需额外收敛）。
+pub fn is_under_user_profile(path: &Path) -> bool {
+    match dirs::home_dir() {
+        Some(home) => path.starts_with(home),
+        None => false,
+    }
 }
 
 /// Unix：std 的 symlink 判定即足够。

@@ -209,7 +209,14 @@ fn normalize_controller(raw: &str) -> String {
     if is_wildcard {
         return format!("http://127.0.0.1:{effective_port}");
     }
-    format!("http://{host_clean}:{effective_port}")
+    // IPv6 字面量在 URL 里必须保留方括号，否则 `http://::1:9097` 无法解析。
+    // 判断依据：去掉外层方括号后仍含 `:`（IPv6 地址段分隔符）。
+    let host_out = if host_clean.contains(':') {
+        format!("[{host_clean}]")
+    } else {
+        host_clean.to_string()
+    };
+    format!("http://{host_out}:{effective_port}")
 }
 
 /// Clash RESTful API 调用。控制器是本机服务，故走 no_proxy。
@@ -333,7 +340,10 @@ mod tests {
             (":9090", "http://127.0.0.1:9090"),
             ("0.0.0.0:9090", "http://127.0.0.1:9090"),
             ("[::]:9090", "http://127.0.0.1:9090"),
-            ("[::1]", "http://::1:9097"),
+            // IPv6 字面量必须保留方括号，否则 `http://::1:9097` 无法被解析。
+            ("[::1]", "http://[::1]:9097"),
+            ("[::1]:9097", "http://[::1]:9097"),
+            ("[fe80::1]:7890", "http://[fe80::1]:7890"),
             ("127.0.0.1", "http://127.0.0.1:9097"),
             ("localhost:9097", "http://localhost:9097"),
             ("http://0.0.0.0:9097", "http://127.0.0.1:9097"),

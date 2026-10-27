@@ -735,14 +735,13 @@ function App() {
 
   const remove = (id: string, label: string) => {
     if (!window.confirm(`删除账号快照「${label}」？这不会删除 Claude Code 当前登录。`)) return;
-    // 二次确认会话历史：目录可能很大（GB 级），默认不删，与上游行为一致。
+    // 二次确认会话历史。默认按钮（确定）是**仅删快照**这个安全选项，
+    // 破坏性的「一并删除会话历史」必须由用户显式选择。
     const withSessions = window.confirm(
-      '同时删除这个账号的会话历史（session 隔离目录，可能占用大量磁盘空间）？\n\n' +
-        '点「确定」= 一并删除；点「取消」= 只删快照、保留会话历史。',
+      `删除「${label}」时，是否同时删除它的会话历史？\n\n` +
+        '· 点「确定」= 一并删除（不可恢复，可能释放大量磁盘空间）\n' +
+        '· 点「取消」= 只删快照、保留会话历史',
     );
-    if (!withSessions) {
-      // 取消 = 只删快照，deleteSessions 传 false，无需额外操作。
-    }
     run('delete', async () => {
       await invoke('delete_profile', { id, deleteSessions: withSessions });
       return withSessions ? '账号快照与会话历史已删除' : '账号快照已删除（会话历史保留）';

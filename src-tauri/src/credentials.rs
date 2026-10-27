@@ -55,6 +55,10 @@ pub fn read_password() -> Result<Option<String>, String> {
 }
 
 /// 写入 OAuth 凭据。Windows 上原子写入凭据文件；macOS 写 Keychain。
+///
+/// 配置目录被用户改到用户 profile 之外（例如 `D:\claude-alt`）时，凭据文件继承的
+/// 是盘符根 ACL（同机其他本地账户可能读到）。此时额外收敛为「当前用户 + SYSTEM」。
+/// 默认位置在 profile 内、本来就私有，不做多余 icacls。
 pub fn write_password(password: &str) -> Result<(), String> {
     #[cfg(windows)]
     {
@@ -68,7 +72,21 @@ pub fn write_password(password: &str) -> Result<(), String> {
                 "写入 .credentials.json 失败: {}",
                 crate::fsx::humanize_io_error(&e)
             )
-        })
+        })?;
+        if !crate::platform::imp::is_under_user_profile(&path) {
+            if crate::platform::imp::secure_private_file(&path) {
+                crate::log_info(&format!(
+                    "配置目录在用户 profile 之外，已收敛凭据文件权限：{}",
+                    path.to_string_lossy()
+                ));
+            } else {
+                crate::log_error(&format!(
+                    "凭据文件权限收敛失败（icacls 出错），该文件可能被同机其他账户读取：{}",
+                    path.to_string_lossy()
+                ));
+            }
+        }
+        Ok(())
     }
     #[cfg(not(windows))]
     {
