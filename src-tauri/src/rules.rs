@@ -30,6 +30,7 @@ use crate::jsonio;
 use crate::net;
 use crate::paths;
 use crate::platform::imp;
+use crate::store;
 
 /// Script.js 托管块起始标记。
 const SCRIPT_BEGIN: &str = "// >>> claude-switcher managed rules >>>";
@@ -254,9 +255,15 @@ fn rule_disabled(rule: &Value) -> bool {
 /// 前 3 条必须是 AND 规则（UDP + 目标端口，target 按策略为 REJECT 或代理组），
 /// 随后 13 条必须是域名后缀（大小写不敏感、目标为代理组）；任一带 `extra.disabled:
 /// true` 的规则视为未生效。
+///
+/// `rules` 接受两种形态：内核 `GET /rules` 的真实返回 `{"rules":[...]}`，或已拆出的
+/// 裸数组 `[...]`（单测与旧调用方）。**必须容忍包装**：早期只接受裸数组，
+/// `as_array` 对真实响应恒失败，导致规则验证永远走不到逐条比对。
 pub fn verify_pinned_rules(rules: &Value, group: &str, policy: WebRtcPolicy) -> Result<(), String> {
     let list = rules
-        .as_array()
+        .get("rules")
+        .and_then(|inner| inner.as_array())
+        .or_else(|| rules.as_array())
         .ok_or_else(|| "Clash /rules 返回格式异常".to_string())?;
     let expected_len = CLAUDE_PORTS.len() + CLAUDE_DOMAINS.len();
     if list.len() < expected_len {
@@ -598,14 +605,22 @@ fn backup_path_for(path: &Path) -> PathBuf {
     path.with_file_name(format!("{file_name}.bak.{nanos}"))
 }
 
-/// 重启 Clash Verge GUI（best-effort）：杀掉 GUI 进程，再从常见安装位置拉起。
+/// 重启 Clash Verge（best-effort）：杀掉 GUI 与内核进程，再从常见安装位置拉起。
 ///
-/// 找不到 exe / 拉起失败时返回 false，由调用方提示用户手动重启；**不阻塞验证**，
-/// 验证循环本身会等到内核重新加载为止。
+/// 找不到 exe / 拉起失败时提示用户手动重启；**不阻塞验证**，验证循环本身会等到
+/// 内核重新加载为止。
+///
+/// 进程名必须同时覆盖 GUI 与内核：本函数自家启动的 exe 是 `Clash Verge.exe`
+/// （`Get-Process -Name` 的 ProcessName 为 `Clash Verge`，含空格），而重启内核
+/// Script.js 需要 `verge-mihomo` 也退出。早期只杀 `clash-verge` 这个既不存在
+/// 也不匹配的名字，重启是彻底的 no-op——Script.js 改了但内核没重载。
+const RESTART_PROCESS_NAMES: [&str; 3] = ["Clash Verge", "clash-verge", "verge-mihomo"];
+
 fn restart_clash_verge(report: &mut RulesReport) {
     report.restart_attempted = true;
-    // 只杀 GUI（与上游 Restart-ClashVerge 一致）；内核作为服务/子进程随 GUI 重载。
-    let _ = imp::kill_processes_by_names(&["clash-verge"]);
+    // GUI + 内核一起结束；内核作为服务/子进程随 GUI 重载，杀掉 GUI 进程名即可，
+    // 但 GUI 名的实际形态是 "Clash Verge"（带空格），必须显式列出。
+    let _ = imp::kill_processes_by_names(&RESTART_PROCESS_NAMES);
     std::thread::sleep(Duration::from_secs(2));
 
     let mut candidates: Vec<PathBuf> = Vec::new();
@@ -719,7 +734,13 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
 
     // —— 3. rule 模式：写 Script.js 托管块 ——
     let app = appconfig::load();
-    let group = app.proxy_group.unwrap_or_default();
+    // proxy_group 未配置时回落到默认组（与 CLI 切节点用的 DEFAULT_CLASH_GROUP 一致）：
+    // 早前期望用户手工编辑 appconfig.json，全工程又没有写入路径，导致规则功能
+    // 在默认配置下必然失败。这里保证「装完就能用」，用户改名后仍可在设置里覆盖。
+    let group = app
+        .proxy_group
+        .filter(|g| !g.trim().is_empty())
+        .unwrap_or_else(|| store::DEFAULT_CLASH_GROUP.to_string());
     let group_trimmed = group.trim();
     if group_trimmed.is_empty()
         || group.contains(',')
@@ -941,6 +962,20 @@ mod tests {
     // ---------- verify_pinned_rules ----------
 
     #[test]
+    fn verify_accepts_kernel_envelope_with_rules_key() {
+        // 内核 `GET /rules` 的真实返回是 `{"rules":[...]}`（上游 fixture 亦如此）。
+        // 早期实现直接把响应体当数组取，as_array 恒失败 → 规则验证永远回滚。
+        let rules = valid_rules("g", WebRtcPolicy::Proxy);
+        let envelope = json!({ "rules": rules });
+        assert!(verify_pinned_rules(&envelope, "g", WebRtcPolicy::Proxy).is_ok());
+    }
+
+    #[test]
+    fn verify_rejects_short_list() {
+        assert!(verify_pinned_rules(&json!([]), "g", WebRtcPolicy::Proxy).is_err());
+    }
+
+    #[test]
     fn verify_accepts_valid_rule_list_case_insensitive() {
         let rules = valid_rules("g", WebRtcPolicy::Proxy);
         assert!(verify_pinned_rules(&rules, "g", WebRtcPolicy::Proxy).is_ok());
@@ -955,6 +990,15 @@ mod tests {
         let mut rules = valid_rules("g", WebRtcPolicy::Proxy);
         rules.as_array_mut().unwrap().remove(0);
         assert!(verify_pinned_rules(&rules, "g", WebRtcPolicy::Proxy).is_err());
+    }
+
+    #[test]
+    fn reject_policy_expects_reject_on_udp_rules() {
+        let rules = valid_rules("g", WebRtcPolicy::Reject);
+        assert!(verify_pinned_rules(&rules, "g", WebRtcPolicy::Reject).is_ok());
+        // reject 策略下 UDP 走了组名 → 失败。
+        let proxy_rules = valid_rules("g", WebRtcPolicy::Proxy);
+        assert!(verify_pinned_rules(&proxy_rules, "g", WebRtcPolicy::Reject).is_err());
     }
 
     #[test]
@@ -988,17 +1032,11 @@ mod tests {
     }
 
     #[test]
-    fn verify_rejects_short_list() {
+    fn verify_rejects_short_list_rejects_empty_and_partial() {
         assert!(verify_pinned_rules(&json!([]), "g", WebRtcPolicy::Proxy).is_err());
-    }
-
-    #[test]
-    fn reject_policy_expects_reject_on_udp_rules() {
-        let rules = valid_rules("g", WebRtcPolicy::Reject);
-        assert!(verify_pinned_rules(&rules, "g", WebRtcPolicy::Reject).is_ok());
-        // reject 策略下 UDP 走了组名 → 失败。
-        let proxy_rules = valid_rules("g", WebRtcPolicy::Proxy);
-        assert!(verify_pinned_rules(&proxy_rules, "g", WebRtcPolicy::Reject).is_err());
+        let mut rules = valid_rules("g", WebRtcPolicy::Proxy);
+        rules.as_array_mut().unwrap().truncate(3);
+        assert!(verify_pinned_rules(&rules, "g", WebRtcPolicy::Proxy).is_err());
     }
 
     // ---------- validate_proxy_state ----------

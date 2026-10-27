@@ -29,6 +29,7 @@ use crate::paths;
 use crate::platform::imp;
 use crate::platform::imp::AdapterInfo;
 use crate::rules::{self, WebRtcPolicy};
+use crate::store;
 use crate::stun::{self, StunResult};
 
 // ────────────────────────── 输出结构 ──────────────────────────
@@ -381,7 +382,7 @@ fn evaluate_rules(cfg: &AppConfig) -> RulesCheck {
     match mode.as_str() {
         "global" | "direct" => RulesCheck::ModeGlobalDirect,
         "rule" => {
-            let group = cfg.proxy_group.clone().unwrap_or_default();
+            let group = effective_proxy_group(cfg);
             if group.trim().is_empty() {
                 return RulesCheck::ApiUnavailable("未配置代理组".to_string());
             }
@@ -398,6 +399,16 @@ fn evaluate_rules(cfg: &AppConfig) -> RulesCheck {
         }
         _ => RulesCheck::UnknownMode,
     }
+}
+
+/// 实际生效的代理组名：`appconfig.proxy_group` 优先，未配置时回落到默认组
+/// （与 CLI 切节点、Script.js 写入用同一个常量，三处必须一致）。
+fn effective_proxy_group(cfg: &AppConfig) -> String {
+    cfg.proxy_group
+        .as_deref()
+        .filter(|g| !g.trim().is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| store::DEFAULT_CLASH_GROUP.to_string())
 }
 
 /// 探测 claude.ai 与 api.anthropic.com 的可达性（阻塞，约 8s 超时）。
@@ -440,7 +451,16 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
     let bindings = imp::ipv6_bindings();
     let dns = resolve_claude_ai();
     let stun_result = match &egress {
-        Ok(e) => Some(stun::probe_stun_leak(&e.ip, 2000)),
+        Ok(e) => {
+            // STUN 探针只解析 IPv4 MAPPED-ADDRESS：出口是 IPv6 时，任何 IPv4
+            // 响应都必然"不等于"IPv6 出口，会被误判成泄漏（假 fail）。
+            // 这种场景跳过探测，交给 WebRTC 检查明确说明未验证。
+            if e.ip.contains(':') {
+                None
+            } else {
+                Some(stun::probe_stun_leak(&e.ip, 2000))
+            }
+        }
         Err(_) => None,
     };
     let guard_installed = guard::guard_installed();
@@ -506,7 +526,20 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
             "DNS",
             judge_dns(dns.as_deref().map_err(|e| e.as_str())),
         ),
-        build_item(9, "webrtc", "WebRTC", judge_webrtc(stun_result.as_ref())),
+        build_item(
+            9,
+            "webrtc",
+            "WebRTC",
+            match stun_result.as_ref() {
+                Some(result) => judge_webrtc(Some(result)),
+                // 出口是 IPv6：STUN 探针只解析 IPv4，比对必然不等——不能当成泄漏。
+                None if egress.as_ref().is_ok_and(|e| e.ip.contains(':')) => (
+                    "warn",
+                    "出口为 IPv6，STUN 探针只比对 IPv4，未验证 WebRTC 泄漏".to_string(),
+                ),
+                None => judge_webrtc(None),
+            },
+        ),
         build_item(10, "guard", "保镖", judge_guard(guard_installed)),
         build_item(
             11,
@@ -631,7 +664,10 @@ fn reenable_tun_mode() -> Result<bool, String> {
     }
     let new_text = text.replace("enable_tun_mode: false", "enable_tun_mode: true");
     fsx::write_atomically(&verge, &new_text).map_err(|e| format!("写入 verge.yaml 失败: {e}"))?;
-    let _ = imp::kill_processes_by_names(&["clash-verge"]);
+    // 进程名必须匹配真实形态：GUI 的 ProcessName 是 "Clash Verge"（带空格，
+    // exe 名 Clash Verge.exe），内核是 verge-mihomo。早期只杀不存在的
+    // "clash-verge"，重启是 no-op，改完的开关永远不会被加载。
+    let _ = imp::kill_processes_by_names(&["Clash Verge", "clash-verge", "verge-mihomo"]);
     std::thread::sleep(Duration::from_secs(2));
     let _ = launch_clash_verge();
     Ok(true)
@@ -739,14 +775,26 @@ pub fn run_fix_blocking() -> FixReport {
         Err(e) => steps.push(step("置顶规则", "fail", e)),
     }
 
-    // E. 重注册保镖（需要管理员）
-    if !guard::guard_installed() {
-        match guard::install_guard() {
-            Ok(()) => steps.push(step("保镖", "ok", "已注册登录时启动计划任务")),
-            Err(e) => steps.push(step("保镖", "fail", format!("注册失败（需管理员）：{e}"))),
-        }
-    } else {
-        steps.push(step("保镖", "ok", "已安装"));
+    // E. 确保保镖在跑（需要管理员）
+    //
+    // 不只判断「是否注册」：注册了但进程没起（任务被手动结束、上次启动失败）
+    // 同样属于保镖缺失。ensure_guard_running 幂等——已注册就补一次启动，
+    // 未注册才走完整注册流程。
+    match guard::ensure_guard_running() {
+        Ok(()) => steps.push(step(
+            "保镖",
+            "ok",
+            if guard::guard_installed() {
+                "保镖计划任务已注册并已启动"
+            } else {
+                "已注册并启动保镖计划任务"
+            },
+        )),
+        Err(e) => steps.push(step(
+            "保镖",
+            "fail",
+            format!("注册/启动失败（需管理员）：{e}"),
+        )),
     }
 
     // F. 复测

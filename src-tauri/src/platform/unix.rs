@@ -170,8 +170,16 @@ pub fn delete_task(_name: &str) -> Result<(), String> {
     Err("该平台暂不支持 delete_task".to_string())
 }
 
+pub fn start_task(_name: &str) -> Result<(), String> {
+    Err("该平台暂不支持 start_task".to_string())
+}
+
 pub fn task_exists(_name: &str) -> Result<bool, String> {
     Err("该平台暂不支持 task_exists".to_string())
+}
+
+pub fn wireguard_tunnel_running() -> Result<bool, String> {
+    Err("该平台暂不支持 wireguard_tunnel_running".to_string())
 }
 
 pub fn start_detached(program: &str, args: &[&str]) -> Result<(), String> {

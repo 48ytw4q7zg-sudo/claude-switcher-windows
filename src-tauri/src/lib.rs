@@ -1310,8 +1310,14 @@ async fn create_backup() -> Result<BackupResult, String> {
     blocking(|| create_backup_with_label("manual")).await
 }
 
+/// 列出备份。串行读最多 30 个含完整 claude_json 的大 JSON，可能耗时数十毫秒到
+/// 数秒，必须离开主线程。
 #[tauri::command]
-fn list_backups() -> Result<Vec<BackupSummary>, String> {
+async fn list_backups() -> Result<Vec<BackupSummary>, String> {
+    blocking(list_backups_blocking).await
+}
+
+fn list_backups_blocking() -> Result<Vec<BackupSummary>, String> {
     p::ensure_app_dirs()?;
     let dir = p::backups_dir()?;
     let entries = match fs::read_dir(&dir) {
@@ -2098,11 +2104,16 @@ pub struct GuardStatusReport {
     pub installed: bool,
 }
 
+/// 查询计划任务要 spawn 隐藏 PowerShell（数百毫秒），必须离开主线程，
+/// 否则点一次保镖面板就让窗口卡一下。
 #[tauri::command]
-fn guard_status() -> GuardStatusReport {
-    GuardStatusReport {
-        installed: guard::guard_installed(),
-    }
+async fn guard_status() -> Result<GuardStatusReport, String> {
+    blocking(|| {
+        Ok(GuardStatusReport {
+            installed: guard::guard_installed(),
+        })
+    })
+    .await
 }
 
 /// 手动执行一次保镖巡检（kill-switch），返回本轮判定（前端「立即检测」按钮）。
@@ -2141,6 +2152,27 @@ fn set_webrtc_policy(policy: String) -> Result<(), String> {
         return Err("WebRTC 策略仅支持 proxy / reject".to_string());
     }
     appconfig::update(|c| c.webrtc_policy = Some(p.clone()))?;
+    Ok(())
+}
+
+/// 读取当前全局环境/代理偏好（前端面板回显已保存值，避免重启后显示默认值、
+/// 用户一点击就把旧选择覆盖掉）。
+#[tauri::command]
+fn get_appconfig() -> appconfig::AppConfig {
+    appconfig::load()
+}
+
+/// 设置 Clash 代理组名（Script.js 置顶规则的目标）。空串清除，回落到默认组。
+#[tauri::command]
+fn set_proxy_group(group: String) -> Result<(), String> {
+    let cleaned = group.trim().to_string();
+    appconfig::update(|c| {
+        c.proxy_group = if cleaned.is_empty() {
+            None
+        } else {
+            Some(cleaned.clone())
+        }
+    })?;
     Ok(())
 }
 
@@ -2315,6 +2347,8 @@ pub fn run() {
             get_clash_mode,
             ensure_clash_rules,
             set_webrtc_policy,
+            get_appconfig,
+            set_proxy_group,
             // Claude Desktop 桌面版
             list_desktop_profiles_cmd,
             capture_desktop_profile_cmd,

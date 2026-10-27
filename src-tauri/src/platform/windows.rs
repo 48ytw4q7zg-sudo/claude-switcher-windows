@@ -425,6 +425,7 @@ fn run_ps(script: &str) -> Result<String, String> {
     let wrapped = format!(
         "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n\
          $OutputEncoding = [System.Text.Encoding]::UTF8\n\
+         $ErrorActionPreference = 'Stop'\n\
          {script}"
     );
     let wide: Vec<u8> = wrapped.encode_utf16().flat_map(u16::to_le_bytes).collect();
@@ -633,6 +634,18 @@ pub fn delete_task(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 启动已注册的计划任务（对齐上游 install.ps1 的 Register + Start-ScheduledTask
+/// 顺序：保镖装好当场生效，不等下次登录）。任务不存在时不报错（幂等）。
+pub fn start_task(name: &str) -> Result<(), String> {
+    let quoted = ps_single_quote(name);
+    run_ps(&format!(
+        "if (Get-ScheduledTask -TaskName {q} -ErrorAction SilentlyContinue) {{ \
+         Start-ScheduledTask -TaskName {q} }}",
+        q = quoted
+    ))?;
+    Ok(())
+}
+
 /// 计划任务是否存在。
 pub fn task_exists(name: &str) -> Result<bool, String> {
     let json = run_ps(&format!(
@@ -645,6 +658,35 @@ pub fn task_exists(name: &str) -> Result<bool, String> {
 fn parse_task_exists(json: &str) -> Result<bool, String> {
     let trimmed = json.trim();
     serde_json::from_str(trimmed).map_err(|e| format!("task_exists 解析失败: {e}; 原文: {trimmed}"))
+}
+
+/// WireGuard 的隧道实际由 `WireGuardTunnel$*` 服务承载，GUI 开着不代表隧道在线。
+pub fn wireguard_tunnel_running() -> Result<bool, String> {
+    let json = run_ps(
+        "@(Get-Service -Name 'WireGuardTunnel*' -ErrorAction SilentlyContinue | \
+         Select-Object Name,Status) | ConvertTo-Json",
+    )?;
+    Ok(wireguard_service_running(&json))
+}
+
+fn wireguard_service_running(json: &str) -> bool {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(json.trim()) else {
+        return false;
+    };
+    let rows: Vec<&serde_json::Value> = match &value {
+        serde_json::Value::Array(rows) => rows.iter().collect(),
+        serde_json::Value::Object(_) => vec![&value],
+        _ => return false,
+    };
+    rows.iter().any(|row| {
+        row.get("Name")
+            .and_then(|v| v.as_str())
+            .is_some_and(|name| name.starts_with("WireGuardTunnel$"))
+            && row
+                .get("Status")
+                .and_then(|v| v.as_str())
+                .is_some_and(|status| status.eq_ignore_ascii_case("Running"))
+    })
 }
 
 /// 无窗口、不等待地启动一个进程（detached，stdio 全部丢弃）。
@@ -712,6 +754,26 @@ fn parse_killed(json: &str) -> Result<Vec<String>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_ps_propagates_non_terminating_errors() {
+        let result = run_ps("Write-Error 'synthetic probe without system changes'; 'false'");
+        assert!(
+            result.is_err(),
+            "Write-Error 不得被当成成功的 PowerShell 输出"
+        );
+        assert!(result.unwrap_err().contains("synthetic probe"));
+    }
+
+    #[test]
+    fn wireguard_service_running_requires_a_running_tunnel() {
+        let services = r#"[{"Name":"WireGuardTunnel$Work","Status":"Running"}]"#;
+        assert!(wireguard_service_running(services));
+        let stopped = r#"[{"Name":"WireGuardTunnel$Work","Status":"Stopped"}]"#;
+        assert!(!wireguard_service_running(stopped));
+        assert!(!wireguard_service_running("[]"));
+        assert!(!wireguard_service_running("not-json"));
+    }
 
     /// `whoami /user` 的真实输出是「表头 + 分隔线 + 数据行」三行，
     /// SID 在第三列；测试用本机实机抓到的格式（中文 Windows 同样输出 ASCII 表头）。

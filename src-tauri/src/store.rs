@@ -146,6 +146,12 @@ pub struct Store {
     /// Claude Desktop 桌面版账号快照列表（旧 store 无此字段时反序列化为空）。
     #[serde(default)]
     pub desktop_profiles: Vec<DesktopProfile>,
+    /// 当前已载入 Claude Desktop 活目录的账号 id。
+    ///
+    /// 切换前必须把活目录回存到这个账号的快照（上游 `Save-Account $cur` 语义），
+    /// 否则每次切换都把活账号静默回退到上次 capture 的状态。
+    #[serde(default)]
+    pub current_desktop_profile_id: Option<String>,
 }
 
 impl Default for Store {
@@ -156,6 +162,7 @@ impl Default for Store {
             pending_new_account: None,
             telemetry_mode: default_telemetry_mode(),
             desktop_profiles: Vec::new(),
+            current_desktop_profile_id: None,
         }
     }
 }

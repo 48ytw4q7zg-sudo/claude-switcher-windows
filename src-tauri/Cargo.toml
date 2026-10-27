@@ -59,6 +59,10 @@ reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "system-proxy",
     "rustls-tls-native-roots",
+    # diagnose-proxy 与 clash 代理端口回退都要构造 socks5 / socks5h 代理：
+    # 没有该 feature 时 Proxy::all 对 socks scheme 直接 builder error，
+    # 上游明确支持的 socks5h 诊断会 100% 失败。
+    "socks",
 ] }
 # 进程检测（Claude Code CLI 是否在运行）：跨平台取 exe 名与命令行，
 # 替代 Windows 上 PowerShell Get-CimInstance（慢、OEM 代码页乱码）。

@@ -259,7 +259,9 @@ fn cached_oauth_endpoint(
     // 快路径：TTL 内**且 token 指纹匹配**才返回缓存。
     // 只判 TTL 会切号后仍返回上一个账号的数据（见 CachedOauthValue 注释）。
     {
-        let guard = cache.lock().expect("OAuth 缓存锁中毒");
+        // 锁中毒时取内部数据继续（与本文件 INFLIGHT 的策略一致）：
+        // expect() 会在任一线程 panic 后让后续所有用量查询连锁 panic。
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(cached) = guard.as_ref() {
             if cached.token_fp == token_fp
                 && Utc::now() - cached.fetched_at < Duration::seconds(ttl_secs)

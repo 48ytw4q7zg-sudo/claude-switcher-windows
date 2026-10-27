@@ -89,10 +89,9 @@ fn required_process(mode: &str) -> Option<&'static str> {
         "sing-box" => Some("sing-box"),
         "clashx" => Some("clashx"),
         "surge" => Some("surge"),
-        // 上游 PS 这里查的是 WireGuardTunnel* 服务；Windows 无现成服务查询平台
-        // 函数，按任务约定退化为 GUI 进程 wireguard.exe（存活即认为隧道在跑）。
-        "wireguard" => Some("wireguard"),
-        "auto" | "other" => None,
+        // wireguard 不按进程判定：GUI（wireguard.exe）开着≠隧道在线，真实判定走
+        // `WireGuardTunnel$*` 服务查询（见 client_up_for），与上游 PS 一致。
+        "wireguard" | "auto" | "other" => None,
         // 未知模式按上游旧版 Clash Verge 行为回退到 verge-mihomo。
         _ => Some("verge-mihomo"),
     }
@@ -105,6 +104,16 @@ fn client_alive_in(mode: &str, running: &HashSet<String>) -> bool {
         None => true,
         Some(needle) => running.contains(needle),
     }
+}
+
+/// 客户端在线判定（含 wireguard 特例）：wireguard 查 `WireGuardTunnel$*` 服务是否
+/// Running，其余模式查进程名。服务查询失败按离线处理（fail-closed，与 TUN 探测
+/// 失败同语义）。
+fn client_up_for(mode: &str, running: &HashSet<String>) -> bool {
+    if mode == "wireguard" {
+        return imp::wireguard_tunnel_running().unwrap_or(false);
+    }
+    client_alive_in(mode, running)
 }
 
 /// 枚举当前运行的进程名集合（小写、去 `.exe` 后缀）。
@@ -125,7 +134,7 @@ fn running_process_names() -> HashSet<String> {
 /// 客户端进程/服务是否在线（auto/other 恒 true，只依赖 TUN）。
 pub fn client_alive(mode: &str) -> bool {
     let running = running_process_names();
-    client_alive_in(mode, &running)
+    client_up_for(mode, &running)
 }
 
 // ────────────────────────── 巡检纯决策 ──────────────────────────
@@ -183,7 +192,7 @@ pub fn guard_tick() -> GuardTick {
     let adapters = imp::list_adapters().unwrap_or_default();
     let running = running_process_names();
     let (tun_up, tun_detail) = tun_status_from_adapters(&adapters);
-    let client_up = client_alive_in(&mode, &running);
+    let client_up = client_up_for(&mode, &running);
 
     let prev_offline = OFFLINE.swap(!(tun_up && client_up), Ordering::SeqCst);
     let (alive, log_offline, should_kill) = tick_decision(tun_up, client_up, prev_offline);
@@ -299,7 +308,20 @@ fn current_exe_path() -> Result<String, String> {
 /// 前端应据此弹 UAC 让用户重试。
 pub fn install_guard() -> Result<(), String> {
     let exe = current_exe_path()?;
-    imp::register_logon_task(GUARD_TASK_NAME, &exe, "--guard", true)
+    imp::register_logon_task(GUARD_TASK_NAME, &exe, "--guard", true)?;
+    // 对齐上游 install.ps1：Register 之后立即 Start-ScheduledTask——
+    // 保镖当场生效开始巡检，而不是等下一次登录才上线。
+    imp::start_task(GUARD_TASK_NAME)
+}
+
+/// 保镖兜底（一键修复步骤 E 用）：未注册则注册；已注册也补一次启动（幂等），
+/// 覆盖「任务在但进程没跑」的中间态——上游 install.ps1 同样是注册后立即启动。
+pub fn ensure_guard_running() -> Result<(), String> {
+    if guard_installed() {
+        imp::start_task(GUARD_TASK_NAME)
+    } else {
+        install_guard()
+    }
 }
 
 /// 删除保镖计划任务（不存在视为成功）。
@@ -417,8 +439,10 @@ mod tests {
         // 进程不在 → 离线
         assert!(!client_alive_in("clash-verge", &empty));
         assert!(!client_alive_in("surge", &running)); // 无 surge 进程
-        assert!(!client_alive_in("wireguard", &running)); // 无 wireguard 进程
-                                                          // 未知模式回退到 verge-mihomo
+                                                      // wireguard 不按进程判定（真实判定走 WireGuardTunnel$* 服务，见 client_up_for），
+                                                      // 进程表恒放行。
+        assert!(client_alive_in("wireguard", &empty));
+        // 未知模式回退到 verge-mihomo
         assert!(client_alive_in("some-unknown", &running));
         assert!(!client_alive_in("some-unknown", &empty));
     }

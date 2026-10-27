@@ -75,19 +75,28 @@ fn proxy_ready() -> Result<bool, String> {
 }
 
 /// 定位本机 Chromium 内核浏览器（优先 Edge，回退 Chrome）。
+///
+/// 同时覆盖系统级与**用户级**安装：只查 `Program Files` 会让「只给当前用户装了
+/// Chrome/Edge」的机器永远打不开隔离窗口（上游用 `which` 风格查找，不受此限）。
 fn find_browser() -> Result<String, String> {
-    const CANDIDATES: [&str; 4] = [
-        r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-        r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-        r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-    ];
-    for candidate in CANDIDATES {
-        if Path::new(candidate).exists() {
-            return Ok(candidate.to_string());
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
+        if let Some(root) = std::env::var_os(var) {
+            let root = PathBuf::from(root);
+            candidates.push(root.join("Microsoft\\Edge\\Application\\msedge.exe"));
+            candidates.push(root.join("Google\\Chrome\\Application\\chrome.exe"));
         }
     }
-    Err("未找到 Edge/Chrome".to_string())
+    // 用户级安装的固定位置（per-user 安装不写 ProgramFiles）。
+    if let Ok(local) = std::env::var("LOCALAPPDATA") {
+        candidates.push(PathBuf::from(&local).join("Programs\\Microsoft Edge\\msedge.exe"));
+    }
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate.to_string_lossy().to_string());
+        }
+    }
+    Err("未找到 Edge/Chrome（已检查系统级与用户级安装位置）".to_string())
 }
 
 /// safe-profiles 根目录 `<app_data>/safe-profiles`（不存在则创建）。
@@ -548,8 +557,41 @@ fn detect_install_method(path: &str) -> &'static str {
 }
 
 /// 真实执行 `claude --version` 取版本（隐藏窗口；拿不到返回 None，不阻塞体检）。
+///
+/// **必须带超时**：PATH 上可能放着挂起的 `claude.cmd` / 包装脚本（等 stdin、
+/// 等网络、死循环），无超时的 `.output()` 会永久阻塞，把整个体检命令乃至
+/// spawn_blocking 线程一起卡死。超时按「无版本」处理，其余体检项照常输出。
 fn run_claude_version(exe: &str) -> Option<String> {
-    let output = imp::silent_command(exe).arg("--version").output().ok()?;
+    const VERSION_TIMEOUT: Duration = Duration::from_secs(8);
+    let mut child = imp::silent_command(exe)
+        .arg("--version")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .ok()?;
+
+    // 轮询等待：Rust 标准库没有 wait_timeout，轮询 + 超时后 kill 是稳定做法。
+    let deadline = std::time::Instant::now() + VERSION_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    }
+
+    let output = child.wait_with_output().ok()?;
     if !output.status.success() {
         return None;
     }

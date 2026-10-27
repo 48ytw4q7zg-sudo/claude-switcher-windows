@@ -74,8 +74,9 @@ pub fn keep_stage_dir() -> PathBuf {
 
 /// 解析 keep 列表文本：返回（有效条目, 跳过原因 WARN）。
 ///
-/// 规则：trim 后空行 / 以 `#` 开头忽略（不记 WARN）；绝对路径、含 `..` 分量、
-/// 归一化后为空或 `.` → 记 WARN 跳过。
+/// 规则：trim 后空行 / 以 `#` 开头忽略（不记 WARN）；绝对路径、**盘符前缀
+/// （`C:` / `C:foo` 这类「盘符相对路径」，`PathBuf::join` 会整体替换 base）**、
+/// 含 `..` 分量、归一化后为空或 `.` → 记 WARN 跳过。
 pub fn parse_keep_list(text: &str) -> (Vec<KeepEntry>, Vec<String>) {
     let mut entries = Vec::new();
     let mut warnings = Vec::new();
@@ -84,7 +85,7 @@ pub fn parse_keep_list(text: &str) -> (Vec<KeepEntry>, Vec<String>) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        if is_absolute_path(line) {
+        if is_absolute_path(line) || has_drive_prefix(line) {
             warnings.push(format!("keep 路径必须是相对路径，已跳过: {line}"));
             continue;
         }
@@ -101,6 +102,19 @@ pub fn parse_keep_list(text: &str) -> (Vec<KeepEntry>, Vec<String>) {
         entries.push(KeepEntry { rel: normalized });
     }
     (entries, warnings)
+}
+
+/// 是否带 Windows 盘符前缀（`C:` / `C:foo`）。
+///
+/// `PathBuf::join` 遇到带 prefix 的路径会**整体替换** base——`C:foo` 不是
+/// 相对路径，而是「C 盘当前目录下的 foo」，join 结果完全逃出 base/stage。
+/// 2 字符的 `C:` 同理（解析为 C 盘本身）。macOS/Linux 不存在此形态，照常放行。
+fn has_drive_prefix(line: &str) -> bool {
+    let bytes = line.as_bytes();
+    bytes.len() >= 2
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && std::path::MAIN_SEPARATOR == '\\'
 }
 
 /// 归档当前账号之前：把 keep 列表里存在的路径收进暂存目录。
@@ -314,6 +328,8 @@ skills/
 a/b.json
 /tmp/abs-unix.txt
 C:\\Users\\abs.txt
+C:relative-to-drive.txt
+C:
 relative/../escape.json
 normalizer/
 ./
@@ -336,9 +352,14 @@ normalizer/
         assert!(entries.contains(&KeepEntry {
             rel: "normalizer".into()
         }));
-        // WARN：Unix 绝对 / Windows 绝对 / .. / 空（./）共 4 条。
-        assert_eq!(warnings.len(), 4, "warnings={warnings:?}");
+        // WARN：Unix 绝对 / Windows 绝对 / 盘符相对（C:relative、C:）/
+        // .. / 空（./）共 6 条。
+        assert_eq!(warnings.len(), 6, "warnings={warnings:?}");
         assert!(warnings.iter().any(|w| w.contains("相对路径")));
+        assert!(warnings
+            .iter()
+            .any(|w| w.contains("C:relative-to-drive.txt")));
+        assert!(warnings.iter().any(|w| w.contains("C:")));
         assert!(warnings.iter().any(|w| w.contains("..")));
     }
 

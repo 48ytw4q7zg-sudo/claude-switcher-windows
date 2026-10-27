@@ -1,4 +1,4 @@
-﻿//! Claude Desktop 桌面版（`%APPDATA%\Claude`）账号快照与切换。
+//! Claude Desktop 桌面版（`%APPDATA%\Claude`）账号快照与切换。
 //!
 //! 与 [`crate::isolation`] 管理的 Claude Code CLI（`~/.claude`）并列：Desktop 是
 //! Electron 应用，其登录态与本地状态整体落在 `%APPDATA%\Claude`。上游 PowerShell
@@ -193,9 +193,9 @@ fn is_claude_desktop_exe(exe: Option<&str>) -> bool {
     false
 }
 
-/// Claude Desktop 是否正在运行（含 renderer/gpu 等 Electron 子进程——
+/// Claude Desktop 主进程与全部子进程的 PID 列表（含 renderer/gpu/utility，
 /// 它们的 exe 路径同样落在 AnthropicClaude 目录下）。
-pub fn claude_desktop_running() -> Result<bool, String> {
+fn claude_desktop_processes() -> Vec<u32> {
     let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::All,
@@ -203,15 +203,41 @@ pub fn claude_desktop_running() -> Result<bool, String> {
         ProcessRefreshKind::nothing().with_exe(UpdateKind::Always),
     );
     let self_pid = imp::current_pid();
-    for (pid, process) in system.processes() {
-        if pid.as_u32() == self_pid {
-            continue;
-        }
-        if is_claude_desktop_exe(process.exe().and_then(|p| p.to_str())) {
-            return Ok(true);
-        }
+    system
+        .processes()
+        .iter()
+        .filter(|(pid, _)| pid.as_u32() != self_pid)
+        .filter(|(_, process)| is_claude_desktop_exe(process.exe().and_then(|p| p.to_str())))
+        .map(|(pid, _)| pid.as_u32())
+        .collect()
+}
+
+/// Claude Desktop 是否正在运行。
+pub fn claude_desktop_running() -> Result<bool, String> {
+    Ok(!claude_desktop_processes().is_empty())
+}
+
+/// 按 PID 结束 Desktop 进程树（不按 exe 名）。
+///
+/// **不能只按进程名杀**：`is_claude_desktop_exe` 按 exe 路径判定，接受的形态
+/// 包括 `AnthropicClaude\app.exe`（主程序镜像名不是 `Claude`）。早期只
+/// `kill(&["Claude"])`，那种安装下杀不到任何进程，`wait_until_quite` 15 秒后
+/// 必然超时——Desktop 切换功能整体不可用。这里按判定同源的 PID 列表终止。
+fn kill_desktop_processes() -> Result<Vec<String>, String> {
+    let pids = claude_desktop_processes();
+    if pids.is_empty() {
+        return Ok(Vec::new());
     }
-    Ok(false)
+    let mut killed = Vec::new();
+    for pid in &pids {
+        let _ = crate::platform::imp::silent_command("taskkill")
+            .args(["/PID", &pid.to_string(), "/T", "/F"])
+            .output();
+        killed.push(format!("Claude Desktop (PID {pid})"));
+    }
+    // 等一小会儿让句柄释放，再让调用方轮询判定。
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    Ok(killed)
 }
 
 fn wait_until_quite(running: &dyn Fn() -> Result<bool, String>) -> Result<(), String> {
@@ -312,6 +338,9 @@ fn capture_desktop_profile_into(
         meta: None,
     };
     store.desktop_profiles.push(profile.clone());
+    // capture 到的就是此刻的活目录，因此它立即成为「当前桌面账号」：
+    // 之后第一次切换才会把此后的使用变更回存给它。
+    store.current_desktop_profile_id = Some(profile.id.clone());
     Ok(profile)
 }
 
@@ -329,7 +358,7 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
         &live,
         &accounts,
         &mut store,
-        &|names| imp::kill_processes_by_names(names),
+        &|_names| kill_desktop_processes(),
         &|| claude_desktop_running(),
         &backup_root,
         &copy_dir_recursive,
@@ -391,7 +420,58 @@ fn switch_desktop_profile_in(
             .map(|w| format!("跨身份保留：{w}")),
     );
 
-    // 2. 备份当前活目录到 staging（随后清空/回滚都靠它兜底）。
+    // 2. 把当前活目录回存到「当前账号」的快照（上游 Save-Account $cur 语义）。
+    //
+    // 没有这一步，切换即静默回退：A 账号在 capture 之后产生的登录态/会话变更
+    // 只进一次性 staging 备份，从不写回 A 的快照；再切回 A 时活目录被清空并
+    // 载入的是 capture 那一刻的旧快照。CLI 侧对应 refresh_current_profile_snapshot。
+    //
+    // 只回存与当前账号 id 匹配的快照；id 为 None（从未切换过）或快照目录缺失时
+    // 跳过——首次切换前没有"当前账号"，此时活目录内容由 staging 备份兜底。
+    if let Some(current_id) = store.current_desktop_profile_id.clone() {
+        if current_id != profile.id {
+            if let Some(current) = store
+                .desktop_profiles
+                .iter()
+                .find(|p| p.id == current_id)
+                .cloned()
+            {
+                let current_snapshot = accounts_dir.join(&current.id);
+                if current_snapshot.is_dir() {
+                    // 先清空旧快照再拷入活目录：保证快照与活目录逐字一致
+                    // （robocopy /MIR 的上游语义），而不是残留旧文件。
+                    fsx::retry_io(|| fs::remove_dir_all(&current_snapshot)).map_err(|e| {
+                        format!(
+                            "回存账号「{}」快照失败（{}）：{}",
+                            current.name,
+                            current_snapshot.display(),
+                            fsx::humanize_io_error(&e)
+                        )
+                    })?;
+                    let outcome = copy(live_dir, &current_snapshot)?;
+                    if let Some(p) = store
+                        .desktop_profiles
+                        .iter_mut()
+                        .find(|p| p.id == current.id)
+                    {
+                        p.updated_at = Utc::now();
+                        p.size_bytes = dir_size(&current_snapshot);
+                    }
+                    warnings.push(format!(
+                        "已回存当前账号「{}」的使用变更（{} 字节）",
+                        current.name, outcome.bytes
+                    ));
+                } else {
+                    warnings.push(format!(
+                        "账号「{}」的快照目录缺失，跳过回存（活目录变更仍在下方备份中）",
+                        current.name
+                    ));
+                }
+            }
+        }
+    }
+
+    // 3. 备份当前活目录到 staging（随后清空/回滚都靠它兜底）。
     let backup_path = if live_dir.is_dir() {
         fs::create_dir_all(backup_root)
             .map_err(|e| format!("创建备份目录失败 {}: {e}", backup_root.display()))?;
@@ -475,6 +555,8 @@ fn switch_desktop_profile_in(
         p.updated_at = Utc::now();
         p.size_bytes = dir_size(live_dir);
     }
+    // 记录「现在活目录里装的是谁」：下次切换时才知道该把活目录回存给谁。
+    store.current_desktop_profile_id = Some(profile.id.clone());
     Ok(warnings)
 }
 
@@ -488,6 +570,10 @@ pub fn delete_desktop_profile(id: &str, also_files: bool) -> Result<(), String> 
         return Ok(());
     };
     let profile = store.desktop_profiles.remove(pos);
+    // 删的是当前账号：清掉当前标记，避免下次切换尝试回存到不存在的快照。
+    if store.current_desktop_profile_id.as_deref() == Some(id) {
+        store.current_desktop_profile_id = None;
+    }
     store::save_store(&store)?;
 
     if also_files {
@@ -717,6 +803,113 @@ mod tests {
         assert!(p.last_switched_at.is_some());
         assert!(warnings.iter().any(|w| w.contains("已载入")));
         assert!(warnings.iter().any(|w| w.contains("备份")));
+    }
+
+    #[test]
+    fn switch_in_saves_current_live_changes_into_current_account_snapshot() {
+        // 上游 Save-Account $cur 语义：切换前必须把活目录回存给「当前账号」，
+        // 否则每次切换都把活账号静默回退到上次 capture 的状态。
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = dir.path().join("desktop-accounts");
+        let snap_a = accounts.join("a-id");
+        let snap_b = accounts.join("b-id");
+        fs::create_dir_all(&snap_a).unwrap();
+        fs::create_dir_all(&snap_b).unwrap();
+        // A 的快照是 capture 那一刻的旧内容。
+        fs::write(snap_a.join("who.txt"), b"A-at-capture").unwrap();
+        fs::write(snap_b.join("who.txt"), b"B-account").unwrap();
+
+        let mut store = Store::default();
+        let now = Utc::now();
+        for (id, name) in [("a-id", "A"), ("b-id", "B")] {
+            store.desktop_profiles.push(DesktopProfile {
+                id: id.into(),
+                name: name.into(),
+                notes: None,
+                created_at: now,
+                updated_at: now,
+                last_switched_at: None,
+                snapshot_rel: format!("desktop-accounts/{id}"),
+                size_bytes: 0,
+                meta: None,
+            });
+        }
+        // 当前活目录装的是 A，且 A 在使用期间产生了新变更。
+        store.current_desktop_profile_id = Some("a-id".into());
+        let live = dir.path().join("APPDATA").join("Claude");
+        fs::create_dir_all(live.join("cache")).unwrap();
+        fs::write(live.join("who.txt"), b"A-after-use").unwrap();
+        fs::write(live.join("cache/new.tmp"), b"new").unwrap();
+
+        switch_desktop_profile_in(
+            "b-id",
+            &live,
+            &accounts,
+            &mut store,
+            &|_names| Ok(Vec::new()),
+            &|| Ok(false),
+            &dir.path().join("backups"),
+            &copy_dir_recursive,
+        )
+        .unwrap();
+
+        // A 的快照必须拿到使用后的内容，而不是停留在 capture 那一刻。
+        assert_eq!(
+            fs::read_to_string(snap_a.join("who.txt")).unwrap(),
+            "A-after-use",
+            "不回存活目录会静默丢失 A 的使用变更"
+        );
+        assert_eq!(
+            fs::read(snap_a.join("cache/new.tmp")).unwrap(),
+            b"new",
+            "新增文件也要回存"
+        );
+        // 当前账号标记切到 B：下次切换才会把 B 的变更回存给 B。
+        assert_eq!(store.current_desktop_profile_id.as_deref(), Some("b-id"));
+    }
+
+    #[test]
+    fn switch_in_skips_save_back_when_no_current_desktop_account() {
+        // 从未 capture/切换过（无当前标记）时不得报错，也不得凭空创建快照。
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = dir.path().join("desktop-accounts");
+        let snapshot = accounts.join("b-id");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("who.txt"), b"B-account").unwrap();
+
+        let mut store = Store::default();
+        store.desktop_profiles.push(DesktopProfile {
+            id: "b-id".into(),
+            name: "B".into(),
+            notes: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_switched_at: None,
+            snapshot_rel: "desktop-accounts/b-id".into(),
+            size_bytes: 0,
+            meta: None,
+        });
+        let live = dir.path().join("APPDATA").join("Claude");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("who.txt"), b"unknown-account").unwrap();
+
+        switch_desktop_profile_in(
+            "b-id",
+            &live,
+            &accounts,
+            &mut store,
+            &|_names| Ok(Vec::new()),
+            &|| Ok(false),
+            &dir.path().join("backups"),
+            &copy_dir_recursive,
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(live.join("who.txt")).unwrap(),
+            "B-account"
+        );
+        assert_eq!(store.current_desktop_profile_id.as_deref(), Some("b-id"));
     }
 
     #[test]

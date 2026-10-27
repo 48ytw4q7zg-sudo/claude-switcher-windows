@@ -86,6 +86,9 @@ fn read_override() -> Option<ClashOverride> {
 }
 
 /// 探测运行时配置：手动覆盖 > Clash Verge 配置文件 > 默认端口。
+///
+/// 控制器地址规范化失败（远程主机 / https）时记日志并回落到本机默认端口，
+/// **绝不把 secret 发给非回环目标**。
 pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
     if let Some(override_cfg) = read_override() {
         let controller = override_cfg
@@ -93,7 +96,13 @@ pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map(normalize_controller);
+            .and_then(|raw| match normalize_controller(raw) {
+                Ok(url) => Some(url),
+                Err(e) => {
+                    crate::log_error(&format!("clash.json 控制器地址被拒绝：{e}"));
+                    None
+                }
+            });
         let secret = override_cfg
             .secret
             .as_deref()
@@ -115,17 +124,28 @@ pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
     }
 
     for path in paths::clash_config_candidates().unwrap_or_default() {
+        // read_yaml_optional 取得 PathBuf 所有权，日志里还要用 path，先克隆一份。
+        let path_for_log = path.clone();
         let Ok(Some(value)) = crate::jsonio::read_yaml_optional(path) else {
             continue;
         };
-        // normalize_controller 会把 0.0.0.0 / :: / 空主机统一改写成 127.0.0.1
-        // （Windows 上 connect 0.0.0.0 必然失败）。
+        // normalize_controller 把 0.0.0.0 / :: / 空主机统一改写成 127.0.0.1
+        // （Windows 上 connect 0.0.0.0 必然失败），并拒绝非回环目标。
         let controller = value
             .get("external-controller")
             .and_then(|v| v.as_str())
             .map(ToOwned::to_owned)
             .filter(|s| !s.trim().is_empty())
-            .map(|raw| normalize_controller(&raw))
+            .and_then(|raw| match normalize_controller(&raw) {
+                Ok(url) => Some(url),
+                Err(e) => {
+                    crate::log_error(&format!(
+                        "{} 的 external-controller 被拒绝（{e}），回落到本机默认端口",
+                        path_for_log.display()
+                    ));
+                    None
+                }
+            })
             .unwrap_or_else(probe_default_controller);
         let secret = value
             .get("secret")
@@ -180,10 +200,15 @@ fn http_client(
 /// `external-controller` 常写成 `0.0.0.0:9090`、`:9090`、`[::]:9090` 甚至无端口的
 /// `[::1]`：在 Windows 上 connect `0.0.0.0` 会直接失败（类 Unix 系统却可以），
 /// 因此把通配/空主机统一改写成 `127.0.0.1`，端口缺失时补 9097。
-fn normalize_controller(raw: &str) -> String {
+///
+/// **只接受回环地址**：控制器是本机服务，`clash-verge.yaml` 若被改成远程主机
+/// （配置被篡改 / 误贴别人的配置），把 bearer secret 发过去等于主动泄露。
+/// 上游测试 `test_remote_controller_is_rejected_before_sending_secret` 同样要求
+/// 先拒绝再发送。这里规范化阶段就把非回环目标拦下，`clash_api` 根本不会发起请求。
+fn normalize_controller(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return probe_default_controller();
+        return Ok(probe_default_controller());
     }
     // 补协议头，便于后续按 host:port 拆解。
     let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
@@ -192,8 +217,8 @@ fn normalize_controller(raw: &str) -> String {
         format!("http://{trimmed}")
     };
     let Some(rest) = with_scheme.strip_prefix("http://") else {
-        // https:// 的控制器按原样返回（用户显式指定，不做猜测）。
-        return with_scheme;
+        // https:// 一律拒绝：本机控制器不使用 TLS，出现 https 只可能是误配置。
+        return Err(format!("控制器必须是本机 http 地址，拒绝: {trimmed}"));
     };
 
     // 拆 host 与 port。IPv6 用方括号包住地址，只有端口分隔符在 `]` 后才拆；
@@ -204,19 +229,32 @@ fn normalize_controller(raw: &str) -> String {
         _ => (rest, ""),
     };
     let host_clean = host.trim_matches(|c| c == '[' || c == ']');
-    let is_wildcard = host_clean.is_empty() || host_clean == "0.0.0.0" || host_clean == "::";
-    let effective_port = if port.is_empty() { "9097" } else { port };
-    if is_wildcard {
-        return format!("http://127.0.0.1:{effective_port}");
+    // 回环判定：空主机/0.0.0.0/:: 视为通配（本机），以及字面回环地址。
+    let is_loopback = host_clean.is_empty()
+        || host_clean == "0.0.0.0"
+        || host_clean == "::"
+        || host_clean.eq_ignore_ascii_case("localhost")
+        || host_clean == "127.0.0.1"
+        || host_clean == "::1"
+        || host_clean.starts_with("127.");
+    if !is_loopback {
+        return Err(format!(
+            "Clash 控制器必须是本机回环地址，拒绝连接远程主机: {trimmed}"
+        ));
     }
-    // IPv6 字面量在 URL 里必须保留方括号，否则 `http://::1:9097` 无法解析。
-    // 判断依据：去掉外层方括号后仍含 `:`（IPv6 地址段分隔符）。
-    let host_out = if host_clean.contains(':') {
+    let effective_port = if port.is_empty() { "9097" } else { port };
+    // 通配地址（空主机 / 0.0.0.0 / ::）必须先改写成 127.0.0.1——Windows 上
+    // connect 0.0.0.0 必然失败，而 `[::]:9090` 这种形式同样连不上。
+    // 顺序很重要：`::` 含冒号，若先走「IPv6 保留方括号」分支就永远改不掉。
+    let host_out = if host_clean.is_empty() || host_clean == "0.0.0.0" || host_clean == "::" {
+        "127.0.0.1".to_string()
+    } else if host_clean.contains(':') {
+        // 其余 IPv6 字面量必须保留方括号，否则 `http://::1:9097` 无法解析。
         format!("[{host_clean}]")
     } else {
         host_clean.to_string()
     };
-    format!("http://{host_out}:{effective_port}")
+    Ok(format!("http://{host_out}:{effective_port}"))
 }
 
 /// Clash RESTful API 调用。控制器是本机服务，故走 no_proxy。
@@ -343,16 +381,37 @@ mod tests {
             // IPv6 字面量必须保留方括号，否则 `http://::1:9097` 无法被解析。
             ("[::1]", "http://[::1]:9097"),
             ("[::1]:9097", "http://[::1]:9097"),
-            ("[fe80::1]:7890", "http://[fe80::1]:7890"),
             ("127.0.0.1", "http://127.0.0.1:9097"),
             ("localhost:9097", "http://localhost:9097"),
             ("http://0.0.0.0:9097", "http://127.0.0.1:9097"),
             ("127.0.0.1:9097", "http://127.0.0.1:9097"),
+            ("127.0.0.5:9097", "http://127.0.0.5:9097"),
         ];
         for (input, expected) in cases {
-            assert_eq!(normalize_controller(input), expected, "input={input}");
+            assert_eq!(
+                normalize_controller(input).as_deref(),
+                Ok(expected),
+                "input={input}"
+            );
         }
         // 空串会探测默认端口，结果依赖本机控制器，不能写死。
-        assert!(normalize_controller("").starts_with("http://127.0.0.1:"));
+        assert!(normalize_controller("")
+            .unwrap()
+            .starts_with("http://127.0.0.1:"));
+
+        // 非回环目标必须被拒绝：否则 bearer secret 会主动发往远程主机。
+        for remote in [
+            "untrusted.invalid:9090",
+            "http://untrusted.invalid:9090",
+            "192.168.1.50:9097",
+            "10.0.0.8:9090",
+            "[fe80::1]:7890",
+            "https://127.0.0.1:9097",
+        ] {
+            assert!(
+                normalize_controller(remote).is_err(),
+                "远程/非 http 控制器必须被拒绝: {remote}"
+            );
+        }
     }
 }

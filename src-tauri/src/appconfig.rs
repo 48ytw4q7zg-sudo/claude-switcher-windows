@@ -39,13 +39,30 @@ fn config_path() -> Result<std::path::PathBuf, String> {
     Ok(paths::app_data_dir()?.join("appconfig.json"))
 }
 
-/// 读取配置；文件不存在/损坏时返回默认（损坏不覆盖，调用 save 才会重写）。
+/// 读取配置；文件不存在时返回默认。
+///
+/// **文件损坏时不静默回默认**：记一条日志说明原内容未被采用，且不会自动重写
+/// （要等某次 `update()` 才会整体覆盖）。静默回退会让用户以为地区/代理设置
+/// 还在，实际已被默认值取代，排障时毫无线索。
 pub fn load() -> AppConfig {
     match config_path() {
-        Ok(path) if path.exists() => std::fs::read_to_string(&path)
-            .ok()
-            .and_then(|text| serde_json::from_str::<AppConfig>(&text).ok())
-            .unwrap_or_default(),
+        Ok(path) if path.exists() => match std::fs::read_to_string(&path) {
+            Ok(text) => match serde_json::from_str::<AppConfig>(&text) {
+                Ok(cfg) => cfg,
+                Err(e) => {
+                    crate::log_error(&format!(
+                        "appconfig.json 解析失败，本次按默认配置运行（{}）；\
+                         下次保存设置会整体覆盖该文件",
+                        e
+                    ));
+                    AppConfig::default()
+                }
+            },
+            Err(e) => {
+                crate::log_error(&format!("appconfig.json 读取失败，按默认配置运行: {e}"));
+                AppConfig::default()
+            }
+        },
         _ => AppConfig::default(),
     }
 }
