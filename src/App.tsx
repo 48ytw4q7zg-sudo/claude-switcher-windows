@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
 import {
@@ -28,6 +28,13 @@ import {
   UserRound,
 } from 'lucide-react';
 import { ClaudeTrayPopup } from './components/ClaudeTrayPopup';
+import { SecurityPanel } from './components/SecurityPanel';
+import { RegionPanel } from './components/RegionPanel';
+import { GuardPanel } from './components/GuardPanel';
+import { ClashModePanel } from './components/ClashModePanel';
+import { DesktopProfiles } from './components/DesktopProfiles';
+import { PrivacyTools } from './components/PrivacyTools';
+import { useModalDialog } from './useModalDialog';
 
 const WINDOW_LABEL = (() => {
   if (new URLSearchParams(window.location.search).get('window') === 'tray-popup') {
@@ -110,6 +117,33 @@ interface ClaudeStatus {
   pending_new_account?: PendingNewAccount | null;
   warnings: string[];
   telemetry_mode: TelemetryMode;
+  /** 残留的切换事务日志（上次切换中断）；有值时提示用备份回滚。 */
+  pending_switch?: SwitchJournal | null;
+}
+
+interface SwitchJournal {
+  target_id: string;
+  step: string;
+  backup_id?: string | null;
+  started_at: string;
+}
+
+interface UpdateCheckResult {
+  current_version: string;
+  latest_version?: string | null;
+  has_update: boolean;
+  release_url: string;
+  message: string;
+}
+
+interface ExportResult {
+  path: string;
+  bytes: number;
+}
+
+interface ImportResult {
+  imported_bytes: number;
+  backup_of_previous: string;
 }
 
 interface SessionIsolationStatus {
@@ -261,6 +295,9 @@ type BusyAction =
   | 'restore'
   | 'telemetry'
   | 'autostart'
+  | 'export'
+  | 'import'
+  | 'update'
   | null;
 
 type NewAccountModalState = 'draft' | 'running' | 'done';
@@ -533,9 +570,11 @@ function App() {
     }
   }, []);
 
-  const load = useCallback(async () => {
+  const load = useCallback(async (opts?: { keepError?: boolean }) => {
     setBusy('refresh');
-    setError(null);
+    // keepError：删除等操作失败后的兜底刷新不能把原错误冲掉——
+    // 「快照已删但目录清理失败」时，用户最需要看到的是删除失败本身。
+    if (!opts?.keepError) setError(null);
     try {
       const [nextStatus, nextProfiles, nextBackups] = await Promise.all([
         invoke<ClaudeStatus>('get_status'),
@@ -549,7 +588,7 @@ function App() {
       // 遥测模式：get_status 始终带 telemetry_mode（后端非 Option 字段）。
       setTelemetryMode(nextStatus.telemetry_mode);
     } catch (err) {
-      setError(String(err));
+      if (!opts?.keepError) setError(String(err));
       return;
     } finally {
       // 主数据已就绪：立刻解除 busy，让按钮可用（用量/Clash 是渐进加载）。
@@ -584,12 +623,13 @@ function App() {
     try {
       const message = await fn();
       if (message) setToast(message);
-      // 操作已经成功；refresh 失败不应把结果显示成错误（否则用户以为操作失败会重试）。
-      // load() 内部会 setError，这里吞掉异常即可。
-      await load().catch(() => undefined);
     } catch (err) {
       setError(String(err));
     } finally {
+      // 无论成败都刷新列表：删除场景里「快照已删、目录清理失败」invoke 会抛错，
+      // 但账号确实已不在——不刷新会让界面残留已不存在的快照。
+      // keepError：刷新失败不能覆盖原错误（否则用户看不到真正的失败原因）。
+      await load({ keepError: true }).catch(() => undefined);
       setBusy(null);
     }
   };
@@ -733,6 +773,48 @@ function App() {
     });
   };
 
+  // ── 快照加密导出/导入（CSBK1，口令 ≥8 位）与版本检查 ──
+  const [exportPath, setExportPath] = useState('');
+  const [exportPassword, setExportPassword] = useState('');
+  const [importPath, setImportPath] = useState('');
+  const [importPassword, setImportPassword] = useState('');
+  const [updateInfo, setUpdateInfo] = useState<UpdateCheckResult | null>(null);
+
+  const exportStore = () =>
+    run('export', async () => {
+      const result = await invoke<ExportResult>('export_store_encrypted', {
+        dest: exportPath.trim(),
+        password: exportPassword,
+      });
+      setExportPassword('');
+      return `已加密导出（${(result.bytes / 1024).toFixed(1)} KB）→ ${result.path}`;
+    });
+
+  const importStore = () => {
+    if (
+      !window.confirm(
+        '导入会覆盖当前全部账号快照（现有 store 会先备份为 store.private.json.pre-import-*）。确定继续？',
+      )
+    )
+      return;
+    run('import', async () => {
+      const result = await invoke<ImportResult>('import_store_encrypted', {
+        src: importPath.trim(),
+        password: importPassword,
+      });
+      setImportPassword('');
+      await load().catch(() => undefined);
+      return `导入完成；原 store 已备份到 ${result.backup_of_previous}`;
+    });
+  };
+
+  const checkUpdate = () =>
+    run('update', async () => {
+      const result = await invoke<UpdateCheckResult>('check_for_update');
+      setUpdateInfo(result);
+      return result.message;
+    });
+
   const remove = (id: string, label: string) => {
     // 弹三选项确认框。破坏性选项必须由用户显式点击触发——
     // 不能用 window.confirm（它的「取消」/Esc 在习惯上表示"放弃整个操作"，
@@ -744,11 +826,9 @@ function App() {
     const target = deleteTarget;
     setDeleteTarget(null);
     if (!target) return;
+    // 列表刷新由 run() 的 finally 统一兜底（成功失败都会刷），这里不用再刷。
     run('delete', async () => {
       await invoke('delete_profile', { id: target.id, deleteSessions: withSessions });
-      // 无论成功失败都刷新列表：快照删除成功但目录清理失败时，
-      // 账号实际已不在列表里，不刷新会让界面与磁盘不一致。
-      await load().catch(() => undefined);
       return withSessions ? '账号快照与会话历史已删除' : '账号快照已删除（会话历史保留）';
     });
   };
@@ -792,6 +872,10 @@ function App() {
   const [includeNetwork, setIncludeNetwork] = useState(false);
   // 删除账号的三选项确认（label 用于展示，id 用于执行）。
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; label: string } | null>(null);
+  const deleteDialogRef = useRef<HTMLElement | null>(null);
+  const deleteCancelRef = useRef<HTMLButtonElement | null>(null);
+  // C-2：Esc=取消、初始焦点在「取消」、焦点陷阱、背景滚动锁定。
+  useModalDialog(deleteTarget !== null, () => setDeleteTarget(null), deleteDialogRef, deleteCancelRef);
 
   /// 收集诊断信息并复制到剪贴板。默认只做本地检查（不发网络请求），
   /// 勾选后再查 Clash 与 OAuth——断网时也不会卡住界面。
@@ -898,7 +982,14 @@ function App() {
 
       {deleteTarget && (
         <div className="modal-scrim" role="presentation">
-          <section className="prepare-modal" role="dialog" aria-modal="true" aria-labelledby="delete-title">
+          <section
+            className="prepare-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="delete-title"
+            aria-describedby="delete-desc"
+            ref={deleteDialogRef}
+          >
             <div className="modal-title" id="delete-title">
               <Trash2 />
               <div>
@@ -906,12 +997,12 @@ function App() {
                 <span>这不会删除 Claude Code 当前的登录态。</span>
               </div>
             </div>
-            <p className="telemetry-intro">
+            <p className="telemetry-intro" id="delete-desc">
               请选择删除范围。会话历史包含该账号的 projects 会话记录，可能占用大量磁盘空间；
-              删除后<strong>不可恢复</strong>。
+              删除后<strong>不可恢复</strong>。按 Esc 等同「取消」。
             </p>
             <div className="modal-actions">
-              <button className="ghost" onClick={() => setDeleteTarget(null)}>
+              <button className="ghost" onClick={() => setDeleteTarget(null)} ref={deleteCancelRef}>
                 取消
               </button>
               <button className="primary" onClick={() => confirmDelete(false)}>
@@ -1424,6 +1515,25 @@ function App() {
         </div>
       </section>
 
+      {/* ── 新增：环境安检 / 地区与客户端 / 保镖 / Clash 模式 / 桌面版 / 隐私诊断 ── */}
+      <SecurityPanel />
+
+      <section className="profiles">
+        <div className="section-title">
+          <h2>地区 · 保镖 · Clash 规则</h2>
+          <span>出口 / 后台巡检 / 内核规则</span>
+        </div>
+        <div className="grid" style={{ gridTemplateColumns: 'repeat(3, minmax(0,1fr))' }}>
+          <RegionPanel />
+          <GuardPanel />
+          <ClashModePanel />
+        </div>
+      </section>
+
+      <DesktopProfiles />
+
+      <PrivacyTools />
+
       <section className="profiles">
         <div className="section-title">
           <h2>账号快照</h2>
@@ -1583,6 +1693,75 @@ function App() {
             {busy === 'list-backups' ? <Loader2 className="spin" /> : <History />}
             刷新备份列表
           </button>
+        </div>
+
+        {/* 快照加密导出/导入 + 版本检查 */}
+        <div className="export-import-row">
+          <div className="export-import-card">
+            <strong>加密导出（换机迁移 / 冷备）</strong>
+            <span>口令 ≥8 位，Argon2id + AES-256-GCM 加密整个快照库。</span>
+            <input
+              placeholder="导出文件路径（如 D:\\backup\\claude-store.csbk）"
+              value={exportPath}
+              onChange={(e) => setExportPath(e.target.value)}
+            />
+            <input
+              type="password"
+              placeholder="导出口令（≥8 位，忘记无法恢复）"
+              value={exportPassword}
+              onChange={(e) => setExportPassword(e.target.value)}
+            />
+            <button
+              className="primary"
+              onClick={exportStore}
+              disabled={!!busy || exportPath.trim().length === 0 || exportPassword.length < 8}
+            >
+              {busy === 'export' ? <Loader2 className="spin" /> : <FileKey />}
+              加密导出
+            </button>
+          </div>
+          <div className="export-import-card">
+            <strong>加密导入（恢复快照库）</strong>
+            <span>覆盖当前快照库；导入前现有 store 自动备份。</span>
+            <input
+              placeholder="导入文件路径（.csbk）"
+              value={importPath}
+              onChange={(e) => setImportPath(e.target.value)}
+            />
+            <input
+              type="password"
+              placeholder="导出时设置的口令"
+              value={importPassword}
+              onChange={(e) => setImportPassword(e.target.value)}
+            />
+            <button
+              className="ghost"
+              onClick={importStore}
+              disabled={!!busy || importPath.trim().length === 0 || importPassword.length === 0}
+            >
+              {busy === 'import' ? <Loader2 className="spin" /> : <RotateCcw />}
+              解密导入
+            </button>
+          </div>
+        </div>
+        <div className="version-check-row">
+          <button className="ghost" onClick={checkUpdate} disabled={!!busy}>
+            {busy === 'update' ? <Loader2 className="spin" /> : <Network />}
+            检查更新
+          </button>
+          {updateInfo && (
+            <span className="version-check-result">
+              {updateInfo.message}
+              {updateInfo.has_update && updateInfo.release_url && (
+                <>
+                  {' '}
+                  <a href={updateInfo.release_url} target="_blank" rel="noreferrer">
+                    打开下载页
+                  </a>
+                </>
+              )}
+            </span>
+          )}
         </div>
         {backups.length === 0 ? (
           <div className="empty">

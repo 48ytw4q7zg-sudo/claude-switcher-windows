@@ -1016,6 +1016,57 @@ code {
   color: #24251f;
 }
 
+/* 快照加密导出/导入 + 版本检查（备份与恢复面板） */
+.export-import-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.export-import-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid rgba(72, 66, 52, 0.18);
+  border-radius: 10px;
+  background: rgba(255, 255, 255, 0.45);
+}
+
+.export-import-card strong {
+  color: #24251f;
+}
+
+.export-import-card span {
+  font-size: 12px;
+  color: #6f6a5e;
+}
+
+.export-import-card input {
+  padding: 8px 10px;
+  border: 1px solid rgba(72, 66, 52, 0.25);
+  border-radius: 6px;
+  background: #fff;
+  font-size: 13px;
+}
+
+.version-check-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.version-check-result {
+  font-size: 13px;
+  color: #4a463d;
+}
+
+.version-check-result a {
+  color: #24251f;
+}
+
 @media (max-width: 980px) {
   body {
     min-width: 0;
@@ -1047,4 +1098,125 @@ code {
   .profile-grid {
     grid-template-columns: 1fr;
   }
+
+  .export-import-row {
+    grid-template-columns: 1fr;
+  }
+}
+
+/* ── 环境安检仪表盘 ── */
+.security-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin: 16px 0;
+  padding: 12px;
+  border-radius: 6px;
+  background: #eee7d8;
+}
+
+.security-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.security-actions {
+  display: flex;
+  gap: 10px;
+}
+
+.check-list {
+  display: grid;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.check-row {
+  display: grid;
+  grid-template-columns: 28px minmax(0, 1fr);
+  gap: 10px;
+  align-items: start;
+  padding: 10px 12px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.45);
+  border: 1px solid rgba(32, 32, 29, 0.08);
+}
+
+.check-dot {
+  display: grid;
+  place-items: center;
+  width: 28px;
+  height: 28px;
+  border-radius: 999px;
+}
+
+.check-dot svg {
+  width: 16px;
+  height: 16px;
+}
+
+.check-dot.ok {
+  color: #17463b;
+  background: #dbe9d5;
+}
+
+.check-dot.warn {
+  color: #7a3a1a;
+  background: #efdcc6;
+}
+
+.check-dot.fail {
+  color: #6e221f;
+  background: #f1d7cf;
+}
+
+.check-row-body {
+  display: grid;
+  gap: 3px;
+  min-width: 0;
+}
+
+.check-row-body strong {
+  color: #24251f;
+  font-size: 14px;
+}
+
+.check-row-body span {
+  color: #6d6458;
+  font-size: 12.5px;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.fix-report {
+  margin-top: 18px;
+  padding-top: 14px;
+  border-top: 1px dashed rgba(32, 32, 29, 0.18);
+}
+
+/* ── 隐私诊断：JSON 输出 ── */
+.diag-pre {
+  margin: 10px 0 0;
+  padding: 10px 12px;
+  max-height: 260px;
+  overflow: auto;
+  border-radius: 6px;
+  background: #efe9d8;
+  color: #4a463d;
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+}
+
+.field-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 8px;
+}
+
+.field-list .field {
+  min-height: 0;
 }
