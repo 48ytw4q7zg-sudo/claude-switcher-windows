@@ -37,12 +37,22 @@ impl BackupSnapshot {
             .filter(|s| !s.is_empty())
             .map(store::decrypt_secret)
             .transpose()?;
+        let mut settings_json = backup
+            .get("settings_json")
+            .filter(|v| !v.is_null())
+            .cloned();
+        if let Some(encrypted) = backup
+            .get("encrypted_auth_settings")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            let auth: Value = serde_json::from_str(&store::decrypt_secret(encrypted)?)
+                .map_err(|e| format!("备份认证配置 JSON 解析失败: {e}"))?;
+            store::restore_auth_settings(&mut settings_json, Some(auth));
+        }
         Ok(BackupSnapshot {
             claude_json: backup.get("claude_json").filter(|v| !v.is_null()).cloned(),
-            settings_json: backup
-                .get("settings_json")
-                .filter(|v| !v.is_null())
-                .cloned(),
+            settings_json,
             keychain,
         })
     }

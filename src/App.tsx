@@ -735,9 +735,17 @@ function App() {
 
   const remove = (id: string, label: string) => {
     if (!window.confirm(`删除账号快照「${label}」？这不会删除 Claude Code 当前登录。`)) return;
+    // 二次确认会话历史：目录可能很大（GB 级），默认不删，与上游行为一致。
+    const withSessions = window.confirm(
+      '同时删除这个账号的会话历史（session 隔离目录，可能占用大量磁盘空间）？\n\n' +
+        '点「确定」= 一并删除；点「取消」= 只删快照、保留会话历史。',
+    );
+    if (!withSessions) {
+      // 取消 = 只删快照，deleteSessions 传 false，无需额外操作。
+    }
     run('delete', async () => {
-      await invoke('delete_profile', { id });
-      return '账号快照已删除';
+      await invoke('delete_profile', { id, deleteSessions: withSessions });
+      return withSessions ? '账号快照与会话历史已删除' : '账号快照已删除（会话历史保留）';
     });
   };
 

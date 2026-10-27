@@ -98,9 +98,13 @@ pub fn read_yaml_optional(path: PathBuf) -> Result<Option<Value>, String> {
     if raw.trim().is_empty() {
         return Ok(None);
     }
-    serde_yaml::from_str::<Value>(&raw)
-        .map(Some)
-        .map_err(|e| format!("YAML 解析失败: {e}"))
+    // Clash Verge 的配置可能是多文档 YAML（含 `---`），只取第一个文档，
+    // 避免单文档解析器把整份配置判为失败。
+    let mut documents = serde_yaml::Deserializer::from_str(&raw);
+    let first = documents.next().map(serde::de::Deserialize::deserialize);
+    first
+        .transpose()
+        .map_err(|e| format!("YAML 解析失败（{}）: {e}", path.display()))
 }
 
 /// 原子写入 pretty JSON（临时文件 + rename 覆盖，绝不写半截）。
@@ -173,5 +177,18 @@ mod tests {
         std::fs::write(&path, content).unwrap();
         let parsed = read_json_optional(path).unwrap().unwrap();
         assert_eq!(parsed["env"]["TZ"], "UTC");
+    }
+
+    #[test]
+    fn read_yaml_optional_takes_first_document() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.yaml");
+        std::fs::write(
+            &path,
+            "external-controller: :9097\n---\nexternal-controller: :9999\n",
+        )
+        .unwrap();
+        let parsed = read_yaml_optional(path).unwrap().unwrap();
+        assert_eq!(parsed["external-controller"], ":9097");
     }
 }

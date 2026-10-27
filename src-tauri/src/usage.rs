@@ -112,22 +112,13 @@ const OAUTH_PROFILE_TTL_SECS: i64 = 6 * 3600;
 /// 直接全清最稳妥，也最符合用户预期。
 pub fn clear_caches() {
     // 三个缓存的 value 类型不同，逐个清（不能用同一个迭代器）。
-    if let Ok(mut guard) = OAUTH_USAGE_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-    {
+    if let Ok(mut guard) = OAUTH_USAGE_CACHE.get_or_init(|| Mutex::new(None)).lock() {
         *guard = None;
     }
-    if let Ok(mut guard) = OAUTH_PROFILE_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-    {
+    if let Ok(mut guard) = OAUTH_PROFILE_CACHE.get_or_init(|| Mutex::new(None)).lock() {
         *guard = None;
     }
-    if let Ok(mut guard) = LOCAL_USAGE_CACHE
-        .get_or_init(|| Mutex::new(None))
-        .lock()
-    {
+    if let Ok(mut guard) = LOCAL_USAGE_CACHE.get_or_init(|| Mutex::new(None)).lock() {
         *guard = None;
     }
 }
@@ -155,11 +146,9 @@ fn collect_jsonl_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Resul
         // 但它**不跟随链接**，符号链接/junction 目录会被误判为非目录而漏掉。
         // 遇到 reparse point 时回退到 metadata()（跟随链接）再判断。
         let is_dir = match entry.file_type() {
-            Ok(kind) if kind.is_symlink() => entry
-                .path()
-                .metadata()
-                .map(|m| m.is_dir())
-                .unwrap_or(false),
+            Ok(kind) if kind.is_symlink() => {
+                entry.path().metadata().map(|m| m.is_dir()).unwrap_or(false)
+            }
             Ok(kind) => kind.is_dir(),
             Err(_) => false,
         };

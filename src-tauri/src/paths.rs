@@ -112,13 +112,15 @@ pub fn ensure_app_dirs() -> Result<(), String> {
     fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
 
     let marker = data_dir.join(".acl-hardened");
-    let needs_hardening = !marker.exists();
-    if needs_hardening {
+    static HARDEN_TRIED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    // 每个进程最多尝试一次：icacls 不可用/卷不支持 ACL 时，不能让每次
+    // 状态刷新都重新 spawn whoami + icacls 并刷满日志。下次启动仍会重试。
+    if !marker.exists() && !HARDEN_TRIED.swap(true, std::sync::atomic::Ordering::SeqCst) {
         if imp::secure_app_data_dir(&data_dir) {
-            // 只有 ACL 真正设置成功才落标记，失败则下次重试。
+            // 只有 ACL 真正设置成功才落标记，失败则下次启动重试。
             let _ = fs::write(&marker, b"acl hardened\n");
         } else {
-            crate::log_error("ACL 加固失败（icacls 执行出错），下次启动将重试");
+            crate::log_error("ACL 加固失败（icacls 执行出错），本次运行不再重试，下次启动将重试");
         }
     }
 

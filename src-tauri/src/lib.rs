@@ -161,10 +161,10 @@ fn get_platform() -> &'static str {
 /// 其中调用 `reqwest::blocking` 有 panic 风险。
 #[tauri::command]
 async fn get_status() -> Result<ClaudeStatus, String> {
-    blocking(get_status_blocking).await
+    blocking(|| get_status_blocking(false)).await
 }
 
-fn get_status_blocking() -> Result<ClaudeStatus, String> {
+fn get_status_blocking(offline: bool) -> Result<ClaudeStatus, String> {
     p::ensure_app_dirs()?;
     let store_data = store::load_store()?;
     let claude_json = read_json_optional(p::claude_json_path()?)?;
@@ -179,7 +179,9 @@ fn get_status_blocking() -> Result<ClaudeStatus, String> {
         fill_meta_from_saved_profile(&mut meta, &store_data);
     }
     let mut warnings = Vec::new();
-    let _ = usage::apply_oauth_profile(&mut meta, keychain.as_deref());
+    if !offline {
+        let _ = usage::apply_oauth_profile(&mut meta, keychain.as_deref());
+    }
 
     if claude_json.is_none() {
         warnings.push("没有发现 ~/.claude.json，可能尚未登录 Claude Code".to_string());
@@ -366,7 +368,17 @@ fn profile_summary_of(profile: &StoredProfile, current_id: Option<&str>) -> Prof
 }
 
 #[tauri::command]
-fn capture_current_profile(name: String, notes: Option<String>) -> Result<ProfileSummary, String> {
+async fn capture_current_profile(
+    name: String,
+    notes: Option<String>,
+) -> Result<ProfileSummary, String> {
+    blocking(move || capture_current_profile_blocking(name, notes)).await
+}
+
+fn capture_current_profile_blocking(
+    name: String,
+    notes: Option<String>,
+) -> Result<ProfileSummary, String> {
     let clean_name = name.trim();
     if clean_name.is_empty() {
         return Err("账号名称不能为空".to_string());
@@ -433,14 +445,7 @@ async fn prepare_new_account_login(
     chrome_profile: Option<String>,
 ) -> Result<PrepareNewAccountResult, String> {
     blocking(move || {
-        prepare_new_account_login_blocking(
-            name,
-            notes,
-            node,
-            timezone,
-            locale,
-            chrome_profile,
-        )
+        prepare_new_account_login_blocking(name, notes, node, timezone, locale, chrome_profile)
     })
     .await
 }
@@ -543,6 +548,8 @@ fn prepare_new_account_login_blocking(
             "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
         ));
     }
+    // 新号流程已清空当前账号并换到全新的日志目录，旧账号缓存不能继续显示。
+    usage::clear_caches();
     Ok(PrepareNewAccountResult {
         pending,
         backup,
@@ -804,13 +811,22 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
         )),
     }
     // 记录切号结果与链接模式：排障时最需要的两条信息。
-    log_error(&format!(
+    // 账号名只记 id 前 8 位（隐私：日志可能被用户直接贴给别人排障）。
+    log_info(&format!(
         "切号成功 → {}（链接模式：{}，Clash：{}）",
-        profile.name,
-        if link_mode.is_empty() { "未激活" } else { &link_mode },
+        &profile.id[..profile.id.len().min(8)],
+        if link_mode.is_empty() {
+            "未激活"
+        } else {
+            &link_mode
+        },
         clash_result
             .as_ref()
-            .map(|c| format!("{}（{}）", c.node, if c.verified { "已确认" } else { "未确认" }))
+            .map(|c| format!(
+                "{}（{}）",
+                c.node,
+                if c.verified { "已确认" } else { "未确认" }
+            ))
             .unwrap_or_else(|| "未绑定".to_string())
     ));
 
@@ -950,7 +966,11 @@ fn set_profile_runtime_binding(
 }
 
 #[tauri::command]
-fn delete_profile(id: String) -> Result<(), String> {
+async fn delete_profile(id: String, delete_sessions: Option<bool>) -> Result<(), String> {
+    blocking(move || delete_profile_blocking(id, delete_sessions.unwrap_or(false))).await
+}
+
+fn delete_profile_blocking(id: String, delete_sessions: bool) -> Result<(), String> {
     let mut store_data = store::load_store()?;
     let before = store_data.profiles.len();
     store_data.profiles.retain(|p| p.id != id);
@@ -960,7 +980,23 @@ fn delete_profile(id: String) -> Result<(), String> {
     if store_data.current_profile_id.as_deref() == Some(&id) {
         store_data.current_profile_id = None;
     }
-    store::save_store(&store_data)
+    store::save_store(&store_data)?;
+    // 可选清理会话历史：目录可能很大（GB 级），只在用户显式勾选时删除。
+    // 失败只记日志不报错——快照已删，目录残留是次要问题。
+    if delete_sessions {
+        let dir = p::session_profiles_dir()?.join(&id);
+        if dir.exists() {
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => log_info(&format!(
+                    "已删除账号 {} 的会话历史（{}）",
+                    &id[..id.len().min(8)],
+                    dir.to_string_lossy()
+                )),
+                Err(e) => log_error(&format!("删除会话历史失败（可手动删除）: {e}")),
+            }
+        }
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -990,6 +1026,12 @@ fn create_backup_with_label(label: &str) -> Result<BackupResult, String> {
         Some(plain) => Some(store::encrypt_keychain_field(&plain)?),
         None => None,
     };
+    // 备份同样不能留下明文 API key / apiKeyHelper；与 store 复用拆分加密，
+    // 旧备份没有 encrypted_auth_settings 字段时仍能按原样恢复。
+    let (plain_settings, secret_settings) = store::split_auth_settings(settings_json);
+    let encrypted_auth_settings = secret_settings
+        .map(|secret| store::encrypt_secret(&secret.to_string()))
+        .transpose()?;
     let id = format!(
         "{}-{}",
         Utc::now().format("%Y%m%d%H%M%S"),
@@ -1001,7 +1043,8 @@ fn create_backup_with_label(label: &str) -> Result<BackupResult, String> {
         "label": label,
         "created_at": Utc::now(),
         "claude_json": claude_json,
-        "settings_json": settings_json,
+        "settings_json": plain_settings,
+        "encrypted_auth_settings": encrypted_auth_settings,
         "keychain_password": keychain_password,
     });
     jsonio::write_json_pretty(path.clone(), &backup)?;
@@ -1057,8 +1100,8 @@ fn prune_backups(keep: usize) {
 }
 
 #[tauri::command]
-fn create_backup() -> Result<BackupResult, String> {
-    create_backup_with_label("manual")
+async fn create_backup() -> Result<BackupResult, String> {
+    blocking(|| create_backup_with_label("manual")).await
 }
 
 #[tauri::command]
@@ -1163,16 +1206,21 @@ fn restore_backup_blocking(id: String) -> Result<RestoreResult, String> {
 
     let backup_result = create_backup_with_label("before-restore")?;
 
-    let claude_json = backup.get("claude_json").filter(|v| !v.is_null());
-    let settings_json = backup.get("settings_json").filter(|v| !v.is_null());
-    let keychain_password = backup
-        .get("keychain_password")
+    let restored = BackupSnapshot::from_backup_value(&backup)?;
+    let claude_json = restored.claude_json.as_ref();
+    let settings_json = restored.settings_json.as_ref();
+    let keychain_password = restored.keychain;
+    let has_auth_settings = backup
+        .get("encrypted_auth_settings")
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
-        .map(store::decrypt_secret)
-        .transpose()?;
+        .is_some();
 
-    if claude_json.is_none() && settings_json.is_none() && keychain_password.is_none() {
+    if claude_json.is_none()
+        && settings_json.is_none()
+        && keychain_password.is_none()
+        && !has_auth_settings
+    {
         return Err("该备份不包含任何可恢复的内容".to_string());
     }
 
@@ -1217,6 +1265,8 @@ fn restore_backup_blocking(id: String) -> Result<RestoreResult, String> {
             "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
         ));
     }
+    // 恢复备份也会改变当前账号及本地日志来源，旧缓存必须立即失效。
+    usage::clear_caches();
 
     Ok(RestoreResult {
         restored_from: clean_id.to_string(),
@@ -1314,7 +1364,18 @@ fn hide_main_window_cmd(app: tauri::AppHandle) {
 /// 无处可去。把关键错误同时落到 `~/.claude-switcher/logs/claude-switcher.log`
 /// （追加写入，带时间戳），排障才有线索。写日志失败绝不影响主流程。
 pub fn log_error(message: &str) {
-    let line = format!("[{}] {}\n", Utc::now().format("%Y-%m-%d %H:%M:%S"), message);
+    log_line("ERROR", message);
+}
+
+/// 信息级日志（切号成功、链接模式这类非错误事件）：与错误共用落盘实现，
+/// 前缀区分级别，排障日志按 ERROR 优先阅读。
+pub fn log_info(message: &str) {
+    log_line("INFO", message);
+}
+
+fn log_line(level: &str, message: &str) {
+    let message = format!("[{level}] {message}");
+    let line = format!("[{}] {message}\n", Utc::now().format("%Y-%m-%d %H:%M:%S"));
     if let Ok(dir) = p::app_data_dir() {
         let logs = dir.join("logs");
         if fs::create_dir_all(&logs).is_ok() {
@@ -1364,7 +1425,7 @@ async fn get_diagnostic_info(include_network: Option<bool>) -> Result<Value, Str
 }
 
 fn get_diagnostic_info_blocking(include_network: bool) -> Result<Value, String> {
-    let status = get_status_blocking()?;
+    let status = get_status_blocking(!include_network)?;
     let processes = processes::claude_code_processes();
     let mut payload = json!({
         "platform": get_platform(),
@@ -1461,26 +1522,79 @@ async fn set_claude_config_dir(path: String) -> Result<String, String> {
 
 fn set_claude_config_dir_blocking(path: String) -> Result<String, String> {
     let override_file = p::app_data_dir()?.join("claude-config-dir.txt");
+    let mut warnings: Vec<String> = Vec::new();
     let trimmed = path.trim();
     if trimmed.is_empty() {
         // 清除覆盖：文件不存在也算成功（幂等）。
         if override_file.exists() {
             fs::remove_file(&override_file).map_err(|e| format!("清除配置目录覆盖失败: {e}"))?;
         }
+        usage::clear_caches();
         return Ok("已恢复默认配置目录".to_string());
     }
     let dir = PathBuf::from(trimmed);
     if !dir.is_absolute() {
         return Err("请填写绝对路径（例如 D:\\claude-alt）".to_string());
     }
-    // 先校验新目录存在且可写，避免保存一个不可用路径让凭据写失败。
+    // **父目录必须已存在**：`create_dir_all` 会把拼错的路径（比如 `D:\claude-al`）
+    // 直接建出来，用户还以为保存对了。只有父目录存在才允许创建最后一级。
+    match dir.parent() {
+        Some(parent) if parent.exists() => {}
+        _ => {
+            return Err(format!(
+                "父目录不存在：{}（请先确认路径拼写，本工具不会自动创建多级目录）",
+                dir.parent()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            ));
+        }
+    }
+    // 先校验新目录可写，避免保存一个不可用路径让凭据写失败。
     fs::create_dir_all(&dir).map_err(|e| format!("配置目录不可写: {e}"))?;
     let probe = dir.join(".claude-switcher-write-test");
     fs::write(&probe, b"ok").map_err(|e| format!("配置目录不可写: {e}"))?;
     fs::remove_file(&probe).map_err(|e| format!("清理写入测试失败: {e}"))?;
 
-    // 不自动删除旧目录或旧链接：它们可能仍包含用户会话历史。切换目录前
-    // 保留现场，避免悬空链接指向不存在的位置；切换后重新激活账号隔离。
+    // 凭据迁移：新目录里没有 .credentials.json 时 Claude Code 会显示未登录。
+    // 读取旧凭据（覆盖生效前的目录），写入新目录——不删旧文件（回退路径保留）。
+    let old_credentials = credentials::read_password()?;
+    let new_credentials = {
+        let candidate = dir.join(".credentials.json");
+        if candidate.exists() {
+            Some(fs::read_to_string(&candidate).map_err(|e| e.to_string())?)
+        } else {
+            None
+        }
+    };
+    if let (Some(plain), None) = (&old_credentials, &new_credentials) {
+        // 先写覆盖文件再写凭据：万一凭据写失败，用户只需再执行一次即可。
+        fs::create_dir_all(p::app_data_dir()?).map_err(|e| e.to_string())?;
+        crate::fsx::write_atomically(&override_file, trimmed).map_err(|e| {
+            format!(
+                "保存配置目录覆盖失败: {}",
+                crate::fsx::humanize_io_error(&e)
+            )
+        })?;
+        crate::fsx::write_atomically(&dir.join(".credentials.json"), plain).map_err(|e| {
+            format!(
+                "迁移凭据到新目录失败: {}",
+                crate::fsx::humanize_io_error(&e)
+            )
+        })?;
+        // 隔离链接重建：新目录的 projects 等要重新指向当前账号的隔离目录，
+        // 否则用户会以为切号生效了、实际 Claude Code 读的是空目录。
+        rebuild_isolation_after_config_switch(&mut warnings);
+        usage::clear_caches();
+        return Ok(with_warnings(
+            format!(
+                "配置目录已设为：{}（当前登录态已迁移；旧目录数据保留）",
+                dir.display()
+            ),
+            &warnings,
+        ));
+    }
+
+    // 不自动删除旧目录或旧链接：它们可能仍包含用户会话历史。
     fs::create_dir_all(p::app_data_dir()?).map_err(|e| e.to_string())?;
     // 只写路径本身，不带换行（读取端会 trim）。
     crate::fsx::write_atomically(&override_file, trimmed).map_err(|e| {
@@ -1490,7 +1604,45 @@ fn set_claude_config_dir_blocking(path: String) -> Result<String, String> {
         )
     })?;
     usage::clear_caches();
-    Ok(format!("配置目录已设为：{}", dir.display()))
+    rebuild_isolation_after_config_switch(&mut warnings);
+    let base = if new_credentials.is_some() {
+        format!("配置目录已设为：{}", dir.display())
+    } else {
+        format!(
+            "配置目录已设为：{}（该目录没有登录态，Claude Code 将显示未登录；可重新登录或切回）",
+            dir.display()
+        )
+    };
+    Ok(with_warnings(base, &warnings))
+}
+
+/// 把非阻断 warning 拼到成功消息后面（隔离重建失败这类）。
+fn with_warnings(base: String, warnings: &[String]) -> String {
+    if warnings.is_empty() {
+        base
+    } else {
+        format!("{base}\n注意：{}", warnings.join("；"))
+    }
+}
+
+/// 切换配置目录后重建当前账号的隔离链接。
+///
+/// 旧目录里指向 `session-profiles/<id>` 的链接是**旧路径**上的，换目录后新目录里
+/// 没有链接，Claude Code 会读到空 projects。这里对当前账号重新 activate 一次
+/// （幂等：已正确链接就直接返回）。失败只作 warning，不阻断切换本身。
+fn rebuild_isolation_after_config_switch(warnings: &mut Vec<String>) {
+    let Ok(store_data) = store::load_store() else {
+        return;
+    };
+    let Some(current_id) = store_data.current_profile_id else {
+        return;
+    };
+    match isolation::activate_profile_claude_local_state(&current_id) {
+        Ok(items) => warnings.extend(items),
+        Err(e) => warnings.push(format!(
+            "隔离链接重建失败（账号材料已切换，重新执行一次「切换」可补上）：{e}"
+        )),
+    }
 }
 
 /// Run 注册表项的值名（固定，便于 UI 显示与排查）。
@@ -1499,6 +1651,10 @@ const AUTOSTART_VALUE_NAME: &str = "ClaudeSwitcher";
 /// HKCU 下开机自启的标准位置。
 #[cfg(windows)]
 const AUTOSTART_RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
+
+#[cfg(windows)]
+const AUTOSTART_APPROVED_KEY: &str =
+    "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 
 /// 开机自启开关（Windows 写 HKCU Run 项；其它平台不支持）。
 ///
@@ -1525,10 +1681,27 @@ fn set_autostart(enabled: bool) -> Result<(), String> {
             .map_err(|e| format!("打开 Run 注册表项失败: {e}"))?;
 
         if enabled {
-            let exe = std::env::current_exe().map_err(|e| format!("定位当前可执行文件失败: {e}"))?;
+            let exe =
+                std::env::current_exe().map_err(|e| format!("定位当前可执行文件失败: {e}"))?;
             let value = format!("\"{}\" --autostart", exe.to_string_lossy());
             run.set_value(AUTOSTART_VALUE_NAME, &value)
-                .map_err(|e| format!("写入开机自启失败: {e}"))
+                .map_err(|e| format!("写入开机自启失败: {e}"))?;
+            // Run 项存在不代表 Windows 会启动：任务管理器的 StartupApproved
+            // 禁用标记也必须清除，否则应用里反复点“开启”永远不会生效。
+            let (approved, _) = RegKey::predef(HKEY_CURRENT_USER)
+                .create_subkey(AUTOSTART_APPROVED_KEY)
+                .map_err(|e| format!("打开 StartupApproved 注册表项失败: {e}"))?;
+            approved
+                .set_raw_value(
+                    AUTOSTART_VALUE_NAME,
+                    &winreg::RegValue {
+                        // 与 Windows 启动项启用值保持一致：02 + 11 个 0。
+                        bytes: vec![0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                        vtype: winreg::enums::RegType::REG_BINARY,
+                    },
+                )
+                .map_err(|e| format!("恢复启动项启用状态失败: {e}"))?;
+            Ok(())
         } else {
             // delete_value 对不存在的值返回 NotFound——这正是幂等成功。
             match run.delete_value(AUTOSTART_VALUE_NAME) {
@@ -1552,8 +1725,7 @@ struct AutostartState {
     registered: bool,
     /// 是否在任务管理器「启动应用」里被用户禁用。
     /// Windows 会把禁用状态存在 StartupApproved\Run 的二进制值里：
-    /// 首字节 0x02/0x03 表示启用，0x01/0x03 的其它组合表示禁用
-    /// （实测：启用=02，禁用=03；缺失=启用）。
+    /// 首字节按奇偶判断（偶数启用，奇数禁用；02 启用、03 禁用，缺失按启用）。
     disabled_by_user: bool,
 }
 
@@ -1580,7 +1752,7 @@ fn get_autostart() -> AutostartState {
             .and_then(|key| key.get_raw_value(AUTOSTART_VALUE_NAME))
             .ok()
             .and_then(|raw| raw.bytes.first().copied())
-            .map(|first| first == 0x03)
+            .map(|first| first % 2 == 1)
             .unwrap_or(false);
 
         AutostartState {

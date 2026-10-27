@@ -427,9 +427,10 @@ pub fn load_store() -> Result<Store, String> {
             profile.keychain_password = Some(plain);
         }
         if let Some(enc) = profile.encrypted_auth_settings.take() {
-            let auth: Value = serde_json::from_str(&decrypt_secret(&enc).map_err(|e| {
-                format!("解密账号「{}」的认证配置失败: {e}", profile.name)
-            })?)
+            let auth: Value = serde_json::from_str(
+                &decrypt_secret(&enc)
+                    .map_err(|e| format!("解密账号「{}」的认证配置失败: {e}", profile.name))?,
+            )
             .map_err(|e| format!("认证配置 JSON 解析失败: {e}"))?;
             restore_auth_settings(&mut profile.settings_json, Some(auth));
         }
@@ -472,8 +473,16 @@ pub fn split_auth_settings(settings: Option<Value>) -> (Option<Value>, Option<Va
     {
         obj.remove("env");
     }
-    let plain = if obj.is_empty() { None } else { Some(Value::Object(obj)) };
-    let secret = if auth.is_empty() { None } else { Some(Value::Object(auth)) };
+    let plain = if obj.is_empty() {
+        None
+    } else {
+        Some(Value::Object(obj))
+    };
+    let secret = if auth.is_empty() {
+        None
+    } else {
+        Some(Value::Object(auth))
+    };
     (plain, secret)
 }
 
@@ -483,7 +492,9 @@ pub fn split_auth_settings(settings: Option<Value>) -> (Option<Value>, Option<Va
 /// 认证部分也带一个只含认证键的 env 块——整块覆盖会把明文侧的键丢掉。
 /// 顶层其它键（apiKeyHelper 等）直接覆盖即可（拆分时必然从明文侧移除过）。
 pub fn restore_auth_settings(settings: &mut Option<Value>, auth: Option<Value>) {
-    let Some(Value::Object(auth)) = auth else { return };
+    let Some(Value::Object(auth)) = auth else {
+        return;
+    };
     let mut target = settings.take().unwrap_or_else(|| serde_json::json!({}));
     if !target.is_object() {
         target = serde_json::json!({});
@@ -526,8 +537,7 @@ pub fn save_store(store: &Store) -> Result<(), String> {
             profile.keychain_password = Some(enc);
         }
         // 认证字段加密而非删除：保留原配置，切号/恢复时完整还原。
-        let (plain_settings, secret_settings) =
-            split_auth_settings(profile.settings_json.take());
+        let (plain_settings, secret_settings) = split_auth_settings(profile.settings_json.take());
         profile.settings_json = plain_settings;
         if let Some(secret) = secret_settings {
             profile.encrypted_auth_settings = Some(
@@ -669,7 +679,8 @@ mod tests {
         assert!(plain.is_none());
         assert!(secret.is_none());
         // 无认证字段时 secret 为 None（不产生空加密块）。
-        let (plain, secret) = split_auth_settings(Some(serde_json::json!({ "env": { "TZ": "UTC" } })));
+        let (plain, secret) =
+            split_auth_settings(Some(serde_json::json!({ "env": { "TZ": "UTC" } })));
         assert!(secret.is_none());
         assert_eq!(plain.unwrap()["env"]["TZ"], "UTC");
     }

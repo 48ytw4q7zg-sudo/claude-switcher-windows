@@ -196,29 +196,20 @@ fn normalize_controller(raw: &str) -> String {
         return with_scheme;
     };
 
-    // 拆 host 与 port。IPv6 形如 `[::1]` / `[::]:9097`（方括号套住地址），
-    // 只在最后一个 `:` 位于右方括号**之后**时才当端口分隔，否则 `[::1]`
-    // 会被误拆成 host="[" port=":1]"。
-    let (host, port) = match rest.rfind(':') {
-        Some(idx) if idx > rest.rfind(']').unwrap_or(0) => {
-            (&rest[..idx], &rest[idx + 1..])
-        }
+    // 拆 host 与 port。IPv6 用方括号包住地址，只有端口分隔符在 `]` 后才拆；
+    // 无 `]` 时普通 host:port 与 `:9097` 都要拆开（`:9097` 的 host 是空串）。
+    let (host, port) = match (rest.rfind(':'), rest.rfind(']')) {
+        (Some(idx), Some(bracket)) if idx > bracket => (&rest[..idx], &rest[idx + 1..]),
+        (Some(idx), None) => (&rest[..idx], &rest[idx + 1..]),
         _ => (rest, ""),
     };
     let host_clean = host.trim_matches(|c| c == '[' || c == ']');
     let is_wildcard = host_clean.is_empty() || host_clean == "0.0.0.0" || host_clean == "::";
-    let effective_port = if port.is_empty() {
-        "9097"
-    } else {
-        port
-    };
+    let effective_port = if port.is_empty() { "9097" } else { port };
     if is_wildcard {
         return format!("http://127.0.0.1:{effective_port}");
     }
-    if port.is_empty() {
-        return format!("http://{host_clean}:{effective_port}");
-    }
-    format!("http://{host_clean}:{port}")
+    format!("http://{host_clean}:{effective_port}")
 }
 
 /// Clash RESTful API 调用。控制器是本机服务，故走 no_proxy。
@@ -329,4 +320,29 @@ pub fn clash_group_path(group: &str) -> String {
 
 pub fn clash_proxy_path(node: &str) -> String {
     format!("/proxies/{}", urlencoding::encode(node))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::normalize_controller;
+
+    #[test]
+    fn controller_normalization_table() {
+        let cases = [
+            (":9097", "http://127.0.0.1:9097"),
+            (":9090", "http://127.0.0.1:9090"),
+            ("0.0.0.0:9090", "http://127.0.0.1:9090"),
+            ("[::]:9090", "http://127.0.0.1:9090"),
+            ("[::1]", "http://::1:9097"),
+            ("127.0.0.1", "http://127.0.0.1:9097"),
+            ("localhost:9097", "http://localhost:9097"),
+            ("http://0.0.0.0:9097", "http://127.0.0.1:9097"),
+            ("127.0.0.1:9097", "http://127.0.0.1:9097"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(normalize_controller(input), expected, "input={input}");
+        }
+        // 空串会探测默认端口，结果依赖本机控制器，不能写死。
+        assert!(normalize_controller("").starts_with("http://127.0.0.1:"));
+    }
 }

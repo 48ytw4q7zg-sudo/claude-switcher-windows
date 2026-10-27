@@ -299,7 +299,9 @@ mod tests {
             // WindowsApps 排除只针对 claude.exe，不能漏检 node + cli.js。
             (
                 r"C:\Program Files\WindowsApps\Node.JS.20.11\node.exe",
-                Some(vec![r"C:\Users\A\node_modules\@anthropic-ai\claude-code\cli.js".into()]),
+                Some(vec![
+                    r"C:\Users\A\node_modules\@anthropic-ai\claude-code\cli.js".into(),
+                ]),
                 true,
                 "Store 版 Node 跑 npm 版 Claude Code（WindowsApps 不排除 node）",
             ),
