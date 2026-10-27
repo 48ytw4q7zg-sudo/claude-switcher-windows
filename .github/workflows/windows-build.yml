@@ -49,4 +49,4 @@ jobs:
         with:
           name: Claude-Switcher-nsis
           path: src-tauri/target/release/bundle/nsis/*.exe
-          if-no-files-found: continue
+          if-no-files-found: error
