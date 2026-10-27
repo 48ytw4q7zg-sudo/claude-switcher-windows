@@ -42,6 +42,7 @@ pub fn secure_app_data_dir(dir: &Path) -> bool {
 }
 
 /// Unix：单个文件按 0o600 收敛（凭据类文件，配置目录被改到 home 外时用）。
+#[allow(dead_code)] // 调用方在 Windows cfg 分支内；unix 保留同签名实现供 API 对齐。
 pub fn secure_private_file(path: &Path) -> bool {
     fs::set_permissions(path, fs::Permissions::from_mode(0o600)).is_ok()
 }
@@ -89,6 +90,7 @@ pub fn paths_equivalent(a: &Path, b: &Path) -> bool {
     normalize_path(a) == normalize_path(b)
 }
 
+#[allow(dead_code)] // 同上：仅 Windows 路径调用，stub 供 API 对齐。
 /// Unix 上 create_junction 不会被调用（目录直接 symlink）；提供 stub 以对齐 API。
 pub fn create_junction(_target: &Path, _live: &Path) -> io::Result<()> {
     Err(io::Error::new(

@@ -22,6 +22,8 @@ pub fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// 带锁重试的删除（目录）。
+// macOS 无调用方（锁重试删除只在 Windows 链接清理路径使用），保留供 API 对齐。
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
     imp::retry_locked(|| fs::remove_dir(path))
 }
