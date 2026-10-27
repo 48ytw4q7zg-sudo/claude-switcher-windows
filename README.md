@@ -2,9 +2,12 @@
 
 [![CI](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/actions/workflows/ci.yml/badge.svg)](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/actions/workflows/ci.yml)
 
-一个 Windows 桌面工具，用来管理多个本机 **Claude Code CLI** 账号：保存账号快照、切换 OAuth 凭据、按账号隔离 Claude Code 本地痕迹（会话历史 / 配置 / 遥测等 8 个隔离面），并把每个账号绑定到 Clash Verge 的 `Auto-Claude` 节点。
+一个 Windows 桌面工具，**同时管理 Claude Code CLI 与 Claude Desktop 桌面版**：
+- **CLI**：保存账号快照、切换 OAuth 凭据、按账号隔离 Claude Code 本地痕迹（会话历史 / 配置 / 遥测等 8 个隔离面），并把每个账号绑定到 Clash Verge 的 `Auto-Claude` 节点；
+- **桌面版**：`%APPDATA%\Claude` 整体快照/切换；
+- **环境安全**：14 项安全检查、一键修复、保镖 kill-switch、时区/地区锁定、Clash 规则托管、STUN/WebRTC 泄漏探测、指纹与 CLI 体检、加密快照、自动更新。
 
-基于 **Tauri 2 + Rust + React 19 + TypeScript** 构建，桌面壳为 Windows 原生 WebView2。
+基于 **Tauri 2 + Rust + React 19 + TypeScript** 构建，桌面壳为 Windows 原生 WebView2。融合 [VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher) 与 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) 两个上游的全部能力。
 
 ---
 
@@ -14,31 +17,34 @@
 | --- | --- |
 | 本仓库（源码） | [48ytw4q7zg-sudo/claude-switcher-windows](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows) |
 | 安装包下载 | 本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases)（MSI / NSIS，SHA256 见 Release 说明） |
-| 上游原项目 | [VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher)（macOS 版，本仓库的直接迁移基线） |
-| 相关项目（同名不同产品） | [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher)（Claude 桌面版环境管理器，见下） |
+| 上游基线 A（CLI） | [VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher)（macOS 版，Tauri 2 + Rust + React） |
+| 上游基线 B（环境/桌面版） | [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher)（bash/PowerShell/Swift，已融合） |
 
 ### 平台分工（不同项目对应不同系统）
 
 | 项目 | 面向系统 | 说明 |
 | --- | --- | --- |
 | [VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher) | **macOS** | 上游原项目，同为 Tauri 2 + Rust + React。本仓库的迁移基线为 commit [`6897984`](https://github.com/VallierDev/claude-switcher/commit/68979843313a0cb7da3cda32765184436ba9598e)。感谢原作者 **[@VallierDev](https://github.com/VallierDev)**。 |
-| **本仓库** | **Windows 10 / 11（x64）** | 保持上游全部功能的前提下完成 Windows 适配、模块化重构与加固，并额外增加单实例、开机自启、Clash 控制器覆盖等增强。 |
-| [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) | macOS 为主 + Windows（Beta） | **另一个产品**：Claude **桌面版** 环境管理器（环境审计、守护进程、系统时区与地区锁定、指纹体检等），技术栈 Swift + bash/Python 核心 + PowerShell/WPF Windows Beta。感谢 **[@YOURSJEYO](https://github.com/YOURSJEYO)** 在同类工具生态上的工作。 |
+| **本仓库** | **Windows 10 / 11（x64）** | 融合两个上游的**全部功能**，并完成 Windows 适配、模块化重构与加固；额外提供单实例、开机自启、Clash 控制器覆盖等增强。 |
+| [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) | macOS 为主 + Windows（Beta） | 本仓库的**第二个融合基线**（commit [`870c4ca`](https://github.com/YOURSJEYO/claude-switcher/commit/870c4ca0754234965878ef58144d7a755d965037)）：环境审计、守护进程、时区/地区锁定、Clash 规则、指纹体检、桌面版管理。感谢 **[@YOURSJEYO](https://github.com/YOURSJEYO)**。 |
 
-### 与 YOURSJEYO/claude-switcher 的关系（避免混淆）
+### 功能融合说明
 
-两个项目**同名，但不是同一个产品，也没有代码血缘关系**：
+本仓库把两个上游的能力统一到一个 Tauri 应用中：
 
-| 对比项 | 本仓库 | YOURSJEYO/claude-switcher |
+| 维度 | 来自 VallierDev（基线 A） | 来自 YOURSJEYO（基线 B） |
 | --- | --- | --- |
-| 管理对象 | Claude Code **CLI**（`~/.claude`、`~/.claude.json`、OAuth 凭据） | Claude **桌面版**（`%APPDATA%\Claude`） |
-| 技术栈 | Tauri 2 + Rust + React（迁移自 VallierDev 上游） | Swift + bash/Python 核心 + PowerShell/WPF Windows Beta |
-| 核心能力 | 账号快照 / 凭据切换 / 会话隔离 / Clash 节点绑定 | 环境审计、守护进程、系统时区与地区锁定、指纹体检 |
-| 许可 | Apache-2.0（本仓库） | MIT |
+| 管理对象 | Claude Code CLI（`~/.claude`、`~/.claude.json`、OAuth 凭据） | Claude Desktop 桌面版（`%APPDATA%\Claude`） |
+| 核心能力 | 账号快照 / 凭据切换 / 会话隔离 / Clash 节点绑定 / 用量 | 14 项检查、一键修复、保镖/看门狗、地区锁定、规则托管、STUN/指纹/CLI 体检、加密快照、自动更新 |
 
-本仓库的功能全部迁移自 VallierDev 上游，**不包含** YOURSJEYO 项目的任何代码或功能。若你在找 Claude 桌面版的环境管理工具，请访问 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher)。
+> 旧版 README 曾写「不包含 YOURSJEYO 的任何代码或功能」。**项目 owner 已明确推翻
+> 该决定，要求融合全部功能**；该表述作废。基线 B 的脚本（PowerShell/bash/Swift）
+> 仅作为逐行行为基准，所有能力均用 Rust + React 重新实现。
 
-**迁移范围**：OAuth 凭据读写与清除、账号快照切换、备份/还原、一键新号向导、session/config 隔离、Clash 节点绑定、用量展示、托盘弹窗与数据目录入口——上游功能**一个不少**。Windows 上没有沿用 macOS 的 Keychain / `pgrep` / `security` 命令，而是替换为等价的系统 API（见「架构」）。
+**迁移范围**：两个上游的功能**一个不少**（CLI 与桌面版账号管理、备份/还原、一键新号、
+全部隔离面、Clash 节点与规则、14 项检查与一键修复、保镖/看门狗、地区锁定、
+STUN/open-safe/代理诊断/指纹/CLI 体检、加密快照、自动更新）。Windows 上没有沿用
+macOS 的 Keychain / `pgrep` / `security` 或 WPF/Swift，而是替换为等价的 Rust + 系统 API（见「架构」）。
 
 ---
 
@@ -129,8 +135,8 @@ claude-switcher-windows/
 
 | 形态 | 入口 | 适用场景 |
 | --- | --- | --- |
-| **NSIS 安装版** | Release 中 `Claude Switcher_0.1.0_x64-setup.exe` | 普通用户，双击安装（推荐） |
-| **MSI 安装版** | Release 中 `Claude Switcher_0.1.0_x64_zh-CN.msi` | 企业分发 / 域管理 |
+| **NSIS 安装版** | Release 中 `ClaudeSwitcher_0.2.0_x64-setup.exe` | 普通用户，双击安装（推荐） |
+| **MSI 安装版** | Release 中 `ClaudeSwitcher_0.2.0_x64_zh-CN.msi` | 企业分发 / 域管理 |
 | **免安装可执行文件** | 源码构建产物 `src-tauri\target\release\claude-switcher.exe` | 高手自用，便携 |
 | **开发模式** | `npm run tauri dev` | 二次开发，带热更新 |
 
@@ -155,7 +161,7 @@ claude-switcher-windows/
 ### 一、小白版（只需要双击，适合第一次用）
 
 1. **确认是 64 位系统**：设置 → 系统 → 系统信息 →「系统类型」应含 **64 位操作系统，x64**。若是 ARM64 或 32 位，本工具跑不了。
-2. **下载安装包**：打开本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases) → v0.1.0，下载 `Claude Switcher_0.1.0_x64-setup.exe`（推荐，NSIS 安装包）；也可用 `Claude Switcher_0.1.0_x64_zh-CN.msi`。SHA256 校验值在 Release 说明里。
+2. **下载安装包**：打开本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases) → 最新版，下载 `ClaudeSwitcher_0.2.0_x64-setup.exe`（推荐，NSIS 安装包）；也可用 `ClaudeSwitcher_0.2.0_x64_zh-CN.msi`。SHA256 校验值在 Release 说明与 `SHA256SUMS.txt` 里。
 3. **双击安装包**，按提示点「下一步」直到安装完成。
 4. 若 Windows 弹出 **SmartScreen**「Windows 已保护你的电脑」，点「更多信息」→「仍要运行」。
    > 这是**未签名安装包**的正常提示。请只从本仓库 Release 下载，不要从来路不明的链接安装。
@@ -202,8 +208,8 @@ npm run tauri build
 
 ```text
 src-tauri\target\release\claude-switcher.exe                       # 免安装可执行文件
-src-tauri\target\release\bundle\msi\Claude Switcher_0.1.0_x64_zh-CN.msi
-src-tauri\target\release\bundle\nsis\Claude Switcher_0.1.0_x64-setup.exe
+src-tauri\target\release\bundle\msi\ClaudeSwitcher_0.2.0_x64_zh-CN.msi
+src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.2.0_x64-setup.exe
 ```
 
 补充：
@@ -257,7 +263,7 @@ src-tauri\target\release\bundle\nsis\Claude Switcher_0.1.0_x64-setup.exe
 | 层 | 选型 |
 | --- | --- |
 | 桌面壳 | Tauri 2.11（`tauri.conf.json`，Windows x64，WebView2 `embedBootstrapper`，NSIS 简体中文 + WiX zh-CN） |
-| 后端 | Rust（16 个模块，原 4229 行单文件 `lib.rs` 拆分）；34 个 `#[tauri::command]` |
+| 后端 | Rust（18 个 `.rs` 文件：`lib.rs` + `main.rs` + 13 个业务模块 + `platform/` 3 个文件；原 4229 行单文件 `lib.rs` 拆分）；34 个 `#[tauri::command]` |
 | 前端 | React 19 + TypeScript + Vite + lucide-react；`src/App.tsx` 主窗口、`src/components/ClaudeTrayPopup.tsx` 托盘弹窗 |
 | HTTP | `reqwest` + rustls（替代 `curl.exe`，读系统/环境代理，JSON body 走 socket 不走 argv） |
 | 加密 | AES-256-GCM（`enc:v1:` + base64(nonce 12B ‖ ciphertext)）；主密钥存 Windows 凭据管理器 |
@@ -270,7 +276,7 @@ src-tauri\target\release\bundle\nsis\Claude Switcher_0.1.0_x64-setup.exe
 3. **写文件一律原子**：`fsx::write_atomically`（临时文件 + rename）。绝不用 `fs::write` 直接写 `store.private.json` / `.credentials.json` / `~/.claude.json`——截断式写入中途崩溃会丢数据。rename 失败时**不删**目标文件（旧数据必须保留）。
 4. **凭据与密钥边界**：`settings_json` 里的认证字段（`AUTH_ENV_KEYS` + `apiKeyHelper`）落盘前 `split_auth_settings` 拆出加密，读时 `restore_auth_settings` 合并回去；解密路径**绝不生成新密钥**（缺密钥报错让用户恢复，绝不覆盖）；`keyring::Error` 除 `NoEntry` 外一律致命（PlatformFailure 可能是 DPAPI 失败，当「不存在」会铸新钥覆盖旧数据）。
 
-### 模块划分（src-tauri/src/，16 个模块）
+### 模块划分（src-tauri/src/，18 个 `.rs` 文件：13 个业务模块 + `lib.rs`/`main.rs` + `platform/` 3 个）
 
 | 模块 | 职责 |
 | --- | --- |
@@ -418,9 +424,13 @@ Windows 凭据管理器：claude-switcher-store-key（32B AES-256-GCM 主密钥�
 - 原子写入、文件锁重试（32/33 退避、5 只重试一次）、悬空链接识别、路径归一化（`\\?\` 前缀 / 大小写 / 8.3 短名 / 正斜杠统一，含 `C:\Users\A` vs `C:\Users\AB` 前缀陷阱防护）
 - 读 JSON 自动处理 UTF-8 BOM 与 UTF-16（记事本改过的 settings.json 不会让界面打不开）
 - 事务回滚顺序「先凭据后 JSON」；账号材料已切换后链接激活失败降级为 warning（避免「显示失败、实际已切」）
-- 删除账号三选项确认弹窗（破坏性选项不设默认焦点）
+- 删除账号三选项确认弹窗（破坏性选项不设默认焦点；Esc=取消、初始焦点在「取消」、焦点陷阱、背景滚动锁定）
+- **切换前预检**（v0.2.0）：目标快照凭据可解密 / 配置目录可写，任一失败在动数据前中止（无损放弃点）
+- **切换事务日志**（v0.2.0）：`switch-journal.json` 记录切换目标/步骤/备份 id；正常完成即清除，中断残留会在状态里提示按备份回滚
+- **快照加密导出/导入**（v0.2.0）：单文件 CSBK1 格式（Argon2id + AES-256-GCM，口令 ≥8 位），换机迁移/冷备；导入前自动备份现有 store，口令错/文件损坏绝不覆盖现有数据
+- **应用内版本检查**（v0.2.0）：GitHub Releases 比对，有新版提示并给下载页链接（不自动安装；API 限流静默）
 - 本机日志（`~/.claude-switcher/logs/`，1MB 滚动）+ panic hook + 诊断信息一键复制
-- 新增单元测试：链接识别、悬空链接、路径归一化、原子写入、merge/scrub 逻辑、BOM/UTF-16 解码、进程匹配表格、Windows 反斜杠 `subagents` 过滤、删除链路 `deactivate_in` 等
+- 新增单元测试：链接识别、悬空链接、路径归一化、原子写入、merge/scrub 逻辑、BOM/UTF-16 解码、进程匹配表格、Windows 反斜杠 `subagents` 过滤、删除链路 `deactivate_in`（含硬链接 config.json、悬空 junction、移除失败中止保现场）、版本号比较等
 
 ### 踩过的坑（摘要，全文见 AGENTS.md）
 
@@ -449,7 +459,7 @@ npx tsc --noEmit                            # 前端类型
 npm run tauri build                         # 出 MSI + NSIS
 ```
 
-当前测试状态：**52 通过 + 1 ignored**（`encrypt_decrypt_roundtrip` 需实机凭据存储）。测试覆盖亮点：链接识别与悬空链接、路径归一化（含 8.3 短名）、原子写入、merge/scrub 逻辑、BOM/UTF-16 解码、进程匹配表格（16 例）、Clash 控制器地址归一化（11 例，含 IPv6）、`is_under` 前缀陷阱、删除链路 `deactivate_in`（只删本账号链接）。
+当前测试状态（v0.2.0）：**58 通过 + 1 ignored**（`encrypt_decrypt_roundtrip` 需实机凭据存储；以 `cargo test --lib` 实际输出为准）。测试覆盖亮点：链接识别与悬空链接、路径归一化（含 8.3 短名）、原子写入、merge/scrub 逻辑、BOM/UTF-16 解码、进程匹配表格（16 例）、Clash 控制器地址归一化（11 例，含 IPv6）、`is_under` 前缀陷阱、删除链路 `deactivate_in`（含硬链接 config.json、悬空 junction、移除失败中止保现场）、版本号比较。
 
 ---
 
@@ -463,13 +473,13 @@ npm run tauri build                         # 出 MSI + NSIS
 ## 构建与发布
 
 - `CI`（`.github/workflows/ci.yml`）：push / PR 时在 macOS 与 Windows runner 上跑前端构建、`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --lib`、Tauri build。（macOS runner 的 host 与 target 不同，会额外按 target 再跑一遍 clippy；Windows runner 两者相同，不重复。）
-- `Windows Build`（`.github/workflows/windows-build.yml`）：手动触发或打 `v*` tag，产出 MSI / NSIS 并上传为 Actions 产物。**Release v0.1.0 的安装包即由此工作流构建。**
+- `Windows Build`（`.github/workflows/windows-build.yml`）：打 `v*` tag 自动构建 MSI / NSIS 并**自动创建 Release**（含 `SHA256SUMS.txt`，裸文件名可直接 `sha256sum -c`）；手动触发只出 Actions 产物。**构建来源证明（v0.2.0 起）**：安装包带 GitHub attestation，可验证确实来自本仓库 CI：`gh attestation verify .\ClaudeSwitcher_0.2.0_x64-setup.exe -R 48ytw4q7zg-sudo/claude-switcher-windows`。**从 v0.1.0 升级请先卸载旧版**（v0.2.0 更换了应用标识与发布者署名；用户数据在 `%USERPROFILE%\.claude-switcher\` 不受影响，装完新版自动继续使用）。
 - `macOS Build`（`.github/workflows/macos-build.yml`）：手动触发，产出 macOS app + DMG（供上游功能回归对比）。
-- 未配置代码签名证书；首次运行安装包会有 SmartScreen 提示，属预期。有条件可接 Azure Trusted Signing 或自持证书消除该提示。
+- 未配置代码签名证书；首次运行安装包会有 SmartScreen 提示，属预期。有条件可接 Azure Trusted Signing 或自持证书消除该提示。**路线图**：可申请 SignPath Foundation 面向开源项目的免费代码签名（需项目审核通过）。
 
 ## 出处与许可
 
-- 本仓库是 [VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher)（macOS 版）的 Windows 迁移版，迁移基线 commit [`6897984`](https://github.com/VallierDev/claude-switcher/commit/68979843313a0cb7da3cda32765184436ba9598e)，逐功能对等迁移，平台差异替换为 Windows 等价实现。基线记录与功能映射见 [docs/upstream-baseline.md](docs/upstream-baseline.md)。
+- 本仓库是两个上游的融合：[VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher)（CLI，基线 commit [`6897984`](https://github.com/VallierDev/claude-switcher/commit/68979843313a0cb7da3cda32765184436ba9598e)）与 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher)（环境/桌面版，基线 commit [`870c4ca`](https://github.com/YOURSJEYO/claude-switcher/commit/870c4ca0754234965878ef58144d7a755d965037)），逐功能对等迁移，平台差异替换为 Windows 等价实现。基线记录与功能对等矩阵见 [docs/upstream-baseline.md](docs/upstream-baseline.md)。
 - 本仓库 LICENSE 为 **Apache-2.0**（见 `LICENSE` 文件）。
 - **上游仓库未声明许可证**（无 LICENSE 文件）。若上游后续补充许可，本仓库的许可应与之对齐；在此之前请联系上游作者确认授权范围。
 - 涉及 Anthropic / Claude Code 的商标与名称归其权利人所有。本工具只在本地操作 Claude Code 已生成的文件，不修改、不分发任何 Anthropic 专有代码。
@@ -477,7 +487,7 @@ npm run tauri build                         # 出 MSI + NSIS
 ## 致谢
 
 - 上游原项目与作者：**[@VallierDev](https://github.com/VallierDev)** — [VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher)。本 Windows 迁移版在保持原功能的基础上做了系统适配与加固，感谢上游的设计。
-- 同名工具生态：**[@YOURSJEYO](https://github.com/YOURSJEYO)** — [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher)。与本仓库定位不同（Claude 桌面版环境管理器），感谢其在同类工具上的工作。
+- 第二个融合基线：**[@YOURSJEYO](https://github.com/YOURSJEYO)** — [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher)。本仓库的环境安全与桌面版能力（14 项检查、保镖、地区锁定、规则托管、STUN/指纹、桌面版管理）均来自该上游的行为基准，感谢其设计。
 - 本仓库维护者：[48ytw4q7zg-sudo](https://github.com/48ytw4q7zg-sudo)。
 
 ## 维护与贡献

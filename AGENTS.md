@@ -4,10 +4,16 @@
 
 ## 这是什么
 
-Windows 版 Claude Code CLI 账号切换器（Tauri 2 + Rust + React）。
-上游是 macOS 桌面应用（**同为 Tauri 2 + Rust + React**，非 Swift），
-基线 commit 与功能映射见 [`docs/upstream-baseline.md`](docs/upstream-baseline.md)。
-**不是** YOURSJEYO/claude-switcher（那是 Claude 桌面版环境管理器，已明确不移植）。
+Windows 版 Claude 账号切换器（Tauri 2 + Rust + React），**同时管理
+Claude Code CLI 与 Claude Desktop 桌面版**。
+
+融合两个上游（基线 commit 与功能对等矩阵见 [`docs/upstream-baseline.md`](docs/upstream-baseline.md)）：
+- **VallierDev/claude-switcher**：macOS 桌面应用（同为 Tauri 2 + Rust + React，非 Swift），CLI 账号切换；
+- **YOURSJEYO/claude-switcher**：环境安全 + 桌面版（bash/PowerShell/Swift）。
+
+> **决定反转**：旧文档曾写「YOURSJEYO 已明确不移植」。项目 owner 已明确推翻，
+> 要求把 YOURSJEYO 全部功能一模一样迁移并融合，**不再有「不移植」的说法**。
+> 上游 PowerShell/bash/Swift 仅作逐行行为基准，主交付是 Tauri 应用。
 
 ## 构建与验证命令
 
@@ -39,16 +45,28 @@ src-tauri/src/
 ├── platform/{windows,unix,mod}.rs   # 唯一允许写 cfg 的地方
 ├── paths.rs        # 路径解析 + 目录保障（CLAUDE_CONFIG_DIR 跟随）
 ├── credentials.rs  # 凭据读写（Windows 文件 / macOS Keychain）
-├── store.rs        # 账号快照 + AES-GCM 加密
+├── store.rs        # 账号快照 + AES-GCM 加密（含 DesktopProfile）
 ├── accounts.rs     # 账号材料事务写入 + settings env 注入
-├── isolation.rs    # 按 profile 接管/激活本地状态
+├── isolation.rs    # 按 profile 接管/激活本地状态（CLI）
+├── desktop.rs      # Claude Desktop 快照/捕获/切换/删除（含备份回滚）
+├── appconfig.rs    # 全局配置 appconfig.json（country/tz/locale/proxy_mode/webrtc）
+├── egress.rs       # 出口 IP 探测（Cloudflare/ipinfo）+ 住宅/机房 ASN
+├── region.rs       # 国家→时区/locale/GeoID，IANA→Windows 时区
+├── stun.rs         # UDP STUN 探针（WebRTC 泄漏判定）
+├── checks.rs       # 14 项安全检查 + 静默总检 + 一键修复
+├── guard.rs        # 保镖 kill-switch + 时区看门狗 + 计划任务
+├── rules.rs        # Clash 模式识别 + Script.js 托管规则 + 内核验证/回滚
+├── diagnostics.rs  # open-safe / 代理诊断 / 指纹 / cli-info
+├── keep.rs         # 跨身份保留 keep-in-workspace
+├── export.rs       # 加密快照导出/导入（Argon2id + AES-GCM，CSBK1）
+├── update.rs       # GitHub Release 自动更新
 ├── links.rs        # symlink / junction / 硬链接
 ├── fsx.rs          # 原子写入 + 锁重试
 ├── processes.rs    # Claude Code 进程检测（sysinfo）
 ├── net.rs          # reqwest HTTP（OAuth + Clash）
 ├── usage.rs        # 用量统计 + 缓存
 ├── tray.rs         # 托盘 / 弹窗定位
-└── lib.rs          # Tauri 命令层
+└── lib.rs          # Tauri 命令层（--guard / --autostart 在此分发）
 ```
 
 新增平台相关能力时：先在 `platform/{windows,unix}.rs` 加同名函数，再在业务里调 `platform::imp::xxx`。
@@ -108,6 +126,18 @@ async fn xxx() -> Result<T, String> {
    （Store 版 Node 也在那个目录）。
 10. **reqwest `default-features = false` 会丢掉 `system-proxy`**：Clash 系统代理
     开关就读不到。还要 `rustls-tls-native-roots` 信任 Windows 证书库。
+11. **Tauri command 的返回类型必须 `Serialize`**：新增的 `GuardTick` 一开始只
+    derive(Debug,Clone)，注册进 generate_handler 后报 `async_kind` trait bound 不满足；
+    补 `serde::Serialize` 即可。
+12. **STUN 无响应 ≠ 零泄漏**：UDP 可能被丢弃，必须判为 warn，不能当作没暴露真实 IP。
+13. **Clash 规则只写 `profiles\Script.js` 托管块**（`// >>>/<<< claude-switcher
+    managed rules`），不再写 Merge.yaml；写完重启内核并以 `/rules` 前 16 条验证，
+    失败回滚备份。旧 prepend-rules / 多文档要清理。
+14. **地区按出口动态锁定，不固定 en-US**：Windows beta 把区域写死 en-US 是缺陷；
+    换国家节点后必须能 `set-region`（重锁国家/时区/locale/GeoID）。
+15. **`blocking(|| f())` 对无参函数是 redundant_closure**：clippy 要求直接传函数
+    指针 `blocking(f)`；但被调函数返回非 Result（如直接返回 report）时仍要
+    `blocking(|| Ok(report))`。
 
 ## 实机未验证项（改相关代码后优先测）
 
@@ -115,3 +145,7 @@ async fn xxx() -> Result<T, String> {
 - 多显示器 + 任务栏在左/上/右的托盘弹窗定位。
 - Clash 实机节点切换（控制器地址归一化只有表格测试）。
 - 配置目录切换后的凭据迁移与隔离重建。
+- 保镖真实 kill（Desktop+CLI）、计划任务 highest 注册与 AtLogOn 触发。
+- TUN 网卡、verge.yaml TUN 恢复后 Clash Verge 实机重启。
+- open-safe 真实浏览器拉起/WebRTC 标志/profile 销毁；自动更新全流程。
+- 安装包升级/卸载回归。
