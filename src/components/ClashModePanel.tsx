@@ -7,7 +7,7 @@ import {
   RefreshCw,
   Settings2,
 } from 'lucide-react';
-import type { RulesReport } from './types';
+import type { AppConfig, RulesReport } from './types';
 
 const MODE_LABELS: Record<string, string> = {
   rule: '规则模式 (rule)',
@@ -20,9 +20,11 @@ export function ClashModePanel() {
   const [mode, setMode] = useState<string | null>(null);
   const [rules, setRules] = useState<RulesReport | null>(null);
   const [webrtc, setWebrtc] = useState<string>('proxy');
+  const [proxyGroup, setProxyGroup] = useState<string>('');
   const [loadingMode, setLoadingMode] = useState(false);
   const [writingRules, setWritingRules] = useState(false);
   const [settingWebrtc, setSettingWebrtc] = useState(false);
+  const [savingGroup, setSavingGroup] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const loadMode = useCallback(async () => {
@@ -37,9 +39,22 @@ export function ClashModePanel() {
     }
   }, []);
 
+  // 回读已保存的 WebRTC 策略与代理组：不回读会让面板在重启后显示默认值，
+  // 用户一点按钮就把之前的选择覆盖掉。
+  const loadConfig = useCallback(async () => {
+    try {
+      const cfg = await invoke<AppConfig>('get_appconfig');
+      if (cfg.webrtc_policy) setWebrtc(cfg.webrtc_policy);
+      setProxyGroup(cfg.proxy_group ?? '');
+    } catch {
+      // 配置读取失败不阻塞面板，策略按钮保持默认态。
+    }
+  }, []);
+
   useEffect(() => {
     loadMode();
-  }, [loadMode]);
+    loadConfig();
+  }, [loadMode, loadConfig]);
 
   const writeRules = async () => {
     setWritingRules(true);
@@ -68,7 +83,19 @@ export function ClashModePanel() {
     }
   };
 
-  const busy = loadingMode || writingRules || settingWebrtc;
+  const saveGroup = async () => {
+    setSavingGroup(true);
+    setError(null);
+    try {
+      await invoke('set_proxy_group', { group: proxyGroup });
+    } catch (err) {
+      setError(String(err));
+    } finally {
+      setSavingGroup(false);
+    }
+  };
+
+  const busy = loadingMode || writingRules || settingWebrtc || savingGroup;
 
   return (
     <div className="panel">
@@ -140,6 +167,20 @@ export function ClashModePanel() {
           </button>
         </div>
       </label>
+
+      <label style={{ marginTop: 16 }}>
+        置顶规则目标代理组（留空则用默认组）
+        <input
+          value={proxyGroup}
+          onChange={(e) => setProxyGroup(e.target.value)}
+          placeholder="Auto-Claude"
+          disabled={busy}
+        />
+      </label>
+      <button className="ghost wide" onClick={saveGroup} disabled={busy} style={{ marginTop: 8 }}>
+        {savingGroup ? <Loader2 className="spin" /> : <Settings2 />}
+        保存代理组名
+      </button>
 
       {error && (
         <div className="inline-error" style={{ marginTop: 12 }}>

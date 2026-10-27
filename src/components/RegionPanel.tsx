@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Globe, Loader2, MapPin, RefreshCw, Settings2 } from 'lucide-react';
-import type { EgressInfo, RegionLockReport } from './types';
+import type { AppConfig, EgressInfo, RegionLockReport } from './types';
 
 const CLIENT_OPTIONS = [
   { value: 'auto', label: '自动识别' },
@@ -36,9 +36,21 @@ export function RegionPanel() {
     }
   }, []);
 
+  // 回读已保存的代理客户端：不回读会让下拉框在重启后恒显示「自动识别」，
+  // 用户一选别的就把旧选择覆盖掉。
+  const loadConfig = useCallback(async () => {
+    try {
+      const cfg = await invoke<AppConfig>('get_appconfig');
+      if (cfg.proxy_mode) setClientMode(cfg.proxy_mode);
+    } catch {
+      // 配置读取失败不阻塞面板，下拉保持默认态。
+    }
+  }, []);
+
   useEffect(() => {
     probe();
-  }, [probe]);
+    loadConfig();
+  }, [probe, loadConfig]);
 
   const lockRegion = async () => {
     setLocking(true);

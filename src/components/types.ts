@@ -62,6 +62,17 @@ export interface GuardTick {
   killed: string[];
 }
 
+/** 全局环境/代理偏好（对应后端 appconfig.json）。 */
+export interface AppConfig {
+  country_target?: string | null;
+  tz_target?: string | null;
+  locale_target?: string | null;
+  proxy_mode?: string | null;
+  proxy_group?: string | null;
+  webrtc_policy?: string | null;
+  last_egress_ip?: string | null;
+}
+
 export interface RulesReport {
   mode: string;
   script_changed: boolean;

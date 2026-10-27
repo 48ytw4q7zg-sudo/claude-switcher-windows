@@ -1,128 +1,113 @@
 # Claude Switcher（Windows 版）
 
-[![CI](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/actions/workflows/ci.yml/badge.svg)](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/actions/workflows/ci.yml)
-
 一个 Windows 桌面工具，**同时管理 Claude Code CLI 与 Claude Desktop 桌面版**：
 - **CLI**：保存账号快照、切换 OAuth 凭据、按账号隔离 Claude Code 本地痕迹（会话历史 / 配置 / 遥测等 8 个隔离面），并把每个账号绑定到 Clash Verge 的 `Auto-Claude` 节点；
 - **桌面版**：`%APPDATA%\Claude` 整体快照/切换；
 - **环境安全**：14 项安全检查、一键修复、保镖 kill-switch、时区/地区锁定、Clash 规则托管、STUN/WebRTC 泄漏探测、指纹与 CLI 体检、加密快照、自动更新。
 
-基于 **Tauri 2 + Rust + React 19 + TypeScript** 构建，桌面壳为 Windows 原生 WebView2。融合 [VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher) 与 [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) 两个上游的全部能力。
+基于 **Tauri 2 + Rust + React 19 + TypeScript** 构建，桌面壳为 Windows 原生 WebView2。
 
 ---
 
-## 项目地址与出处
+## 一、原项目地址与平台分工（不同项目对应不同系统）
 
-| 项目 | 地址 |
+本项目**融合了两个上游的全部功能**，它们是**面向不同系统的独立项目**，请勿混用：
+
+| 项目 | 地址 | 面向系统 | 说明 |
+| --- | --- | --- | --- |
+| 上游 A（CLI 切换器） | [VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher) | **macOS** | macOS 原版，同为 Tauri 2 + Rust + React。本仓库的 CLI 账号切换迁移基线为 commit [`6897984`](https://github.com/VallierDev/claude-switcher/commit/68979843313a0cb7da3cda32765184436ba9598e)。感谢原作者 **[@VallierDev](https://github.com/VallierDev)**。 |
+| 上游 B（环境/桌面版） | [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) | **macOS 为主 + Windows（Beta）+ Linux（Beta）** | bash/PowerShell/Swift 实现的环境安全套件。本仓库的第二个融合基线为 commit [`870c4ca`](https://github.com/YOURSJEYO/claude-switcher/commit/870c4ca0754234965878ef58144d7a755d965037)。感谢原作者 **[@YOURSJEYO](https://github.com/YOURSJEYO)**。 |
+| **本仓库** | [48ytw4q7zg-sudo/claude-switcher-windows](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows) | **Windows 10 / 11（x64）** | 把两个上游的能力融合进**同一个 Tauri 应用**，并完成 Windows 适配、模块化重构与加固。 |
+
+> **关于平台分工**：上游 A 是 macOS 的 Claude Code CLI 账号切换器；上游 B 以 macOS 为主，同时提供 Windows（Beta，PowerShell + WPF）与 Linux（Beta，bash + systemd）版本。**三者是不同的项目、面向不同的操作系统**。本仓库是上游 B 的 Windows 能力的**原生重写版**——不再依赖 PowerShell/WPF 脚本，而是用 Rust + React 实现，与上游 A 的 Tauri 技术栈统一，因此同时具备两边的全部功能。
+>
+> **功能融合说明**：本仓库把两个上游的能力统一到一个 Tauri 应用中——
+>
+> | 维度 | 来自 VallierDev（基线 A） | 来自 YOURSJEYO（基线 B） |
+> | --- | --- | --- |
+> | 管理对象 | Claude Code CLI（`~/.claude`、`~/.claude.json`、OAuth 凭据） | Claude Desktop 桌面版（`%APPDATA%\Claude`） |
+> | 核心能力 | 账号快照 / 凭据切换 / 会话隔离 / Clash 节点绑定 / 用量 | 14 项检查、一键修复、保镖/看门狗、地区锁定、规则托管、STUN/指纹/CLI 体检、加密快照、自动更新 |
+>
+> 上游 B 的 PowerShell / bash / Swift 脚本仅作为**逐行行为基准**，所有能力均用 Rust + React 重新实现。Windows 上没有沿用 macOS 的 Keychain / `pgrep` / `security`，而是替换为等价的 Rust + 系统 API。
+>
+> 早期版本的本文件曾写「不包含 YOURSJEYO 的任何代码或功能」，**该表述已作废**：项目 owner 已明确要求融合全部功能。
+
+### 当前交付状态
+
+| 项 | 状态 |
 | --- | --- |
-| 本仓库（源码） | [48ytw4q7zg-sudo/claude-switcher-windows](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows) |
-| 安装包下载 | 本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases)（MSI / NSIS，SHA256 见 Release 说明） |
-| 上游基线 A（CLI） | [VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher)（macOS 版，Tauri 2 + Rust + React） |
-| 上游基线 B（环境/桌面版） | [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher)（bash/PowerShell/Swift，已融合） |
-
-### 平台分工（不同项目对应不同系统）
-
-| 项目 | 面向系统 | 说明 |
-| --- | --- | --- |
-| [VallierDev/claude-switcher](https://github.com/VallierDev/claude-switcher) | **macOS** | 上游原项目，同为 Tauri 2 + Rust + React。本仓库的迁移基线为 commit [`6897984`](https://github.com/VallierDev/claude-switcher/commit/68979843313a0cb7da3cda32765184436ba9598e)。感谢原作者 **[@VallierDev](https://github.com/VallierDev)**。 |
-| **本仓库** | **Windows 10 / 11（x64）** | 融合两个上游的**全部功能**，并完成 Windows 适配、模块化重构与加固；额外提供单实例、开机自启、Clash 控制器覆盖等增强。 |
-| [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) | macOS 为主 + Windows（Beta） | 本仓库的**第二个融合基线**（commit [`870c4ca`](https://github.com/YOURSJEYO/claude-switcher/commit/870c4ca0754234965878ef58144d7a755d965037)）：环境审计、守护进程、时区/地区锁定、Clash 规则、指纹体检、桌面版管理。感谢 **[@YOURSJEYO](https://github.com/YOURSJEYO)**。 |
-
-### 功能融合说明
-
-本仓库把两个上游的能力统一到一个 Tauri 应用中：
-
-| 维度 | 来自 VallierDev（基线 A） | 来自 YOURSJEYO（基线 B） |
-| --- | --- | --- |
-| 管理对象 | Claude Code CLI（`~/.claude`、`~/.claude.json`、OAuth 凭据） | Claude Desktop 桌面版（`%APPDATA%\Claude`） |
-| 核心能力 | 账号快照 / 凭据切换 / 会话隔离 / Clash 节点绑定 / 用量 | 14 项检查、一键修复、保镖/看门狗、地区锁定、规则托管、STUN/指纹/CLI 体检、加密快照、自动更新 |
-
-> 旧版 README 曾写「不包含 YOURSJEYO 的任何代码或功能」。**项目 owner 已明确推翻
-> 该决定，要求融合全部功能**；该表述作废。基线 B 的脚本（PowerShell/bash/Swift）
-> 仅作为逐行行为基准，所有能力均用 Rust + React 重新实现。
-
-**迁移范围**：两个上游的功能**一个不少**（CLI 与桌面版账号管理、备份/还原、一键新号、
-全部隔离面、Clash 节点与规则、14 项检查与一键修复、保镖/看门狗、地区锁定、
-STUN/open-safe/代理诊断/指纹/CLI 体检、加密快照、自动更新）。Windows 上没有沿用
-macOS 的 Keychain / `pgrep` / `security` 或 WPF/Swift，而是替换为等价的 Rust + 系统 API（见「架构」）。
+| 源码 | `main` 分支（本仓库） |
+| 安装包 | **Release v0.2.0**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS），产物来源可审计，SHA256 见 Release 说明 |
+| 测试 | `cargo test --lib` **161 passed / 0 failed / 1 ignored**；`cargo clippy --all-targets -- -D warnings` 零警告；`npx tsc --noEmit` 通过 |
+| 实测环境 | **Windows 11 Pro x64**（build 26300）；Windows 10 未实机验证 |
+| 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
 
 ---
 
-## 当前交付状态
+## 二、项目结构
 
-- 源码：`main` 分支。
-- 安装包：**Release v0.1.0**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 上构建（MSI + NSIS），产物来源可审计，SHA256 见 Release 说明。
-- 开发与实测环境：**Windows 11 Pro x64**（build 26300）。Windows 10 未实机验证（见「验收边界」）。
-- 安装包**未做代码签名**：干净系统首次运行会弹 SmartScreen，属预期（见「常见问题」）。
-
----
-
-## 系统介绍（这是什么、能做什么）
-
-Claude Code CLI 的登录凭据、全局配置和会话历史都散落在用户目录里，多账号使用时会互相覆盖。本工具把这些材料按账号做**快照 + 切换 + 隔离**：
-
-- **保存当前账号**：一键把当前登录态的凭据、`~/.claude.json`、`settings.json` 存成账号快照。
-- **切换账号**：一键把目标账号的材料写回 Claude Code 的存储位置，并把会话历史、配置等本地痕迹换成该账号自己的（切换前自动备份，可回滚）。
-- **会话隔离**：`projects`、`telemetry`、`file-history`、`shell-snapshots`、`cache`、`debug`、`plugins/data`、`config.json` 共 **8 个隔离面**，账号之间互不可见。
-- **Clash 节点绑定**：每个账号可绑定 Clash Verge 的节点（默认组 `Auto-Claude`），切换账号时自动切节点。
-- **一键新号**：向导式登录新账号（准备环境 → 手动完成 OAuth → 自动存成快照）。
-- **备份与恢复**：快照备份带标签管理，切换前自动创建 `before-switch-to-<id>` 备份。
-- **用量展示**：本地 jsonl 日志聚合 + OAuth API 用量，托盘弹窗随时看。
-- **常驻托盘**：单实例、关窗到托盘、开机自启。
-
-### 主窗口面板
-
-当前本机状态 · 保存当前账号 · 一键新号 · 账号快照 · 网络节点（Clash）· Claude 用量 · 备份与恢复 · 数据位置（链接模式 / 配置目录 / 开机自启）· 遥测去关联 · 隐私环境变量注入
-
-### 托盘
-
-| 操作 | 行为 |
-| --- | --- |
-| 单击托盘图标 | 弹出用量窗口 |
-| 双击托盘图标 | 打开主窗口 |
-| 右键托盘图标 | 打开主窗口 / 刷新用量 / 退出 Claude Switcher |
-
-> Windows 11 默认把新装的托盘图标收进「^」溢出区，找不到时见「常见问题」。
-
----
-
-## 项目结构
-
-```
+```text
 claude-switcher-windows/
 ├── src-tauri/
 │   ├── src/
-│   │   ├── lib.rs                 # ★ 命令层：34 个 #[tauri::command] + 应用启动
+│   │   ├── lib.rs                 # ★ 命令层：36 个 #[tauri::command] + 应用启动
 │   │   ├── main.rs                # 桌面程序入口（无控制台窗口）
 │   │   ├── accounts.rs            # 账号材料事务写入 + settings env 注入
-│   │   ├── store.rs               # 账号快照库 + AES-GCM 加密
+│   │   ├── store.rs               # 账号快照库 + AES-GCM 加密（含 DesktopProfile）
 │   │   ├── credentials.rs         # 凭据读写/清除（平台差异收拢）
 │   │   ├── isolation.rs           # 8 个隔离面的接管/激活/取消
 │   │   ├── links.rs               # symlink / junction / 硬链接
 │   │   ├── fsx.rs                 # 原子写入 + 锁重试
 │   │   ├── jsonio.rs              # BOM / UTF-16 容错读写
 │   │   ├── paths.rs               # 路径解析 + 目录保障 + ACL 收敛标记
-│   │   ├── processes.rs           # Claude Code 进程检测/结束
-│   │   ├── net.rs                 # reqwest HTTP（Clash + OAuth）
+│   │   ├── processes.rs           # Claude Code CLI 进程检测/结束
+│   │   ├── net.rs                 # reqwest HTTP（Clash 控制器 + OAuth）
 │   │   ├── clash.rs               # Clash 节点状态/切换/延迟检查
-│   │   ├── usage.rs               # 用量统计 + 缓存
+│   │   ├── usage.rs               # 用量统计 + 缓存（TTL + in-flight 合并）
 │   │   ├── tray.rs                # 托盘/弹窗定位
+│   │   ├── export.rs              # 加密快照导出/导入（CSBK1：Argon2id + AES-GCM）
+│   │   ├── update.rs              # GitHub Release 版本检查
+│   │   ├── appconfig.rs           # 全局配置 appconfig.json（country/tz/locale/proxy_mode/proxy_group/webrtc）
+│   │   ├── egress.rs              # 出口 IP 探测（Cloudflare trace + ipinfo）+ 住宅/机房 ASN
+│   │   ├── region.rs              # 国家→时区/locale/GeoID 映射、IANA→Windows 时区
+│   │   ├── stun.rs                # UDP STUN 探针（WebRTC 泄漏判定）
+│   │   ├── desktop.rs             # Claude Desktop 快照/捕获/切换/删除（含回存与回滚）
+│   │   ├── guard.rs               # 保镖 kill-switch + 时区看门狗 + 计划任务
+│   │   ├── rules.rs               # Clash 模式识别 + Script.js 托管规则 + 内核验证/回滚
+│   │   ├── checks.rs              # 14 项安全检查 + 静默总检 + 一键修复
+│   │   ├── keep.rs                # 跨身份保留 keep-in-workspace（stage/merge）
+│   │   ├── diagnostics.rs         # open-safe / 代理诊断 / 指纹 / cli-info
 │   │   └── platform/              # ★ 唯一允许写 #[cfg] 的地方
 │   │       ├── mod.rs             # 平台分发入口（imp）
-│   │       ├── windows.rs         # 全部 Win32 细节
+│   │       ├── windows.rs         # 全部 Win32 细节（含计划任务/服务/网卡查询）
 │   │       └── unix.rs            # 同名 API 的 Unix 实现（macOS 不回归）
 │   ├── Cargo.toml
 │   ├── tauri.conf.json            # 窗口/托盘/打包（WebView2 embedBootstrapper）
+│   ├── windows-app.manifest       # asInvoker / longPathAware / comctl32 v6
 │   └── icons/
 ├── src/
 │   ├── App.tsx                    # 主窗口（React 19 + TypeScript）
-│   ├── components/ClaudeTrayPopup.tsx  # 托盘用量弹窗
-│   └── *.css
+│   ├── App.css
+│   ├── main.tsx
+│   ├── useModalDialog.ts          # 弹窗 Esc/焦点陷阱/滚动锁定
+│   ├── components/
+│   │   ├── ClaudeTrayPopup.tsx    # 托盘用量弹窗
+│   │   ├── SecurityPanel.tsx      # 14 项安检 + 一键修复
+│   │   ├── GuardPanel.tsx         # 保镖安装/巡检
+│   │   ├── RegionPanel.tsx        # 地区锁定 + 代理客户端
+│   │   ├── ClashModePanel.tsx     # Clash 模式/规则/WebRTC 策略/代理组
+│   │   ├── DesktopProfiles.tsx    # Claude Desktop 账号管理
+│   │   ├── PrivacyTools.tsx       # open-safe / 代理诊断 / 指纹 / cli-info
+│   │   └── types.ts               # 前后端契约类型
 ├── docs/
-│   └── upstream-baseline.md       # 上游基线记录 + 功能映射 + 升级审查流程
+│   ├── upstream-baseline.md       # 双上游基线记录 + 功能对等矩阵 + 升级审查流程
+│   ├── backend-interfaces.md      # 平台层契约
+│   ├── qa-report.md               # QA 报告（含第二轮全量复核的 19 项修复记录）
+│   ├── release-v0.1.0.md          # v0.1.0 发布记录
+│   └── prior-session-recovery.md  # 前序会话恢复报告
 ├── .github/workflows/
 │   ├── ci.yml                     # push / PR 质量门禁（macOS + Windows）
-│   ├── windows-build.yml          # 手动 / v* tag → MSI + NSIS
+│   ├── windows-build.yml          # 手动 / v* tag → MSI + NSIS + Release
 │   └── macos-build.yml            # 手动 → macOS app + DMG
 ├── AGENTS.md                      # 维护者交接说明（踩坑记录全文）
 ├── LICENSE                        # Apache-2.0
@@ -131,7 +116,7 @@ claude-switcher-windows/
 
 ---
 
-## 运行形态总览
+## 三、运行形态总览
 
 | 形态 | 入口 | 适用场景 |
 | --- | --- | --- |
@@ -140,25 +125,27 @@ claude-switcher-windows/
 | **免安装可执行文件** | 源码构建产物 `src-tauri\target\release\claude-switcher.exe` | 高手自用，便携 |
 | **开发模式** | `npm run tauri dev` | 二次开发，带热更新 |
 
+### 这是什么、能做什么
+
+Claude Code CLI 的登录凭据、全局配置和会话历史都散落在用户目录里，多账号使用时会互相覆盖。本工具把这些材料按账号做**快照 + 切换 + 隔离**，并对 Claude Desktop 桌面版做同样的事，外加一整套环境安全审计：
+
+- **CLI 账号管理**：保存当前账号（凭据 + `~/.claude.json` + `settings.json`）→ 一键切换（自动备份、可回滚）→ 一键新号向导。
+- **会话隔离**：`projects`、`telemetry`、`file-history`、`shell-snapshots`、`cache`、`debug`、`plugins/data`、`config.json` 共 **8 个隔离面**，账号之间互不可见。
+- **Clash 节点绑定**：每个账号可绑定 Clash Verge 节点（默认组 `Auto-Claude`），切换账号时自动切节点。
+- **Claude Desktop 管理**：`%APPDATA%\Claude` 整体快照/切换，**切换前自动把当前使用变更回存**，失败自动回滚。
+- **环境安全**：14 项检查 + 一键修复 + 保镖 kill-switch（代理掉线秒级杀进程）+ 时区看门狗。
+- **隐私工具**：STUN 泄漏探测、一次性隔离浏览器、代理诊断、系统指纹体检、CLI 安装体检。
+- **数据迁移**：加密快照导出/导入（CSBK1），换机冷备。
+
+### 主窗口面板（9 个）
+
+当前本机状态 · 保存当前账号 · 一键新号 · 账号快照 · 网络节点（Clash）· Claude 用量 · 备份与恢复 · 数据位置（链接模式 / 配置目录 / 开机自启）· 遥测去关联 · **环境安检**（14 项 + 一键修复）· **保镖**（安装 / 立即巡检 / 卸载）· **地区与代理客户端**（set-region / set-client / 代理组）· **Clash 模式与规则**（模式识别 / 写规则 / WebRTC 策略）· **Claude Desktop 账号** · **隐私与诊断工具**
+
+### 托盘
+
 ---
 
-## 安装使用教程
-
-### 选你的教程
-
-| 你是谁 | 看哪一段 |
-| --- | --- |
-| 电脑新手，要一步一步点鼠标 | **小白版** |
-| 会用终端、想源码构建 / 命令行排障 | **高手版** |
-
-> **重要前提（官方验收边界，别跳过）**
->
-> - 仅支持 **Windows 10/11 的 64 位（x64）**；32 位、Windows 7/8.1、原生 ARM64 不在支持范围。
-> - 实测环境为 Windows 11 Pro x64（build 26300）；**Windows 10 未实机验证**。
-> - 安装包未做代码签名，SmartScreen 提示属预期。
-> - WebView2 运行时由安装包自动引导安装（`embedBootstrapper`），无需手动安装运行库。
-
-### 一、小白版（只需要双击，适合第一次用）
+## 四、安装使用教程
 
 1. **确认是 64 位系统**：设置 → 系统 → 系统信息 →「系统类型」应含 **64 位操作系统，x64**。若是 ARM64 或 32 位，本工具跑不了。
 2. **下载安装包**：打开本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases) → 最新版，下载 `ClaudeSwitcher_0.2.0_x64-setup.exe`（推荐，NSIS 安装包）；也可用 `ClaudeSwitcher_0.2.0_x64_zh-CN.msi`。SHA256 校验值在 Release 说明与 `SHA256SUMS.txt` 里。
@@ -244,7 +231,7 @@ src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.2.0_x64-setup.exe
 
 ## 验收边界（实机未验证项）
 
-以下功能已实现并有单元测试或代码审查覆盖，但**未在真实 Windows 环境实机验证**（沙箱无显示器、无 Claude Code 登录态）：
+以下功能已实现并有单元测试或代码审查覆盖，但**未在真实 Windows 环境实机验证**（沙箱无管理员权限、无显示器、无 Claude Code 登录态）：
 
 | 项 | 状态 |
 | --- | --- |
@@ -253,6 +240,20 @@ src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.2.0_x64-setup.exe
 | Clash 实机节点切换（控制器地址归一化只有表格测试） | 未实机验证 |
 | 配置目录切换后的凭据迁移与隔离重建 | 未实机验证 |
 | 安装包升级 / 卸载回归（需要干净虚拟机） | 未实机验证 |
+| **保镖真实 kill**（Desktop + CLI）、计划任务 highest 权限注册与 AtLogOn 触发 | 未实机验证 |
+| **TUN 网卡探测**、`verge.yaml` TUN 开关恢复后 Clash Verge 实机重启加载 | 未实机验证 |
+| **14 项检查的真实网络链路**（出口 IP / DNS / WebRTC / 生态可达性） | 未实机验证 |
+| **UAC 提权弹窗**、`lock_region` 真实写入系统时区/区域/GeoID | 未实机验证 |
+| **open-safe 真实浏览器拉起**、WebRTC 标志生效、profile 销毁 | 未实机验证 |
+| **一键修复全流程**（拉起内核 → 恢复 TUN → 写规则 → 内核验证 → 注册保镖 → 复测） | 未实机验证 |
+| **Claude Desktop 切换**（进程结束、活目录回存、快照载入、回滚） | 未实机验证 |
+| **自动更新全流程** | 未实机验证 |
+| **加密快照跨机导入** | 未实机验证（导入侧已加外机密文拒绝，但换机场景未实测） |
+
+> 另有两项**已知功能缺口**（非缺陷，未在第二轮补齐）：
+> ① 自动更新目前只做版本检查并提供下载页链接，不自动下载安装（未签名场景下 updater 插件方案不现实）；
+> ② 上游的「48 小时出口 IP 漂移历史」警告未实现（当前只比对上一次出口）。
+> 详见 `docs/qa-report.md` 第四之二节。
 
 ---
 
@@ -263,41 +264,68 @@ src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.2.0_x64-setup.exe
 | 层 | 选型 |
 | --- | --- |
 | 桌面壳 | Tauri 2.11（`tauri.conf.json`，Windows x64，WebView2 `embedBootstrapper`，NSIS 简体中文 + WiX zh-CN） |
-| 后端 | Rust（18 个 `.rs` 文件：`lib.rs` + `main.rs` + 13 个业务模块 + `platform/` 3 个文件；原 4229 行单文件 `lib.rs` 拆分）；34 个 `#[tauri::command]` |
-| 前端 | React 19 + TypeScript + Vite + lucide-react；`src/App.tsx` 主窗口、`src/components/ClaudeTrayPopup.tsx` 托盘弹窗 |
-| HTTP | `reqwest` + rustls（替代 `curl.exe`，读系统/环境代理，JSON body 走 socket 不走 argv） |
-| 加密 | AES-256-GCM（`enc:v1:` + base64(nonce 12B ‖ ciphertext)）；主密钥存 Windows 凭据管理器 |
+| 后端 | Rust（**27 个 `.rs` 文件**：`lib.rs` + `main.rs` + 23 个业务模块 + `platform/` 3 个文件；原 4229 行单文件 `lib.rs` 拆分）；**36 个 `#[tauri::command]`** |
+| 前端 | React 19 + TypeScript + Vite + lucide-react；`src/App.tsx` 主窗口 + 7 个功能面板组件 |
+| HTTP | `reqwest` + rustls（替代 `curl.exe`，读系统/环境代理，JSON body 走 socket 不走 argv，含 `socks` feature） |
+| 加密 | AES-256-GCM（`enc:v1:` + base64(nonce 12B ‖ ciphertext)）；主密钥存 Windows 凭据管理器；快照导出用 Argon2id + AES-256-GCM（CSBK1） |
 | 系统 API | `sysinfo`（进程）、`windows-sys`（文件 ID、reparse tag、SID、长路径）、`junction` crate、`keyring`（凭据管理器） |
+| 系统查询 | 隐藏 PowerShell + `ConvertTo-Json`（网卡/时区/区域/IPv6/计划任务/服务；枚举值不随 UI 语言本地化） |
 
-### 设计原则（四条硬规则）
+### 设计原则（五条硬规则）
 
 1. **cfg 收拢**：所有平台差异必须收拢在 `platform/{windows,unix}.rs`，业务代码不写 `#[cfg(windows)]`。新增平台能力时：先在 platform 加同名函数，再在业务里调 `platform::imp::xxx`。
-2. **阻塞命令走 `blocking()`**：Tauri 2 中非 `async` 命令跑在主线程，任何可能阻塞的（网络、进程扫描、目录 rename、凭据读取）都必须 `blocking(|| ...)` 包装。**不用** `#[tauri::command(async)]` 包同步函数（会跑在 tokio 工作线程，调 `reqwest::blocking` 有 panic 风险）。
+2. **阻塞命令走 `blocking()`**：Tauri 2 中非 `async` 命令跑在主线程，任何可能阻塞的（网络、进程扫描、目录 rename、凭据读取、PowerShell 查询）都必须 `blocking(|| ...)` 包装。**不用** `#[tauri::command(async)]` 包同步函数（会跑在 tokio 工作线程，调 `reqwest::blocking` 有 panic 风险）。
 3. **写文件一律原子**：`fsx::write_atomically`（临时文件 + rename）。绝不用 `fs::write` 直接写 `store.private.json` / `.credentials.json` / `~/.claude.json`——截断式写入中途崩溃会丢数据。rename 失败时**不删**目标文件（旧数据必须保留）。
 4. **凭据与密钥边界**：`settings_json` 里的认证字段（`AUTH_ENV_KEYS` + `apiKeyHelper`）落盘前 `split_auth_settings` 拆出加密，读时 `restore_auth_settings` 合并回去；解密路径**绝不生成新密钥**（缺密钥报错让用户恢复，绝不覆盖）；`keyring::Error` 除 `NoEntry` 外一律致命（PlatformFailure 可能是 DPAPI 失败，当「不存在」会铸新钥覆盖旧数据）。
+5. **PowerShell 错误必须显式传播**：PowerShell 的非终止错误（`Write-Error`）**不改变进程退出码**，所以 `run_ps` 的脚本头强制 `$ErrorActionPreference = 'Stop'`，把非终止错误转成非零退出码；否则「设置失败」会被当成成功上报。
 
-### 模块划分（src-tauri/src/，18 个 `.rs` 文件：13 个业务模块 + `lib.rs`/`main.rs` + `platform/` 3 个）
+### 模块划分（src-tauri/src/，27 个 `.rs` 文件：23 个业务模块 + `lib.rs`/`main.rs` + `platform/` 3 个）
+
+**来自上游 A（VallierDev，CLI 账号切换）——13 个模块：**
 
 | 模块 | 职责 |
 | --- | --- |
-| `lib.rs` | 34 个命令处理器、返回类型、应用启动（单实例、关窗到托盘）、日志与 panic hook |
+| `lib.rs` | 36 个命令处理器、返回类型、应用启动（单实例、关窗到托盘、`--guard`/`--autostart` 分发）、日志与 panic hook |
 | `main.rs` | 桌面程序入口（`windows_subsystem = "windows"` 无黑窗），调 `claude_switcher_lib::run()` |
 | `accounts.rs` | 账号材料事务写入：Merge / FullReplace 两种语义、回滚「先凭据后 JSON」、settings env 注入（遥测 + runtime） |
-| `store.rs` | `store.private.json` 读写；AES-GCM 加解密；`split_auth_settings` / `restore_auth_settings`；密钥「只读现有、解密绝不铸新钥」 |
+| `store.rs` | `store.private.json` 读写；AES-GCM 加解密；`split_auth_settings` / `restore_auth_settings`；`DesktopProfile` 与 `current_desktop_profile_id`；密钥「只读现有、解密绝不铸新钥」 |
 | `credentials.rs` | Windows 凭据文件 / macOS Keychain 的读写与清除（差异收拢进 platform） |
 | `isolation.rs` | 按 profile 接管/激活 `projects`、`telemetry`、`file-history`、`shell-snapshots`、`cache`、`debug`、`plugins/data`、`config.json` 共 8 个隔离面 |
 | `links.rs` | 符号链接 / junction / 硬链接的创建、识别（含悬空链接）、移除与链接模式上报 |
-| `fsx.rs` | 原子写入（`.原文件名.tmp-<rand>` + rename）、rename/删除锁重试（Windows 错误 5/32/33 短退避）、错误人性化 |
+| `fsx.rs` | 原子写入（`.原文件名.tmp-<rand>` + rename）、rename/删除锁重试（Windows 错误 5/32/33 短退避）、陈旧临时文件清理 |
 | `jsonio.rs` | 文本读取自动处理 UTF-8 BOM 与 UTF-16LE/BE（记事本改过的 settings.json 不会让界面打不开） |
 | `paths.rs` | 路径解析（`CLAUDE_CONFIG_DIR` → `USERPROFILE` → `home_dir`）与目录保障、ACL 一次性收敛标记 |
 | `processes.rs` | Claude Code CLI 检测与结束（精确匹配防误杀，`taskkill /T` → `/T /F`） |
-| `net.rs` | Clash 控制器 / OAuth 请求、默认端口真实探测（9097 → 9090）、代理回退与超时预算 |
 | `clash.rs` | 节点组状态、切换、节点 alive 与到 `api.anthropic.com` 的延迟检查 |
-| `usage.rs` | 本地日志聚合 + OAuth usage/profile 的 TTL 缓存与 in-flight 合并 + 本地快照 45 秒缓存 |
+| `usage.rs` | 本地日志聚合 + OAuth usage/profile 的 TTL 缓存与 in-flight 合并 + 本地快照 45 秒缓存 + token 指纹防串号 |
 | `tray.rs` | 托盘 tooltip、弹窗定位（工作区/多屏）、失焦防抖、右键菜单 |
+
+**来自上游 B（YOURSJEYO，环境安全 / 桌面版）——10 个模块：**
+
+| 模块 | 职责 |
+| --- | --- |
+| `appconfig.rs` | 全局配置 `~/.claude-switcher/appconfig.json`：`country_target` / `tz_target` / `locale_target` / `proxy_mode` / `proxy_group` / `webrtc_policy` / `last_egress_ip`；读取失败记日志（不静默覆盖） |
+| `egress.rs` | 出口 IP 探测：Cloudflare `cdn-cgi/trace` 优先、`ipinfo.io/json` 兜底；住宅 vs 机房 ASN 启发式 |
+| `region.rs` | 国家 → 时区 / locale / GeoID 映射表（11 国）；IANA → Windows 时区 ID（约 60 条）；未知回退 US / UTC |
+| `stun.rs` | 手写 RFC 5389 STUN 协议栈：并发向 5 台服务器（含 3 台国内节点）发 Binding Request，解析 XOR-MAPPED / MAPPED-ADDRESS；**无响应判 warn，绝不视为零暴露** |
+| `desktop.rs` | Claude Desktop（`%APPDATA%\Claude`）快照 / 捕获 / 切换 / 删除 / 重命名；**切换前把活目录回存当前账号快照**（上游 `Save-Account` 语义）；失败用 staging 备份回滚 |
+| `guard.rs` | 保镖 kill-switch（10s 巡检、fail-closed、杀 Desktop + CLI）+ 时区看门狗（偏离 `tz_target` 自动回滚）+ `ClaudeBodyguard` 计划任务注册/启动 |
+| `rules.rs` | Clash 模式识别（Mihomo `/configs` → 回退 yaml `mode:`）；只写 `profiles\Script.js` 托管块（不写 Merge.yaml）；重启后经内核 `/rules` 逐条验证前 16 条，失败从备份回滚 |
+| `checks.rs` | **14 项安全检查** + 静默总检（N/14）+ 一键修复（拉起内核 → 恢复 TUN 开关 → 锁时区 → 关 IPv6 → 写规则 → 注册保镖 → 复测） |
+| `keep.rs` | 跨身份保留 `keep-in-workspace.txt`：stage（切换前收进暂存）/ merge（还原后合并）；**拒绝绝对路径、`..`、盘符前缀、符号链接**；残留暂存拒绝覆盖 |
+| `diagnostics.rs` | open-safe（一次性隔离浏览器，禁用非代理 UDP，关闭即销毁 profile）/ diagnose-proxy（无认证传输可达性，401/403 分类，不回显凭据）/ fingerprint（系统侧指纹 + 虚拟机启发式）/ cli-info（PATH 顺序、版本、安装方式、多份告警；**带 8s 超时**） |
+| `export.rs` | 加密快照导出/导入（CSBK1：magic + salt16 + nonce12 + AES-256-GCM，Argon2id m=64MiB/t=3/p=1，口令 ≥8）；**导入前检测外机密文并拒绝**（避免换机后整个账号库不可用） |
+| `update.rs` | GitHub Releases latest 版本比对（只提示不自动安装；API 限流静默） |
+| `net.rs`（扩展） | Clash 控制器运行时配置探测：手动覆盖 > yaml > 端口探测（9097 → 9090）；**只接受回环控制器**（拒绝远程主机，防止 secret 外发） |
+| `platform/windows.rs`（扩展） | 新增：网卡列表、IPv6 绑定、时区读写、区域/GeoID、计划任务注册/删除/**启动**、WireGuard 隧道服务查询、无窗口进程拉起、按名/按 PID 结束进程 |
+
+**平台分发：**
+
+| 模块 | 职责 |
+| --- | --- |
 | `platform/mod.rs` | **平台分发唯一入口**：`#[cfg]` 只出现在这里与 `windows.rs` / `unix.rs`；两文件提供同名 API |
 
-### 命令清单（34 个 `#[tauri::command]`，按域分组）
+### 命令清单（36 个 `#[tauri::command]`，按域分组）
 
 | 域 | 命令 |
 | --- | --- |
@@ -311,14 +339,21 @@ src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.2.0_x64-setup.exe
 | 窗口 / 托盘 | `show_main_window_cmd`、`hide_main_window_cmd`、`quit_app_cmd` |
 | 设置 | `set_telemetry_mode`、`set_autostart`、`get_autostart`、`open_developer_settings` |
 | 数据目录 | `open_data_dir`、`open_logs_dir`、`get_logs_dir` |
+| **环境安检** | `run_security_checks`、`run_security_fix`、`detect_egress` |
+| **地区 / 客户端** | `lock_region`、`set_client`、`get_appconfig`、`set_proxy_group`、`set_webrtc_policy` |
+| **保镖** | `guard_status`、`guard_run_tick`、`install_guard_cmd`、`uninstall_guard_cmd` |
+| **Clash 规则** | `get_clash_mode`、`ensure_clash_rules` |
+| **Claude Desktop** | `list_desktop_profiles_cmd`、`capture_desktop_profile_cmd`、`switch_desktop_profile_cmd`、`delete_desktop_profile_cmd`、`rename_desktop_profile_cmd` |
+| **隐私 / 诊断** | `open_safe_cmd`、`close_safe_cmd`、`diagnose_proxy_cmd`、`system_fingerprint_cmd`、`cli_info_cmd` |
+| **加密快照** | `export_store_encrypted`、`import_store_encrypted`、`check_for_update` |
 
 ### 关键数据流
 
 ```
-React 主窗口 / 托盘弹窗
-        │  invoke（34 个命令）
+React 主窗口（7 个面板） / 托盘弹窗
+        │  invoke（36 个命令，阻塞操作全部经 blocking() 移出主线程）
         ▼
-lib.rs（命令层，阻塞操作全部经 blocking() 移出主线程）
+lib.rs（命令层）
    ├─ accounts.rs ── credentials.rs ──► %USERPROFILE%\.claude\.credentials.json
    │        │                          %USERPROFILE%\.claude.json
    │        │                          <claude_dir>\settings.json
@@ -326,8 +361,20 @@ lib.rs（命令层，阻塞操作全部经 blocking() 移出主线程）
    │                          主密钥 → Windows 凭据管理器 claude-switcher-store-key
    ├─ isolation.rs ── links.rs ──► session-profiles/<profile-id>/ 的链接与备份
    ├─ processes.rs ── sysinfo ──► Claude Code CLI 进程
-   ├─ net.rs / clash.rs ──► Clash 控制器（127.0.0.1:9097 / 9090）
-   └─ usage.rs ──► <claude_dir>\projects\**\*.jsonl  +  api.anthropic.com OAuth usage
+   ├─ net.rs / clash.rs ──► Clash 控制器（仅回环 127.0.0.1:9097 / 9090）
+   ├─ usage.rs ──► <claude_dir>\projects\**\*.jsonl  +  api.anthropic.com OAuth usage
+   │
+   ├─【YOURSJEYO 融合链路】
+   ├─ checks.rs ──┬─ guard.rs ──► 计划任务 ClaudeBodyguard（10s 巡检、fail-closed）
+   │              ├─ egress.rs ──► cloudflare trace / ipinfo.io
+   │              ├─ stun.rs ──► 5 台 STUN 服务器（UDP Binding）
+   │              ├─ rules.rs ──► profiles\Script.js + 内核 /rules 验证
+   │              ├─ region.rs + platform::imp ──► 系统时区 / 区域 / GeoID
+   │              └─ platform::imp ──► 网卡 / IPv6 绑定 / DNS 解析
+   ├─ desktop.rs ──► %APPDATA%\Claude 活目录 ↔ desktop-accounts/<id> 快照
+   ├─ keep.rs ──► keep-in-workspace.txt ↔ keep-stage/
+   ├─ diagnostics.rs ──► 隔离浏览器 / 代理诊断 / 指纹 / CLI 体检
+   └─ export.rs ──► CSBK1 加密快照文件（Argon2id + AES-256-GCM）
 ```
 
 ### 数据与存储布局
@@ -412,13 +459,20 @@ Windows 凭据管理器：claude-switcher-store-key（32B AES-256-GCM 主密钥�
 | 网络请求 | `curl` | `reqwest` + rustls（无黑窗、无 PATH 依赖、读系统代理） |
 | 托盘弹窗 | 图标下方弹出 | 图标上方弹出，按点击坐标所在显示器 + 工作区夹紧，失焦 500ms 防抖，双击图标打开主窗口 |
 | 打开数据目录 | `open` | `explorer`（spawn，忽略非零退出码） |
+| **环境查询** | `ifconfig` / `scutil` / `launchctl` / `dig` | 隐藏 PowerShell + `ConvertTo-Json`（网卡、IPv6 绑定、时区、区域、GeoID、计划任务、服务；**枚举值不随 UI 语言本地化**） |
+| **计划任务** | `launchctl` LaunchDaemon | Windows 计划任务 `ClaudeBodyguard`（AtLogOn + RunLevel Highest），注册后**立即启动**（不等下次登录） |
+| **WireGuard 存活** | `scutil --nc list` | `Get-Service WireGuardTunnel*` 查 Running（GUI 开着≠隧道在线） |
+| **kill-switch** | `pkill claude` | `taskkill /T /F` 结束 Desktop + CLI；**Desktop 按 exe 路径判定 PID 后终止**（主程序镜像名可能不是 `Claude`） |
+| **规则托管** | `profiles/Script.js` 全局扩展脚本 | 同名同机制；内核验证用 `GET /rules`，**必须容忍 `{"rules":[...]}` 包装** |
+| **地区锁定** | `defaults write` / `systemsetup` | `Set-TimeZone` / `Set-Culture` / `Set-WinHomeLocation`（需管理员） |
+| **加密快照** | `hdiutil` AES-256 DMG | 单文件 CSBK1（Argon2id + AES-256-GCM），跨平台可用 |
 
 ### 本仓库额外增强
 
 - 单实例（避免双开并发写 store）
 - 关窗到托盘 + 右键退出 + 开机自启（`HKCU\...\Run`，带 `--autostart` 静默启动参数）
-- Clash 控制器 / secret / 代理端口手动覆盖；默认端口 9097 → 9090 真实探测
-- 用量 TTL 缓存 + 并发 in-flight 合并 + 本地快照 45 秒缓存
+- Clash 控制器 / secret / 代理端口手动覆盖；默认端口 9097 → 9090 真实探测；**只接受回环控制器**（拒绝远程主机，防止 secret 外发）
+- 用量 TTL 缓存 + 并发 in-flight 合并 + 本地快照 45 秒缓存 + token 指纹防串号
 - 链接模式显示与开发者模式一键引导（`ms-settings:developers`）
 - 手动指定 Claude 配置目录（解决 GUI 启动读不到终端环境变量的问题）
 - 原子写入、文件锁重试（32/33 退避、5 只重试一次）、悬空链接识别、路径归一化（`\\?\` 前缀 / 大小写 / 8.3 短名 / 正斜杠统一，含 `C:\Users\A` vs `C:\Users\AB` 前缀陷阱防护）
@@ -427,10 +481,15 @@ Windows 凭据管理器：claude-switcher-store-key（32B AES-256-GCM 主密钥�
 - 删除账号三选项确认弹窗（破坏性选项不设默认焦点；Esc=取消、初始焦点在「取消」、焦点陷阱、背景滚动锁定）
 - **切换前预检**（v0.2.0）：目标快照凭据可解密 / 配置目录可写，任一失败在动数据前中止（无损放弃点）
 - **切换事务日志**（v0.2.0）：`switch-journal.json` 记录切换目标/步骤/备份 id；正常完成即清除，中断残留会在状态里提示按备份回滚
-- **快照加密导出/导入**（v0.2.0）：单文件 CSBK1 格式（Argon2id + AES-256-GCM，口令 ≥8 位），换机迁移/冷备；导入前自动备份现有 store，口令错/文件损坏绝不覆盖现有数据
+- **快照加密导出/导入**（v0.2.0）：单文件 CSBK1 格式（Argon2id + AES-256-GCM，口令 ≥8 位），换机迁移/冷备；导入前自动备份现有 store，**并检测外机密文拒绝导入**（避免换机后整个账号库不可用）；口令错/文件损坏绝不覆盖现有数据
 - **应用内版本检查**（v0.2.0）：GitHub Releases 比对，有新版提示并给下载页链接（不自动安装；API 限流静默）
+- **Desktop 活目录回存**：切换前把当前账号的使用变更写回它的快照（对齐上游 `Save-Account`），不会静默回退到上次 capture
+- **keep 沙箱加固**：拒绝绝对路径、`..`、**盘符相对路径**（`C:foo`/`C:`，`PathBuf::join` 会整体替换 base）、符号链接
+- **cli_info 带 8 秒超时**：PATH 上挂起的 `claude.cmd` 不会让体检永久卡死
+- **前端配置回读**：`get_appconfig` 让面板显示已保存值，不会重启后显示默认值并覆盖旧选择
+- **代理组可配置**：`set_proxy_group` + 面板输入框；未配置时回落默认组 `Auto-Claude`（装完即可用）
 - 本机日志（`~/.claude-switcher/logs/`，1MB 滚动）+ panic hook + 诊断信息一键复制
-- 新增单元测试：链接识别、悬空链接、路径归一化、原子写入、merge/scrub 逻辑、BOM/UTF-16 解码、进程匹配表格、Windows 反斜杠 `subagents` 过滤、删除链路 `deactivate_in`（含硬链接 config.json、悬空 junction、移除失败中止保现场）、版本号比较等
+- **单元测试 161 个**（基线 57 → 新增 104）：链接识别、悬空链接、路径归一化、原子写入、merge/scrub 逻辑、BOM/UTF-16 解码、进程匹配表格、删除链路 `deactivate_in`、版本号比较、14 项检查判定表、TUN 检测表、STUN 协议解析、规则验证（含内核 `{"rules":[...]}` 包装）、地区映射、Desktop 回存与回滚、keep 沙箱、控制器回环校验、PowerShell 错误传播等
 
 ### 踩过的坑（摘要，全文见 AGENTS.md）
 
