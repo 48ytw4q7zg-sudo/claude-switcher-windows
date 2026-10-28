@@ -79,11 +79,14 @@ fn encode_utf16le_base64(script: &str) -> String {
 /// 尝试用 Windows Terminal 启动（新窗口）。
 fn launch_wt(encoded: &str) -> Result<(), String> {
     // wt -w new powershell -NoExit -EncodedCommand <b64>
+    // 用 PowerShell 完整路径，避免 PATH 缺少 WindowsPowerShell 目录时拉起失败。
+    let ps = crate::platform::imp::powershell_path();
+    let ps = ps.to_string_lossy();
     let output = Command::new("wt.exe")
         .args([
             "-w",
             "new",
-            "powershell",
+            ps.as_ref(),
             "-NoExit",
             "-EncodedCommand",
             encoded,
@@ -99,12 +102,15 @@ fn launch_wt(encoded: &str) -> Result<(), String> {
 
 /// 退回方案：cmd /c start 开一个可见的 PowerShell 窗口（勿用 silent_command）。
 fn launch_via_cmd_start(encoded: &str) -> Result<(), String> {
+    // 用 PowerShell 完整路径，避免 PATH 缺少 WindowsPowerShell 目录时拉起失败。
+    let ps = crate::platform::imp::powershell_path();
+    let ps = ps.to_string_lossy();
     let output = Command::new("cmd")
         .args([
             "/C",
             "start",
             "Claude",
-            "powershell",
+            ps.as_ref(),
             "-NoExit",
             "-EncodedCommand",
             encoded,

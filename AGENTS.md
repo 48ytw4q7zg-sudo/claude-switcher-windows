@@ -155,6 +155,11 @@ async fn xxx() -> Result<T, String> {
     （`TestKeyBackendGuard`），避免中断时残留测试密钥；密钥测试用全局锁串行。
 20. **P2-2 凭据锁禁止凭猜测实现**：须先用 Process Monitor 实机抓 claude.exe/
     node.exe 刷新令牌时的锁文件，抓不到就在文档标「待实机调研」。
+21. **不要依赖 PATH 按名启动 `powershell.exe`**：部分精简/安装环境（以及被改写过的
+    进程 PATH）里不含 `System32\WindowsPowerShell\v1.0`，按名启动报「系统找不到指定的
+    文件」，会让所有走 `run_ps` 的系统状态查询（网卡/服务/进程/计划任务…）整体失败。
+    统一用 `platform::powershell_path()`（从 `SystemRoot` 拼权威路径）；并行终端把
+    powershell 作为参数传给 wt/cmd 时同样用完整路径。
 
 ## 实机未验证项（改相关代码后优先测）
 

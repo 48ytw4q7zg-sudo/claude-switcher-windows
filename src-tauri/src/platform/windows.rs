@@ -45,6 +45,16 @@ pub fn silent_command(program: &str) -> Command {
     command
 }
 
+/// Windows PowerShell 5.1 的完整路径。
+///
+/// 不要依赖 PATH 直接按名启动 `powershell.exe`：部分精简/安装环境（以及被
+/// 改写过的进程 PATH）里并不包含 `System32\WindowsPowerShell\v1.0`，按名
+/// 启动会报「系统找不到指定的文件」。统一从 `SystemRoot` 拼出权威路径。
+pub fn powershell_path() -> PathBuf {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+    PathBuf::from(root).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe")
+}
+
 /// 当前进程 PID（用于进程检测时排除自身，替代 spawn tasklist）。
 pub fn current_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
@@ -430,7 +440,8 @@ fn run_ps(script: &str) -> Result<String, String> {
     );
     let wide: Vec<u8> = wrapped.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let encoded = BASE64.encode(&wide);
-    let out = silent_command("powershell.exe")
+    let ps = powershell_path();
+    let out = silent_command(ps.to_string_lossy().as_ref())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -763,6 +774,23 @@ mod tests {
             "Write-Error 不得被当成成功的 PowerShell 输出"
         );
         assert!(result.unwrap_err().contains("synthetic probe"));
+    }
+
+    #[test]
+    fn powershell_path_points_to_system_root_copy() {
+        let path = powershell_path();
+        // 必须落在 SystemRoot 下，且文件真实存在（不依赖 PATH）。
+        let root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
+        assert!(
+            path.starts_with(PathBuf::from(&root)),
+            "powershell 路径应位于 SystemRoot({root}) 下，实为 {path:?}"
+        );
+        assert!(path.is_file(), "powershell.exe 应真实存在: {path:?}");
+        assert!(
+            path.to_string_lossy()
+                .ends_with("WindowsPowerShell\\v1.0\\powershell.exe"),
+            "应指向 Windows PowerShell 5.1 目录: {path:?}"
+        );
     }
 
     #[test]
