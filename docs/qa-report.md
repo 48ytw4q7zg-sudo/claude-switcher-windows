@@ -120,6 +120,32 @@ open-safe（`open_safe`/`close_safe`）、代理诊断（`diagnose_proxy`）、�
 | pi（`pic -p`） | **失败**：`pic --check` 报安装不完整（package version 不符 + bridge 过期），未运行 |
 | 结论 | 本轮**未取得**符合 §D「OpenAI 或 Anthropic 当前最新旗舰」资格的独立审核。三条审查 lane 的产出按「参考证据」使用，全部 finding 均经父会话回读源码独立证实；跨 harness 签署状态记为**未满足**，需在修复完成后补一次合格审核 |
 
+## 四之四、第三轮修复（E-1~E-7）与 Windows-only 收敛
+
+第三轮由同一份独立审查提出 E-1~E-7，全部属于账号迁移/数据正确性/测试隔离/构建链路。
+另按 owner 决定，本项目**只做 Windows**，macOS/Linux 适配代码已整体移除。
+
+| # | 问题 | 修复 |
+| --- | --- | --- |
+| E-1 | 导入在全新机器被拒绝（主密钥检查堵死换机主路径） | `StoreKeyStatus` 三态：`Missing` 且无本机密文 → 放行（save_store 铸第一把钥）；`Missing` 但已有密文 → 拒绝；`Unavailable` → 明确报错 |
+| E-2 | 导入带入原机器运行时状态 | 导入清空 `current_profile_id` / `current_desktop_profile_id` / `desktop_profiles`（后者的快照目录不在导出文件里） |
+| E-3 | 版本缓存固化失败结果、升级后误报更新 | 只缓存成功结果；失败短 TTL（10 分钟）；缓存校验 `current_version` |
+| E-4 | 测试改进程环境变量污染并行测试 | `test_support` 共享 `ENV_LOCK` + `Drop` 自动还原（原值缺失用 `remove_var`）；20 轮 `--test-threads=8` 全过 |
+| E-5 | manifest 版本替换脆弱（预发布版生成非法四段式） | `{{VERSION}}` 占位符；只取数字段补足 a.b.c.d |
+| E-6 | Desktop 回存恢复失败误导 / 体积双算 / 残留无清理 | 恢复失败如实指向 `.old`；`dir_size` 单次复用；启动清理 `.new`、`.old` 只提示不删（可能是唯一副本） |
+| E-7 | keep 测试名实不符、设备名缺项 | 补 `CONIN$`/`CONOUT$`/上标 `COM¹²³`、中间分量尾空格用例 |
+
+CI 随后又抓出两处跨平台/竞态问题并已修复：
+- macOS CI：Windows 专用用例与 `test_support` 在 mac 目标下 dead-code/断言不适用 → 测试限 Windows 编译；
+- Windows CI：两个导入测试共享真实凭据库，`import_allows` 铸的密钥让 `import_refuses` 误判 `Present`
+  → 密钥状态门检查移入 `ENV_LOCK` 内，测试结束后删除所铸密钥。
+
+**Windows-only 收敛**（`refactor!` 提交）：删除 `platform/unix.rs`、全部 Keychain/unix 分支、
+`macos-build.yml`、macOS CI 矩阵、`macos-private-api`；`platform/mod.rs` 对非 Windows 目标
+`compile_error!`。净删约 615 行。`store.rs` 尚余一处 `#[cfg(not(windows))]` 的
+`keychain_write_raw` 因安全分类器要求用户对具体删除目标确认而保留——它在 Windows 构建中
+不参与编译，对产物无影响。
+
 ## 五、风险用例（需重点回归）
 
 1. **保镖 fail-closed**：代理内核或 TUN 丢失时，是否在 10s 内强制结束 Claude
