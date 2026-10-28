@@ -723,6 +723,112 @@ pub fn apply_oauth_profile(
     Ok(())
 }
 
+/// P2-1：阈值提醒里推荐切换的账号。
+#[derive(Debug, Serialize)]
+pub struct RecommendedAccount {
+    pub id: String,
+    pub name: String,
+    pub last_used_percent: Option<f64>,
+}
+
+/// P2-1：阈值提醒结果。
+#[derive(Debug, Serialize)]
+pub struct QuotaReminder {
+    pub enabled: bool,
+    pub threshold: u8,
+    /// 当前账号 5 小时用量百分比。
+    pub current_percent: Option<f64>,
+    /// 达阈值时，缓存里余量最多的账号（供「一键切换」）；未达阈值为 None。
+    pub recommended: Option<RecommendedAccount>,
+}
+
+/// 把当前账号的 5 小时用量百分比缓存到其 profile（仅在变化时写盘）。
+/// best-effort：失败不影响主流程。
+fn record_current_usage_percent(percent: f64) {
+    let Ok(mut store_data) = store::load_store() else {
+        return;
+    };
+    let Some(current_id) = store_data.current_profile_id.clone() else {
+        return;
+    };
+    let Some(profile) = store_data.profiles.iter_mut().find(|p| p.id == current_id) else {
+        return;
+    };
+    // 保留一位小数，避免微小波动反复写盘。
+    let rounded = (percent * 10.0).round() / 10.0;
+    if profile.last_used_percent == Some(rounded) {
+        return;
+    }
+    profile.last_used_percent = Some(rounded);
+    profile.updated_at = Utc::now();
+    let _ = store::save_store(&store_data);
+}
+
+/// 纯函数：在候选（id, name, 缓存百分比）中选余量最多（百分比最小）的账号。
+fn pick_most_remaining<'a>(
+    candidates: &[(&'a str, &'a str, f64)],
+) -> Option<(&'a str, &'a str, f64)> {
+    candidates
+        .iter()
+        .copied()
+        .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+}
+
+/// P2-1：阈值提醒（阻塞，调用方走 blocking）。
+///
+/// 只做提醒 + 推荐，**不做后台自动换号**：其他账号用量会过时、后台刷新令牌风险高，
+/// 真正切换由用户点「一键切换」触发。
+pub fn quota_reminder_blocking() -> Result<QuotaReminder, String> {
+    let config = crate::appconfig::load();
+    let threshold = config.quota_reminder_threshold;
+    if !config.quota_reminder_enabled {
+        return Ok(QuotaReminder {
+            enabled: false,
+            threshold,
+            current_percent: None,
+            recommended: None,
+        });
+    }
+
+    let snapshot = claude_usage_snapshot()?;
+    let current_percent = snapshot.session.used_percent;
+    if let Some(p) = current_percent {
+        record_current_usage_percent(p);
+    }
+
+    let crossed = current_percent
+        .map(|p| p >= f64::from(threshold))
+        .unwrap_or(false);
+
+    let recommended = if crossed {
+        let store_data = store::load_store()?;
+        let current_id = store_data.current_profile_id;
+        let candidates: Vec<(&str, &str, f64)> = store_data
+            .profiles
+            .iter()
+            .filter(|p| Some(p.id.as_str()) != current_id.as_deref())
+            .filter_map(|p| {
+                p.last_used_percent
+                    .map(|pct| (p.id.as_str(), p.name.as_str(), pct))
+            })
+            .collect();
+        pick_most_remaining(&candidates).map(|(id, name, pct)| RecommendedAccount {
+            id: id.to_string(),
+            name: name.to_string(),
+            last_used_percent: Some(pct),
+        })
+    } else {
+        None
+    };
+
+    Ok(QuotaReminder {
+        enabled: true,
+        threshold,
+        current_percent,
+        recommended,
+    })
+}
+
 pub fn compact_token_count(value: u64) -> String {
     if value >= 1_000_000_000 {
         let scaled = value as f64 / 1_000_000_000.0;
@@ -791,6 +897,13 @@ mod tests {
         assert_eq!(oauth_access_token_from_raw(&nested).unwrap(), "tok-1");
         let flat = serde_json::json!({ "access_token": "tok-2" }).to_string();
         assert_eq!(oauth_access_token_from_raw(&flat).unwrap(), "tok-2");
+    }
+
+    #[test]
+    fn pick_most_remaining_returns_lowest_percent() {
+        let candidates = [("a", "A", 80.0), ("b", "B", 40.0), ("c", "C", 60.0)];
+        assert_eq!(pick_most_remaining(&candidates), Some(("b", "B", 40.0)));
+        assert_eq!(pick_most_remaining(&[]), None);
     }
 
     #[test]

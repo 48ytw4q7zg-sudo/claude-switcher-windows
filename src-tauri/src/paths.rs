@@ -1,7 +1,7 @@
 //! 路径解析（含 CLAUDE_CONFIG_DIR 跟随）与目录保障。
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::fsx;
 use crate::platform::imp;
@@ -45,8 +45,34 @@ pub fn claude_config_json_path() -> Result<PathBuf, String> {
     Ok(crate::credentials::claude_dir()?.join("config.json"))
 }
 
-/// 本工具私有数据目录 `~/.claude-switcher`。
+/// 便携模式判定（纯函数）：给定目录下存在 `portable.flag` 即返回该目录。
+fn portable_root_for(dir: &Path) -> Option<PathBuf> {
+    if dir.join("portable.flag").exists() {
+        Some(dir.to_path_buf())
+    } else {
+        None
+    }
+}
+
+/// 便携模式根目录：若 exe 同目录存在 `portable.flag`，返回 exe 所在目录。
+///
+/// 便携模式下账号库、日志、配置都落在 exe 目录（随 zip 整体拷走即迁移），
+/// 不再写用户主目录。
+pub fn portable_root() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let dir = exe.parent()?.to_path_buf();
+    portable_root_for(&dir)
+}
+
+/// 本工具私有数据目录：
+/// - 便携模式（exe 旁有 `portable.flag`）→ exe 目录；
+/// - 常规安装 → `~/.claude-switcher`。
 pub fn app_data_dir() -> Result<PathBuf, String> {
+    if let Some(root) = portable_root() {
+        // 确保目录存在（exe 目录一般已存在，但 best-effort 保障）。
+        let _ = fs::create_dir_all(&root);
+        return Ok(root);
+    }
     Ok(home_dir()?.join(".claude-switcher"))
 }
 
@@ -192,4 +218,32 @@ fn cleanup_tmp_once() {
         let _ = crate::fsx::cleanup_stale_tmp_files(&app_data_dir().unwrap_or_default());
         let _ = crate::fsx::cleanup_stale_tmp_files(&backups_dir().unwrap_or_default());
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn portable_flag_detected() {
+        let dir = tempfile::tempdir().unwrap();
+        // 无 flag → None。
+        assert_eq!(portable_root_for(dir.path()), None);
+        // 有 flag → 该目录。
+        std::fs::write(dir.path().join("portable.flag"), "").unwrap();
+        assert_eq!(
+            portable_root_for(dir.path()),
+            Some(dir.path().to_path_buf())
+        );
+    }
+
+    #[test]
+    fn non_portable_app_data_under_home() {
+        // 测试环境的 exe 旁没有 portable.flag，应落在 home/.claude-switcher。
+        let dir = app_data_dir().expect("app data dir");
+        assert!(dir
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with(".claude-switcher"));
+    }
 }

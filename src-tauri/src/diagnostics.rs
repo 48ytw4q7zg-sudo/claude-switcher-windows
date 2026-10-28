@@ -805,7 +805,6 @@ mod tests {
         assert!(!text.contains("host:bad"));
     }
 
-    #[cfg(windows)]
     #[test]
     fn find_claude_executables_table() {
         // 伪造 PATH：dir1 有 claude.cmd，dir2 有 claude.exe，dir3 无。

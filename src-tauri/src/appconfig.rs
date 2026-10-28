@@ -10,7 +10,7 @@ use crate::fsx;
 use crate::paths;
 
 /// 全局环境与代理偏好。所有字段可选，缺省走默认/自动探测。
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
     /// 目标国家码（如 "US"、"JP"），由出口 IP 锁定。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -33,6 +33,35 @@ pub struct AppConfig {
     /// 最近一次出口 IPv4（用于「IP 一致」检查）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_egress_ip: Option<String>,
+    /// P2-1：额度阈值提醒（当前账号达阈值时提醒 + 一键切换），**默认关闭**。
+    /// 只做提醒，不做后台自动换号。
+    #[serde(default)]
+    pub quota_reminder_enabled: bool,
+    /// P2-1：提醒阈值（百分比，默认 90）。
+    #[serde(default = "default_quota_reminder_threshold")]
+    pub quota_reminder_threshold: u8,
+}
+
+/// P2-1 默认提醒阈值 90%。
+fn default_quota_reminder_threshold() -> u8 {
+    90
+}
+
+impl Default for AppConfig {
+    fn default() -> Self {
+        AppConfig {
+            country_target: None,
+            tz_target: None,
+            locale_target: None,
+            proxy_mode: None,
+            proxy_group: None,
+            webrtc_policy: None,
+            last_egress_ip: None,
+            quota_reminder_enabled: false,
+            // 与 serde default 保持一致（90），否则缺字段解析与 Default 不一致。
+            quota_reminder_threshold: default_quota_reminder_threshold(),
+        }
+    }
 }
 
 fn config_path() -> Result<std::path::PathBuf, String> {

@@ -33,17 +33,20 @@ mod isolation;
 mod jsonio;
 mod keep;
 mod links;
+mod mcp;
 mod net;
+mod notify_state;
+mod parallel;
 mod paths;
 mod platform;
 mod processes;
+mod reconcile;
 mod region;
 mod rules;
 mod store;
 mod stun;
-// 只有 Windows 的导入/导出测试会用它（且这些测试本身就限 Windows）；
-// 其他平台编译进来会因无使用者触发 dead-code，反而挡住 macOS CI 的 clippy 门禁。
-#[cfg(all(test, windows))]
+// 测试共享基础设施（环境锁 / 环境还原器）。
+#[cfg(test)]
 mod test_support;
 mod tray;
 mod update;
@@ -225,24 +228,10 @@ async fn blocking<T: Send + 'static>(
         .map_err(|e| format!("后台任务失败: {e}"))?
 }
 
-fn string_field<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
-    let mut cur = value;
-    for key in path {
-        cur = cur.get(*key)?;
-    }
-    cur.as_str()
-}
-
-/// 当前平台（前端替代已弃用的 navigator.platform）。
+/// 当前平台（前端替代已弃用的 navigator.platform）。本产品只面向 Windows。
 #[tauri::command]
 fn get_platform() -> &'static str {
-    if cfg!(target_os = "windows") {
-        "windows"
-    } else if cfg!(target_os = "macos") {
-        "macos"
-    } else {
-        "linux"
-    }
+    "windows"
 }
 
 /// 应用内版本检查（GitHub Releases latest）。网络请求，走 blocking 壳。
@@ -532,6 +521,7 @@ fn capture_current_profile_blocking(
         settings_json,
         encrypted_auth_settings: None,
         keychain_password,
+        last_used_percent: None,
         clash: None,
         runtime: Some(runtime),
     };
@@ -722,6 +712,7 @@ fn complete_new_account_login_blocking() -> Result<ProfileSummary, String> {
         settings_json,
         encrypted_auth_settings: None,
         keychain_password: Some(keychain_password),
+        last_used_percent: None,
         clash: Some(store::ProfileClashBinding {
             enabled: true,
             group: pending.group.clone(),
@@ -788,70 +779,15 @@ fn cancel_pending_new_account_login_blocking() -> Result<Option<SwitchResult>, S
 
 /// 切换前 best-effort 回写「当前活账号」的 live 快照到它对应的 profile。
 /// 快照不完整或身份不匹配时跳过并 warn，绝不阻断切号。
-fn refresh_current_profile_snapshot(store_data: &mut Store, target_id: &str) -> Vec<String> {
-    let mut warnings = Vec::new();
-
-    let Some(current_id) = store_data.current_profile_id.clone() else {
-        return warnings;
-    };
-    if current_id == target_id {
-        return warnings;
+/// 切换 / 新号登录前：读取 live 快照并做身份对账（Current / Other / Unknown），
+/// 把 live 状态回写到正确的账号，必要时自动收养。详见 [`reconcile`]。
+fn refresh_current_profile_snapshot(store_data: &mut Store, _target_id: &str) -> Vec<String> {
+    match accounts::current_snapshot() {
+        Ok(snapshot) => reconcile::reconcile_live_into_store(store_data, &snapshot, Utc::now()),
+        Err(err) => vec![format!(
+            "未能读取当前 live 快照，已跳过对账（不中断切换）：{err}"
+        )],
     }
-    let Some(profile) = store_data.profiles.iter_mut().find(|p| p.id == current_id) else {
-        return warnings;
-    };
-
-    let (claude_json, settings_json, keychain_password) = match accounts::current_snapshot() {
-        Ok(snapshot) => snapshot,
-        Err(err) => {
-            warnings.push(format!(
-                "未能读取当前账号 live 快照，已跳过对「{}」的回写：{err}",
-                profile.name
-            ));
-            return warnings;
-        }
-    };
-
-    let Some(claude_json) = claude_json else {
-        warnings.push(format!(
-            "当前缺少 ~/.claude.json，已跳过对「{}」的快照回写",
-            profile.name
-        ));
-        return warnings;
-    };
-    let Some(keychain_password) = keychain_password else {
-        warnings.push(format!(
-            "当前缺少{CREDENTIAL_STORE_LABEL}登录态，已跳过对「{}」的快照回写",
-            profile.name
-        ));
-        return warnings;
-    };
-
-    let Some(live_uuid) = string_field(&claude_json, &["oauthAccount", "accountUuid"]) else {
-        warnings.push(format!(
-            "无法从 live ~/.claude.json 读取 accountUuid，无法确认身份，已跳过对「{}」的回写",
-            profile.name
-        ));
-        return warnings;
-    };
-    match profile.meta.account_uuid.as_deref() {
-        Some(profile_uuid) if profile_uuid == live_uuid => {
-            profile.meta =
-                usage::extract_meta(Some(&claude_json), Some(keychain_password.as_str()));
-            profile.claude_json = claude_json;
-            profile.settings_json = settings_json;
-            profile.keychain_password = Some(keychain_password);
-            profile.updated_at = Utc::now();
-        }
-        _ => {
-            warnings.push(format!(
-                "当前 live 身份（accountUuid={live_uuid}）与账号「{}」不一致，可能是手动登录了别的号，已跳过回写以免覆盖凭据",
-                profile.name
-            ));
-        }
-    }
-
-    warnings
 }
 
 /// 切号流程里有阻塞操作（杀进程等待约 1.2s、Clash 切换 250ms sleep、
@@ -860,6 +796,83 @@ fn refresh_current_profile_snapshot(store_data: &mut Store, target_id: &str) -> 
 #[tauri::command]
 async fn switch_profile(id: String) -> Result<SwitchResult, String> {
     blocking(move || switch_profile_blocking(id)).await
+}
+
+/// 并行模式：为指定账号开一个独立终端（CLAUDE_CONFIG_DIR 隔离），
+/// 与「全局切换」互不影响。阻塞（写文件 + 拉起终端），走 blocking。
+#[tauri::command]
+async fn open_parallel_terminal(id: String) -> Result<parallel::ParallelTerminalResult, String> {
+    blocking(move || parallel::open_parallel_terminal_for_profile(&id)).await
+}
+
+/// 列出 MCP 服务器（scope: "global" | "project"）。
+#[tauri::command]
+async fn list_mcp_servers(
+    scope: String,
+    project_dir: Option<String>,
+) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let scope = parse_mcp_scope(&scope);
+        mcp::list_mcp_servers(scope, project_dir.as_deref())
+    })
+    .await
+}
+
+/// 新增 / 更新 MCP 服务器。
+#[tauri::command]
+async fn upsert_mcp_server(
+    scope: String,
+    project_dir: Option<String>,
+    name: String,
+    server: serde_json::Value,
+) -> Result<(), String> {
+    blocking(move || {
+        let scope = parse_mcp_scope(&scope);
+        mcp::upsert_mcp_server(scope, project_dir.as_deref(), &name, server)
+    })
+    .await
+}
+
+/// 删除 MCP 服务器。
+#[tauri::command]
+async fn delete_mcp_server(
+    scope: String,
+    project_dir: Option<String>,
+    name: String,
+) -> Result<bool, String> {
+    blocking(move || {
+        let scope = parse_mcp_scope(&scope);
+        mcp::delete_mcp_server(scope, project_dir.as_deref(), &name)
+    })
+    .await
+}
+
+fn parse_mcp_scope(scope: &str) -> mcp::McpScope {
+    if scope.eq_ignore_ascii_case("project") {
+        mcp::McpScope::Project
+    } else {
+        mcp::McpScope::Global
+    }
+}
+
+/// P2-1：查询阈值提醒（当前用量 + 推荐切换账号）。
+#[tauri::command]
+async fn get_quota_reminder() -> Result<usage::QuotaReminder, String> {
+    blocking(usage::quota_reminder_blocking).await
+}
+
+/// P2-1：设置阈值提醒开关与阈值（默认关闭）。
+#[tauri::command]
+async fn set_quota_reminder(enabled: bool, threshold: u8) -> Result<appconfig::AppConfig, String> {
+    blocking(move || {
+        appconfig::update(|cfg| {
+            cfg.quota_reminder_enabled = enabled;
+            if (1..=100).contains(&threshold) {
+                cfg.quota_reminder_threshold = threshold;
+            }
+        })
+    })
+    .await
 }
 
 fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
@@ -1847,13 +1860,10 @@ fn rebuild_isolation_after_config_switch(warnings: &mut Vec<String>) {
 }
 
 /// Run 注册表项的值名（固定，便于 UI 显示与排查）。
-#[cfg(windows)]
 const AUTOSTART_VALUE_NAME: &str = "ClaudeSwitcher";
 /// HKCU 下开机自启的标准位置。
-#[cfg(windows)]
 const AUTOSTART_RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 
-#[cfg(windows)]
 const AUTOSTART_APPROVED_KEY: &str =
     "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run";
 
@@ -2201,8 +2211,15 @@ pub fn run() {
         guard::run_guard_loop();
     }
 
+    // 便携模式（P2-4）：WebView2 用户数据目录必须在 WebView2 创建前设置，
+    // 指向 exe 目录，使内核缓存也随便携 zip 一起携带。
+    if let Some(portable_root) = paths::portable_root() {
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &portable_root);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_notification::init())
         // 单实例：双击两次只留一个托盘图标，也避免并发写 store。
         .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
             tray::show_main_window(app);
@@ -2245,6 +2262,12 @@ pub fn run() {
             complete_new_account_login,
             cancel_pending_new_account_login,
             switch_profile,
+            open_parallel_terminal,
+            list_mcp_servers,
+            upsert_mcp_server,
+            delete_mcp_server,
+            get_quota_reminder,
+            set_quota_reminder,
             get_clash_status,
             get_claude_usage,
             switch_clash_node,

@@ -1,6 +1,6 @@
 [package]
 name = "claude-switcher"
-version = "0.2.2"
+version = "0.3.0"
 description = "Claude Code local account switcher (Windows)"
 authors = ["48ytw4q7zg-sudo"]
 edition = "2021"
@@ -29,6 +29,8 @@ tauri = { version = "2", features = [
     "image-ico",
 ] }
 tauri-plugin-opener = "2"
+# 系统通知：托盘一键切换结果、额度阈值提醒（P1-2 / P1-4）。
+tauri-plugin-notification = "2"
 # 单实例：双击两次只留一个托盘图标，也避免并发写 store。
 tauri-plugin-single-instance = "2"
 serde = { version = "1", features = ["derive"] }

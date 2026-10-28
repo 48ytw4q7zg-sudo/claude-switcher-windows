@@ -375,7 +375,6 @@ fn normalize_rel(line: &str) -> String {
 mod tests {
     use super::*;
 
-    #[cfg(windows)]
     #[test]
     fn parse_keep_list_filters_comments_and_rejects_unsafe() {
         let text = "\
@@ -423,7 +422,6 @@ normalizer/
         assert!(warnings.iter().any(|w| w.contains("..")));
     }
 
-    #[cfg(windows)]
     #[test]
     fn rejects_windows_only_path_hazards() {
         // Windows 特有的四类坑：备用数据流、非法字符、保留设备名、尾点尾空格，
@@ -531,18 +529,11 @@ skills
         fs::write(&list, "real-link\n").unwrap();
         let stage = tmp.path().join("stage");
 
-        #[cfg(windows)]
+        // junction：base/real-link -> base/real；权限不足则跳过断言。
+        if crate::platform::imp::create_junction(&base.join("real-link"), &base.join("real"))
+            .is_err()
         {
-            // junction：base/real-link -> base/real；权限不足则跳过断言。
-            if crate::platform::imp::create_junction(&base.join("real-link"), &base.join("real"))
-                .is_err()
-            {
-                return;
-            }
-        }
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(base.join("real"), base.join("real-link")).unwrap();
+            return;
         }
 
         let report = stage_keep_with(&base, &list, &stage).unwrap();

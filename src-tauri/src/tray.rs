@@ -45,9 +45,6 @@ pub fn refresh_tray_status(app: &tauri::AppHandle) -> Result<(), String> {
             tooltip.push_str(&candidate);
         }
     }
-    #[cfg(target_os = "macos")]
-    tray.set_title(Some(String::new()))
-        .map_err(|e| format!("更新菜单栏标题失败: {e}"))?;
     tray.set_tooltip(Some(tooltip))
         .map_err(|e| format!("更新托盘提示失败: {e}"))?;
     Ok(())
@@ -64,12 +61,8 @@ fn position_tray_popup(
     let popup_h = POPUP_HEIGHT * scale;
 
     let mut x = tray_position.x - popup_w / 2.0;
-    #[cfg(target_os = "macos")]
-    let mut y = tray_position.y + 4.0 * scale;
-    #[cfg(windows)]
+    // Windows：弹窗向上展开到托盘图标上方。
     let mut y = tray_position.y - popup_h - 4.0 * scale;
-    #[cfg(not(any(target_os = "macos", windows)))]
-    let mut y = tray_position.y + 4.0 * scale;
 
     // 点击坐标所在显示器（多显示器时弹窗跟着图标走）。
     let monitor = window
@@ -177,12 +170,83 @@ pub fn quit_app(app: &AppHandle) {
     app.exit(0);
 }
 
-/// 构建托盘右键菜单（打开主窗 / 刷新用量 / 退出）。
+/// 托盘菜单账号项 id 前缀，后接 profile id；点击即一键切换到该账号。
+pub const SWITCH_MENU_ID_PREFIX: &str = "tray-switch-";
+/// 托盘菜单里账号名的最大字符数（超长截断，避免菜单过宽）。
+const MENU_LABEL_MAX_CHARS: usize = 24;
+/// 账号数超过这个值时，账号列表收进「切换账号」子菜单。
+const MENU_FLAT_MAX_PROFILES: usize = 10;
+
+/// 截断超长账号名（按字符而非字节，含中文不 panic）。
+fn truncate_menu_label(label: &str) -> String {
+    if label.chars().count() <= MENU_LABEL_MAX_CHARS {
+        return label.to_string();
+    }
+    let head: String = label.chars().take(MENU_LABEL_MAX_CHARS).collect();
+    format!("{head}…")
+}
+
+/// 账号菜单项的显示文本：当前账号前缀「●」，名称超长截断。
+fn account_menu_label(name: &str, is_current: bool) -> String {
+    let marker = if is_current { "● " } else { "" };
+    format!("{marker}{}", truncate_menu_label(name))
+}
+
+/// 账号数是否需要收进子菜单（> MENU_FLAT_MAX_PROFILES）。
+fn account_list_needs_submenu(profile_count: usize) -> bool {
+    profile_count > MENU_FLAT_MAX_PROFILES
+}
+
+/// 构建托盘右键菜单：账号列表（当前账号 ● 标记，点击一键切换）+ 打开/刷新/退出。
 /// best-effort：任一构造步骤失败都返回 Err，由调用方打日志，不影响托盘本体。
 fn build_tray_menu<R: tauri::Runtime>(
     app: &AppHandle<R>,
     tray: &tauri::tray::TrayIcon<R>,
 ) -> Result<(), String> {
+    let store_data = crate::store::load_store().unwrap_or_default();
+    let current_id = store_data.current_profile_id;
+
+    // 账号菜单项（按当前 store 动态生成）。
+    let account_items: Vec<tauri::menu::MenuItem<R>> = store_data
+        .profiles
+        .iter()
+        .map(|profile| {
+            let is_current = current_id.as_deref() == Some(profile.id.as_str());
+            tauri::menu::MenuItem::with_id(
+                app,
+                format!("{SWITCH_MENU_ID_PREFIX}{}", profile.id),
+                account_menu_label(&profile.name, is_current),
+                true,
+                None::<&str>,
+            )
+            .map_err(|e| format!("创建账号菜单项失败: {e}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    // 组装菜单引用（所有 owned 项在本函数内保持存活）。
+    let mut menu_refs: Vec<&dyn tauri::menu::IsMenuItem<R>> = Vec::new();
+    // 提升到函数作用域：子菜单与分隔符在下方 if 块内创建，
+    // 但引用要一直活到 Menu::with_items。
+    let submenu;
+    let sep;
+
+    if !account_items.is_empty() {
+        if account_list_needs_submenu(account_items.len()) {
+            let inner: Vec<&dyn tauri::menu::IsMenuItem<R>> =
+                account_items.iter().map(|i| i as &_).collect();
+            submenu = tauri::menu::Submenu::with_items(app, "切换账号", true, &inner)
+                .map_err(|e| format!("创建账号子菜单失败: {e}"))?;
+            menu_refs.push(&submenu);
+        } else {
+            for item in &account_items {
+                menu_refs.push(item);
+            }
+        }
+        sep = tauri::menu::PredefinedMenuItem::separator(app)
+            .map_err(|e| format!("创建分隔符失败: {e}"))?;
+        menu_refs.push(&sep);
+    }
+
     let open_item =
         tauri::menu::MenuItem::with_id(app, "tray-open", "打开主窗口", true, None::<&str>)
             .map_err(|e| format!("创建菜单项失败: {e}"))?;
@@ -197,37 +261,69 @@ fn build_tray_menu<R: tauri::Runtime>(
         None::<&str>,
     )
     .map_err(|e| format!("创建菜单项失败: {e}"))?;
-    let menu = tauri::menu::Menu::with_items(app, &[&open_item, &refresh_item, &quit_item])
-        .map_err(|e| format!("组装菜单失败: {e}"))?;
+    menu_refs.push(&open_item);
+    menu_refs.push(&refresh_item);
+    menu_refs.push(&quit_item);
+
+    let menu =
+        tauri::menu::Menu::with_items(app, &menu_refs).map_err(|e| format!("组装菜单失败: {e}"))?;
     tray.set_menu(Some(menu))
         .map_err(|e| format!("挂载菜单失败: {e}"))
 }
 
-/// 供调用方直接把 `tray_by_id` 的返回值（按值）传进来的重载。
-fn build_tray_menu_owned<R: tauri::Runtime>(
-    app: &AppHandle<R>,
-    tray: tauri::tray::TrayIcon<R>,
-) -> Result<(), String> {
+/// 一键切换后由外部调用：重建托盘菜单（刷新当前账号 ● 标记）。
+pub fn rebuild_tray_menu(app: &tauri::AppHandle) -> Result<(), String> {
+    let Some(tray) = app.tray_by_id("main") else {
+        return Ok(());
+    };
     build_tray_menu(app, &tray)
+}
+
+/// 托盘一键切换：在后台线程执行切换，随后重建菜单并弹系统通知。
+pub fn handle_tray_switch(app: &tauri::AppHandle, profile_id: &str) {
+    let handle = app.clone();
+    let profile_id = profile_id.to_string();
+    thread::spawn(move || {
+        let result = crate::switch_profile_blocking(profile_id);
+        // 无论成功失败都重建菜单（成功时刷新 ● 标记）。
+        if let Err(e) = rebuild_tray_menu(&handle) {
+            crate::log_error(&format!("重建托盘菜单失败: {e}"));
+        }
+        notify_switch_result(&handle, &result);
+    });
+}
+
+/// 用系统通知展示一键切换结果。
+fn notify_switch_result(app: &tauri::AppHandle, result: &Result<crate::SwitchResult, String>) {
+    use tauri_plugin_notification::NotificationExt;
+    let (title, body) = match result {
+        Ok(switch) => (
+            "账号切换成功",
+            format!(
+                "已切换到「{}」，请重启 Claude Code 会话",
+                switch.switched_to
+            ),
+        ),
+        Err(e) => ("账号切换失败", e.clone()),
+    };
+    if let Err(e) = app.notification().builder().title(title).body(body).show() {
+        crate::log_error(&format!("发送切换通知失败: {e}"));
+    }
 }
 
 pub fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
     let app_handle = app.handle().clone();
     if let Some(tray) = app_handle.tray_by_id("main") {
-        #[cfg(target_os = "macos")]
-        let _ = tray.set_title(Some(String::new()));
         let _ = tray.set_tooltip(Some("Claude Switcher".to_string()));
-        // Windows：tauri.conf.json 里的 tray.png 是 macOS 单色模板图标，
-        // 在深色任务栏上看不清。改用多尺寸彩色 ICO（16/24/32/48/64/256），
-        // 高 DPI 与不同任务栏尺寸下都清晰。
-        #[cfg(windows)]
+        // tauri.conf.json 里的 tray.png 是单色模板图标，在深色任务栏上看不清。
+        // 改用多尺寸彩色 ICO（16/24/32/48/64/256），高 DPI 与不同任务栏尺寸下都清晰。
         if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico")) {
             let _ = tray.set_icon(Some(icon));
         }
 
-        // Windows 习惯：右键托盘出菜单（打开主窗 / 刷新 / 退出）。
+        // Windows 习惯：右键托盘出菜单（账号列表 + 打开主窗 / 刷新 / 退出）。
         // 菜单构建失败不阻断托盘初始化（托盘本体已经可用），只打日志。
-        if let Err(error) = build_tray_menu_owned(&app_handle, tray) {
+        if let Err(error) = build_tray_menu(&app_handle, &tray) {
             crate::log_error(&format!("构建托盘菜单失败: {error}"));
         }
     }
@@ -235,9 +331,12 @@ pub fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
     let refresh_handle = app_handle.clone();
     thread::spawn(move || {
         let _ = refresh_tray_status(&refresh_handle);
+        // 额度阈值通知（P1-4）：随 60s 刷新一起评估，内部按周期去重。
+        let _ = crate::notify_state::evaluate_quota_notification(&refresh_handle);
         loop {
             thread::sleep(StdDuration::from_secs(60));
             let _ = refresh_tray_status(&refresh_handle);
+            let _ = crate::notify_state::evaluate_quota_notification(&refresh_handle);
         }
     });
 
@@ -266,17 +365,59 @@ pub fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
         }
     });
 
-    app.on_menu_event(|app, event| match event.id().as_ref() {
-        "tray-open" => show_main_window(app),
-        "tray-refresh" => {
-            let handle = app.clone();
-            thread::spawn(move || {
-                let _ = refresh_tray_status(&handle);
-            });
+    app.on_menu_event(|app, event| {
+        let id = event.id().as_ref();
+        // 账号菜单项：一键切换（后台线程执行 + 重建菜单 + 通知）。
+        if let Some(profile_id) = id.strip_prefix(SWITCH_MENU_ID_PREFIX) {
+            handle_tray_switch(app, profile_id);
+            return;
         }
-        "tray-quit" => quit_app(app),
-        _ => {}
+        match id {
+            "tray-open" => show_main_window(app),
+            "tray-refresh" => {
+                let handle = app.clone();
+                thread::spawn(move || {
+                    let _ = refresh_tray_status(&handle);
+                });
+            }
+            "tray-quit" => quit_app(app),
+            _ => {}
+        }
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod menu_tests {
+    use super::*;
+
+    #[test]
+    fn current_account_marked_with_dot() {
+        assert_eq!(account_menu_label("美国号", true), "● 美国号");
+        assert_eq!(account_menu_label("美国号", false), "美国号");
+    }
+
+    #[test]
+    fn long_name_truncated_by_chars() {
+        let long = "a".repeat(30);
+        let out = account_menu_label(&long, false);
+        assert_eq!(out.chars().count(), MENU_LABEL_MAX_CHARS + 1); // 24 + …
+        assert!(out.ends_with('…'));
+        // 当前标记 + 截断仍正常。
+        let out = account_menu_label(&long, true);
+        assert!(out.starts_with("● "));
+    }
+
+    #[test]
+    fn submenu_used_only_above_threshold() {
+        assert!(!account_list_needs_submenu(0));
+        assert!(!account_list_needs_submenu(10));
+        assert!(account_list_needs_submenu(11));
+    }
+
+    #[test]
+    fn switch_id_prefix_stable() {
+        assert_eq!(SWITCH_MENU_ID_PREFIX, "tray-switch-");
+    }
 }

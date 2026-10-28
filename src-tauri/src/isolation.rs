@@ -481,21 +481,14 @@ mod tests {
     use std::fs;
     use std::path::Path;
 
-    /// 建一个目录 junction（Windows）或符号链接（Unix）指向 target。
-    /// **Windows 的 junction 要求 live 的父目录已存在**，否则报
+    /// 建一个目录 junction 指向 target。
+    /// **junction 要求 live 的父目录已存在**，否则报
     /// 「系统找不到指定的路径」(os error 3)，所以先建父目录。
     fn make_link(target: &Path, live: &Path) {
         if let Some(parent) = live.parent() {
             fs::create_dir_all(parent).expect("创建 live 父目录失败");
         }
-        #[cfg(windows)]
-        {
-            crate::platform::imp::create_junction(target, live).expect("创建 junction 失败");
-        }
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(target, live).expect("创建 symlink 失败");
-        }
+        crate::platform::imp::create_junction(target, live).expect("创建 junction 失败");
     }
 
     /// 场景：claude_root 下有指向本账号的 junction、指向别处的 junction、普通目录。
@@ -564,7 +557,6 @@ mod tests {
     }
 
     /// 悬空 junction（目标已被删除）仍应被识别并移除。
-    #[cfg(windows)]
     #[test]
     fn deactivate_in_removes_dangling_junction() {
         let dir = tempfile::tempdir().unwrap();
@@ -582,8 +574,7 @@ mod tests {
     }
 
     /// 某一项取消失败 → 整体返回 Err，且**后续链接不动**（保现场让用户排障）。
-    /// Windows：对 junction 本身开一个「不允许删除」的句柄，remove_dir 必然失败。
-    #[cfg(windows)]
+    /// 对 junction 本身开一个「不允许删除」的句柄，remove_dir 必然失败。
     #[test]
     fn deactivate_in_aborts_and_keeps_other_links_when_removal_fails() {
         use std::os::windows::fs::OpenOptionsExt;

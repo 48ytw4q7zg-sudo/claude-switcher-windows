@@ -132,7 +132,6 @@ mod tests {
         assert_eq!(detect_link_mode(&live, &target), LinkMode::NotLinked);
     }
 
-    #[cfg(windows)]
     #[test]
     fn detect_link_mode_for_junction() {
         let dir = tempfile::tempdir().unwrap();
@@ -144,7 +143,6 @@ mod tests {
         assert!(is_linked_to(&live, &target));
     }
 
-    #[cfg(windows)]
     #[test]
     fn is_linked_to_is_case_insensitive_on_windows() {
         let dir = tempfile::tempdir().unwrap();
@@ -160,7 +158,6 @@ mod tests {
     /// 悬空链接（目标已被删除）必须仍被识别为链接。
     /// 这是 activate_* 的关键前提：`live.exists()` 对悬空链接返回 false，
     /// 若不先判 path_is_link 就会走进「创建目录」分支并最终建链接失败。
-    #[cfg(windows)]
     #[test]
     fn dangling_junction_is_still_a_link() {
         let dir = tempfile::tempdir().unwrap();

@@ -722,7 +722,6 @@ mod tests {
     }
 
     /// 悬空 junction（目标已被删）必须被跳过而不是让整个复制失败。
-    #[cfg(windows)]
     #[test]
     fn copy_dir_skips_dangling_junction() {
         let dir = tempfile::tempdir().unwrap();

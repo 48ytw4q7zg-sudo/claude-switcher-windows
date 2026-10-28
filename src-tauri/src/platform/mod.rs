@@ -18,9 +18,6 @@ mod tests {
     use std::path::Path;
 
     /// Windows 专有语义（`\\?\` 前缀剥离 + 大小写归一）。
-    /// 必须 cfg(windows)：unix 的 normalize_path 只做词法清理，
-    /// 在 macOS CI 上跑这个断言必然失败。
-    #[cfg(windows)]
     #[test]
     fn normalize_path_handles_verbatim_case_and_trailing_sep() {
         let a = imp::normalize_path(Path::new(
@@ -39,7 +36,6 @@ mod tests {
         assert!(!imp::paths_equivalent(a, b));
     }
 
-    #[cfg(windows)]
     #[test]
     fn is_link_and_junction_roundtrip() {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
@@ -55,7 +51,6 @@ mod tests {
         assert_eq!(canon_live, canon_target);
     }
 
-    #[cfg(windows)]
     #[test]
     fn same_file_detects_hard_link() {
         let dir = tempfile::tempdir().expect("创建临时目录失败");
