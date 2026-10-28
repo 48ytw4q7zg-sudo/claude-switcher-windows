@@ -71,6 +71,41 @@ export interface AppConfig {
   proxy_group?: string | null;
   webrtc_policy?: string | null;
   last_egress_ip?: string | null;
+  /** P2-1：额度阈值提醒开关（默认关闭）。 */
+  quota_reminder_enabled?: boolean;
+  /** P2-1：提醒阈值（默认 90）。 */
+  quota_reminder_threshold?: number;
+}
+
+/** P1-3：并行终端启动结果。 */
+export interface ParallelTerminalResult {
+  profile_id: string;
+  config_dir: string;
+  launcher: 'wt' | 'cmd-start' | string;
+}
+
+/** P2-1：推荐切换的账号。 */
+export interface RecommendedAccount {
+  id: string;
+  name: string;
+  last_used_percent?: number | null;
+}
+
+/** P2-1：阈值提醒结果。 */
+export interface QuotaReminder {
+  enabled: boolean;
+  threshold: number;
+  current_percent?: number | null;
+  recommended?: RecommendedAccount | null;
+}
+
+/** P2-3：MCP 服务器（stdio / http / sse）。 */
+export interface McpServer {
+  type?: 'stdio' | 'http' | 'sse' | string;
+  command?: string;
+  args?: string[];
+  env?: Record<string, string>;
+  url?: string;
 }
 
 export interface RulesReport {

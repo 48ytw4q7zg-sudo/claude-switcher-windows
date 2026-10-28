@@ -1220,3 +1220,134 @@ code {
 .field-list .field {
   min-height: 0;
 }
+
+/* ── P2-1 额度阈值提醒 ── */
+.quota-controls {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.quota-threshold {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: #484234;
+}
+
+.quota-threshold input {
+  width: 64px;
+  padding: 6px 8px;
+  border: 1px solid rgba(72, 66, 52, 0.25);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.quota-banner {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 12px;
+  padding: 12px;
+  border: 1px solid rgba(176, 120, 30, 0.4);
+  border-radius: 10px;
+  background: rgba(240, 200, 120, 0.22);
+}
+
+.quota-banner svg {
+  flex: none;
+  color: #b07020;
+}
+
+.quota-banner div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+/* ── P2-3 MCP 管理 ── */
+.mcp-scope {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.mcp-scope input {
+  flex: 1;
+  min-width: 200px;
+  padding: 7px 9px;
+  border: 1px solid rgba(72, 66, 52, 0.25);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.6);
+}
+
+.mcp-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 12px 0;
+}
+
+.mcp-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 11px;
+  border: 1px solid rgba(72, 66, 52, 0.16);
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.mcp-row > div {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+  min-width: 0;
+}
+
+.mcp-target,
+.mcp-env {
+  color: #6a6250;
+  font-size: 0.85rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mcp-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px;
+  border: 1px dashed rgba(72, 66, 52, 0.3);
+  border-radius: 10px;
+}
+
+.mcp-form-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.mcp-form-head span {
+  flex: 1;
+}
+
+.mcp-form input,
+.mcp-form textarea,
+.mcp-form select {
+  padding: 7px 9px;
+  border: 1px solid rgba(72, 66, 52, 0.25);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.6);
+  resize: vertical;
+}
+
+.muted {
+  color: #6a6250;
+}

@@ -24,6 +24,7 @@ import {
   Router,
   RotateCcw,
   ShieldAlert,
+  TerminalSquare,
   Trash2,
   UserRound,
 } from 'lucide-react';
@@ -34,6 +35,8 @@ import { GuardPanel } from './components/GuardPanel';
 import { ClashModePanel } from './components/ClashModePanel';
 import { DesktopProfiles } from './components/DesktopProfiles';
 import { PrivacyTools } from './components/PrivacyTools';
+import { QuotaReminderPanel } from './components/QuotaReminder';
+import { McpPanel } from './components/McpPanel';
 import { useModalDialog } from './useModalDialog';
 
 const WINDOW_LABEL = (() => {
@@ -179,6 +182,13 @@ interface SwitchResult {
   warnings: string[];
 }
 
+/** P1-3：并行终端启动结果。 */
+interface ParallelTerminalResult {
+  profile_id: string;
+  config_dir: string;
+  launcher: string;
+}
+
 interface PrepareNewAccountResult {
   pending: PendingNewAccount;
   backup: BackupResult;
@@ -293,6 +303,7 @@ type BusyAction =
   | 'clash'
   | 'list-backups'
   | 'restore'
+  | 'parallel'
   | 'telemetry'
   | 'autostart'
   | 'export'
@@ -739,6 +750,15 @@ function App() {
         ? `Auto-Claude 已切到 ${result.clash.node}；`
         : '';
       return `${result.switched_to} 已切换；${clash}${result.restart_hint}`;
+    });
+
+  // P1-3：并行模式——为该账号开一个独立终端（CLAUDE_CONFIG_DIR 隔离），
+  // 不接管全局 ~/.claude，可与当前账号同时使用。
+  const openParallel = (id: string) =>
+    run('parallel', async () => {
+      const result = await invoke<ParallelTerminalResult>('open_parallel_terminal', { id });
+      const via = result.launcher === 'wt' ? 'Windows Terminal' : 'PowerShell（未装 Terminal，已退回）';
+      return `已用 ${via} 打开并行终端；配置目录：${result.config_dir}`;
     });
 
   const loadBackups = useCallback(async () => {
@@ -1532,6 +1552,10 @@ function App() {
 
       <DesktopProfiles />
 
+      <QuotaReminderPanel />
+
+      <McpPanel />
+
       <PrivacyTools />
 
       <section className="profiles">
@@ -1617,9 +1641,19 @@ function App() {
                     className="primary"
                     onClick={() => switchTo(profile.id)}
                     disabled={!!busy}
+                    title="全局切换：接管唯一的 ~/.claude"
                   >
                     {busy === 'switch' ? <Loader2 className="spin" /> : <CheckCircle2 />}
                     {currentProfile?.id === profile.id ? '重新应用' : '切换'}
+                  </button>
+                  <button
+                    className="ghost"
+                    onClick={() => openParallel(profile.id)}
+                    disabled={!!busy}
+                    title="并行模式：开一个独立终端，不影响当前账号"
+                  >
+                    {busy === 'parallel' ? <Loader2 className="spin" /> : <TerminalSquare />}
+                    并行终端
                   </button>
                   <button className="danger" onClick={() => remove(profile.id, profile.name)} disabled={!!busy}>
                     <Trash2 />
