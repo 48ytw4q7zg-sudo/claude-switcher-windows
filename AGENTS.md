@@ -47,11 +47,15 @@ src-tauri/src/
 ├── platform/{windows,mod}.rs   # Windows 平台适配（唯一允许写 cfg 的地方）
 ├── paths.rs        # 路径解析 + 目录保障（CLAUDE_CONFIG_DIR 跟随）
 ├── credentials.rs  # 凭据读写（Windows 凭据文件）
-├── store.rs        # 账号快照 + AES-GCM 加密（含 DesktopProfile）
+├── store.rs        # 账号快照 + AES-GCM 加密（含 DesktopProfile / KeyBackend trait）
 ├── accounts.rs     # 账号材料事务写入 + settings env 注入
+├── reconcile.rs    # 切换前对账 + 自动收养（Current/Other/Unknown）
+├── parallel.rs     # 按终端并行多账号（独立 CLAUDE_CONFIG_DIR）
+├── mcp.rs          # MCP 服务器管理（stdio cmd /c 包装）
+├── notify_state.rs # 额度阈值通知状态（每周期每档一次）
 ├── isolation.rs    # 按 profile 接管/激活本地状态（CLI）
 ├── desktop.rs      # Claude Desktop 快照/捕获/切换/删除（含备份回滚）
-├── appconfig.rs    # 全局配置 appconfig.json（country/tz/locale/proxy_mode/webrtc）
+├── appconfig.rs    # 全局配置 appconfig.json（country/tz/locale/proxy_mode/webrtc/quota）
 ├── egress.rs       # 出口 IP 探测（Cloudflare/ipinfo）+ 住宅/机房 ASN
 ├── region.rs       # 国家→时区/locale/GeoID，IANA→Windows 时区
 ├── stun.rs         # UDP STUN 探针（WebRTC 泄漏判定）
@@ -140,6 +144,17 @@ async fn xxx() -> Result<T, String> {
 15. **`blocking(|| f())` 对无参函数是 redundant_closure**：clippy 要求直接传函数
     指针 `blocking(f)`；但被调函数返回非 Result（如直接返回 report）时仍要
     `blocking(|| Ok(report))`。
+16. **Windows 上 npx/npm/pnpm/yarn 是 .cmd shim**：MCP stdio 直接 spawn 会失败，
+    必须 `cmd /c <command> <args>` 包装（`mcp::normalize_mcp_stdio`），且要幂等。
+17. **额度阈值通知必须按重置周期去重**：以官方 usage 的 `resets_at` 为 key，
+    周期变化才清档；状态落 `notify-state.json` 原子写。Toast 需 AUMID，
+    开发模式显示成宿主（PowerShell）身份属正常。
+18. **便携模式的 WEBVIEW2_USER_DATA_FOLDER 必须在 WebView2 创建前设置**：
+    在 `run()` 里 Builder 之前 set_var；`portable.flag` 在 exe 旁。
+19. **测试绝不读写真实凭据库**：主密钥走 `KeyBackend` trait，测试注入内存后端
+    （`TestKeyBackendGuard`），避免中断时残留测试密钥；密钥测试用全局锁串行。
+20. **P2-2 凭据锁禁止凭猜测实现**：须先用 Process Monitor 实机抓 claude.exe/
+    node.exe 刷新令牌时的锁文件，抓不到就在文档标「待实机调研」。
 
 ## 实机未验证项（改相关代码后优先测）
 
@@ -151,3 +166,6 @@ async fn xxx() -> Result<T, String> {
 - TUN 网卡、verge.yaml TUN 恢复后 Clash Verge 实机重启。
 - open-safe 真实浏览器拉起/WebRTC 标志/profile 销毁；自动更新全流程。
 - 安装包升级/卸载回归。
+- 托盘一键切换（动态菜单/通知/重建）、按终端并行多账号（wt/cmd 拉起）。
+- 额度阈值通知/提醒（Toast/AUMID）、MCP 真实拉起、便携版解压运行。
+- P2-2 凭据锁：待 Process Monitor 实机调研，本轮不实现。

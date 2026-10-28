@@ -3,7 +3,8 @@
 一个 Windows 桌面工具，**同时管理 Claude Code CLI 与 Claude Desktop 桌面版**：
 - **CLI**：保存账号快照、切换 OAuth 凭据、按账号隔离 Claude Code 本地痕迹（会话历史 / 配置 / 遥测等 8 个隔离面），并把每个账号绑定到 Clash Verge 的 `Auto-Claude` 节点；
 - **桌面版**：`%APPDATA%\Claude` 整体快照/切换；
-- **环境安全**：14 项安全检查、一键修复、保镖 kill-switch、时区/地区锁定、Clash 规则托管、STUN/WebRTC 泄漏探测、指纹与 CLI 体检、加密快照、自动更新。
+- **环境安全**：14 项安全检查、一键修复、保镖 kill-switch、时区/地区锁定、Clash 规则托管、STUN/WebRTC 泄漏探测、指纹与 CLI 体检、加密快照、自动更新；
+- **多账号增强（v0.3.0）**：按终端并行多账号（每账号独立配置目录）、托盘一键切换、额度阈值提醒 + 一键切换、MCP 服务器管理、便携版 zip。
 
 基于 **Tauri 2 + Rust + React 19 + TypeScript** 构建，桌面壳为 Windows 原生 WebView2。
 
@@ -37,8 +38,8 @@
 | 项 | 状态 |
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
-| 安装包 | **Release v0.2.2**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS），产物来源可审计，SHA256 见 Release 说明 |
-| 测试 | `cargo test --lib` **161 passed / 0 failed / 1 ignored**；`cargo clippy --all-targets -- -D warnings` 零警告；`npx tsc --noEmit` 通过 |
+| 安装包 | **Release v0.3.0**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计，SHA256 见 Release 说明 |
+| 测试 | `cargo test --lib` **207 passed / 0 failed / 0 ignored**；`cargo clippy --all-targets -- -D warnings` 零警告；`npx tsc --noEmit` 通过 |
 | 实测环境 | **Windows 11 Pro x64**（build 26300）；Windows 10 未实机验证 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
 
@@ -50,10 +51,14 @@
 claude-switcher-windows/
 ├── src-tauri/
 │   ├── src/
-│   │   ├── lib.rs                 # ★ 命令层：36 个 #[tauri::command] + 应用启动
+│   │   ├── lib.rs                 # ★ 命令层：#[tauri::command] + 应用启动（--guard 分发）
 │   │   ├── main.rs                # 桌面程序入口（无控制台窗口）
 │   │   ├── accounts.rs            # 账号材料事务写入 + settings env 注入
-│   │   ├── store.rs               # 账号快照库 + AES-GCM 加密（含 DesktopProfile）
+│   │   ├── reconcile.rs           # 切换前对账 + 自动收养（Current/Other/Unknown）
+│   │   ├── parallel.rs            # 按终端并行多账号（独立 CLAUDE_CONFIG_DIR）
+│   │   ├── mcp.rs                 # MCP 服务器管理（stdio cmd /c 包装）
+│   │   ├── notify_state.rs        # 额度阈值通知状态（每周期每档一次）
+│   │   ├── store.rs               # 账号快照库 + AES-GCM 加密（KeyBackend trait）
 │   │   ├── credentials.rs         # 凭据读写/清除（平台差异收拢）
 │   │   ├── isolation.rs           # 8 个隔离面的接管/激活/取消
 │   │   ├── links.rs               # symlink / junction / 硬链接
@@ -96,12 +101,15 @@ claude-switcher-windows/
 │   │   ├── RegionPanel.tsx        # 地区锁定 + 代理客户端
 │   │   ├── ClashModePanel.tsx     # Clash 模式/规则/WebRTC 策略/代理组
 │   │   ├── DesktopProfiles.tsx    # Claude Desktop 账号管理
+│   │   ├── QuotaReminder.tsx      # 额度阈值提醒 + 一键切换
+│   │   ├── McpPanel.tsx           # MCP 服务器管理
 │   │   ├── PrivacyTools.tsx       # open-safe / 代理诊断 / 指纹 / cli-info
 │   │   └── types.ts               # 前后端契约类型
 ├── docs/
 │   ├── upstream-baseline.md       # 双上游基线记录 + 功能对等矩阵 + 升级审查流程
 │   ├── backend-interfaces.md      # 平台层契约
 │   ├── qa-report.md               # QA 报告（含第二轮全量复核的 19 项修复记录）
+│   ├── qa-v0.3.0.md               # v0.3.0 账号管理增强 QA 报告
 │   ├── release-v0.1.0.md          # v0.1.0 发布记录
 │   └── prior-session-recovery.md  # 前序会话恢复报告
 ├── .github/workflows/
@@ -118,9 +126,9 @@ claude-switcher-windows/
 
 | 形态 | 入口 | 适用场景 |
 | --- | --- | --- |
-| **NSIS 安装版** | Release 中 `ClaudeSwitcher_0.2.2_x64-setup.exe` | 普通用户，双击安装（推荐） |
-| **MSI 安装版** | Release 中 `ClaudeSwitcher_0.2.2_x64_zh-CN.msi` | 企业分发 / 域管理 |
-| **免安装可执行文件** | 源码构建产物 `src-tauri\target\release\claude-switcher.exe` | 高手自用，便携 |
+| **NSIS 安装版** | Release 中 `ClaudeSwitcher_0.3.0_x64-setup.exe` | 普通用户，双击安装（推荐） |
+| **MSI 安装版** | Release 中 `ClaudeSwitcher_0.3.0_x64_zh-CN.msi` | 企业分发 / 域管理 |
+| **便携版 zip** | Release 中 `ClaudeSwitcher-portable.zip` | 解压即用，数据随 exe 目录携带 |
 | **开发模式** | `npm run tauri dev` | 二次开发，带热更新 |
 
 ### 这是什么、能做什么
@@ -135,25 +143,43 @@ Claude Code CLI 的登录凭据、全局配置和会话历史都散落在用户�
 - **隐私工具**：STUN 泄漏探测、一次性隔离浏览器、代理诊断、系统指纹体检、CLI 安装体检。
 - **数据迁移**：加密快照导出/导入（CSBK1），换机冷备。
 
-### 主窗口面板（9 个）
+### 多账号增强（v0.3.0）
 
-当前本机状态 · 保存当前账号 · 一键新号 · 账号快照 · 网络节点（Clash）· Claude 用量 · 备份与恢复 · 数据位置（链接模式 / 配置目录 / 开机自启）· 遥测去关联 · **环境安检**（14 项 + 一键修复）· **保镖**（安装 / 立即巡检 / 卸载）· **地区与代理客户端**（set-region / set-client / 代理组）· **Clash 模式与规则**（模式识别 / 写规则 / WebRTC 策略）· **Claude Desktop 账号** · **隐私与诊断工具**
+- **切换前对账 + 自动收养**：切换前读取 live 身份，分为 Current / Other(id) / Unknown(uuid)。手动登录过别的号会被识别并回写对应账号（提示「检测到手动换号」）；live 身份在仓库里没有对应账号时，用 live 材料自动新建账号（名「自动收养-<邮箱或 uuid 前8>-<MMdd-HHmm>」，标注可重命名）。live 缺字段不会中断切换。
+- **托盘一键切换**：右键托盘菜单按账号动态生成（当前账号 ● 标记，超长截断，>10 个收进「切换账号」子菜单），点击即切换，结果弹系统通知并重建菜单。
+- **按终端并行多账号**：每个账号开一个独立终端，`CLAUDE_CONFIG_DIR` 指向 `~/.claude-switcher/accounts/<id>/`，多终端可同时登录不同账号；优先用 Windows Terminal（`-EncodedCommand` UTF-16LE base64），未装则退回 `cmd start powershell`；共享 skills 走复制。与「全局切换」（接管唯一的 `~/.claude`）互不影响。
+- **额度阈值通知**：80% / 95% 两档系统通知，每个重置周期每档只通知一次（`notify-state.json` 原子写）。
+- **额度阈值提醒 + 一键切换**：当前账号达阈值（默认 90%，可配）时提醒，一键切到缓存里余量最多的账号；**只做提醒，不做后台自动换号**（其他账号用量会过时、后台刷新令牌风险高）；默认关闭。
+- **MCP 服务器管理**：管理全局 `~/.claude.json` 的 `mcpServers` 与项目 `.mcp.json`；`npx/npm/pnpm/yarn` 启动的 stdio 自动 `cmd /c` 包装；校验 stdio/http/sse 字段；密钥类 env 不进日志。
+- **便携版 zip**：exe 旁放 `portable.flag` 即进入便携模式，数据目录与 WebView2 用户数据都指向 exe 目录，整体解压即用、拷走即迁移。
+
+### 主窗口面板
+
+当前本机状态 · 保存当前账号 · 一键新号 · 账号快照（含并行终端）· 网络节点（Clash）· Claude 用量 · 备份与恢复 · 数据位置（链接模式 / 配置目录 / 开机自启）· 遥测去关联 · **环境安检**（14 项 + 一键修复）· **保镖**（安装 / 立即巡检 / 卸载）· **地区与代理客户端**（set-region / set-client / 代理组）· **Clash 模式与规则**（模式识别 / 写规则 / WebRTC 策略）· **Claude Desktop 账号** · **额度阈值提醒** · **MCP 服务器** · **隐私与诊断工具**
 
 ### 托盘
+
+- **左键单击**：弹出用量窗口；**左键双击**：打开主窗口。
+- **右键菜单**：账号列表（当前账号 ● 标记，点击一键切换）+ 打开主窗口 / 刷新用量 / 退出。
+- 主窗口点 X 只是隐藏到托盘，彻底退出走托盘菜单。
+
+### 便携版
+
+解压 `ClaudeSwitcher-portable.zip`，在 exe 同目录放一个空的 `portable.flag`（zip 内已附带），双击 `ClaudeSwitcher.exe` 即可以便携模式运行：账号库、日志、配置与 WebView2 数据都落在 exe 目录，不写注册表/用户目录；整个目录拷走即迁移。
 
 ---
 
 ## 四、安装使用教程
 
 1. **确认是 64 位系统**：设置 → 系统 → 系统信息 →「系统类型」应含 **64 位操作系统，x64**。若是 ARM64 或 32 位，本工具跑不了。
-2. **下载安装包**：打开本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases) → 最新版，下载 `ClaudeSwitcher_0.2.2_x64-setup.exe`（推荐，NSIS 安装包）；也可用 `ClaudeSwitcher_0.2.2_x64_zh-CN.msi`。SHA256 校验值在 Release 说明与 `SHA256SUMS.txt` 里。
+2. **下载安装包**：打开本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases) → 最新版，下载 `ClaudeSwitcher_0.3.0_x64-setup.exe`（推荐，NSIS 安装包）；也可用 `ClaudeSwitcher_0.3.0_x64_zh-CN.msi`；想免安装则下载 `ClaudeSwitcher-portable.zip`。SHA256 校验值在 Release 说明与 `SHA256SUMS.txt` 里。
 3. **双击安装包**，按提示点「下一步」直到安装完成。
 4. 若 Windows 弹出 **SmartScreen**「Windows 已保护你的电脑」，点「更多信息」→「仍要运行」。
    > 这是**未签名安装包**的正常提示。请只从本仓库 Release 下载，不要从来路不明的链接安装。
 5. 从开始菜单打开 **Claude Switcher**。
 6. **先保存当前账号**：在「保存当前账号」面板输入名称（如「Claude 主号」），点「保存快照」。前提：你已经在 Claude Code 中登录过至少一个账号。
 7. **切换账号**：在「账号快照」里点对应卡片的「切换」。若 Claude Code 还在运行，工具会提示你**切换后重启 Claude Code**（正在运行的会话不会自动换账号）。
-8. **托盘用法**：点右下角托盘的彩色图标弹出用量窗口；**双击**图标打开主窗口；**右键**托盘图标有「打开主窗口 / 刷新用量 / 退出 Claude Switcher」。
+8. **托盘用法**：点右下角托盘的彩色图标弹出用量窗口；**双击**图标打开主窗口；**右键**托盘图标可直接在账号列表里点账号一键切换（当前账号 ● 标记），也有「打开主窗口 / 刷新用量 / 退出 Claude Switcher」。
 9. 主窗口点 **X** 只是**隐藏到托盘**，不会退出；要彻底退出请用托盘右键菜单或主窗口「退出」按钮。
 10. （可选）在「数据位置」面板点「开启开机自启」，电脑重启后自动运行（只影响当前 Windows 用户）。
 11. （可选）「一键新号」向导：选节点 → 准备环境 → 手动打开 Claude Code 完成 OAuth 登录 → 回到本工具点「登录完成后保存」。
@@ -187,14 +213,22 @@ npm run tauri dev
 
 # 6. 出安装包（MSI + NSIS）
 npm run tauri build
+
+# 7. 便携版 zip（CI 自动；本地可手动打包）
+$staging = "portable-staging"
+New-Item -ItemType Directory -Force $staging | Out-Null
+Copy-Item src-tauri\target\release\claude-switcher.exe $staging\ClaudeSwitcher.exe
+New-Item -ItemType File $staging\portable.flag | Out-Null
+Compress-Archive -Path "$staging\*" -DestinationPath ClaudeSwitcher-portable.zip -Force
 ```
 
 产物位置：
 
 ```text
 src-tauri\target\release\claude-switcher.exe                       # 免安装可执行文件
-src-tauri\target\release\bundle\msi\ClaudeSwitcher_0.2.2_x64_zh-CN.msi
-src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.2.2_x64-setup.exe
+src-tauri\target\release\bundle\msi\ClaudeSwitcher_0.3.0_x64_zh-CN.msi
+src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.3.0_x64-setup.exe
+ClaudeSwitcher-portable.zip                                       # 便携版
 ```
 
 补充：
@@ -247,6 +281,15 @@ src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.2.2_x64-setup.exe
 | **Claude Desktop 切换**（进程结束、活目录回存、快照载入、回滚） | 未实机验证 |
 | **自动更新全流程** | 未实机验证 |
 | **加密快照跨机导入** | 未实机验证（导入侧已加外机密文拒绝，但换机场景未实测） |
+| **托盘一键切换**（动态菜单、点击切换、系统通知、菜单重建） | 未实机验证（无显示器/无托盘环境） |
+| **按终端并行多账号**（wt/cmd 拉起、独立配置目录、共享 skills） | 未实机验证 |
+| **额度阈值通知 / 提醒**（Toast、notify-state、一键切换） | 未实机验证（Toast 需 AUMID；开发模式显示成 PowerShell 身份属正常） |
+| **MCP 服务器管理**（stdio 拉起、cmd /c 包装、.mcp.json 读写） | 未实机验证（纯逻辑有单测，真实拉起未测） |
+| **便携版 zip**（portable.flag、数据目录与 WebView2 重定向） | 未实机验证（需在 WebView2 创建前设置，真实解压运行未测） |
+
+> **P2-2 凭据锁：本轮不实现（待实机调研）**。必须先用 Process Monitor 实机抓取
+> `claude.exe` / `node.exe` 刷新令牌时的锁文件（路径、句柄、持续时间），确认后再实现，
+> 禁止凭猜测写。当前在文档中标记为「待实机调研」。
 
 > 另有两项**已知功能缺口**（非缺陷，未在第二轮补齐）：
 > ① 自动更新目前只做版本检查并提供下载页链接，不自动下载安装（未签名场景下 updater 插件方案不现实）；
