@@ -30,24 +30,35 @@ pub struct UpdateCheckResult {
 
 /// 检查更新（网络请求，必须经 `blocking()` 调用，勿在主线程直接跑）。
 ///
-/// 带 6 小时磁盘缓存：匿名 GitHub API 限流是每小时 60 次**按 IP**，用户经 Clash
-/// 共享出口 IP 时很容易 403。缓存让面板反复打开不再重复请求，限流时也能返回
-/// 上次的成功结果（`message` 会说明是缓存值）。
+/// 带磁盘缓存：匿名 GitHub API 限流是每小时 60 次**按 IP**，用户经 Clash 共享
+/// 出口 IP 时很容易 403。缓存让面板反复打开不再重复请求。
+///
+/// **只缓存成功结果**：失败（限流/断网）也用长 TTL 的话，断网时打开一次，
+/// 之后 6 小时内即使网络恢复，面板也只会返回缓存的失败——用户以为升级通道
+/// 坏了。失败改用短 TTL，很快会重新尝试。
+///
+/// 读缓存时校验 `current_version`：用户在缓存期内升级到新版本后，旧缓存会说
+/// 「发现新版本 v0.3.0（当前 v0.2.0）」——版本号已经对不上了。
 pub fn check_for_update_blocking() -> UpdateCheckResult {
     let current = env!("CARGO_PKG_VERSION").to_string();
 
-    if let Some(cached) = read_cache() {
+    if let Some(cached) = read_cache(&current) {
         return cached.result;
     }
 
     let fresh = fetch_latest(&current);
-    write_cache(&fresh);
+    if fresh.latest_version.is_some() {
+        write_cache(&fresh);
+    }
     fresh
 }
 
-/// 缓存有效期。GitHub 匿名限流按 IP 每小时 60 次，6 小时足以把重复打开面板的
-/// 请求压到接近于零，同时不会让用户隔天还看到旧版本提示。
+/// 成功结果的缓存有效期。GitHub 匿名限流按 IP 每小时 60 次，6 小时足以把重复
+/// 打开面板的请求压到接近于零，同时不会让用户隔天还看到旧版本提示。
 const CACHE_TTL_SECS: i64 = 6 * 60 * 60;
+/// 失败结果的缓存有效期：短到不足以让用户以为功能坏了，又足以避免连续
+/// 快速重试（限流时每次打开面板都打一次 API 只会让限流更久）。
+const FAILURE_TTL_SECS: i64 = 10 * 60;
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CachedCheck {
@@ -61,12 +72,22 @@ fn cache_path() -> Option<std::path::PathBuf> {
         .map(|d| d.join("update-check.json"))
 }
 
-fn read_cache() -> Option<CachedCheck> {
+fn read_cache(current: &str) -> Option<CachedCheck> {
     let path = cache_path()?;
     let raw = std::fs::read_to_string(path).ok()?;
     let mut cached: CachedCheck = serde_json::from_str(&raw).ok()?;
     let age = chrono::Utc::now().timestamp() - cached.checked_at;
-    if !(0..=CACHE_TTL_SECS).contains(&age) {
+    // 成功用长 TTL，失败用短 TTL（见 `check_for_update_blocking` 的说明）。
+    let ttl = if cached.result.latest_version.is_some() {
+        CACHE_TTL_SECS
+    } else {
+        FAILURE_TTL_SECS
+    };
+    if !(0..=ttl).contains(&age) {
+        return None;
+    }
+    // 版本已变（用户在缓存期内升级）→ 缓存作废，重新检查。
+    if cached.result.current_version != current {
         return None;
     }
     // 标注这是缓存值：用户看到「有更新」时能判断信息可能不够新。

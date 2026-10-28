@@ -41,6 +41,8 @@ mod region;
 mod rules;
 mod store;
 mod stun;
+#[cfg(test)]
+mod test_support;
 mod tray;
 mod update;
 mod usage;

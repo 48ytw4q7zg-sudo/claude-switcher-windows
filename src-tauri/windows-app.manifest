@@ -8,7 +8,7 @@
     未开启时行为与之前一致，无副作用。
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-  <assemblyIdentity version="0.2.0.0" name="io.github.48ytw4q7zg-sudo.claude-switcher" type="win32"/>
+  <assemblyIdentity version="{{VERSION}}" name="io.github.48ytw4q7zg-sudo.claude-switcher" type="win32"/>
   <dependency>
     <dependentAssembly>
       <assemblyIdentity

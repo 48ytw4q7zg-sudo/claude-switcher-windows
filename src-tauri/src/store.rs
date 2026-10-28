@@ -302,8 +302,43 @@ static STORE_KEY_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// 用途：导入加密快照前先确认主密钥在位。若缺失就导入，`save_store` 会在加密
 /// 路径上铸造一把**新**密钥——导入是"成功"了，但机器上原有的密文快照从此
 /// 永远解不开，抢救变成永久丢失。宁可拒绝导入并让用户先恢复密钥。
-pub fn store_key_exists() -> bool {
-    matches!(read_store_key(), Ok(Some(_)))
+/// store 加密主密钥的状态（三态）。
+///
+/// 区分 `Missing` 与 `Unavailable` 很重要：前者是「凭据库里确实没有这个条目」，
+/// 后者是「条目可能存在但读不出」（DPAPI 失败、凭据库损坏、被安全策略挡住）。
+/// 把 Unavailable 当 Missing 处理会导致铸新钥覆盖旧数据。
+pub enum StoreKeyStatus {
+    /// 密钥在位。
+    Present,
+    /// 确实没有密钥（全新安装 / 尚未保存过任何账号）。
+    Missing,
+    /// 读不出密钥（原因见 `read_store_key_raw` 的注释）。
+    Unavailable(String),
+}
+
+/// 本机 store 加密主密钥的状态（**只读，绝不铸造**）。
+pub fn store_key_status() -> StoreKeyStatus {
+    match read_store_key() {
+        Ok(Some(_)) => StoreKeyStatus::Present,
+        Ok(None) => StoreKeyStatus::Missing,
+        Err(e) => StoreKeyStatus::Unavailable(e),
+    }
+}
+
+/// 磁盘上的 store 文件是否含 `enc:v1:` 密文。
+///
+/// 用于判断「导入时能不能安全地铸造新密钥」：若本机已有密文快照却没有密钥，
+/// 铸新钥会让那些旧快照永久解不开——这种场景必须拒绝导入。反之（没有 store，
+/// 或 store 里全是明文）铸造新密钥是无害的。
+pub fn existing_store_has_ciphertext() -> bool {
+    let Ok(path) = paths::store_path() else {
+        return false;
+    };
+    let Ok(raw) = std::fs::read_to_string(&path) else {
+        return false;
+    };
+    // 直接搜前缀：不必解析结构，密文只可能出现在凭文字段的值里。
+    raw.contains(ENC_PREFIX)
 }
 
 /// **加密路径专用**：读现有密钥，缺失才生成 32B 新密钥写入凭据存储。

@@ -143,11 +143,14 @@ fn invalid_component_reason(rel: &str) -> Option<String> {
             return Some("含 Windows 非法字符".to_string());
         }
         // 保留设备名：写这些名会被重定向到设备，拷不出内容。
-        // 比对时去掉扩展名（`NUL.txt` 的设备名仍是 `NUL`）。
+        // `CONIN$` / `CONOUT$` 的 `$` 是名字的一部分，不能截断；
+        // 设备名后面允许跟扩展名（`NUL.txt` 的设备名仍是 `NUL`），
+        // 所以用第一个 `.` 前的整段来比。
         let stem = component.split('.').next().unwrap_or(component);
-        const RESERVED: [&str; 22] = [
-            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
-            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        const RESERVED: [&str; 27] = [
+            "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4",
+            "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3",
+            "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
         ];
         if RESERVED.contains(&stem.to_uppercase().as_str()) {
             return Some("是 Windows 保留设备名".to_string());
@@ -372,6 +375,7 @@ fn normalize_rel(line: &str) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
     #[test]
     fn parse_keep_list_filters_comments_and_rejects_unsafe() {
         let text = "\
@@ -419,6 +423,7 @@ normalizer/
         assert!(warnings.iter().any(|w| w.contains("..")));
     }
 
+    #[cfg(windows)]
     #[test]
     fn rejects_windows_only_path_hazards() {
         // Windows 特有的四类坑：备用数据流、非法字符、保留设备名、尾点尾空格，
@@ -436,8 +441,10 @@ what?.json
 quote\".json
 angle<>.json
 pipe|.json
-trailing.
-trailing-space.
+trailing-dot.
+CONIN$.txt
+a /b.json
+mid /inside.json
 Skills
 skills
 ";

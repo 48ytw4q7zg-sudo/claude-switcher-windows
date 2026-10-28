@@ -486,27 +486,45 @@ fn switch_desktop_profile_in(
                     })?;
                     if let Err(e) = fsx::retry_io(|| fs::rename(&staging, &current_snapshot)) {
                         // 正式名没换上：把旧快照请回来，现场回到替换前。
-                        let _ = fsx::retry_io(|| fs::rename(&retired, &current_snapshot));
-                        return Err(format!(
-                            "回存账号「{}」快照失败（{}）：{}（已恢复原快照）",
-                            current.name,
-                            current_snapshot.display(),
-                            fsx::humanize_io_error(&e)
-                        ));
+                        // 恢复也可能失败（.old 被占用等）——此时必须如实告知旧快照
+                        // 现在落在 `.old` 目录，不能让用户以为已经恢复好了。
+                        match fsx::retry_io(|| fs::rename(&retired, &current_snapshot)) {
+                            Ok(()) => {
+                                return Err(format!(
+                                    "回存账号「{}」快照失败（{}）：{}（已恢复原快照）",
+                                    current.name,
+                                    current_snapshot.display(),
+                                    fsx::humanize_io_error(&e)
+                                ));
+                            }
+                            Err(restore_err) => {
+                                return Err(format!(
+                                    "回存账号「{}」快照失败（{}）：{}；且恢复原快照也失败：{}。\
+                                     原快照目前仍在 {}，请手动处理（不要直接删除）。",
+                                    current.name,
+                                    current_snapshot.display(),
+                                    fsx::humanize_io_error(&e),
+                                    fsx::humanize_io_error(&restore_err),
+                                    retired.display()
+                                ));
+                            }
+                        }
                     }
                     let _ = fsx::retry_io(|| fs::remove_dir_all(&retired));
+                    // size_bytes 只算一次：快照有几个 GB 时，重复走完整目录遍历
+                    // 会让每次切换都白等一遍。
+                    let saved_size = dir_size(&current_snapshot);
                     if let Some(p) = store
                         .desktop_profiles
                         .iter_mut()
                         .find(|p| p.id == current.id)
                     {
                         p.updated_at = Utc::now();
-                        p.size_bytes = dir_size(&current_snapshot);
+                        p.size_bytes = saved_size;
                     }
                     warnings.push(format!(
                         "已回存当前账号「{}」的使用变更（{} 字节）",
-                        current.name,
-                        dir_size(&current_snapshot)
+                        current.name, saved_size
                     ));
                 } else {
                     warnings.push(format!(

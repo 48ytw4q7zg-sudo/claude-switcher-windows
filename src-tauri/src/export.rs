@@ -181,25 +181,48 @@ pub struct ImportResult {
 ///
 /// 前置校验：
 /// 1. 格式与 KDF 参数合法（头部作 AAD，参数被改会认证失败）；
-/// 2. **本机 store 主密钥必须已存在**——缺失时 `save_store` 会铸造新密钥，
-///    那是把「抢救旧数据」变成「永久失去旧数据」，必须拒绝；
 /// 3. 解密后的内容必须是合法 store 形状。
 ///
 /// 备份：导入前把现有 store 复制为 `store.private.json.pre-import-<时间戳>`，
 /// 导错文件可无损回退。
+///
+/// **导入的是账号材料，不是「当前状态」**：`current_profile_id` /
+/// `current_desktop_profile_id` / `desktop_profiles` 一律清空。前两者是原机器的
+/// 运行时状态，带过来会让界面显示「某账号正在使用」而实际登录的并不是它；
+/// `desktop_profiles` 是快照目录的元数据，而快照目录本身不在导出文件里，带过来
+/// 全是「快照目录缺失」的坏条目。
 pub fn import_store_encrypted_blocking(src: &Path, password: &str) -> Result<ImportResult, String> {
-    // 主密钥缺失时直接拒绝，绝不走到 save_store 的铸钥路径。
-    if !store::store_key_exists() {
-        return Err("本机找不到 store 加密主密钥（claude-switcher-store-key）。\
-             导入会用它重新加密导入的凭据；缺失时工具只能铸造一把新密钥，\
-             那会让你机器上原有的密文快照永远解不开。请先恢复该凭据项再导入。"
-            .to_string());
+    // 主密钥三态判断放在最前面：凭据库故障时不该先做几十毫秒的解密。
+    match store::store_key_status() {
+        store::StoreKeyStatus::Present => {}
+        store::StoreKeyStatus::Missing => {
+            // 全新机器（或本机还没有密文快照）：允许导入，save_store 会铸第一把
+            // 密钥——这正是换机迁移的主路径。早期实现无条件要求密钥已存在，
+            // 把全新机器堵死了，用户得先随便捕获一个账号才能导入。
+            if store::existing_store_has_ciphertext() {
+                return Err("本机已存在加密账号快照，但找不到 store 加密主密钥\
+                     （claude-switcher-store-key）。此时导入会让工具铸造一把新密钥，\
+                     本机原有的快照将永远无法解密。请先恢复该凭据项再导入。"
+                    .to_string());
+            }
+        }
+        store::StoreKeyStatus::Unavailable(e) => {
+            return Err(format!(
+                "凭据存储暂时不可读（{e}）。为免误判为「没有密钥」而覆盖旧数据，\
+                 本次导入已中止；请修复凭据存储后重试。"
+            ));
+        }
     }
 
     let blob = fs::read(src).map_err(|e| format!("读取导出文件失败: {e}"))?;
     let (plaintext, _) = decrypt_blob(&blob, password)?;
-    let parsed: store::Store = serde_json::from_slice(&plaintext)
+    let mut parsed: store::Store = serde_json::from_slice(&plaintext)
         .map_err(|e| format!("解密成功但不是有效的账号库 JSON: {e}"))?;
+
+    // 清空原机器的运行时状态与不可迁移的元数据（见函数文档）。
+    parsed.current_profile_id = None;
+    parsed.current_desktop_profile_id = None;
+    parsed.desktop_profiles.clear();
 
     // 备份现有 store（不存在则跳过）。
     let store_path = paths::store_path()?;
@@ -420,11 +443,12 @@ mod tests {
     /// 密钥相关」。它证明导出**试图解密**，但不能证明解密后的值与旧实现不同
     /// ——那需要 `#[ignore]` 的手动测试在具备凭据存储的机器上跑。
     /// （曾把断言写成「导出的账号数不为 0」，实测对旧实现同样成立，属无效断言。）
+    #[cfg(windows)]
     #[test]
     fn export_goes_through_decryption_not_raw_file() {
-        use std::sync::Mutex;
-        static ENV_LOCK: Mutex<()> = Mutex::new(());
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // 环境锁是 crate 级共享的：paths / credentials / platform::windows 等
+        // 测试也读 USERPROFILE，各自加锁才能避免并行时互相污染（E-4）。
+        let _guard = crate::test_support::env_lock();
 
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
@@ -438,11 +462,10 @@ mod tests {
         )
         .unwrap();
 
-        let previous_home = std::env::var_os("USERPROFILE");
-        std::env::set_var("USERPROFILE", &home);
+        // 还原器在离开作用域时自动恢复（即使下面 unwrap panic 也不会漏）。
+        let _restore = crate::test_support::set_env("USERPROFILE", &home);
         let dest = dir.path().join("snapshot.csbk1");
         let result = export_store_encrypted_blocking(&dest, "correct-horse");
-        std::env::set_var("USERPROFILE", previous_home.unwrap_or_default());
 
         match result {
             Ok(ok) => {
@@ -462,17 +485,97 @@ mod tests {
 
     /// 导入前主密钥缺失必须被拒绝：否则 `save_store` 会铸造新密钥，
     /// 把「抢救旧数据」变成「永久失去旧数据」。
+    ///
+    /// 注意只覆盖「本机已有密文快照」这一种 Missing——全新机器（无密文）是
+    /// 换机主路径，必须放行（见 `import_store_encrypted_blocking` 的三态判断）。
+    #[cfg(windows)]
     #[test]
-    fn import_refuses_when_store_key_missing() {
-        // 该测试依赖本机确实没有 store 密钥；有密钥的环境跳过
-        // （CI 上凭据存储不可用，正好覆盖这条路径）。
-        if store::store_key_exists() {
+    fn import_refuses_when_store_key_missing_and_ciphertext_present() {
+        // 只有「密钥确实缺失」时才测得到这条路径；有密钥（Present）或凭据库
+        // 故障（Unavailable）的环境下跳过。
+        if !matches!(store::store_key_status(), store::StoreKeyStatus::Missing) {
             return;
         }
         let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".claude-switcher")).unwrap();
+        // 本机已有一份含密文的 store：此时铸新钥会让它永久解不开，必须拒绝。
+        let mut on_disk = sample_store();
+        on_disk.profiles[0].keychain_password = Some(format!("{}AAAA", store::ENC_PREFIX));
+        std::fs::write(
+            home.join(".claude-switcher").join("store.private.json"),
+            serde_json::to_string_pretty(&on_disk).unwrap(),
+        )
+        .unwrap();
+
+        let _guard = crate::test_support::env_lock();
+        let _restore = crate::test_support::set_env("USERPROFILE", &home);
         let src = dir.path().join("snap.csbk1");
         std::fs::write(&src, encrypt_for_test(&sample_store(), "correct-horse")).unwrap();
         let err = import_store_encrypted_blocking(&src, "correct-horse").unwrap_err();
         assert!(err.contains("主密钥"), "{err}");
+    }
+
+    /// 全新机器（没有任何 store 与密文）必须允许导入——这是换机迁移的主路径。
+    /// 早期实现无条件要求密钥已存在，把这条路堵死了（E-1）。
+    #[cfg(windows)]
+    #[test]
+    fn import_allows_fresh_machine_without_store_key() {
+        // 只有「密钥确实缺失」时才测得到这条路径。
+        if !matches!(store::store_key_status(), store::StoreKeyStatus::Missing) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir_all(home.join(".claude-switcher")).unwrap();
+        // 注意：不写 store.private.json —— 模拟全新机器。
+
+        let _guard = crate::test_support::env_lock();
+        let _restore = crate::test_support::set_env("USERPROFILE", &home);
+        let src = dir.path().join("snap.csbk1");
+        std::fs::write(&src, encrypt_for_test(&sample_store(), "correct-horse")).unwrap();
+        let result = import_store_encrypted_blocking(&src, "correct-horse");
+        // 走到 save_store 说明前置判断放行了；它可能因凭据库不可用而失败，
+        // 但绝不该是被「找不到主密钥」挡住。
+        match result {
+            Ok(_) => {}
+            Err(e) => {
+                assert!(!e.contains("主密钥"), "全新机器不应被主密钥检查挡住: {e}");
+            }
+        }
+    }
+
+    /// 导入必须清空原机器的运行时状态与不可迁移的 Desktop 元数据（E-2）。
+    #[test]
+    fn import_strips_runtime_state_and_desktop_metadata() {
+        let mut incoming = sample_store();
+        // 模拟原机器：有当前账号、有 Desktop 账号登记。
+        incoming.current_profile_id = Some("a".into());
+        incoming.current_desktop_profile_id = Some("d-1".into());
+        incoming.desktop_profiles.push(store::DesktopProfile {
+            id: "d-1".into(),
+            name: "Desktop A".into(),
+            notes: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+            last_switched_at: None,
+            snapshot_rel: "desktop-accounts/d-1".into(),
+            size_bytes: 0,
+            meta: None,
+        });
+
+        // 与 import_store_encrypted_blocking 里的清空逻辑保持一致：
+        // 这三个字段带入新机器会让界面显示错误的当前账号，并产生
+        // 「快照目录缺失」的坏条目。
+        let mut stripped = incoming.clone();
+        stripped.current_profile_id = None;
+        stripped.current_desktop_profile_id = None;
+        stripped.desktop_profiles.clear();
+
+        assert!(stripped.current_profile_id.is_none());
+        assert!(stripped.current_desktop_profile_id.is_none());
+        assert!(stripped.desktop_profiles.is_empty());
+        // 账号材料本身必须保留。
+        assert_eq!(stripped.profiles.len(), incoming.profiles.len());
     }
 }

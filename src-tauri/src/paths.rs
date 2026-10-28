@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 
+use crate::fsx;
 use crate::platform::imp;
 
 /// HOME 目录：`USERPROFILE` → `dirs::home_dir()`。
@@ -139,7 +140,51 @@ pub fn ensure_app_dirs() -> Result<(), String> {
     }
     // 清理上次进程被杀留下的原子写临时文件（`.xxx.tmp-<uuid>`）。
     cleanup_tmp_once();
+    // 清理 Desktop 回存的两段式替换残留（`<id>.new` / `<id>.old`）。
+    cleanup_desktop_swap_residue_once();
     Ok(())
+}
+
+/// 进程内只执行一次清理 Desktop 回存的替换残留。
+///
+/// 回存走「拷到 `<id>.new` → 旧目录改名 `<id>.old` → `.new` 改正式名 → 删 `.old`」。
+/// 进程在中间任意一步被杀（断电、强杀）就会留下 `.new` 或 `.old`：
+/// - `.old` 里装的还是**旧快照**，直接删会丢失该账号的上一次状态；
+/// - `.new` 是半成品，下次回存会先被清掉。
+///
+/// 保守策略：只删 `.new`（半成品，无独有价值）；`.old` 保留并记日志，
+/// 让用户决定——里面可能是唯一副本。它们在 `desktop-accounts/` 下，以下划线
+/// 前缀不参与账号枚举。
+fn cleanup_desktop_swap_residue_once() {
+    static CLEANUP_ONCE: std::sync::Once = std::sync::Once::new();
+    CLEANUP_ONCE.call_once(|| {
+        let Ok(accounts) = app_data_dir().map(|d| d.join("desktop-accounts")) else {
+            return;
+        };
+        let Ok(entries) = fs::read_dir(&accounts) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            // `.new` 是回存的半成品，安全删除。
+            if let Some(id) = name.strip_suffix(".new") {
+                let _ = fsx::retry_io(|| fs::remove_dir_all(entry.path()));
+                crate::log_info(&format!(
+                    "已清理上次中断的 Desktop 回存半成品（账号 {}）",
+                    id
+                ));
+            } else if let Some(id) = name.strip_suffix(".old") {
+                // `.old` 可能是唯一副本，只提示不删。
+                crate::log_info(&format!(
+                    "发现 Desktop 回存残留的旧快照目录（账号 {}）：{}。\
+                     其中是上一次的快照状态，确认无需恢复后可手动删除。",
+                    id,
+                    entry.path().display()
+                ));
+            }
+        }
+    });
 }
 
 /// 进程内只执行一次的 tmp 清理（`Once`）：避免每次 `ensure_app_dirs` 都删一遍，
