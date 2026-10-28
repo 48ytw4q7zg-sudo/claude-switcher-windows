@@ -142,9 +142,9 @@ CI 随后又抓出两处跨平台/竞态问题并已修复：
 
 **Windows-only 收敛**（`refactor!` 提交）：删除 `platform/unix.rs`、全部 Keychain/unix 分支、
 `macos-build.yml`、macOS CI 矩阵、`macos-private-api`；`platform/mod.rs` 对非 Windows 目标
-`compile_error!`。净删约 615 行。`store.rs` 尚余一处 `#[cfg(not(windows))]` 的
-`keychain_write_raw` 因安全分类器要求用户对具体删除目标确认而保留——它在 Windows 构建中
-不参与编译，对产物无影响。
+`compile_error!`。净删约 615 行。`store.rs` 的 `keychain_write_raw` 曾因安全分类器要求
+用户对具体删除目标确认而暂留，owner 确认后已删除（提交 `6529a5c`）——至此 macOS 适配
+代码全部清空。
 
 ## 五、风险用例（需重点回归）
 
