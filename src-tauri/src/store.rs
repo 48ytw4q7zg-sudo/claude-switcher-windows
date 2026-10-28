@@ -392,68 +392,6 @@ pub fn encrypt_keychain_field(value: &str) -> Result<String, String> {
     encrypt_secret(value)
 }
 
-/// macOS：写 keychain（hex -X 形式；payload 走 stdin 避免 ps 泄露）。
-#[cfg(not(windows))]
-fn keychain_write_raw(account: &str, service: &str, value: &str) -> Result<(), String> {
-    use std::io::Write;
-    use std::process::{Command, Stdio};
-
-    let hex: String = value
-        .as_bytes()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    let command = format!("add-generic-password -U -a \"{account}\" -s \"{service}\" -X {hex}\n");
-    const STDIN_LINE_LIMIT: usize = 4096 - 64;
-
-    if command.len() <= STDIN_LINE_LIMIT {
-        let mut child = Command::new("security")
-            .arg("-i")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| format!("写入 Keychain 失败: {e}"))?;
-        child
-            .stdin
-            .take()
-            .ok_or_else(|| "写入 Keychain 失败：无法获取 security stdin".to_string())?
-            .write_all(command.as_bytes())
-            .map_err(|e| format!("写入 Keychain 失败: {e}"))?;
-        let out = child
-            .wait_with_output()
-            .map_err(|e| format!("写入 Keychain 失败: {e}"))?;
-        if out.status.success() {
-            return Ok(());
-        }
-        return Err(format!(
-            "写入 Keychain 失败: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ));
-    }
-    let out = Command::new("security")
-        .args([
-            "add-generic-password",
-            "-U",
-            "-a",
-            account,
-            "-s",
-            service,
-            "-X",
-            &hex,
-        ])
-        .output()
-        .map_err(|e| format!("写入 Keychain 失败: {e}"))?;
-    if out.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "写入 Keychain 失败: {}",
-            String::from_utf8_lossy(&out.stderr)
-        ))
-    }
-}
-
 // ───────────────────────── store 读写 ─────────────────────────
 
 pub fn load_store() -> Result<Store, String> {
