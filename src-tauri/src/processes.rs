@@ -179,7 +179,6 @@ pub fn kill_claude_code_processes() -> Result<Vec<String>, String> {
 }
 
 /// 单个 PID 终止。force=false 温和终止（进程树），force=true 强制。
-#[cfg(windows)]
 fn terminate_pid(pid: &str, force: bool) -> Result<(), String> {
     let mut command = imp::silent_command("taskkill");
     command.args(["/PID", pid, "/T"]);
@@ -202,26 +201,6 @@ fn terminate_pid(pid: &str, force: bool) -> Result<(), String> {
                 "强制结束 Claude Code 进程失败（退出码 {code}）: {}",
                 stderr.trim()
             ));
-        }
-    }
-    Ok(())
-}
-
-/// 单个 PID 终止（Unix）。
-#[cfg(unix)]
-fn terminate_pid(pid: &str, force: bool) -> Result<(), String> {
-    let mut command = imp::silent_command("kill");
-    if force {
-        command.arg("-9");
-    }
-    let output = command
-        .arg(pid)
-        .output()
-        .map_err(|e| format!("结束 Claude Code 进程失败: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.contains("No such process") {
-            return Err(format!("结束 Claude Code 进程失败: {}", stderr.trim()));
         }
     }
     Ok(())

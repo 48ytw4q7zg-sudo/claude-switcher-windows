@@ -41,7 +41,9 @@ mod region;
 mod rules;
 mod store;
 mod stun;
-#[cfg(test)]
+// 只有 Windows 的导入/导出测试会用它（且这些测试本身就限 Windows）；
+// 其他平台编译进来会因无使用者触发 dead-code，反而挡住 macOS CI 的 clippy 门禁。
+#[cfg(all(test, windows))]
 mod test_support;
 mod tray;
 mod update;
@@ -391,22 +393,11 @@ fn get_status_blocking(offline: bool) -> Result<ClaudeStatus, String> {
     })
 }
 
-/// 凭据文件存在性探测。
-/// Windows 上是主存储（`.credentials.json`）；macOS 上它是旧版残留文件（凭据在 Keychain）。
-/// Note: credentials::credentials_path() 在 Windows 上才有（macOS 版是 legacy_credentials_path）。
+/// 凭据文件存在性探测（Windows 主存储 `.credentials.json`）。
 fn credentials_file_probe() -> bool {
-    #[cfg(windows)]
-    {
-        credentials::credentials_path()
-            .map(|path| path.exists())
-            .unwrap_or(false)
-    }
-    #[cfg(not(windows))]
-    {
-        credentials::legacy_credentials_path()
-            .map(|path| path.exists())
-            .unwrap_or(false)
-    }
+    credentials::credentials_path()
+        .map(|path| path.exists())
+        .unwrap_or(false)
 }
 
 fn fill_meta_from_saved_profile(meta: &mut store::ProfileMeta, store_data: &Store) {
@@ -1491,31 +1482,7 @@ fn restore_backup_blocking(id: String) -> Result<RestoreResult, String> {
 
 // ───────────────────────── 其它命令 ─────────────────────────
 
-#[cfg(unix)]
-#[tauri::command]
-fn open_data_dir() -> Result<(), String> {
-    let path = p::app_data_dir()?;
-    let program = if cfg!(target_os = "macos") {
-        "open"
-    } else {
-        "xdg-open"
-    };
-    let output = platform::imp::silent_command(program)
-        .arg(path)
-        .output()
-        .map_err(|e| format!("打开目录失败: {e}"))?;
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(format!(
-            "打开目录失败: {}",
-            String::from_utf8_lossy(&output.stderr)
-        ))
-    }
-}
-
 /// Windows：explorer 即使成功也常返回非零退出码，用 spawn 忽略退出码。
-#[cfg(windows)]
 #[tauri::command]
 fn open_data_dir() -> Result<(), String> {
     let path = p::app_data_dir()?;
@@ -1676,37 +1643,23 @@ fn get_diagnostic_info_blocking(include_network: bool) -> Result<Value, String> 
 /// 一键打开 Windows「开发者设置」页（降级到 junction/硬链接时的引导）。
 #[tauri::command]
 fn open_developer_settings() -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        platform::imp::silent_command("explorer")
-            .arg("ms-settings:developers")
-            .spawn()
-            .map_err(|e| format!("打开开发者设置失败: {e}"))?;
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        Err("仅 Windows 支持打开开发者设置".to_string())
-    }
+    platform::imp::silent_command("explorer")
+        .arg("ms-settings:developers")
+        .spawn()
+        .map_err(|e| format!("打开开发者设置失败: {e}"))?;
+    Ok(())
 }
 
 /// 打开日志目录（资源管理器）。
 #[tauri::command]
 fn open_logs_dir() -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        let dir = p::app_data_dir()?.join("logs");
-        fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        platform::imp::silent_command("explorer")
-            .arg(dir)
-            .spawn()
-            .map_err(|e| format!("打开日志目录失败: {e}"))?;
-        Ok(())
-    }
-    #[cfg(not(windows))]
-    {
-        Err("仅 Windows 支持打开日志目录".to_string())
-    }
+    let dir = p::app_data_dir()?.join("logs");
+    fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    platform::imp::silent_command("explorer")
+        .arg(dir)
+        .spawn()
+        .map_err(|e| format!("打开日志目录失败: {e}"))?;
+    Ok(())
 }
 
 // ───────────────────────── Claude 配置目录覆盖 ─────────────────────────
@@ -1914,55 +1867,46 @@ const AUTOSTART_APPROVED_KEY: &str =
 /// 说明：这是增强项，上游 macOS 版没有对应功能。
 #[tauri::command]
 fn set_autostart(enabled: bool) -> Result<(), String> {
-    #[cfg(windows)]
-    {
-        use winreg::enums::HKEY_CURRENT_USER;
-        use winreg::RegKey;
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
 
-        // **必须用 create_subkey**：`open_subkey` 内部是 `KEY_READ` 只读句柄
-        // （winreg reg_key.rs:146），在它上面 set_value/delete_value 会返回
-        // 拒绝访问 (os error 5)。Run 项在 Windows 上一定存在，用 open_subkey
-        // 试探再 create 的写法永远走只读分支——自启开关会 100% 失败。
-        // create_subkey 用 KEY_ALL_ACCESS，项已存在时也能正常打开（reg_key.rs:241）。
-        let (run, _) = RegKey::predef(HKEY_CURRENT_USER)
-            .create_subkey(AUTOSTART_RUN_KEY)
-            .map_err(|e| format!("打开 Run 注册表项失败: {e}"))?;
+    // **必须用 create_subkey**：`open_subkey` 内部是 `KEY_READ` 只读句柄
+    // （winreg reg_key.rs:146），在它上面 set_value/delete_value 会返回
+    // 拒绝访问 (os error 5)。Run 项在 Windows 上一定存在，用 open_subkey
+    // 试探再 create 的写法永远走只读分支——自启开关会 100% 失败。
+    // create_subkey 用 KEY_ALL_ACCESS，项已存在时也能正常打开（reg_key.rs:241）。
+    let (run, _) = RegKey::predef(HKEY_CURRENT_USER)
+        .create_subkey(AUTOSTART_RUN_KEY)
+        .map_err(|e| format!("打开 Run 注册表项失败: {e}"))?;
 
-        if enabled {
-            let exe =
-                std::env::current_exe().map_err(|e| format!("定位当前可执行文件失败: {e}"))?;
-            let value = format!("\"{}\" --autostart", exe.to_string_lossy());
-            run.set_value(AUTOSTART_VALUE_NAME, &value)
-                .map_err(|e| format!("写入开机自启失败: {e}"))?;
-            // Run 项存在不代表 Windows 会启动：任务管理器的 StartupApproved
-            // 禁用标记也必须清除，否则应用里反复点“开启”永远不会生效。
-            let (approved, _) = RegKey::predef(HKEY_CURRENT_USER)
-                .create_subkey(AUTOSTART_APPROVED_KEY)
-                .map_err(|e| format!("打开 StartupApproved 注册表项失败: {e}"))?;
-            approved
-                .set_raw_value(
-                    AUTOSTART_VALUE_NAME,
-                    &winreg::RegValue {
-                        // 与 Windows 启动项启用值保持一致：02 + 11 个 0。
-                        bytes: vec![0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
-                        vtype: winreg::enums::RegType::REG_BINARY,
-                    },
-                )
-                .map_err(|e| format!("恢复启动项启用状态失败: {e}"))?;
-            Ok(())
-        } else {
-            // delete_value 对不存在的值返回 NotFound——这正是幂等成功。
-            match run.delete_value(AUTOSTART_VALUE_NAME) {
-                Ok(()) => Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(e) => Err(format!("删除开机自启失败: {e}")),
-            }
+    if enabled {
+        let exe = std::env::current_exe().map_err(|e| format!("定位当前可执行文件失败: {e}"))?;
+        let value = format!("\"{}\" --autostart", exe.to_string_lossy());
+        run.set_value(AUTOSTART_VALUE_NAME, &value)
+            .map_err(|e| format!("写入开机自启失败: {e}"))?;
+        // Run 项存在不代表 Windows 会启动：任务管理器的 StartupApproved
+        // 禁用标记也必须清除，否则应用里反复点“开启”永远不会生效。
+        let (approved, _) = RegKey::predef(HKEY_CURRENT_USER)
+            .create_subkey(AUTOSTART_APPROVED_KEY)
+            .map_err(|e| format!("打开 StartupApproved 注册表项失败: {e}"))?;
+        approved
+            .set_raw_value(
+                AUTOSTART_VALUE_NAME,
+                &winreg::RegValue {
+                    // 与 Windows 启动项启用值保持一致：02 + 11 个 0。
+                    bytes: vec![0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                    vtype: winreg::enums::RegType::REG_BINARY,
+                },
+            )
+            .map_err(|e| format!("恢复启动项启用状态失败: {e}"))?;
+        Ok(())
+    } else {
+        // delete_value 对不存在的值返回 NotFound——这正是幂等成功。
+        match run.delete_value(AUTOSTART_VALUE_NAME) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(format!("删除开机自启失败: {e}")),
         }
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = enabled;
-        Err("开机自启仅支持 Windows".to_string())
     }
 }
 
@@ -1979,41 +1923,31 @@ struct AutostartState {
 
 #[tauri::command]
 fn get_autostart() -> AutostartState {
-    #[cfg(windows)]
-    {
-        use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
-        use winreg::RegKey;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
+    use winreg::RegKey;
 
-        let registered = RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey(AUTOSTART_RUN_KEY)
-            .and_then(|key| key.get_value::<String, _>(AUTOSTART_VALUE_NAME))
-            .is_ok();
+    let registered = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey(AUTOSTART_RUN_KEY)
+        .and_then(|key| key.get_value::<String, _>(AUTOSTART_VALUE_NAME))
+        .is_ok();
 
-        // StartupApproved\Run 里与本值名对应的二进制：首字节 02=启用、03=禁用。
-        // 注意 winreg 0.52 的 FromRegValue 没为 Vec<u8> 实现（只支持 String/u32 等），
-        // 二进制值必须走 get_raw_value 拿原始 bytes。
-        let disabled_by_user = RegKey::predef(HKEY_CURRENT_USER)
-            .open_subkey_with_flags(
-                "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run",
-                KEY_READ,
-            )
-            .and_then(|key| key.get_raw_value(AUTOSTART_VALUE_NAME))
-            .ok()
-            .and_then(|raw| raw.bytes.first().copied())
-            .map(|first| first % 2 == 1)
-            .unwrap_or(false);
+    // StartupApproved\Run 里与本值名对应的二进制：首字节 02=启用、03=禁用。
+    // 注意 winreg 0.52 的 FromRegValue 没为 Vec<u8> 实现（只支持 String/u32 等），
+    // 二进制值必须走 get_raw_value 拿原始 bytes。
+    let disabled_by_user = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey_with_flags(
+            "Software\\Microsoft\\Windows\\CurrentVersion\\Explorer\\StartupApproved\\Run",
+            KEY_READ,
+        )
+        .and_then(|key| key.get_raw_value(AUTOSTART_VALUE_NAME))
+        .ok()
+        .and_then(|raw| raw.bytes.first().copied())
+        .map(|first| first % 2 == 1)
+        .unwrap_or(false);
 
-        AutostartState {
-            registered,
-            disabled_by_user,
-        }
-    }
-    #[cfg(not(windows))]
-    {
-        AutostartState {
-            registered: false,
-            disabled_by_user: false,
-        }
+    AutostartState {
+        registered,
+        disabled_by_user,
     }
 }
 

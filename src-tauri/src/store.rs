@@ -252,7 +252,6 @@ fn read_store_key() -> Result<Option<[u8; 32]>, String> {
     Ok(Some(key))
 }
 
-#[cfg(windows)]
 fn read_store_key_raw(username: &str) -> Result<Option<String>, String> {
     let entry = keyring::Entry::new(credentials::STORE_KEY_KEYCHAIN_SERVICE, username)
         .map_err(|e| format!("读取 store 加密密钥失败: {e}"))?;
@@ -270,38 +269,12 @@ fn read_store_key_raw(username: &str) -> Result<Option<String>, String> {
     }
 }
 
-#[cfg(not(windows))]
-fn read_store_key_raw(username: &str) -> Result<Option<String>, String> {
-    use std::process::Command;
-
-    let output = Command::new("security")
-        .arg("find-generic-password")
-        .arg("-a")
-        .arg(username)
-        .arg("-s")
-        .arg(credentials::STORE_KEY_KEYCHAIN_SERVICE)
-        .arg("-w")
-        .output()
-        .map_err(|e| format!("读取 store 加密密钥失败: {e}"))?;
-    if !output.status.success() {
-        return Ok(None);
-    }
-    Ok(Some(
-        String::from_utf8_lossy(&output.stdout).trim().to_string(),
-    ))
-}
-
 /// 进程内的密钥创建锁。
 /// 首次运行时托盘刷新线程与命令线程可能同时发现「没有密钥」并各生成一把，
 /// 后写入的覆盖先写入的——先加密的数据从此解不开。用 Mutex 串行化，
 /// 持锁后再读一次，第二个线程就会拿到第一个线程写好的密钥。
 static STORE_KEY_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 本机是否已有 store 加密主密钥（**只读，绝不铸造**）。
-///
-/// 用途：导入加密快照前先确认主密钥在位。若缺失就导入，`save_store` 会在加密
-/// 路径上铸造一把**新**密钥——导入是"成功"了，但机器上原有的密文快照从此
-/// 永远解不开，抢救变成永久丢失。宁可拒绝导入并让用户先恢复密钥。
 /// store 加密主密钥的状态（三态）。
 ///
 /// 区分 `Missing` 与 `Unavailable` 很重要：前者是「凭据库里确实没有这个条目」，
@@ -361,19 +334,11 @@ fn load_or_create_store_key() -> Result<[u8; 32], String> {
     rand::rngs::OsRng.fill_bytes(&mut key);
     let b64 = BASE64.encode(key);
 
-    #[cfg(windows)]
-    {
-        let entry = keyring::Entry::new(credentials::STORE_KEY_KEYCHAIN_SERVICE, &username)
-            .map_err(|e| format!("定位 store 加密密钥条目失败: {e}"))?;
-        entry
-            .set_password(&b64)
-            .map_err(|e| format!("写入 store 加密密钥失败: {e}"))?;
-    }
-    #[cfg(not(windows))]
-    {
-        keychain_write_raw(&username, credentials::STORE_KEY_KEYCHAIN_SERVICE, &b64)
-            .map_err(|e| format!("写入 store 加密密钥失败: {e}"))?;
-    }
+    let entry = keyring::Entry::new(credentials::STORE_KEY_KEYCHAIN_SERVICE, &username)
+        .map_err(|e| format!("定位 store 加密密钥条目失败: {e}"))?;
+    entry
+        .set_password(&b64)
+        .map_err(|e| format!("写入 store 加密密钥失败: {e}"))?;
     Ok(key)
 }
 

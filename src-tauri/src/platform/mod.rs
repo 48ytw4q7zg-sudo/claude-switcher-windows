@@ -1,20 +1,16 @@
-//! 平台适配层：收拢全部 `#[cfg]` 噪音。
+//! 平台适配层（Windows 专用）。
 //!
 //! - [`crate::platform::windows`]：Windows 实现（静默子进程、ACL、junction、
-//!   reparse tag、路径归一化、文件 ID、工作区、锁重试）。
-//! - [`crate::platform::unix`]：Unix（macOS/Linux）同名 API。
+//!   reparse tag、路径归一化、文件 ID、工作区、锁重试、系统查询）。
 //!
-//! 上层代码一律通过本模块调用，不直接写 `#[cfg(windows)]`。
+//! 本项目只面向 Windows：非 Windows 目标直接编译报错，不提供 Unix 兜底。
+//! 历史上这里还有 `unix.rs` 对等实现，已按「只做 Windows」的产品决定移除。
 
-#[cfg(windows)]
+#[cfg(not(windows))]
+compile_error!("claude-switcher 仅支持 Windows；macOS/Linux 适配代码已移除");
+
 pub mod windows;
-#[cfg(windows)]
 pub use windows as imp;
-
-#[cfg(unix)]
-pub mod unix;
-#[cfg(unix)]
-pub use unix as imp;
 
 #[cfg(test)]
 mod tests {

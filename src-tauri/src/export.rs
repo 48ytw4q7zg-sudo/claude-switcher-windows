@@ -314,6 +314,23 @@ fn decrypt_blob(blob: &[u8], password: &str) -> Result<(Vec<u8>, u8), String> {
 mod tests {
     use super::*;
 
+    /// 删除测试中铸造的 store 主密钥，把真实凭据库恢复到运行前状态。
+    ///
+    /// `import_allows_fresh_machine` 走完整导入路径，`save_store` 会把新密钥写进
+    /// **真实**的 Windows 凭据库。不清理的话，串行在后的 `import_refuses` 会把
+    /// 状态误判为 Present 而跳过（Windows CI 实测竞态）。
+    fn cleanup_minted_store_key() {
+        let Ok(username) = crate::credentials::current_username() else {
+            return;
+        };
+        if let Ok(entry) =
+            keyring::Entry::new(crate::credentials::STORE_KEY_KEYCHAIN_SERVICE, &username)
+        {
+            // NoEntry 也无妨：本就是要清掉它。
+            let _ = entry.delete_credential();
+        }
+    }
+
     fn sample_store() -> store::Store {
         let mut s = store::Store::default();
         s.profiles.push(store::StoredProfile {
@@ -491,6 +508,9 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn import_refuses_when_store_key_missing_and_ciphertext_present() {
+        // 锁必须先于密钥状态检查：`import_allows` 测试会在真实凭据库铸造密钥，
+        // 锁外检查会在它之后误判 Present，走进放行分支（Windows CI 实测竞态）。
+        let _guard = crate::test_support::env_lock();
         // 只有「密钥确实缺失」时才测得到这条路径；有密钥（Present）或凭据库
         // 故障（Unavailable）的环境下跳过。
         if !matches!(store::store_key_status(), store::StoreKeyStatus::Missing) {
@@ -508,7 +528,6 @@ mod tests {
         )
         .unwrap();
 
-        let _guard = crate::test_support::env_lock();
         let _restore = crate::test_support::set_env("USERPROFILE", &home);
         let src = dir.path().join("snap.csbk1");
         std::fs::write(&src, encrypt_for_test(&sample_store(), "correct-horse")).unwrap();
@@ -521,6 +540,8 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn import_allows_fresh_machine_without_store_key() {
+        // 锁先于状态检查（同 `import_refuses` 的竞态注释）。
+        let _guard = crate::test_support::env_lock();
         // 只有「密钥确实缺失」时才测得到这条路径。
         if !matches!(store::store_key_status(), store::StoreKeyStatus::Missing) {
             return;
@@ -530,11 +551,13 @@ mod tests {
         std::fs::create_dir_all(home.join(".claude-switcher")).unwrap();
         // 注意：不写 store.private.json —— 模拟全新机器。
 
-        let _guard = crate::test_support::env_lock();
         let _restore = crate::test_support::set_env("USERPROFILE", &home);
         let src = dir.path().join("snap.csbk1");
         std::fs::write(&src, encrypt_for_test(&sample_store(), "correct-horse")).unwrap();
         let result = import_store_encrypted_blocking(&src, "correct-horse");
+        // 清理本测试在真实凭据库铸造的密钥，恢复运行前状态——
+        // 不清理会让后续的 `import_refuses` 误判 Present 而跳过（Windows CI 实测）。
+        cleanup_minted_store_key();
         // 走到 save_store 说明前置判断放行了；它可能因凭据库不可用而失败，
         // 但绝不该是被「找不到主密钥」挡住。
         match result {

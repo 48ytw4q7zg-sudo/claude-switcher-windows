@@ -77,10 +77,9 @@ claude-switcher-windows/
 │   │   ├── checks.rs              # 14 项安全检查 + 静默总检 + 一键修复
 │   │   ├── keep.rs                # 跨身份保留 keep-in-workspace（stage/merge）
 │   │   ├── diagnostics.rs         # open-safe / 代理诊断 / 指纹 / cli-info
-│   │   └── platform/              # ★ 唯一允许写 #[cfg] 的地方
-│   │       ├── mod.rs             # 平台分发入口（imp）
-│   │       ├── windows.rs         # 全部 Win32 细节（含计划任务/服务/网卡查询）
-│   │       └── unix.rs            # 同名 API 的 Unix 实现（macOS 不回归）
+│   │   └── platform/              # ★ Windows 平台适配（唯一允许写 cfg 的地方）
+│   │       ├── mod.rs             # 平台入口（非 Windows 目标直接编译报错）
+│   │       └── windows.rs         # 全部 Win32 细节
 │   ├── Cargo.toml
 │   ├── tauri.conf.json            # 窗口/托盘/打包（WebView2 embedBootstrapper）
 │   ├── windows-app.manifest       # asInvoker / longPathAware / comctl32 v6
@@ -106,9 +105,8 @@ claude-switcher-windows/
 │   ├── release-v0.1.0.md          # v0.1.0 发布记录
 │   └── prior-session-recovery.md  # 前序会话恢复报告
 ├── .github/workflows/
-│   ├── ci.yml                     # push / PR 质量门禁（macOS + Windows）
+│   ├── ci.yml                     # push / PR 质量门禁（Windows）
 │   ├── windows-build.yml          # 手动 / v* tag → MSI + NSIS + Release
-│   └── macos-build.yml            # 手动 → macOS app + DMG
 ├── AGENTS.md                      # 维护者交接说明（踩坑记录全文）
 ├── LICENSE                        # Apache-2.0
 └── README.md                      # 本文件
@@ -323,7 +321,7 @@ src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.2.1_x64-setup.exe
 
 | 模块 | 职责 |
 | --- | --- |
-| `platform/mod.rs` | **平台分发唯一入口**：`#[cfg]` 只出现在这里与 `windows.rs` / `unix.rs`；两文件提供同名 API |
+| `platform/mod.rs` | **Windows 平台适配唯一入口**：非 Windows 目标直接 `compile_error!`（本项目只做 Windows） |
 
 ### 命令清单（36 个 `#[tauri::command]`，按域分组）
 
@@ -533,7 +531,6 @@ npm run tauri build                         # 出 MSI + NSIS
 
 - `CI`（`.github/workflows/ci.yml`）：push / PR 时在 macOS 与 Windows runner 上跑前端构建、`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --lib`、Tauri build。（macOS runner 的 host 与 target 不同，会额外按 target 再跑一遍 clippy；Windows runner 两者相同，不重复。）
 - `Windows Build`（`.github/workflows/windows-build.yml`）：打 `v*` tag 自动构建 MSI / NSIS 并**自动创建 Release**（含 `SHA256SUMS.txt`，裸文件名可直接 `sha256sum -c`）；手动触发只出 Actions 产物。**构建来源证明（v0.2.0 起）**：安装包带 GitHub attestation，可验证确实来自本仓库 CI：`gh attestation verify .\ClaudeSwitcher_0.2.1_x64-setup.exe -R 48ytw4q7zg-sudo/claude-switcher-windows`。**从 v0.1.0 升级请先卸载旧版**（v0.2.0 更换了应用标识与发布者署名；用户数据在 `%USERPROFILE%\.claude-switcher\` 不受影响，装完新版自动继续使用）。
-- `macOS Build`（`.github/workflows/macos-build.yml`）：手动触发，产出 macOS app + DMG（供上游功能回归对比）。
 - 未配置代码签名证书；首次运行安装包会有 SmartScreen 提示，属预期。有条件可接 Azure Trusted Signing 或自持证书消除该提示。**路线图**：可申请 SignPath Foundation 面向开源项目的免费代码签名（需项目审核通过）。
 
 ## 出处与许可

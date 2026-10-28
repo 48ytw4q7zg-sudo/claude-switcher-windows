@@ -10,7 +10,6 @@
     "frontendDist": "../dist"
   },
   "app": {
-    "macOSPrivateApi": true,
     "trayIcon": {
       "id": "main",
       "iconPath": "icons/tray.png",

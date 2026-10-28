@@ -22,8 +22,6 @@ pub fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
 }
 
 /// 带锁重试的删除（目录）。
-// macOS 无调用方（锁重试删除只在 Windows 链接清理路径使用），保留供 API 对齐。
-#[cfg_attr(not(windows), allow(dead_code))]
 pub fn remove_dir_with_retry(path: &Path) -> io::Result<()> {
     imp::retry_locked(|| fs::remove_dir(path))
 }
@@ -46,8 +44,6 @@ pub fn retry_io<T>(f: impl FnMut() -> io::Result<T>) -> io::Result<T> {
 /// 的 `.json` 替换掉（变成 `.credentials.tmp-xxx`），语义错误且残留物难辨认。
 ///
 /// 细节处理：
-/// - **权限继承**：Unix 上 atomic rename 会丢掉原文件的 mode（上游对凭据类文件
-///   做过 0600）。写临时文件后先把原文件的权限复制过来；原文件不存在则设 0600。
 /// - **写句柄 sync**：`sync_all` 需要写权限，用只读句柄打开再 sync 在 Windows 上
 ///   必然失败（`FlushFileBuffers` 要求 `GENERIC_WRITE`）。这里用写模式打开、写完
 ///   立即 sync。
@@ -61,9 +57,6 @@ pub fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    // 记住原文件的权限，rename 之后要复刻回去（仅 Unix 需要；Windows 用 ACL 继承）。
-    #[cfg(unix)]
-    let original_mode = fs::metadata(path).ok().map(|m| m.permissions());
 
     let file_name = path
         .file_name()
@@ -88,18 +81,6 @@ pub fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     if let Err(e) = write_result {
         let _ = fs::remove_file(&tmp);
         return Err(e);
-    }
-
-    // 复刻权限：原文件存在则沿用其 mode；不存在（首次创建）则按 0600 收敛，
-    // 避免凭据类文件在 Unix 上以默认 umask（常为 0644）落盘。
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = match &original_mode {
-            Some(perms) => perms.mode(),
-            None => 0o600,
-        };
-        let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(mode));
     }
 
     let result = rename_with_retry(&tmp, path);
@@ -155,13 +136,10 @@ pub fn cleanup_stale_tmp_files(dir: &Path) -> usize {
 /// 给「Windows 上目录被占用导致接管失败」的错误信息补上人话提示。
 pub fn humanize_io_error(error: &io::Error) -> String {
     let text = error.to_string();
-    #[cfg(windows)]
-    {
-        if matches!(error.raw_os_error(), Some(5 | 32 | 33)) {
-            return format!(
-                "{text}（文件被占用：请关闭正在运行的 Claude Code / VS Code / 杀软实时扫描后重试）"
-            );
-        }
+    if matches!(error.raw_os_error(), Some(5 | 32 | 33)) {
+        return format!(
+            "{text}（文件被占用：请关闭正在运行的 Claude Code / VS Code / 杀软实时扫描后重试）"
+        );
     }
     text
 }

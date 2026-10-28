@@ -23,11 +23,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# macos-private-api 仅在 macOS 上实际生效（透明/无边框窗口），在 Windows/Linux 上为空；
-# 但 tauri-build 要求 tauri.conf.json 的 macOSPrivateApi 与该 feature 保持一致，故全局声明。
 tauri = { version = "2", features = [
     "tray-icon",
-    "macos-private-api",
     "image-png",
     "image-ico",
 ] }

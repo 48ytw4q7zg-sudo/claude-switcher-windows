@@ -10,13 +10,10 @@ use crate::platform::imp;
 /// Windows 上优先 USERPROFILE（跟 Claude Code 的行为一致；Git Bash 里设置的
 /// HOME 会把凭据/配置目录分叉，明确定义优先级避免歧义）。
 pub fn home_dir() -> Result<PathBuf, String> {
-    #[cfg(windows)]
-    {
-        if let Some(profile) = std::env::var_os("USERPROFILE") {
-            let trimmed = profile.to_string_lossy().trim().to_string();
-            if !trimmed.is_empty() {
-                return Ok(PathBuf::from(trimmed));
-            }
+    if let Some(profile) = std::env::var_os("USERPROFILE") {
+        let trimmed = profile.to_string_lossy().trim().to_string();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
         }
     }
     dirs::home_dir().ok_or_else(|| "无法定位 HOME 目录".to_string())

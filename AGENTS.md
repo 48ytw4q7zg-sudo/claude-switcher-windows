@@ -38,13 +38,15 @@ npm run tauri build                        # 出 MSI + NSIS
 
 ### cfg 收拢（重要）
 
-**所有平台差异必须收拢在 `platform/` 模块**，业务代码不写 `#[cfg(windows)]`：
+**所有平台差异必须收拢在 `platform/` 模块**，业务代码不写 `#[cfg(windows)]`。
+本项目只面向 Windows（`platform/mod.rs` 对非 Windows 目标 `compile_error!`），
+macOS/Linux 适配代码已按产品决定移除：
 
 ```
 src-tauri/src/
-├── platform/{windows,unix,mod}.rs   # 唯一允许写 cfg 的地方
+├── platform/{windows,mod}.rs   # Windows 平台适配（唯一允许写 cfg 的地方）
 ├── paths.rs        # 路径解析 + 目录保障（CLAUDE_CONFIG_DIR 跟随）
-├── credentials.rs  # 凭据读写（Windows 文件 / macOS Keychain）
+├── credentials.rs  # 凭据读写（Windows 凭据文件）
 ├── store.rs        # 账号快照 + AES-GCM 加密（含 DesktopProfile）
 ├── accounts.rs     # 账号材料事务写入 + settings env 注入
 ├── isolation.rs    # 按 profile 接管/激活本地状态（CLI）
@@ -69,7 +71,7 @@ src-tauri/src/
 └── lib.rs          # Tauri 命令层（--guard / --autostart 在此分发）
 ```
 
-新增平台相关能力时：先在 `platform/{windows,unix}.rs` 加同名函数，再在业务里调 `platform::imp::xxx`。
+新增平台相关能力时：先在 `platform/windows.rs` 加同名函数，再在业务里调 `platform::imp::xxx`。
 
 ### 阻塞命令必须走 `blocking()`
 
@@ -94,8 +96,8 @@ async fn xxx() -> Result<T, String> {
 
 ### 凭据与密钥边界
 
-- OAuth blob：Windows 存 `<claude_dir>\.credentials.json`；macOS 存 Keychain。
-- store 主密钥：Credential Manager（Windows）/ Keychain（macOS），32B AES-256-GCM。
+- OAuth blob：存 `<claude_dir>\.credentials.json`（官方主存储）。
+- store 主密钥：Windows Credential Manager（`claude-switcher-store-key`），32B AES-256-GCM。
 - `settings_json` 里的认证字段（`AUTH_ENV_KEYS` + `apiKeyHelper`）落盘前必须
   `store::split_auth_settings` 拆出加密，读时 `restore_auth_settings` 合并回去。
 - **解密路径绝不生成新密钥**：缺密钥时报错，让用户恢复，绝不覆盖。
