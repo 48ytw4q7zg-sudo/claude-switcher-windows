@@ -39,6 +39,9 @@ const LIVE_BACKUP_SUBDIR: &str = "desktop-accounts/.live-backup";
 /// 结束进程后轮询其退出的轮次与间隔（对齐上游 Stop-ClaudeApp 的 15 秒等待）。
 const QUIT_WAIT_ROUNDS: u32 = 15;
 const QUIT_WAIT_INTERVAL_MS: u64 = 1000;
+/// 温和关闭的等待：10 轮 × 500ms = 5 秒（Electron flush + 自行退出通常 <2 秒）。
+const GRACEFUL_WAIT_ROUNDS: u32 = 10;
+const GRACEFUL_WAIT_INTERVAL_MS: u64 = 500;
 
 // ───────────────────────── 路径 ─────────────────────────
 
@@ -229,11 +232,35 @@ fn kill_desktop_processes() -> Result<Vec<String>, String> {
         return Ok(Vec::new());
     }
     let mut killed = Vec::new();
+    // 两段式结束：先温和关闭，再强杀。
+    //
+    // Claude Desktop 是 Electron 应用，`%APPDATA%\Claude` 里有 LevelDB 与
+    // SQLite（带 WAL）。直接 `taskkill /F` 会在任意两点之间撕掉进程，WAL 可能
+    // 没来得及 checkpoint，拷出来的快照处于不一致状态——下次载入时登录态或
+    // 会话异常，而这种损坏是延迟暴露的，很难查。
+    // 温和关闭（不带 /F，对 GUI 窗口发 WM_CLOSE）让应用自己 flush 后退出；
+    // 等待数秒仍未退出才强杀。托盘常驻的辅助进程也要覆盖。
     for pid in &pids {
+        let _ = crate::platform::imp::silent_command("taskkill")
+            .args(["/PID", &pid.to_string()])
+            .output();
+    }
+    // 给应用留出 flush + 自行退出的时间（含子进程逐个退出）。
+    let mut still_running = Vec::new();
+    for _ in 0..GRACEFUL_WAIT_ROUNDS {
+        std::thread::sleep(std::time::Duration::from_millis(GRACEFUL_WAIT_INTERVAL_MS));
+        still_running = claude_desktop_processes();
+        if still_running.is_empty() {
+            return Ok(killed);
+        }
+    }
+
+    // 超时：对仍存活的进程强杀。
+    for pid in &still_running {
         let _ = crate::platform::imp::silent_command("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .output();
-        killed.push(format!("Claude Desktop (PID {pid})"));
+        killed.push(format!("Claude Desktop (PID {pid}, 强制)"));
     }
     // 等一小会儿让句柄释放，再让调用方轮询判定。
     std::thread::sleep(std::time::Duration::from_millis(500));
@@ -438,17 +465,36 @@ fn switch_desktop_profile_in(
             {
                 let current_snapshot = accounts_dir.join(&current.id);
                 if current_snapshot.is_dir() {
-                    // 先清空旧快照再拷入活目录：保证快照与活目录逐字一致
-                    // （robocopy /MIR 的上游语义），而不是残留旧文件。
-                    fsx::retry_io(|| fs::remove_dir_all(&current_snapshot)).map_err(|e| {
+                    // 安全替换：先拷到 `.new`，成功后再让旧目录让位。
+                    //
+                    // 早期实现是「先 remove_dir_all 旧快照，再 copy」——拷贝中途
+                    // 失败（文件被占用、磁盘满）时旧快照已没了、新快照只是半成品，
+                    // 快照得重新捕获。改成两段式替换后，任何一步失败旧快照都完好，
+                    // 最坏情况只是残留一个 `.new` 半成品（下次会被覆盖）。
+                    let staging = accounts_dir.join(format!("{}.new", current.id));
+                    let retired = accounts_dir.join(format!("{}.old", current.id));
+                    let _ = fsx::retry_io(|| fs::remove_dir_all(&staging));
+                    let _ = fsx::retry_io(|| fs::remove_dir_all(&retired));
+                    copy(live_dir, &staging)?;
+                    fsx::retry_io(|| fs::rename(&current_snapshot, &retired)).map_err(|e| {
                         format!(
-                            "回存账号「{}」快照失败（{}）：{}",
+                            "回存账号「{}」时替换旧快照失败（{}）：{}",
                             current.name,
                             current_snapshot.display(),
                             fsx::humanize_io_error(&e)
                         )
                     })?;
-                    let outcome = copy(live_dir, &current_snapshot)?;
+                    if let Err(e) = fsx::retry_io(|| fs::rename(&staging, &current_snapshot)) {
+                        // 正式名没换上：把旧快照请回来，现场回到替换前。
+                        let _ = fsx::retry_io(|| fs::rename(&retired, &current_snapshot));
+                        return Err(format!(
+                            "回存账号「{}」快照失败（{}）：{}（已恢复原快照）",
+                            current.name,
+                            current_snapshot.display(),
+                            fsx::humanize_io_error(&e)
+                        ));
+                    }
+                    let _ = fsx::retry_io(|| fs::remove_dir_all(&retired));
                     if let Some(p) = store
                         .desktop_profiles
                         .iter_mut()
@@ -459,7 +505,8 @@ fn switch_desktop_profile_in(
                     }
                     warnings.push(format!(
                         "已回存当前账号「{}」的使用变更（{} 字节）",
-                        current.name, outcome.bytes
+                        current.name,
+                        dir_size(&current_snapshot)
                     ));
                 } else {
                     warnings.push(format!(

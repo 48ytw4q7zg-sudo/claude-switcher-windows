@@ -41,7 +41,10 @@ export function useModalDialog(
       }
       if (e.key !== 'Tab') return;
       const focusables = dialog.querySelectorAll<HTMLElement>(
-        'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+        // 排除 disabled：删除确认弹窗的破坏性按钮常在忙碌时禁用，
+        // 若把它算进 focusables，第一个/最后一个落在它上面时焦点陷阱会失效
+        // （Tab 跑到已禁用元素上等于跑出弹窗）。
+        'button:not([disabled]), [href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
       );
       if (focusables.length === 0) return;
       const first = focusables[0];

@@ -74,12 +74,19 @@ pub fn keep_stage_dir() -> PathBuf {
 
 /// 解析 keep 列表文本：返回（有效条目, 跳过原因 WARN）。
 ///
-/// 规则：trim 后空行 / 以 `#` 开头忽略（不记 WARN）；绝对路径、**盘符前缀
-/// （`C:` / `C:foo` 这类「盘符相对路径」，`PathBuf::join` 会整体替换 base）**、
-/// 含 `..` 分量、归一化后为空或 `.` → 记 WARN 跳过。
+/// 规则：trim 后空行 / 以 `#` 开头忽略（不记 WARN）；以下形态记 WARN 跳过——
+/// - 绝对路径、盘符前缀（`C:` / `C:foo`，`PathBuf::join` 会整体替换 base）；
+/// - 含 `..` 分量；归一化后为空或 `.`；
+/// - 含 `:` 的分量（备用数据流 `settings.json:x`）；
+/// - 含 Windows 非法字符 `* ? " < > |` 或控制字符；
+/// - 保留设备名（`CON`/`PRN`/`AUX`/`NUL`/`COM1-9`/`LPT1-9`，含带扩展名形态）；
+/// - 分量以点或空格结尾（Windows 会静默去掉，暂存/合并路径会错位）；
+/// - 与其他条目大小写重复（NTFS 大小写不敏感，暂存时互相覆盖）。
 pub fn parse_keep_list(text: &str) -> (Vec<KeepEntry>, Vec<String>) {
     let mut entries = Vec::new();
     let mut warnings = Vec::new();
+    // 大小写不敏感去重：key 是 lower 后的 rel。
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for raw in text.lines() {
         let line = raw.trim();
         if line.is_empty() || line.starts_with('#') {
@@ -99,9 +106,58 @@ pub fn parse_keep_list(text: &str) -> (Vec<KeepEntry>, Vec<String>) {
             warnings.push(format!("keep 路径不能包含 ..，已跳过: {line}"));
             continue;
         }
+        if let Some(reason) = invalid_component_reason(&normalized) {
+            warnings.push(format!("keep 路径{reason}，已跳过: {line}"));
+            continue;
+        }
+        let key = normalized.to_lowercase();
+        if !seen.insert(key) {
+            warnings.push(format!(
+                "keep 路径与其他条目大小写重复（Windows 大小写不敏感），已跳过: {line}"
+            ));
+            continue;
+        }
         entries.push(KeepEntry { rel: normalized });
     }
     (entries, warnings)
+}
+
+/// 逐分量检查 Windows 路径的非法形态，返回人类可读的拒绝原因。
+///
+/// 覆盖四类在 macOS/Linux 上不存在、但会让 Windows 暂存/合并错乱的形态：
+/// 备用数据流、非法字符、保留设备名、尾点尾空格。
+fn invalid_component_reason(rel: &str) -> Option<String> {
+    for component in rel.split(['/', '\\']) {
+        if component.is_empty() {
+            continue;
+        }
+        // 备用数据流：`settings.json:x` 在 NTFS 上写的是流，不是普通文件。
+        if component.contains(':') {
+            return Some("含冒号（可能是备用数据流）".to_string());
+        }
+        // Windows 文件名非法字符 + 控制字符。
+        if component
+            .chars()
+            .any(|c| matches!(c, '*' | '?' | '"' | '<' | '>' | '|') || (c as u32) < 32)
+        {
+            return Some("含 Windows 非法字符".to_string());
+        }
+        // 保留设备名：写这些名会被重定向到设备，拷不出内容。
+        // 比对时去掉扩展名（`NUL.txt` 的设备名仍是 `NUL`）。
+        let stem = component.split('.').next().unwrap_or(component);
+        const RESERVED: [&str; 22] = [
+            "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7",
+            "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+        ];
+        if RESERVED.contains(&stem.to_uppercase().as_str()) {
+            return Some("是 Windows 保留设备名".to_string());
+        }
+        // 尾点/尾空格：Windows 静默去掉，暂存目录与合并目标会指向不同路径。
+        if component.ends_with('.') || component.ends_with(' ') {
+            return Some("的分量以点或空格结尾".to_string());
+        }
+    }
+    None
 }
 
 /// 是否带 Windows 盘符前缀（`C:` / `C:foo`）。
@@ -361,6 +417,56 @@ normalizer/
             .any(|w| w.contains("C:relative-to-drive.txt")));
         assert!(warnings.iter().any(|w| w.contains("C:")));
         assert!(warnings.iter().any(|w| w.contains("..")));
+    }
+
+    #[test]
+    fn rejects_windows_only_path_hazards() {
+        // Windows 特有的四类坑：备用数据流、非法字符、保留设备名、尾点尾空格，
+        // 外加大小写重复。这些在 macOS/Linux 上不存在，属移植必须补的校验。
+        let text = "\
+settings.json
+settings.json:secret
+NUL.txt
+com1
+LPT1.log
+CON
+aux/config.json
+bad*name.txt
+what?.json
+quote\".json
+angle<>.json
+pipe|.json
+trailing.
+trailing-space.
+Skills
+skills
+";
+        let (entries, warnings) = parse_keep_list(text);
+        // 只剩 settings.json 与 Skills（skills 因大小写重复被跳过）。
+        assert_eq!(
+            entries,
+            vec![
+                KeepEntry {
+                    rel: "settings.json".into()
+                },
+                KeepEntry {
+                    rel: "Skills".into()
+                }
+            ],
+            "entries={entries:?}"
+        );
+        for needle in [
+            "冒号",
+            "保留设备名",
+            "非法字符",
+            "以点或空格结尾",
+            "大小写重复",
+        ] {
+            assert!(
+                warnings.iter().any(|w| w.contains(needle)),
+                "缺少拒绝原因「{needle}」: {warnings:?}"
+            );
+        }
     }
 
     #[test]

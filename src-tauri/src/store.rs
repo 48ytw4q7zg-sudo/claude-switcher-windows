@@ -297,6 +297,15 @@ fn read_store_key_raw(username: &str) -> Result<Option<String>, String> {
 /// 持锁后再读一次，第二个线程就会拿到第一个线程写好的密钥。
 static STORE_KEY_CREATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+/// 本机是否已有 store 加密主密钥（**只读，绝不铸造**）。
+///
+/// 用途：导入加密快照前先确认主密钥在位。若缺失就导入，`save_store` 会在加密
+/// 路径上铸造一把**新**密钥——导入是"成功"了，但机器上原有的密文快照从此
+/// 永远解不开，抢救变成永久丢失。宁可拒绝导入并让用户先恢复密钥。
+pub fn store_key_exists() -> bool {
+    matches!(read_store_key(), Ok(Some(_)))
+}
+
 /// **加密路径专用**：读现有密钥，缺失才生成 32B 新密钥写入凭据存储。
 fn load_or_create_store_key() -> Result<[u8; 32], String> {
     // 快路径：不加锁读一次，命中就直接返回（绝大多数调用走这里）。
