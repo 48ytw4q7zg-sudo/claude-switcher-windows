@@ -58,6 +58,28 @@ jobs:
           path: src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
 
+      # P2-4：便携版 zip。内含 exe + portable.flag；运行时账号库/日志/配置与
+      # WebView2 数据都落在 exe 目录（见 paths::portable_root），整体解压即用、
+      # 拷走即迁移，不写注册表/用户目录。
+      - name: Build portable zip
+        shell: pwsh
+        run: |
+          if (Test-Path portable-staging) { Remove-Item portable-staging -Recurse -Force }
+          New-Item -ItemType Directory -Force portable-staging | Out-Null
+          Copy-Item "src-tauri/target/release/claude-switcher.exe" `
+            "portable-staging/ClaudeSwitcher.exe"
+          New-Item -ItemType File "portable-staging/portable.flag" | Out-Null
+          Compress-Archive -Path "portable-staging/*" `
+            -DestinationPath "ClaudeSwitcher-portable.zip" -Force
+          Get-Item ClaudeSwitcher-portable.zip | Select-Object Name,Length
+
+      - name: Upload portable zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: ClaudeSwitcher-portable
+          path: ClaudeSwitcher-portable.zip
+          if-no-files-found: error
+
       # C-7：构建来源证明。用户可用
       #   gh attestation verify <文件> -R 48ytw4q7zg-sudo/claude-switcher-windows
       # 验证安装包确实来自本仓库 CI。
@@ -67,6 +89,7 @@ jobs:
           subject-path: |
             src-tauri/target/release/bundle/nsis/*.exe
             src-tauri/target/release/bundle/msi/*.msi
+            ClaudeSwitcher-portable.zip
 
       # C-8：校验和用裸文件名生成（在资产目录内 sha256sum *），
       # 用户可直接 `sha256sum -c SHA256SUMS.txt` 或对照 Get-FileHash。
@@ -78,6 +101,7 @@ jobs:
           mkdir -p dist-release
           cp src-tauri/target/release/bundle/msi/*.msi dist-release/
           cp src-tauri/target/release/bundle/nsis/*.exe dist-release/
+          cp ClaudeSwitcher-portable.zip dist-release/
           cd dist-release
           sha256sum * > SHA256SUMS.txt
           cat SHA256SUMS.txt
