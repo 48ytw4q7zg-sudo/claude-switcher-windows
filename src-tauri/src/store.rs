@@ -51,6 +51,10 @@ pub struct StoredProfile {
     pub encrypted_auth_settings: Option<String>,
     pub keychain_password: Option<String>,
     pub meta: ProfileMeta,
+    /// P2-1：该账号最近一次 5 小时用量百分比（缓存，用于「余量最多」推荐）。
+    /// 账号为当前活跃账号时由 usage 周期性回写；可能过时，仅作推荐依据。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_used_percent: Option<f64>,
     #[serde(default)]
     pub clash: Option<ProfileClashBinding>,
     #[serde(default)]
@@ -167,6 +171,22 @@ impl Default for Store {
     }
 }
 
+/// 导入专用：返回清空了「运行时状态」与「不可迁移元数据」的副本（纯函数）。
+///
+/// 导入的是账号材料，不是原机器的当前状态：
+/// - `current_profile_id` / `current_desktop_profile_id` 是原机器正在使用的账号，
+///   带过来会让界面显示「某账号在用」而实际登录的并不是它；
+/// - `desktop_profiles` 是快照目录的元数据，而快照目录本身不在导出文件里，
+///   带过来全是「快照目录缺失」的坏条目。
+///
+/// 导入实现与测试都必须走这个函数，避免两处各写一份清空逻辑、改一处漏一处。
+pub fn sanitize_imported_store(mut store: Store) -> Store {
+    store.current_profile_id = None;
+    store.current_desktop_profile_id = None;
+    store.desktop_profiles.clear();
+    store
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PendingNewAccount {
     pub id: String,
@@ -233,40 +253,161 @@ pub fn default_runtime_for_profile(name: &str, node: Option<&str>) -> ProfileRun
 
 // ───────────────────────── store 加密主密钥 ─────────────────────────
 
+/// store 主密钥存取后端（read / write 两个动作）。
+///
+/// 抽成 trait 的原因：
+/// - 生产环境走 Windows Credential Manager（keyring）；
+/// - 测试环境用内存实现，**绝不读写真实凭据库**，避免测试中断时残留测试密钥、
+///   或把真实主密钥覆盖掉。
+pub trait KeyBackend {
+    /// 读取主密钥的 base64 表示；不存在返回 Ok(None)。
+    fn read_key(&self) -> Result<Option<String>, String>;
+    /// 写入主密钥的 base64 表示。
+    fn write_key(&self, value: &str) -> Result<(), String>;
+}
+
+type BoxedKeyBackend = Box<dyn KeyBackend + Send + Sync>;
+
+/// 生产后端：Windows Credential Manager（keyring）。
+struct CredentialManagerKeyBackend;
+
+impl KeyBackend for CredentialManagerKeyBackend {
+    fn read_key(&self) -> Result<Option<String>, String> {
+        let username = credentials::current_username()?;
+        let entry = keyring::Entry::new(credentials::STORE_KEY_KEYCHAIN_SERVICE, &username)
+            .map_err(|e| format!("读取 store 加密密钥失败: {e}"))?;
+        match entry.get_password() {
+            Ok(b64) => Ok(Some(b64)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            // 关键：Windows Credential Manager 在「条目存在但读不出」（DPAPI 解密失败、
+            // 凭据库损坏、条目被其它安全策略挡住）时返回的是 PlatformFailure 而非 NoEntry。
+            // 若这里把它当「不存在」返回 Ok(None)，调用方 load_or_create_store_key 就会
+            // 铸一把新密钥并覆盖旧条目——所有已加密快照永久无法解密。
+            // 因此除 NoEntry 之外的一切错误都必须是致命 Err，绝不静默降级。
+            Err(e) => Err(format!(
+                "读取 store 加密密钥失败（条目存在但无法读取，请勿覆盖保存 store）: {e}"
+            )),
+        }
+    }
+
+    fn write_key(&self, value: &str) -> Result<(), String> {
+        let username = credentials::current_username()?;
+        let entry = keyring::Entry::new(credentials::STORE_KEY_KEYCHAIN_SERVICE, &username)
+            .map_err(|e| format!("定位 store 加密密钥条目失败: {e}"))?;
+        entry
+            .set_password(value)
+            .map_err(|e| format!("写入 store 加密密钥失败: {e}"))
+    }
+}
+
+/// 生产后端的进程级单例（零大小，可在 const 上下文构造）。
+static PRODUCTION_KEY_BACKEND: CredentialManagerKeyBackend = CredentialManagerKeyBackend;
+
+/// 测试可替换的后端：`None` 表示用生产后端，`Some(...)` 为测试注入的后端。
+/// 用 `RwLock<Option<...>>` 而非 `OnceLock<Box<...>>`，是因为测试需要在
+/// 结束后还原回生产后端（`Box::new` 又不能在 static const 上下文里分配）。
+static ACTIVE_KEY_BACKEND: std::sync::RwLock<Option<BoxedKeyBackend>> =
+    std::sync::RwLock::new(None);
+
+/// 串行化密钥相关测试：替换全局后端期间不允许其它测试并行走密钥路径。
+#[cfg(test)]
+static KEY_BACKEND_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 在当前生效的后端上执行一段读取逻辑。
+fn with_active_key_backend<T>(f: impl FnOnce(&dyn KeyBackend) -> T) -> T {
+    let guard = ACTIVE_KEY_BACKEND
+        .read()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match guard.as_ref() {
+        Some(backend) => f(backend.as_ref()),
+        None => f(&PRODUCTION_KEY_BACKEND),
+    }
+}
+
+/// 测试用的后端替换守卫：创建即注入内存后端，Drop 时还原生产后端。
+#[cfg(test)]
+pub struct TestKeyBackendGuard {
+    // 持有串行锁直到守卫离开作用域。
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
+
+#[cfg(test)]
+impl TestKeyBackendGuard {
+    /// 注入一个全新的空内存后端（其它模块测试也可调用）。
+    pub fn install_in_memory() -> Self {
+        let serial = KEY_BACKEND_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut active = ACTIVE_KEY_BACKEND
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = Some(Box::new(InMemoryKeyBackend::new()));
+        TestKeyBackendGuard { _serial: serial }
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestKeyBackendGuard {
+    fn drop(&mut self) {
+        let mut active = ACTIVE_KEY_BACKEND
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *active = None;
+    }
+}
+
+/// 内存后端（测试用）：密钥只存在进程内存里，不碰真实凭据库。
+#[cfg(test)]
+pub struct InMemoryKeyBackend {
+    inner: std::sync::Mutex<Option<String>>,
+}
+
+#[cfg(test)]
+impl InMemoryKeyBackend {
+    fn new() -> Self {
+        InMemoryKeyBackend {
+            inner: std::sync::Mutex::new(None),
+        }
+    }
+}
+
+#[cfg(test)]
+impl KeyBackend for InMemoryKeyBackend {
+    fn read_key(&self) -> Result<Option<String>, String> {
+        let guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(guard.clone())
+    }
+
+    fn write_key(&self, value: &str) -> Result<(), String> {
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *guard = Some(value.to_string());
+        Ok(())
+    }
+}
+
 /// 读取 store 加密主密钥：不存在返回 Ok(None)。
 /// **解密路径只用这个**——绝不在缺密钥时生成新密钥（否则会铸新钥解旧密，
 /// 污染恢复路径导致已加密数据不可逆丢失）。
 fn read_store_key() -> Result<Option<[u8; 32]>, String> {
-    let username = credentials::current_username()?;
-    let b64 = read_store_key_raw(&username)?;
-    let Some(b64) = b64 else {
-        return Ok(None);
-    };
-    let bytes = BASE64
-        .decode(b64.trim().as_bytes())
-        .map_err(|e| format!("store 加密密钥 base64 解码失败: {e}"))?;
-    let key: [u8; 32] = bytes
-        .as_slice()
-        .try_into()
-        .map_err(|_| "store 加密密钥长度异常（应为 32 字节）".to_string())?;
-    Ok(Some(key))
-}
-
-fn read_store_key_raw(username: &str) -> Result<Option<String>, String> {
-    let entry = keyring::Entry::new(credentials::STORE_KEY_KEYCHAIN_SERVICE, username)
-        .map_err(|e| format!("读取 store 加密密钥失败: {e}"))?;
-    match entry.get_password() {
-        Ok(b64) => Ok(Some(b64)),
-        Err(keyring::Error::NoEntry) => Ok(None),
-        // 关键：Windows Credential Manager 在「条目存在但读不出」（DPAPI 解密失败、
-        // 凭据库损坏、条目被其它安全策略挡住）时返回的是 PlatformFailure 而非 NoEntry。
-        // 若这里把它当「不存在」返回 Ok(None)，调用方 load_or_create_store_key 就会
-        // 铸一把新密钥并覆盖旧条目——所有已加密快照永久无法解密。
-        // 因此除 NoEntry 之外的一切错误都必须是致命 Err，绝不静默降级。
-        Err(e) => Err(format!(
-            "读取 store 加密密钥失败（条目存在但无法读取，请勿覆盖保存 store）: {e}"
-        )),
-    }
+    with_active_key_backend(|backend| {
+        let Some(b64) = backend.read_key()? else {
+            return Ok(None);
+        };
+        let bytes = BASE64
+            .decode(b64.trim().as_bytes())
+            .map_err(|e| format!("store 加密密钥 base64 解码失败: {e}"))?;
+        let key: [u8; 32] = bytes
+            .as_slice()
+            .try_into()
+            .map_err(|_| "store 加密密钥长度异常（应为 32 字节）".to_string())?;
+        Ok(Some(key))
+    })
 }
 
 /// 进程内的密钥创建锁。
@@ -285,7 +426,7 @@ pub enum StoreKeyStatus {
     Present,
     /// 确实没有密钥（全新安装 / 尚未保存过任何账号）。
     Missing,
-    /// 读不出密钥（原因见 `read_store_key_raw` 的注释）。
+    /// 读不出密钥（原因见 [`CredentialManagerKeyBackend::read_key`] 的注释）。
     Unavailable(String),
 }
 
@@ -329,16 +470,11 @@ fn load_or_create_store_key() -> Result<[u8; 32], String> {
         return Ok(key);
     }
 
-    let username = credentials::current_username()?;
     let mut key = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut key);
     let b64 = BASE64.encode(key);
 
-    let entry = keyring::Entry::new(credentials::STORE_KEY_KEYCHAIN_SERVICE, &username)
-        .map_err(|e| format!("定位 store 加密密钥条目失败: {e}"))?;
-    entry
-        .set_password(&b64)
-        .map_err(|e| format!("写入 store 加密密钥失败: {e}"))?;
+    with_active_key_backend(|backend| backend.write_key(&b64))?;
     Ok(key)
 }
 
@@ -541,16 +677,31 @@ pub fn save_store(store: &Store) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    /// 加解密往返（走真实 keyring/Keychain；Windows CI 上 Credential Manager 可用）。
-    /// 在拿不到凭据存储的环境会失败——标记 ignore，手动跑。
+    /// 加解密往返：走内存后端，不碰真实 Credential Manager（G-2）。
     #[test]
-    #[ignore]
-    fn encrypt_decrypt_roundtrip() {
+    fn encrypt_decrypt_roundtrip_in_memory() {
+        let _guard = TestKeyBackendGuard::install_in_memory();
         let secret = "claudeAiOauth {\"accessToken\":\"abc-测试\"}";
         let enc = encrypt_secret(secret).unwrap();
         assert!(enc.starts_with(ENC_PREFIX));
         assert_ne!(enc, secret);
         assert_eq!(decrypt_secret(&enc).unwrap(), secret);
+    }
+
+    /// 解密路径缺密钥时必须报错，绝不静默铸新钥（G-2，内存后端验证）。
+    #[test]
+    fn decrypt_ciphertext_without_key_is_error_in_memory() {
+        let _guard = TestKeyBackendGuard::install_in_memory();
+        // 先加密拿到密文，再换一个「空」后端模拟密钥丢失。
+        let enc = encrypt_secret("secret-token").unwrap();
+        {
+            let mut active = ACTIVE_KEY_BACKEND
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *active = Some(Box::new(InMemoryKeyBackend::new()));
+        }
+        let err = decrypt_secret(&enc).unwrap_err();
+        assert!(err.contains("找不到 store 加密主密钥"));
     }
 
     #[test]

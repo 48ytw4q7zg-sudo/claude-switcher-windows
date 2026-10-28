@@ -216,13 +216,11 @@ pub fn import_store_encrypted_blocking(src: &Path, password: &str) -> Result<Imp
 
     let blob = fs::read(src).map_err(|e| format!("读取导出文件失败: {e}"))?;
     let (plaintext, _) = decrypt_blob(&blob, password)?;
-    let mut parsed: store::Store = serde_json::from_slice(&plaintext)
+    let parsed: store::Store = serde_json::from_slice(&plaintext)
         .map_err(|e| format!("解密成功但不是有效的账号库 JSON: {e}"))?;
 
     // 清空原机器的运行时状态与不可迁移的元数据（见函数文档）。
-    parsed.current_profile_id = None;
-    parsed.current_desktop_profile_id = None;
-    parsed.desktop_profiles.clear();
+    let parsed = store::sanitize_imported_store(parsed);
 
     // 备份现有 store（不存在则跳过）。
     let store_path = paths::store_path()?;
@@ -314,23 +312,6 @@ fn decrypt_blob(blob: &[u8], password: &str) -> Result<(Vec<u8>, u8), String> {
 mod tests {
     use super::*;
 
-    /// 删除测试中铸造的 store 主密钥，把真实凭据库恢复到运行前状态。
-    ///
-    /// `import_allows_fresh_machine` 走完整导入路径，`save_store` 会把新密钥写进
-    /// **真实**的 Windows 凭据库。不清理的话，串行在后的 `import_refuses` 会把
-    /// 状态误判为 Present 而跳过（Windows CI 实测竞态）。
-    fn cleanup_minted_store_key() {
-        let Ok(username) = crate::credentials::current_username() else {
-            return;
-        };
-        if let Ok(entry) =
-            keyring::Entry::new(crate::credentials::STORE_KEY_KEYCHAIN_SERVICE, &username)
-        {
-            // NoEntry 也无妨：本就是要清掉它。
-            let _ = entry.delete_credential();
-        }
-    }
-
     fn sample_store() -> store::Store {
         let mut s = store::Store::default();
         s.profiles.push(store::StoredProfile {
@@ -346,6 +327,7 @@ mod tests {
             // 明文凭据：导出时 load_store 已解密，导入时 save_store 会重新加密。
             keychain_password: Some("plain-oauth-blob".into()),
             meta: store::ProfileMeta::default(),
+            last_used_percent: None,
             clash: None,
             runtime: None,
         });
@@ -460,12 +442,14 @@ mod tests {
     /// 密钥相关」。它证明导出**试图解密**，但不能证明解密后的值与旧实现不同
     /// ——那需要 `#[ignore]` 的手动测试在具备凭据存储的机器上跑。
     /// （曾把断言写成「导出的账号数不为 0」，实测对旧实现同样成立，属无效断言。）
-    #[cfg(windows)]
     #[test]
     fn export_goes_through_decryption_not_raw_file() {
         // 环境锁是 crate 级共享的：paths / credentials / platform::windows 等
         // 测试也读 USERPROFILE，各自加锁才能避免并行时互相污染（E-4）。
         let _guard = crate::test_support::env_lock();
+        // 内存后端为空：磁盘上的密文 store 无法解密，导出应报密钥/解密错误——
+        // 这证明导出走的是解密路径而非读磁盘原文。
+        let _key_guard = store::TestKeyBackendGuard::install_in_memory();
 
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
@@ -505,17 +489,16 @@ mod tests {
     ///
     /// 注意只覆盖「本机已有密文快照」这一种 Missing——全新机器（无密文）是
     /// 换机主路径，必须放行（见 `import_store_encrypted_blocking` 的三态判断）。
-    #[cfg(windows)]
     #[test]
     fn import_refuses_when_store_key_missing_and_ciphertext_present() {
-        // 锁必须先于密钥状态检查：`import_allows` 测试会在真实凭据库铸造密钥，
-        // 锁外检查会在它之后误判 Present，走进放行分支（Windows CI 实测竞态）。
+        // 环境锁串行化改 USERPROFILE 的操作。
         let _guard = crate::test_support::env_lock();
-        // 只有「密钥确实缺失」时才测得到这条路径；有密钥（Present）或凭据库
-        // 故障（Unavailable）的环境下跳过。
-        if !matches!(store::store_key_status(), store::StoreKeyStatus::Missing) {
-            return;
-        }
+        // 内存后端为空 → 主密钥状态恒为 Missing（确定性，不依赖真实凭据库）。
+        let _key_guard = store::TestKeyBackendGuard::install_in_memory();
+        assert!(matches!(
+            store::store_key_status(),
+            store::StoreKeyStatus::Missing
+        ));
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir_all(home.join(".claude-switcher")).unwrap();
@@ -537,15 +520,11 @@ mod tests {
 
     /// 全新机器（没有任何 store 与密文）必须允许导入——这是换机迁移的主路径。
     /// 早期实现无条件要求密钥已存在，把这条路堵死了（E-1）。
-    #[cfg(windows)]
     #[test]
     fn import_allows_fresh_machine_without_store_key() {
-        // 锁先于状态检查（同 `import_refuses` 的竞态注释）。
         let _guard = crate::test_support::env_lock();
-        // 只有「密钥确实缺失」时才测得到这条路径。
-        if !matches!(store::store_key_status(), store::StoreKeyStatus::Missing) {
-            return;
-        }
+        // 内存后端为空 → Missing；save_store 会在内存里铸造第一把密钥，必成功。
+        let _key_guard = store::TestKeyBackendGuard::install_in_memory();
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path().join("home");
         std::fs::create_dir_all(home.join(".claude-switcher")).unwrap();
@@ -555,17 +534,8 @@ mod tests {
         let src = dir.path().join("snap.csbk1");
         std::fs::write(&src, encrypt_for_test(&sample_store(), "correct-horse")).unwrap();
         let result = import_store_encrypted_blocking(&src, "correct-horse");
-        // 清理本测试在真实凭据库铸造的密钥，恢复运行前状态——
-        // 不清理会让后续的 `import_refuses` 误判 Present 而跳过（Windows CI 实测）。
-        cleanup_minted_store_key();
-        // 走到 save_store 说明前置判断放行了；它可能因凭据库不可用而失败，
-        // 但绝不该是被「找不到主密钥」挡住。
-        match result {
-            Ok(_) => {}
-            Err(e) => {
-                assert!(!e.contains("主密钥"), "全新机器不应被主密钥检查挡住: {e}");
-            }
-        }
+        // 全新机器必须放行，且内存后端保证 save_store 成功：应得到 Ok。
+        result.expect("全新机器导入应成功");
     }
 
     /// 导入必须清空原机器的运行时状态与不可迁移的 Desktop 元数据（E-2）。
@@ -587,13 +557,8 @@ mod tests {
             meta: None,
         });
 
-        // 与 import_store_encrypted_blocking 里的清空逻辑保持一致：
-        // 这三个字段带入新机器会让界面显示错误的当前账号，并产生
-        // 「快照目录缺失」的坏条目。
-        let mut stripped = incoming.clone();
-        stripped.current_profile_id = None;
-        stripped.current_desktop_profile_id = None;
-        stripped.desktop_profiles.clear();
+        // 直接复用导入实现的同一个纯函数，不再在测试里重写清空逻辑。
+        let stripped = store::sanitize_imported_store(incoming.clone());
 
         assert!(stripped.current_profile_id.is_none());
         assert!(stripped.current_desktop_profile_id.is_none());
