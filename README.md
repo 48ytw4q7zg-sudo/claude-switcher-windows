@@ -37,7 +37,7 @@
 | 项 | 状态 |
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
-| 安装包 | **Release v0.2.0**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS），产物来源可审计，SHA256 见 Release 说明 |
+| 安装包 | **Release v0.2.1**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS），产物来源可审计，SHA256 见 Release 说明 |
 | 测试 | `cargo test --lib` **161 passed / 0 failed / 1 ignored**；`cargo clippy --all-targets -- -D warnings` 零警告；`npx tsc --noEmit` 通过 |
 | 实测环境 | **Windows 11 Pro x64**（build 26300）；Windows 10 未实机验证 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
@@ -120,8 +120,8 @@ claude-switcher-windows/
 
 | 形态 | 入口 | 适用场景 |
 | --- | --- | --- |
-| **NSIS 安装版** | Release 中 `ClaudeSwitcher_0.2.0_x64-setup.exe` | 普通用户，双击安装（推荐） |
-| **MSI 安装版** | Release 中 `ClaudeSwitcher_0.2.0_x64_zh-CN.msi` | 企业分发 / 域管理 |
+| **NSIS 安装版** | Release 中 `ClaudeSwitcher_0.2.1_x64-setup.exe` | 普通用户，双击安装（推荐） |
+| **MSI 安装版** | Release 中 `ClaudeSwitcher_0.2.1_x64_zh-CN.msi` | 企业分发 / 域管理 |
 | **免安装可执行文件** | 源码构建产物 `src-tauri\target\release\claude-switcher.exe` | 高手自用，便携 |
 | **开发模式** | `npm run tauri dev` | 二次开发，带热更新 |
 
@@ -148,7 +148,7 @@ Claude Code CLI 的登录凭据、全局配置和会话历史都散落在用户�
 ## 四、安装使用教程
 
 1. **确认是 64 位系统**：设置 → 系统 → 系统信息 →「系统类型」应含 **64 位操作系统，x64**。若是 ARM64 或 32 位，本工具跑不了。
-2. **下载安装包**：打开本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases) → 最新版，下载 `ClaudeSwitcher_0.2.0_x64-setup.exe`（推荐，NSIS 安装包）；也可用 `ClaudeSwitcher_0.2.0_x64_zh-CN.msi`。SHA256 校验值在 Release 说明与 `SHA256SUMS.txt` 里。
+2. **下载安装包**：打开本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases) → 最新版，下载 `ClaudeSwitcher_0.2.1_x64-setup.exe`（推荐，NSIS 安装包）；也可用 `ClaudeSwitcher_0.2.1_x64_zh-CN.msi`。SHA256 校验值在 Release 说明与 `SHA256SUMS.txt` 里。
 3. **双击安装包**，按提示点「下一步」直到安装完成。
 4. 若 Windows 弹出 **SmartScreen**「Windows 已保护你的电脑」，点「更多信息」→「仍要运行」。
    > 这是**未签名安装包**的正常提示。请只从本仓库 Release 下载，不要从来路不明的链接安装。
@@ -195,8 +195,8 @@ npm run tauri build
 
 ```text
 src-tauri\target\release\claude-switcher.exe                       # 免安装可执行文件
-src-tauri\target\release\bundle\msi\ClaudeSwitcher_0.2.0_x64_zh-CN.msi
-src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.2.0_x64-setup.exe
+src-tauri\target\release\bundle\msi\ClaudeSwitcher_0.2.1_x64_zh-CN.msi
+src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.2.1_x64-setup.exe
 ```
 
 补充：
@@ -518,7 +518,7 @@ npx tsc --noEmit                            # 前端类型
 npm run tauri build                         # 出 MSI + NSIS
 ```
 
-当前测试状态（v0.2.0）：**58 通过 + 1 ignored**（`encrypt_decrypt_roundtrip` 需实机凭据存储；以 `cargo test --lib` 实际输出为准）。测试覆盖亮点：链接识别与悬空链接、路径归一化（含 8.3 短名）、原子写入、merge/scrub 逻辑、BOM/UTF-16 解码、进程匹配表格（16 例）、Clash 控制器地址归一化（11 例，含 IPv6）、`is_under` 前缀陷阱、删除链路 `deactivate_in`（含硬链接 config.json、悬空 junction、移除失败中止保现场）、版本号比较。
+当前测试状态（v0.2.1）：**173 通过 + 1 ignored**（`encrypt_decrypt_roundtrip` 需实机凭据存储；以 `cargo test --lib` 实际输出为准）。测试覆盖亮点：链接识别与悬空链接、路径归一化（含 8.3 短名）、原子写入、merge/scrub 逻辑、BOM/UTF-16 解码、进程匹配表格（16 例）、Clash 控制器地址归一化（11 例，含 IPv6）、`is_under` 前缀陷阱、删除链路 `deactivate_in`（含硬链接 config.json、悬空 junction、移除失败中止保现场）、版本号比较（含预发布后缀）、CSBK1 快照加解密（AAD 防篡改、KDF 参数上限）、keep 路径沙箱（备用数据流/设备名/尾点尾空格/大小写重复）。
 
 ---
 
@@ -532,7 +532,7 @@ npm run tauri build                         # 出 MSI + NSIS
 ## 构建与发布
 
 - `CI`（`.github/workflows/ci.yml`）：push / PR 时在 macOS 与 Windows runner 上跑前端构建、`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --lib`、Tauri build。（macOS runner 的 host 与 target 不同，会额外按 target 再跑一遍 clippy；Windows runner 两者相同，不重复。）
-- `Windows Build`（`.github/workflows/windows-build.yml`）：打 `v*` tag 自动构建 MSI / NSIS 并**自动创建 Release**（含 `SHA256SUMS.txt`，裸文件名可直接 `sha256sum -c`）；手动触发只出 Actions 产物。**构建来源证明（v0.2.0 起）**：安装包带 GitHub attestation，可验证确实来自本仓库 CI：`gh attestation verify .\ClaudeSwitcher_0.2.0_x64-setup.exe -R 48ytw4q7zg-sudo/claude-switcher-windows`。**从 v0.1.0 升级请先卸载旧版**（v0.2.0 更换了应用标识与发布者署名；用户数据在 `%USERPROFILE%\.claude-switcher\` 不受影响，装完新版自动继续使用）。
+- `Windows Build`（`.github/workflows/windows-build.yml`）：打 `v*` tag 自动构建 MSI / NSIS 并**自动创建 Release**（含 `SHA256SUMS.txt`，裸文件名可直接 `sha256sum -c`）；手动触发只出 Actions 产物。**构建来源证明（v0.2.0 起）**：安装包带 GitHub attestation，可验证确实来自本仓库 CI：`gh attestation verify .\ClaudeSwitcher_0.2.1_x64-setup.exe -R 48ytw4q7zg-sudo/claude-switcher-windows`。**从 v0.1.0 升级请先卸载旧版**（v0.2.0 更换了应用标识与发布者署名；用户数据在 `%USERPROFILE%\.claude-switcher\` 不受影响，装完新版自动继续使用）。
 - `macOS Build`（`.github/workflows/macos-build.yml`）：手动触发，产出 macOS app + DMG（供上游功能回归对比）。
 - 未配置代码签名证书；首次运行安装包会有 SmartScreen 提示，属预期。有条件可接 Azure Trusted Signing 或自持证书消除该提示。**路线图**：可申请 SignPath Foundation 面向开源项目的免费代码签名（需项目审核通过）。
 
