@@ -1351,3 +1351,74 @@ code {
 .muted {
   color: #6a6250;
 }
+
+/* ── F-3 令牌状态徽章 ── */
+.token-badge {
+  display: inline-flex;
+  align-items: center;
+  margin: 8px 0 2px;
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12px;
+  font-weight: 750;
+}
+.token-valid {
+  color: #17463b;
+  background: #dbe9d5;
+}
+.token-expiring {
+  color: #7a5418;
+  background: #f0e2c2;
+}
+.token-expired {
+  color: #6e221f;
+  background: #f1d7cf;
+}
+.token-unknown {
+  color: #5a5344;
+  background: #e4ddcc;
+}
+
+/* ── F-1 集成面板 ── */
+.path-preview {
+  display: block;
+  margin: 10px 0;
+  padding: 8px 10px;
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.6);
+  font-size: 12px;
+  word-break: break-all;
+}
+.model-env {
+  width: 100%;
+  margin: 10px 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(72, 66, 52, 0.25);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.6);
+  resize: vertical;
+}
+
+/* ── F-5 供应商 ── */
+.provider-list {
+  display: grid;
+  gap: 12px;
+  margin-top: 14px;
+}
+.provider-row {
+  border: 1px solid rgba(72, 66, 52, 0.18);
+  border-radius: 10px;
+  padding: 12px;
+  background: rgba(255, 255, 255, 0.5);
+}
+
+.inline-success {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 6px;
+  font-size: 13px;
+  font-weight: 750;
+  color: #17463b;
+  background: #dbe9d5;
+  word-break: break-all;
+}

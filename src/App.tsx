@@ -39,6 +39,10 @@ import { QuotaReminderPanel } from './components/QuotaReminder';
 import { ReconcileSettings } from './components/ReconcileSettings';
 import { McpPanel } from './components/McpPanel';
 import { useModalDialog } from './useModalDialog';
+import { initI18n, t } from './i18n';
+import { IntegrationPanel } from './components/IntegrationPanel';
+import { ProviderPanel } from './components/ProviderPanel';
+import { WslPanel } from './components/WslPanel';
 
 const WINDOW_LABEL = (() => {
   if (new URLSearchParams(window.location.search).get('window') === 'tray-popup') {
@@ -78,6 +82,13 @@ interface ProfileMeta {
   rate_limit_tier?: string | null;
 }
 
+/** F-3：访问令牌状态（纯本地按 expiresAt 计算，不发网络）。 */
+interface TokenStatus {
+  state: 'valid' | 'expiring' | 'expired' | 'unknown' | string;
+  has_refresh_token: boolean;
+  expires_at_ms?: number | null;
+}
+
 interface ProfileSummary {
   id: string;
   name: string;
@@ -88,6 +99,7 @@ interface ProfileSummary {
   meta: ProfileMeta;
   clash?: ProfileClashBinding | null;
   runtime?: ProfileRuntimeBinding | null;
+  token_status?: TokenStatus | null;
   is_current: boolean;
 }
 
@@ -478,6 +490,28 @@ function fallbackWindow(label: string): UsageWindow {
   };
 }
 
+/** F-3：令牌状态徽章（纯本地计算，不发网络）。区分两种过期文案。 */
+function TokenBadge({ status }: { status?: TokenStatus | null }) {
+  if (!status) return null;
+  const map: Record<string, { cls: string; key: string }> = {
+    valid: { cls: 'token-valid', key: 'token.valid' },
+    expiring: { cls: 'token-expiring', key: 'token.expiring' },
+    expired: { cls: 'token-expired', key: 'token.expired.refresh' },
+    unknown: { cls: 'token-unknown', key: 'token.unknown' },
+  };
+  const info = map[status.state] ?? map.unknown;
+  // 已过期且无刷新令牌 → 需重新登录；否则使用时自动续期。
+  const textKey =
+    status.state === 'expired' && !status.has_refresh_token
+      ? 'token.expired.noRefresh'
+      : info.key;
+  return (
+    <span className={`token-badge ${info.cls}`} title={t(textKey)}>
+      {t(textKey)}
+    </span>
+  );
+}
+
 function App() {
   if (WINDOW_LABEL === 'tray-popup') {
     return <ClaudeTrayPopup />;
@@ -626,6 +660,7 @@ function App() {
   }, []);
 
   useEffect(() => {
+    initI18n();
     load();
   }, [load]);
 
@@ -1561,6 +1596,12 @@ function App() {
 
       <PrivacyTools />
 
+      <IntegrationPanel />
+
+      <ProviderPanel />
+
+      <WslPanel />
+
       <section className="profiles">
         <div className="section-title">
           <h2>账号快照</h2>
@@ -1597,6 +1638,7 @@ function App() {
                     {profile.clash?.enabled ? profile.clash.node : '节点未绑定'}
                   </span>
                 </div>
+                <TokenBadge status={profile.token_status} />
                 <div className="node-bind">
                   <select
                     value={profile.clash?.enabled ? profile.clash.node : ''}
