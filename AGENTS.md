@@ -72,7 +72,16 @@ src-tauri/src/
 ├── net.rs          # reqwest HTTP（OAuth + Clash）
 ├── usage.rs        # 用量统计 + 独立 usage-cache.json（不解密账号库）
 ├── tray.rs         # 托盘 / 弹窗定位（read_lightweight 轻量读取）
-├── cli.rs          # 命令行入口 --list/--status/--switch（AttachConsole + 单实例转交）
+├── cli.rs          # 命令行入口 --list/--status/--switch/run（AttachConsole + 单实例转交）
+├── bin/cs.rs       # 控制台子系统程序 cs.exe（[[bin]]，不设 windows_subsystem）
+├── naming.rs       # 文件名合法化 + 保留设备名（CON/NUL 等）
+├── shortcuts.rs    # 开始菜单 .lnk（mslnk，每账号 --switch）
+├── token_status.rs # 令牌状态纯函数（有效/即将过期/已过期/未知）
+├── dirbinding.rs   # 目录绑定标记 + cs run（CLAUDE_CONFIG_DIR）
+├── userpath.rs     # 用户 PATH（HKCU，REG_EXPAND_SZ + WM_SETTINGCHANGE）
+├── provider.rs     # 第三方供应商（加密 token，受管 env 键）
+├── wsl.rs          # WSL 实验集成（UTF-16LE，默认关，stdin 传 blob）
+├── sanitize.rs     # 诊断脱敏（敏感键 ***，邮箱留首字符+域名）
 └── lib.rs          # Tauri 命令层（--guard / --autostart / CLI 在此分发；写路径走 with_store）
 ```
 
@@ -102,9 +111,16 @@ async fn xxx() -> Result<T, String> {
 ### 账号库写操作必须走 `with_store`
 
 任何对账号库的读—改—写都用 `store::with_store(|store| { ... Ok(...) })`，闭包
-返回 Ok 后统一原子保存，杜绝并发写互踩。只读路径用 `read_lightweight()`（不解密）
-或 `load_store()`（不持锁）。`STORE_LOCK` 是不可重入的 std `Mutex`，闭包内禁止
-再调获取该锁的函数（见踩坑 22）。
+返回 Ok 后统一原子保存，杜绝并发写互踩。锁顺序为「重入检测 → fs4 跨进程锁 →
+进程内 STORE_LOCK Mutex → load → f → save」。只读路径用 `read_lightweight()`
+（不解密）或 `load_store()`（不持锁）。
+
+- **重入检测**：thread_local `IN_STORE_TX` + Drop guard，嵌套调用 `with_store`
+  立即返回 Err「with_store 不可嵌套调用」而非死锁。闭包内禁止再调任何获取
+  STORE_LOCK 的函数（见踩坑 22）。
+- **跨进程锁**：fs4 在 `app_data_dir/store.lock` 上 `fs4::FileExt::lock` 排他
+  阻塞，覆盖 load→f→save 全程；锁文件创建失败按 Err 返回。便携模式锁文件在
+  `ClaudeSwitcherData` 下。
 
 ### 凭据与密钥边界
 
@@ -181,8 +197,38 @@ async fn xxx() -> Result<T, String> {
     `WEBVIEW2_USER_DATA_FOLDER` 与全部用户数据都落在子目录；exe 目录 / Downloads /
     Desktop 命中 `is_protected_from_hardening` 时跳过 icacls 加固。
 26. **通知 uuid 缺失绝不回退固定 "current" 键**：否则会把通知记到错误账号上；
-    取不到 uuid 直接跳过、不写状态。`resets_at` 先 `round_to_five_minutes`
-    （`div_euclid(300)`）收敛秒级抖动，5h/7d 两个窗口独立去重。
+    取不到 uuid 直接跳过、不写状态。J-6 已弃用 `round_to_five_minutes`，改
+    `same_reset_period`（时间差 abs ≤600s 视为同周期，无法解析则字符串回退），
+    5h/7d 两个窗口独立去重。
+27. **manifest 必须纯 ASCII**：`windows-app.manifest` 含中文注释时，embed-resource
+    调 rc.exe 不传 `/c 65001`，rc.exe 按 GBK 回写而文件头声明 UTF-8，导致所有
+    exe 无法启动（事件日志 SideBySide Id=59，c101008c）。manifest 改英文注释、
+    非 ASCII 字节=0（保留 `{{VERSION}}` 与全部功能 XML）。
+28. **本机 vcvars64 的 Windows SDK 检测失效**：INCLUDE 缺 Windows Kits 路径，
+    但 SDK 10.0.26100.0 实际已装。统一用 agent workspace 的 `cargo-msvc.ps1`
+    （显式 PATH/INCLUDE/LIB、`CARGO_HTTP_CHECK_REVOKE=false`、代理变量）跑
+    check/fetch/test/clippy，勿依赖 vcvars。
+29. **PowerShell 新会话 PATH 不含 System32**：按名启动 powershell/wsl/cmd 会失败，
+    系统命令用 `C:\Windows\System32\...` 全路径；wsl.exe/powershell.exe 均从
+    SystemRoot 拼权威路径。
+30. **Tauri externalBin 在 build.rs 阶段就校验文件存在**：`externalBin=["binaries/cs"]`
+    要求磁盘上有 `binaries/cs-<target-triple>.exe`（本机 triple
+    x86_64-pc-windows-msvc），否则任何 cargo build/check 直接 panic。CI 先
+    `cargo build --bin cs` 再复制到该路径；安装时落成无后缀的 cs.exe。
+31. **winreg 写 REG_EXPAND_SZ 用 set_raw_value**：`RegValue{bytes: UTF-16LE(含尾
+    null), vtype: RegType::REG_EXPAND_SZ}`；读用 get_raw_value +
+    `String::from_reg_value` 按字面读、不展开，保留 %USERPROFILE% 等变量。
+32. **同级备选键用 `first_string_field`，不是 `string_field`**：后者把多个 key 当
+    逐层下钻，备选键（email/accountEmail/username 等）会永远返回 None。
+33. **PowerShell 5.1 会吞掉裸 `--`**：经脚本转发 `cargo clippy -- -D warnings`
+    时 `--` 被 PS 参数绑定剥离，clippy 报 unexpected argument '-D'。把 `--` 写成
+    引号字符串 `'--'` 即可保留。
+34. **诊断/便携新增 zip 依赖**：`zip = { version="2", default-features=false,
+    features=["deflate"] }`（拉入 flate2/crc32fast/miniz_oxide）；诊断包写前先
+    `sanitize::redact_json`，日志走 `redact_emails_in_text`，令牌绝不进包。
+35. **windows-sys 语言/锁的 feature 归属**：`GetUserDefaultUILanguage` 在
+    Win32_Globalization；`CreateFileW` 在 Win32_Security；`SendMessageTimeoutW`
+    在 Win32_UI_WindowsAndMessaging。缺 feature 是编译期长报错，先核对归属。
 
 ## 实机未验证项（改相关代码后优先测）
 
@@ -196,4 +242,8 @@ async fn xxx() -> Result<T, String> {
 - 安装包升级/卸载回归。
 - 托盘一键切换（动态菜单/通知/重建）、按终端并行多账号（wt/cmd 拉起）。
 - 额度阈值通知/提醒（Toast/AUMID）、MCP 真实拉起、便携版解压运行。
-- P2-2 凭据锁：待 Process Monitor 实机调研，本轮不实现。
+- 完整便携版固定 WebView2（约 150MB）：本环境无固定运行时，用
+  `scripts/build-full-portable.ps1` 下载组装后验证；cs run、PATH 注册表写入/广播、
+  开始菜单 .lnk 均未实机验证。
+- 第三方供应商真实连通/切换、WSL 真实写入（本机仅 docker-desktop，0600 无法保证）。
+- F-4 凭据锁（原 P2-2）：待 Process Monitor 实机调研，本轮不实现、不加猜测锁。
