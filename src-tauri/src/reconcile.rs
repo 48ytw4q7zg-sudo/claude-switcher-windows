@@ -26,24 +26,87 @@ pub enum LiveIdentity {
     Unknown(String),
 }
 
-/// 依据 live accountUuid 与当前账号、已登记账号列表，判定 live 身份。
+/// 在 `profile.claude_json` 里按路径取字符串叶子值。
+fn profile_nested_str<'a>(p: &'a StoredProfile, path: &[&str]) -> Option<&'a str> {
+    let mut cur = &p.claude_json;
+    for key in path {
+        cur = cur.get(key)?;
+    }
+    cur.as_str()
+}
+
+/// 某 profile 存的账号 uuid：优先 `meta.account_uuid`，回退 `claude_json.oauthAccount.accountUuid`。
 ///
-/// 取不到 live uuid 时（live 缺字段）返回 `None`，调用方据此走
-/// 「不中断、仅提示」路径。
+/// 老账号（早期收养 / 迁移来的）可能 `meta.account_uuid` 为空，但 `claude_json` 里
+/// 仍内嵌了 oauthAccount——对账必须回退读它，否则老账号会被误判成 Unknown、
+/// 重复收养成第二个同名账号。
+fn profile_account_uuid(p: &StoredProfile) -> Option<&str> {
+    p.meta
+        .account_uuid
+        .as_deref()
+        .or_else(|| profile_nested_str(p, &["oauthAccount", "accountUuid"]))
+}
+
+/// 某 profile 存的邮箱：优先 `meta.email`，回退 `claude_json.oauthAccount.email`。
+fn profile_account_email(p: &StoredProfile) -> Option<&str> {
+    p.meta
+        .email
+        .as_deref()
+        .or_else(|| profile_nested_str(p, &["oauthAccount", "email"]))
+}
+
+/// 命中一个已登记 profile 后，按「它是不是 current」归到 Current / Other。
+fn current_or_other(p: &StoredProfile, current_id: Option<&str>) -> LiveIdentity {
+    if Some(p.id.as_str()) == current_id {
+        LiveIdentity::Current
+    } else {
+        LiveIdentity::Other(p.id.clone())
+    }
+}
+
+/// 依据 live accountUuid / email 与当前账号、已登记账号列表，判定 live 身份。
+///
+/// 匹配顺序：
+/// 1. **uuid 精确匹配**：profile 的 `meta.account_uuid` 或
+///    `claude_json.oauthAccount.accountUuid` 等于 live_uuid；
+/// 2. **邮箱回退匹配**（仅当 uuid 没命中且 live_email 非空）：profile 的 `meta.email`
+///    或 `claude_json.oauthAccount.email` 与 live_email 做**大小写不敏感**比较。
+///
+/// 邮箱回退是为老账号准备的：它们收养时 `meta.account_uuid` 可能没写进去，
+/// 只靠 email 也能认出来，避免重复收养成第二个同名账号。
+///
+/// 两个标识都取不到 live 值时返回 `None`，调用方据此走「不中断、仅提示」路径；
+/// 取到了 uuid 但都没命中 → `Unknown(uuid)`。
 pub fn classify_live_identity(
     live_uuid: Option<&str>,
+    live_email: Option<&str>,
     current_id: Option<&str>,
     profiles: &[StoredProfile],
 ) -> Option<LiveIdentity> {
-    let live_uuid = live_uuid?;
-    let matched = profiles
-        .iter()
-        .find(|p| p.meta.account_uuid.as_deref() == Some(live_uuid));
-    match matched {
-        Some(p) if Some(p.id.as_str()) == current_id => Some(LiveIdentity::Current),
-        Some(p) => Some(LiveIdentity::Other(p.id.clone())),
-        None => Some(LiveIdentity::Unknown(live_uuid.to_string())),
+    // 1) uuid 精确匹配（meta 与内嵌 claude_json 都查）。
+    if let Some(uuid) = live_uuid {
+        if let Some(p) = profiles
+            .iter()
+            .find(|p| profile_account_uuid(p) == Some(uuid))
+        {
+            return Some(current_or_other(p, current_id));
+        }
     }
+
+    // 2) uuid 没命中 → 邮箱大小写不敏感回退（trim 后再比）。
+    let live_email = live_email.map(str::trim).filter(|e| !e.is_empty());
+    if let Some(email) = live_email {
+        if let Some(p) = profiles.iter().find(|p| {
+            profile_account_email(p)
+                .map(|e| e.eq_ignore_ascii_case(email))
+                .unwrap_or(false)
+        }) {
+            return Some(current_or_other(p, current_id));
+        }
+    }
+
+    // 3) 都没命中：有 live uuid → Unknown；连 uuid 都读不到 → None（不中断）。
+    live_uuid.map(|uuid| LiveIdentity::Unknown(uuid.to_string()))
 }
 
 /// 自动收养的账号名：「自动收养-<邮箱或 uuid 前 8>-<MMdd-HHmm>」。
@@ -66,12 +129,14 @@ pub fn auto_adopt_profile_name(email: Option<&str>, uuid: &str, now: DateTime<Ut
 /// - Current：把 live 回写到当前账号（刷新快照）；
 /// - Other(id)：把 live 回写到那个账号，把 `current_profile_id` 指向它，
 ///   提示「检测到手动换号」；
-/// - Unknown(uuid)：用 live 材料自动新建账号，`current_profile_id` 指向它，
-///   提示可重命名；
+/// - Unknown(uuid)：当 `auto_adopt_enabled` 为 true 时，用 live 材料自动新建账号，
+///   `current_profile_id` 指向它，提示可重命名；为 false 时**只提示、不新建、不改
+///   current_profile_id**，等用户手动处理；
 /// - 无法判定（缺材料 / 缺 uuid）：不中断，仅返回提示。
 pub fn reconcile_live_into_store(
     store_data: &mut store::Store,
     snapshot: &LiveSnapshot,
+    auto_adopt_enabled: bool,
     now: DateTime<Utc>,
 ) -> Vec<String> {
     let mut warnings = Vec::new();
@@ -83,8 +148,10 @@ pub fn reconcile_live_into_store(
     };
 
     let live_uuid = lookup_string(claude_json, &["oauthAccount", "accountUuid"]);
+    let live_email = lookup_string(claude_json, &["oauthAccount", "email"]);
     let identity = classify_live_identity(
         live_uuid,
+        live_email,
         store_data.current_profile_id.as_deref(),
         &store_data.profiles,
     );
@@ -95,8 +162,6 @@ pub fn reconcile_live_into_store(
         );
         return warnings;
     };
-
-    let email = lookup_string(claude_json, &["oauthAccount", "email"]);
 
     match identity {
         LiveIdentity::Current => {
@@ -127,14 +192,21 @@ pub fn reconcile_live_into_store(
                     now,
                 );
             }
-            store_data.current_profile_id = Some(other_id.clone());
+            store_data.current_profile_id = Some(other_id);
             warnings.push(format!(
                 "检测到手动换号：live 账号是已登记的「{}」，已把 live 状态回写到该账号",
                 other_name.as_deref().unwrap_or("?")
             ));
         }
         LiveIdentity::Unknown(uuid) => {
-            let name = auto_adopt_profile_name(email, &uuid, now);
+            if !auto_adopt_enabled {
+                warnings.push(format!(
+                    "检测到未登记账号（{}），但自动收养已关闭，未自动新建，可手动处理",
+                    live_email.unwrap_or(&uuid)
+                ));
+                return warnings;
+            }
+            let name = auto_adopt_profile_name(live_email, &uuid, now);
             let profile = build_adopted_profile(
                 name.clone(),
                 claude_json.clone(),
@@ -147,7 +219,7 @@ pub fn reconcile_live_into_store(
             store_data.current_profile_id = Some(new_id);
             warnings.push(format!(
                 "自动收养：live 账号（{}）此前未登记，已自动新建账号「{}」，可在列表中重命名",
-                email.unwrap_or(&uuid),
+                live_email.unwrap_or(&uuid),
                 name
             ));
         }
@@ -164,6 +236,15 @@ fn lookup_string<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     cur.as_str()
 }
 
+/// 把 live 快照回写到已登记 profile。
+///
+/// **绝不拿空凭据覆盖已存凭据**：live 读不到 keychain（`None`）或拿到空白串时，
+/// `profile.keychain_password` 保持原值；只有 live 真给了一段非空白凭据才更新。
+/// meta 提取时用的「生效凭据」也跟着这个规则走——live 有就用 live 的，没有就用
+/// profile 已存的，保证 `has_keychain_credentials` / `subscription_type` 等字段
+/// 不会因一次「没读到 keychain」的刷新被错误重置。
+///
+/// claude_json / settings_json / updated_at 仍照常整体刷新。
 fn write_live_into_profile(
     profile: &mut StoredProfile,
     claude_json: &Value,
@@ -171,10 +252,20 @@ fn write_live_into_profile(
     keychain_password: &Option<String>,
     now: DateTime<Utc>,
 ) {
-    profile.meta = crate::usage::extract_meta(Some(claude_json), keychain_password.as_deref());
+    // live 凭据是否真的可用：Some 且 trim 后非空。
+    let live_cred: Option<&str> = keychain_password
+        .as_deref()
+        .filter(|raw| !raw.trim().is_empty());
+
+    if let Some(cred) = live_cred {
+        profile.keychain_password = Some(cred.to_string());
+    }
+
+    // meta 提取用生效凭据：live 有就用 live 的，否则沿用 profile 已存的。
+    let effective_cred = live_cred.or(profile.keychain_password.as_deref());
+    profile.meta = crate::usage::extract_meta(Some(claude_json), effective_cred);
     profile.claude_json = claude_json.clone();
     profile.settings_json = settings_json.clone();
-    profile.keychain_password = keychain_password.clone();
     profile.updated_at = now;
 }
 
@@ -214,6 +305,8 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    /// 构造一个最小已登记 profile；需要 email / 内嵌 claude_json / keychain 时
+    /// 在返回值上原地改字段即可。
     fn profile_with(id: &str, uuid: Option<&str>) -> StoredProfile {
         StoredProfile {
             id: id.into(),
@@ -242,23 +335,96 @@ mod tests {
             profile_with("p1", Some("uuid-1")),
             profile_with("p2", Some("uuid-2")),
         ];
-        // live = 当前账号。
+        // live = 当前账号（uuid 命中 meta.account_uuid）。
         assert_eq!(
-            classify_live_identity(Some("uuid-1"), Some("p1"), &profiles),
+            classify_live_identity(Some("uuid-1"), None, Some("p1"), &profiles),
             Some(LiveIdentity::Current)
         );
         // live = 另一个已登记账号。
         assert_eq!(
-            classify_live_identity(Some("uuid-2"), Some("p1"), &profiles),
+            classify_live_identity(Some("uuid-2"), None, Some("p1"), &profiles),
             Some(LiveIdentity::Other("p2".into()))
         );
         // live = 未登记账号。
         assert_eq!(
-            classify_live_identity(Some("uuid-x"), Some("p1"), &profiles),
+            classify_live_identity(Some("uuid-x"), None, Some("p1"), &profiles),
             Some(LiveIdentity::Unknown("uuid-x".into()))
         );
         // 取不到 uuid → None（不中断）。
-        assert_eq!(classify_live_identity(None, Some("p1"), &profiles), None);
+        assert_eq!(
+            classify_live_identity(None, None, Some("p1"), &profiles),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_email_fallback_is_case_insensitive() {
+        // 老账号 p1：meta.account_uuid 为空，只在 meta.email 里存了地址。
+        let mut p1 = profile_with("p1", None);
+        p1.meta.email = Some("Bob@Example.com".into());
+        let profiles = vec![p1, profile_with("p2", Some("uuid-2"))];
+
+        // live 没带 uuid，但 email 大小写不同 → 命中同一账号（Current）。
+        assert_eq!(
+            classify_live_identity(None, Some("bob@example.com"), Some("p1"), &profiles),
+            Some(LiveIdentity::Current)
+        );
+        // uuid 命中 p2 时仍优先走 uuid，current 是 p1 → Other(p2)。
+        assert_eq!(
+            classify_live_identity(Some("uuid-2"), Some("other@x.com"), Some("p1"), &profiles),
+            Some(LiveIdentity::Other("p2".into()))
+        );
+        // email 带前后空白也应 trim 后命中。
+        assert_eq!(
+            classify_live_identity(None, Some("  BOB@example.com  "), Some("p1"), &profiles),
+            Some(LiveIdentity::Current)
+        );
+    }
+
+    #[test]
+    fn classify_reads_identity_from_embedded_claude_json() {
+        // 老账号 p1：meta 全空，但 claude_json.oauthAccount 里嵌了身份。
+        let mut p1 = profile_with("p1", None);
+        p1.claude_json = serde_json::json!({
+            "oauthAccount": {
+                "accountUuid": "old-uuid",
+                "email": "Old@Example.com"
+            }
+        });
+        let profiles = vec![p1];
+
+        // live uuid 命中 json 内嵌 uuid。
+        assert_eq!(
+            classify_live_identity(Some("old-uuid"), None, Some("p1"), &profiles),
+            Some(LiveIdentity::Current)
+        );
+        // live 没带 uuid，email 大小写不同 → 回退 json 内嵌 email。
+        assert_eq!(
+            classify_live_identity(None, Some("old@example.com"), Some("p1"), &profiles),
+            Some(LiveIdentity::Current)
+        );
+    }
+
+    #[test]
+    fn classify_no_uuid_no_email_match_is_unknown() {
+        let mut p1 = profile_with("p1", Some("uuid-1"));
+        p1.meta.email = Some("a@x.com".into());
+        let profiles = vec![p1];
+        // uuid 与 email 都对不上。
+        assert_eq!(
+            classify_live_identity(Some("uuid-x"), Some("b@x.com"), Some("p1"), &profiles),
+            Some(LiveIdentity::Unknown("uuid-x".into()))
+        );
+    }
+
+    #[test]
+    fn classify_both_identities_missing_is_none() {
+        let profiles = vec![profile_with("p1", Some("uuid-1"))];
+        // live 既没 uuid 也没 email → None（不中断）。
+        assert_eq!(
+            classify_live_identity(None, None, Some("p1"), &profiles),
+            None
+        );
     }
 
     #[test]
@@ -293,7 +459,7 @@ mod tests {
     fn unknown_is_auto_adopted_and_current_points_to_it() {
         let mut store_data = store::Store::default();
         let snapshot = snapshot_with("new-uuid-1234", Some("new@example.com"));
-        let warnings = reconcile_live_into_store(&mut store_data, &snapshot, now());
+        let warnings = reconcile_live_into_store(&mut store_data, &snapshot, true, now());
         assert_eq!(store_data.profiles.len(), 1, "应自动新建一个账号");
         let created = &store_data.profiles[0];
         assert_eq!(created.name, "自动收养-new@example.com-1028-1000");
@@ -306,13 +472,32 @@ mod tests {
     }
 
     #[test]
+    fn unknown_not_adopted_when_switch_off() {
+        let mut store_data = store::Store::default();
+        store_data.profiles.push(profile_with("p1", Some("uuid-1")));
+        store_data.current_profile_id = Some("p1".into());
+        let snapshot = snapshot_with("new-uuid-9999", Some("new@example.com"));
+        let warnings = reconcile_live_into_store(&mut store_data, &snapshot, false, now());
+        assert_eq!(store_data.profiles.len(), 1, "开关关闭时不新建账号");
+        assert_eq!(
+            store_data.current_profile_id.as_deref(),
+            Some("p1"),
+            "开关关闭时不应改 current_profile_id"
+        );
+        assert!(
+            warnings.iter().any(|w| w.contains("自动收养已关闭")),
+            "应提示自动收养已关闭：{warnings:?}"
+        );
+    }
+
+    #[test]
     fn other_is_written_back_and_manual_switch_reported() {
         let mut store_data = store::Store::default();
         store_data.profiles.push(profile_with("p1", Some("uuid-1")));
         store_data.profiles.push(profile_with("p2", Some("uuid-2")));
         store_data.current_profile_id = Some("p1".into());
         let snapshot = snapshot_with("uuid-2", None);
-        let warnings = reconcile_live_into_store(&mut store_data, &snapshot, now());
+        let warnings = reconcile_live_into_store(&mut store_data, &snapshot, true, now());
         // current 指向 p2，且 p2 已回写 live 凭据。
         assert_eq!(store_data.current_profile_id.as_deref(), Some("p2"));
         let p2 = store_data.profiles.iter().find(|p| p.id == "p2").unwrap();
@@ -326,7 +511,7 @@ mod tests {
         store_data.profiles.push(profile_with("p1", Some("uuid-1")));
         store_data.current_profile_id = Some("p1".into());
         let snapshot = snapshot_with("uuid-1", None);
-        let warnings = reconcile_live_into_store(&mut store_data, &snapshot, now());
+        let warnings = reconcile_live_into_store(&mut store_data, &snapshot, true, now());
         assert_eq!(store_data.profiles.len(), 1, "不应新增账号");
         let p1 = &store_data.profiles[0];
         assert_eq!(p1.keychain_password.as_deref(), Some("keychain"));
@@ -337,7 +522,7 @@ mod tests {
     fn missing_claude_json_does_not_abort() {
         let mut store_data = store::Store::default();
         let snapshot = (None, None, None);
-        let warnings = reconcile_live_into_store(&mut store_data, &snapshot, now());
+        let warnings = reconcile_live_into_store(&mut store_data, &snapshot, true, now());
         assert!(warnings.iter().any(|w| w.contains("~/.claude.json")));
         assert_eq!(store_data.profiles.len(), 0);
     }
@@ -348,8 +533,55 @@ mod tests {
         let claude = serde_json::json!({ "oauthAccount": {} });
         let mut store_data = store::Store::default();
         let snapshot = (Some(claude), None, None);
-        let warnings = reconcile_live_into_store(&mut store_data, &snapshot, now());
+        let warnings = reconcile_live_into_store(&mut store_data, &snapshot, true, now());
         assert!(warnings.iter().any(|w| w.contains("accountUuid")));
         assert_eq!(store_data.profiles.len(), 0);
+    }
+
+    // ── write_live_into_profile：空凭据不得覆盖已存凭据 ──
+
+    #[test]
+    fn write_live_keeps_existing_keychain_when_live_has_none() {
+        let mut p = profile_with("p1", Some("uuid-1"));
+        p.keychain_password = Some("existing-cred".into());
+        let live_claude = serde_json::json!({
+            "oauthAccount": { "accountUuid": "uuid-1", "email": "a@x.com" }
+        });
+
+        // live 没读到凭据（None）。
+        write_live_into_profile(&mut p, &live_claude, &None, &None, now());
+
+        assert_eq!(p.keychain_password.as_deref(), Some("existing-cred"));
+        assert!(
+            p.meta.has_keychain_credentials,
+            "meta 仍应标记 has_keychain_credentials=true"
+        );
+        // claude_json 仍被刷新。
+        assert_eq!(p.claude_json, live_claude);
+    }
+
+    #[test]
+    fn write_live_updates_keychain_when_new_cred_present() {
+        let mut p = profile_with("p1", Some("uuid-1"));
+        p.keychain_password = Some("old".into());
+        let live_claude = serde_json::json!({ "oauthAccount": { "accountUuid": "uuid-1" } });
+
+        write_live_into_profile(&mut p, &live_claude, &None, &Some("new".into()), now());
+
+        assert_eq!(p.keychain_password.as_deref(), Some("new"));
+        assert!(p.meta.has_keychain_credentials);
+    }
+
+    #[test]
+    fn write_live_ignores_blank_keychain() {
+        let mut p = profile_with("p1", Some("uuid-1"));
+        p.keychain_password = Some("existing-cred".into());
+        let live_claude = serde_json::json!({ "oauthAccount": { "accountUuid": "uuid-1" } });
+
+        // 空白串（含纯空格）不得覆盖。
+        write_live_into_profile(&mut p, &live_claude, &None, &Some("   ".into()), now());
+
+        assert_eq!(p.keychain_password.as_deref(), Some("existing-cred"));
+        assert!(p.meta.has_keychain_credentials);
     }
 }
