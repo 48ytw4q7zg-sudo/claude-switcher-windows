@@ -213,8 +213,13 @@ async fn xxx() -> Result<T, String> {
     SystemRoot 拼权威路径。
 30. **Tauri externalBin 在 build.rs 阶段就校验文件存在**：`externalBin=["binaries/cs"]`
     要求磁盘上有 `binaries/cs-<target-triple>.exe`（本机 triple
-    x86_64-pc-windows-msvc），否则任何 cargo build/check 直接 panic。CI 先
-    `cargo build --bin cs` 再复制到该路径；安装时落成无后缀的 cs.exe。
+    x86_64-pc-windows-msvc），否则任何 cargo build/check 直接 panic。安装时落成无后缀的
+    cs.exe。**鸡生蛋顺序坑**：干净检出时该 sidecar 还不存在，而 `cargo build --bin cs`
+    本身就会先跑 build.rs 触发存在性校验而 panic，等构建完再 Copy 已来不及。正确顺序：
+    先在目标路径落一个 0 字节占位文件（tauri-utils 只查 `.exists()`、不校验是否有效 PE，
+    见 resources.rs `resource_from_path`），再 `cargo build --bin cs`，最后用真实
+    `target/release/cs.exe` 覆盖占位。本地已用 release 构建验证：cs.exe 4,349,952 字节、
+    有效 MZ、`--status` 退出 0、无参打印用法退出 2。
 31. **winreg 写 REG_EXPAND_SZ 用 set_raw_value**：`RegValue{bytes: UTF-16LE(含尾
     null), vtype: RegType::REG_EXPAND_SZ}`；读用 get_raw_value +
     `String::from_reg_value` 按字面读、不展开，保留 %USERPROFILE% 等变量。

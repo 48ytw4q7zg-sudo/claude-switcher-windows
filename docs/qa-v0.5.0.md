@@ -140,6 +140,29 @@ F-4 保留待调研；WSL 仅 docker-desktop 发行版，F-6 实验、默认关�
 | `npx tsc --noEmit` | 通过 |
 | `tauri build` | 由 CI（windows-latest）构建 MSI + NSIS，externalBin 含 cs.exe |
 
+## CI 构建修复（externalBin 鸡生蛋）
+
+首次 tag 触发的 Windows Build（run 41048632718）在「Stage cs external binary」
+步骤失败，报错：
+
+```
+tauri build failed: resource path `binaries\cs-x86_64-pc-windows-msvc.exe` doesn't exist
+```
+
+根因：tauri-build 的 build.rs 在编译本 crate 任何目标（含 `--bin cs`）之前就
+校验 sidecar 路径存在；干净检出时该文件还不存在，而 `cargo build --bin cs`
+本身先触发 build.rs 即 panic，等构建完再 Copy 已来不及。
+
+修复（workflow 该步骤）：先在目标路径落一个 0 字节占位文件让存在性校验通过
+（tauri-utils 只查 `.exists()`、不校验是否有效 PE），再 `cargo build --bin cs`，
+最后用真实 cs.exe 覆盖占位。本地已用 release 全流程验证：
+
+- `cargo build --release --bin cs` 不再 panic，产出 cs.exe **4,349,952 字节**、
+  有效 MZ PE；sidecar 与该文件字节一致、SHA256 相同
+  （`199D3A6D5A63817DC7CB60D8580CDF78F1B9CB0E6FCC212BDB5E19933E2425B7`）。
+- 实机运行：`cs --status` 退出 0（输出「当前没有全局账号」）；无参打印用法
+  退出 2。
+
 ## 本轮测试中发现并修复的真实 bug
 
 1. `usage::string_field` 把同级备选键误当逐层下钻路径，导致邮箱/uuid 回退
