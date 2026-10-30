@@ -1,6 +1,6 @@
 [package]
 name = "claude-switcher"
-version = "0.3.1"
+version = "0.4.0"
 description = "Claude Code local account switcher (Windows)"
 authors = ["48ytw4q7zg-sudo"]
 edition = "2021"
@@ -81,6 +81,10 @@ windows-sys = { version = "0.59", features = [
     "Win32_System_Ioctl",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
+    # CLI 入口（--list/--status/--switch）：GUI 子系统附加到父控制台。
+    "Win32_System_Console",
+    # 只读位置启动时弹原生 MessageBox 明确提示。
+    "Win32_UI_WindowsAndMessaging",
 ] }
 # junction 是纯 API 调用，替代 cmd /C mklink /J（cmd 解析 % & ^ 出错、GBK 输出乱码）。
 junction = "1"
