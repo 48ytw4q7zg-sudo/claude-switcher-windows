@@ -40,6 +40,15 @@ pub struct AppConfig {
     /// P2-1：提醒阈值（百分比，默认 90）。
     #[serde(default = "default_quota_reminder_threshold")]
     pub quota_reminder_threshold: u8,
+    /// H-6：切换前对账遇到未登记账号时是否自动收养（默认开）。
+    /// 关闭时只提示「检测到未登记账号」，不自动新建账号。
+    #[serde(default = "default_auto_adopt_enabled")]
+    pub auto_adopt_enabled: bool,
+}
+
+/// H-6：自动收养默认开启。
+fn default_auto_adopt_enabled() -> bool {
+    true
 }
 
 /// P2-1 默认提醒阈值 90%。
@@ -60,6 +69,7 @@ impl Default for AppConfig {
             quota_reminder_enabled: false,
             // 与 serde default 保持一致（90），否则缺字段解析与 Default 不一致。
             quota_reminder_threshold: default_quota_reminder_threshold(),
+            auto_adopt_enabled: default_auto_adopt_enabled(),
         }
     }
 }

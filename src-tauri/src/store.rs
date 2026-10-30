@@ -673,6 +673,99 @@ pub fn save_store(store: &Store) -> Result<(), String> {
     write_json_pretty(path, &value)
 }
 
+/// 进程内账号库互斥（H-2）：所有「读—改—写」必须持锁。
+///
+/// 避免后台托盘线程与用户命令线程并发 load/save：后写者用自己的旧快照整体覆盖
+/// 前写者刚落盘的改动（表现为切换被回滚 / 账号丢失）。
+static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// 在账号库互斥保护下执行一次「读—改—写」（H-2）。
+///
+/// - 持锁期间 load → 闭包修改 → `Ok` 时 save；`Err` 时不保存（旧数据保留）。
+/// - 锁中毒（某线程持锁时 panic）用 `into_inner()` 恢复：账号库是单一真相源，
+///   不能因一次 panic 让后续所有写操作永久失败。
+pub fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
+    let _guard = STORE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut store_data = load_store()?;
+    match f(&mut store_data) {
+        Ok(value) => {
+            save_store(&store_data)?;
+            Ok(value)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// 只读轻量元数据（H-9）：托盘菜单 / CLI / 状态只需要 id / 名称 / uuid / email。
+#[derive(Debug, Clone)]
+pub struct LightProfile {
+    pub id: String,
+    pub name: String,
+    pub account_uuid: Option<String>,
+    pub email: Option<String>,
+}
+
+/// 读账号库的轻量元数据（H-9）：直接解析磁盘 JSON，**不解密 keychain**。
+///
+/// 返回 `(profiles, current_profile_id)`。用于托盘菜单构建、CLI `--list/--status`、
+/// 获取当前账号 uuid，避免后台线程反复解密整个账号库。
+///
+/// uuid/email 优先取 `meta`，回退 `claude_json.oauthAccount`（老账号 meta 可能为空）。
+pub fn read_lightweight() -> Result<(Vec<LightProfile>, Option<String>), String> {
+    let path = paths::store_path()?;
+    if !path.exists() {
+        return Ok((Vec::new(), None));
+    }
+    let raw = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let value: Value =
+        serde_json::from_str(&raw).map_err(|e| format!("store.private.json 解析失败: {e}"))?;
+    let current_id = value
+        .get("current_profile_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string);
+
+    let mut lights = Vec::new();
+    if let Some(arr) = value.get("profiles").and_then(|v| v.as_array()) {
+        for p in arr {
+            let id = p
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let name = p
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            let account_uuid = p
+                .pointer("/meta/account_uuid")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    p.pointer("/claude_json/oauthAccount/accountUuid")
+                        .and_then(|v| v.as_str())
+                })
+                .map(str::to_string);
+            let email = p
+                .pointer("/meta/email")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    p.pointer("/claude_json/oauthAccount/email")
+                        .and_then(|v| v.as_str())
+                })
+                .map(str::to_string);
+            lights.push(LightProfile {
+                id,
+                name,
+                account_uuid,
+                email,
+            });
+        }
+    }
+    Ok((lights, current_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -94,7 +94,47 @@ pub fn current_username() -> Result<String, String> {
 ///    SYSTEM 的真实 SID 是 `S-1-5-18`。
 /// 3. **当前用户不能少**：只授 SYSTEM 会把当前用户也摘掉，连清理目录都做不了
 ///    （实测会 Access denied）。两者都要授。
+///
+/// H-1 保护：绝不能对这些目录执行 `icacls /inheritance:r`（会锁死/破坏用户数据）。
+///
+/// - **exe 所在目录**：便携版若误把数据根设成 exe 目录，断继承会把程序连同用户
+///   放在一起的其它文件锁死；
+/// - **用户 Downloads / Desktop**：这些目录继承的是用户公共/外壳 ACL，且常被
+///   多应用共用，断继承会破坏正常访问。
+///
+/// 返回 true 表示「该位置受保护、应跳过加固」。
+fn is_protected_from_hardening(dir: &Path) -> bool {
+    let dir_norm = normalize_path(dir);
+    // exe 所在目录。
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(exe_dir) = exe.parent() {
+            if normalize_path(exe_dir) == dir_norm {
+                return true;
+            }
+        }
+    }
+    // 用户 Downloads / Desktop（dirs 对已知文件夹解析可靠）。
+    for folder in [dirs::download_dir(), dirs::desktop_dir()]
+        .into_iter()
+        .flatten()
+    {
+        if normalize_path(&folder) == dir_norm {
+            return true;
+        }
+    }
+    false
+}
+
 pub fn secure_app_data_dir(dir: &Path) -> bool {
+    // H-1：exe 目录 / Downloads / 桌面绝不加固。返回 true 视为「无需处理」，
+    // 避免每次启动都重试并刷日志。
+    if is_protected_from_hardening(dir) {
+        crate::log_info(&format!(
+            "数据目录「{}」属于受保护位置（exe 目录/下载/桌面），已跳过 ACL 加固",
+            dir.display()
+        ));
+        return true;
+    }
     let Some(username) = username_for_icacls() else {
         return false;
     };
@@ -713,6 +753,44 @@ pub fn start_detached(program: &str, args: &[&str]) -> Result<(), String> {
         .spawn()
         .map_err(|e| format!("无窗口启动 {program} 失败: {e}"))?;
     Ok(())
+}
+
+/// 附加到父进程的控制台（CLI 入口用）。
+///
+/// 发布版是 GUI 子系统（没有自己的控制台）。当从终端以 `--list/--status/--switch`
+/// 调用时，先 `AttachConsole(ATTACH_PARENT_PROCESS)` 才能把 `println!` 输出到调用方
+/// 终端。父进程没有控制台（如从资源管理器启动）时会失败——此时调用方应改为弹
+/// 原生提示，而不是依赖 stdout。
+///
+/// 返回 true 表示已成功附加。
+pub fn attach_parent_console() -> bool {
+    use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+}
+
+/// 弹一个原生模态消息框（启动致命错误用，如数据目录只读）。
+///
+/// 在 GUI/WebView2 尚未创建前，唯一可靠的「明确提示」就是 Win32 MessageBox。
+/// `flags` 用 `MB_OK | MB_ICONERROR`（0x10 | 0x0）。
+pub fn show_startup_error(title: &str, message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, MB_ICONERROR, MB_OK, MB_TOPMOST,
+    };
+    let title_w = to_wide(title);
+    let message_w = to_wide(message);
+    unsafe {
+        MessageBoxW(
+            std::ptr::null_mut(),
+            message_w.as_ptr(),
+            title_w.as_ptr(),
+            MB_OK | MB_ICONERROR | MB_TOPMOST,
+        );
+    }
+}
+
+/// 把 Rust 字符串转成以 `\0` 结尾的 UTF-16（Win32 宽字符参数）。
+fn to_wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
 /// 按可执行名强制结束一批进程（如 ["Claude","claude"]），返回被结束的进程描述。

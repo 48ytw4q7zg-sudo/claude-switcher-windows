@@ -54,30 +54,79 @@ fn portable_root_for(dir: &Path) -> Option<PathBuf> {
     }
 }
 
-/// 便携模式根目录：若 exe 同目录存在 `portable.flag`，返回 exe 所在目录。
+/// 便携模式标记根：若 exe 同目录存在 `portable.flag`，返回 exe 所在目录（H-1）。
 ///
-/// 便携模式下账号库、日志、配置都落在 exe 目录（随 zip 整体拷走即迁移），
-/// 不再写用户主目录。
+/// 注意：这是**标记/程序根**，数据并不直接落在这里。账号库/日志/WebView2 全部
+/// 落进其下的 [`PORTABLE_DATA_SUBDIR`]（见 [`portable_data_dir`]），避免把数据
+/// 散落在 exe 目录、也避免误对 exe 目录做权限加固。
 pub fn portable_root() -> Option<PathBuf> {
     let exe = std::env::current_exe().ok()?;
     let dir = exe.parent()?.to_path_buf();
     portable_root_for(&dir)
 }
 
+/// 便携版数据子目录名（H-1）：与 exe 隔离，整目录可一并删除/迁移。
+pub const PORTABLE_DATA_SUBDIR: &str = "ClaudeSwitcherData";
+
+/// 便携版数据根：`<exe 目录>/ClaudeSwitcherData`。
+///
+/// 账号库、日志、WebView2 用户数据（`WEBVIEW2_USER_DATA_FOLDER`）都落在这里，
+/// 解压即用、删除即净；`portable.flag` 仍在 exe 旁。
+pub fn portable_data_dir() -> Option<PathBuf> {
+    portable_root().map(|root| root.join(PORTABLE_DATA_SUBDIR))
+}
+
 /// 本工具私有数据目录：
 /// - 便携模式（exe 旁有 `portable.flag`）→ exe 目录；
 /// - 常规安装 → `~/.claude-switcher`。
 pub fn app_data_dir() -> Result<PathBuf, String> {
-    if let Some(root) = portable_root() {
-        // 确保目录存在（exe 目录一般已存在，但 best-effort 保障）。
-        let _ = fs::create_dir_all(&root);
-        return Ok(root);
+    if let Some(data_dir) = portable_data_dir() {
+        // 确保数据子目录存在（best-effort；真正的可写性由 probe_data_dir_writable 把关）。
+        let _ = fs::create_dir_all(&data_dir);
+        return Ok(data_dir);
     }
     Ok(home_dir()?.join(".claude-switcher"))
 }
 
+/// 探测数据目录是否可写（H-1）：写一个临时探针文件再删除。
+///
+/// 便携版解压到 Program Files 等只读位置时，`create_dir_all` / 写文件会失败，
+/// 这里返回**明确人话错误**而非静默失败，由调用方弹原生提示并退出。
+pub fn probe_data_dir_writable() -> Result<(), String> {
+    let data_dir = app_data_dir()?;
+    probe_dir_writable_at(&data_dir)
+}
+
+/// 探测指定目录是否可写（H-1）：确保存在后写一个临时探针文件再删除。
+fn probe_dir_writable_at(data_dir: &Path) -> Result<(), String> {
+    if let Err(e) = fs::create_dir_all(data_dir) {
+        return Err(format!(
+            "无法创建数据目录「{}」：{e}。便携版请把整个文件夹解压到有写入权限的位置（如桌面、文档），\
+             不要在 Program Files 等只读位置直接运行。",
+            data_dir.display()
+        ));
+    }
+    let probe = data_dir.join(format!(".write-probe-{}", uuid::Uuid::new_v4().simple()));
+    match fs::File::create(&probe) {
+        Ok(_) => {
+            let _ = fs::remove_file(&probe);
+            Ok(())
+        }
+        Err(e) => Err(format!(
+            "数据目录「{}」不可写：{e}。便携版请把整个文件夹解压到有写入权限的位置（如桌面、文档），\
+             不要在 Program Files 等只读位置直接运行。",
+            data_dir.display()
+        )),
+    }
+}
+
 pub fn store_path() -> Result<PathBuf, String> {
     Ok(app_data_dir()?.join("store.private.json"))
+}
+
+/// H-2：用量缓存（不含密钥）路径，与账号库分离。
+pub fn usage_cache_path() -> Result<PathBuf, String> {
+    Ok(app_data_dir()?.join("usage-cache.json"))
 }
 
 /// 切换事务日志：记录进行中的切换目标/步骤/备份 id；
@@ -245,5 +294,46 @@ mod tests {
             .to_string_lossy()
             .replace('\\', "/")
             .ends_with(".claude-switcher"));
+    }
+
+    #[test]
+    fn portable_data_dir_is_isolated_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("portable.flag"), "").unwrap();
+        let root = portable_root_for(dir.path()).expect("flag root");
+        // 数据根 = 标记根 / ClaudeSwitcherData（H-1），与 exe 目录隔离。
+        let data = root.join(PORTABLE_DATA_SUBDIR);
+        assert_eq!(
+            data.file_name().and_then(|n| n.to_str()),
+            Some(PORTABLE_DATA_SUBDIR)
+        );
+        assert_ne!(data, root, "数据根绝不能等于 exe 所在目录");
+    }
+
+    #[test]
+    fn probe_data_dir_writable_succeeds_in_tempdir() {
+        let dir = tempfile::tempdir().unwrap();
+        // 可写目录：探针创建后删除，不残留。
+        assert!(probe_dir_writable_at(dir.path()).is_ok());
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .collect();
+        assert!(leftovers.is_empty(), "探针文件不应残留: {leftovers:?}");
+    }
+
+    #[test]
+    fn probe_data_dir_writable_fails_when_parent_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        // 用一个普通文件充当“父目录”：在其下创建数据目录必然失败，
+        // 与提权/只读属性无关（提权的 Administrator 仍能写只读目录，
+        // 因此旧的 readonly 断言不可靠），稳定触发错误分支。
+        let blocker = dir.path().join("not-a-dir");
+        fs::write(&blocker, "x").unwrap();
+        let target = blocker.join("data");
+        let result = probe_dir_writable_at(&target);
+        assert!(result.is_err(), "父级是文件时应探测为不可写");
+        let err = result.unwrap_err();
+        assert!(err.contains("无法创建"), "错误应给出明确人话提示: {err}");
     }
 }
