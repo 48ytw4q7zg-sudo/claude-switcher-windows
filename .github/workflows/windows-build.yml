@@ -41,6 +41,18 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
+      # J-1：先单独构建 cs 控制台程序，再以 target-triple 后缀放进 externalBin 目录。
+      # tauri.conf.json 的 bundle.externalBin = ["binaries/cs"] 会在 MSI/NSIS 安装目录
+      # 里落成 cs.exe（与主程序同目录，PATH 指向该目录即可全局使用）。
+      - name: Stage cs external binary
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
+          cargo build --release --bin cs --manifest-path src-tauri/Cargo.toml
+          Copy-Item "src-tauri/target/release/cs.exe" `
+            "src-tauri/binaries/cs-x86_64-pc-windows-msvc.exe" -Force
+          Get-Item "src-tauri/binaries/cs-x86_64-pc-windows-msvc.exe" | Select-Object Name,Length
+
       - name: Build app
         run: npm run tauri build
 
@@ -58,9 +70,9 @@ jobs:
           path: src-tauri/target/release/bundle/nsis/*.exe
           if-no-files-found: error
 
-      # P2-4：便携版 zip。内含 exe + portable.flag；运行时账号库/日志/配置与
+      # P2-4：便携版 zip。内含主 exe + cs.exe + portable.flag；运行时账号库/日志/配置与
       # WebView2 数据都落在 exe 目录（见 paths::portable_root），整体解压即用、
-      # 拷走即迁移，不写注册表/用户目录。
+      # 拷走即迁移，不写注册表/用户目录。J-1：cs.exe 一并打包。
       - name: Build portable zip
         shell: pwsh
         run: |
@@ -68,6 +80,7 @@ jobs:
           New-Item -ItemType Directory -Force portable-staging | Out-Null
           Copy-Item "src-tauri/target/release/claude-switcher.exe" `
             "portable-staging/ClaudeSwitcher.exe"
+          Copy-Item "src-tauri/target/release/cs.exe" "portable-staging/cs.exe" -Force
           New-Item -ItemType File "portable-staging/portable.flag" | Out-Null
           Compress-Archive -Path "portable-staging/*" `
             -DestinationPath "ClaudeSwitcher-portable.zip" -Force
