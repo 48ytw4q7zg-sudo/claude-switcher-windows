@@ -122,6 +122,8 @@ export function QuotaReminderPanel() {
                   缓存里「{recommended.name}」余量最多
                   {recommended.last_used_percent != null &&
                     `（约 ${recommended.last_used_percent.toFixed(0)}%）`}
+                  {recommended.minutes_ago != null &&
+                    `，数据为 ${recommended.minutes_ago} 分钟前`}
                   ，建议切换。
                 </span>
               ) : (

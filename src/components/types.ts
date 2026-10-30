@@ -75,6 +75,8 @@ export interface AppConfig {
   quota_reminder_enabled?: boolean;
   /** P2-1：提醒阈值（默认 90）。 */
   quota_reminder_threshold?: number;
+  /** H-6：检测到未登记账号时是否自动收养（默认开启）。 */
+  auto_adopt_enabled?: boolean;
 }
 
 /** P1-3：并行终端启动结果。 */
@@ -89,6 +91,8 @@ export interface RecommendedAccount {
   id: string;
   name: string;
   last_used_percent?: number | null;
+  /** H-2：推荐依据的缓存数据距今多少分钟。 */
+  minutes_ago?: number | null;
 }
 
 /** P2-1：阈值提醒结果。 */

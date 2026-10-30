@@ -36,6 +36,7 @@ import { ClashModePanel } from './components/ClashModePanel';
 import { DesktopProfiles } from './components/DesktopProfiles';
 import { PrivacyTools } from './components/PrivacyTools';
 import { QuotaReminderPanel } from './components/QuotaReminder';
+import { ReconcileSettings } from './components/ReconcileSettings';
 import { McpPanel } from './components/McpPanel';
 import { useModalDialog } from './useModalDialog';
 
@@ -1553,6 +1554,8 @@ function App() {
       <DesktopProfiles />
 
       <QuotaReminderPanel />
+
+      <ReconcileSettings />
 
       <McpPanel />
 
