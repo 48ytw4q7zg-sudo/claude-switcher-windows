@@ -70,9 +70,10 @@ src-tauri/src/
 ├── fsx.rs          # 原子写入 + 锁重试
 ├── processes.rs    # Claude Code 进程检测（sysinfo）
 ├── net.rs          # reqwest HTTP（OAuth + Clash）
-├── usage.rs        # 用量统计 + 缓存
-├── tray.rs         # 托盘 / 弹窗定位
-└── lib.rs          # Tauri 命令层（--guard / --autostart 在此分发）
+├── usage.rs        # 用量统计 + 独立 usage-cache.json（不解密账号库）
+├── tray.rs         # 托盘 / 弹窗定位（read_lightweight 轻量读取）
+├── cli.rs          # 命令行入口 --list/--status/--switch（AttachConsole + 单实例转交）
+└── lib.rs          # Tauri 命令层（--guard / --autostart / CLI 在此分发；写路径走 with_store）
 ```
 
 新增平台相关能力时：先在 `platform/windows.rs` 加同名函数，再在业务里调 `platform::imp::xxx`。
@@ -97,6 +98,13 @@ async fn xxx() -> Result<T, String> {
 `fsx::write_atomically`：临时文件 + rename。**绝不要** `fs::write` 直接写
 `store.private.json` / `.credentials.json` / `~/.claude.json`——截断式写入中途
 崩溃会丢数据。`rename_with_retry` 失败时**不要**删目标文件（旧数据必须保留）。
+
+### 账号库写操作必须走 `with_store`
+
+任何对账号库的读—改—写都用 `store::with_store(|store| { ... Ok(...) })`，闭包
+返回 Ok 后统一原子保存，杜绝并发写互踩。只读路径用 `read_lightweight()`（不解密）
+或 `load_store()`（不持锁）。`STORE_LOCK` 是不可重入的 std `Mutex`，闭包内禁止
+再调获取该锁的函数（见踩坑 22）。
 
 ### 凭据与密钥边界
 
@@ -160,6 +168,21 @@ async fn xxx() -> Result<T, String> {
     文件」，会让所有走 `run_ps` 的系统状态查询（网卡/服务/进程/计划任务…）整体失败。
     统一用 `platform::powershell_path()`（从 `SystemRoot` 拼权威路径）；并行终端把
     powershell 作为参数传给 wt/cmd 时同样用完整路径。
+22. **`store::with_store` 的锁是 std `Mutex`，不可重入**：闭包内再调任何获取
+    `STORE_LOCK` 的函数会自死锁。`cancel_pending` 因内部要调 `switch`（自带锁），
+    改成「只读 load 预检 → 调 switch → 窄 with_store 清 pending」，绝不持锁进
+    switch。新增写路径先确认它调用的函数不获取 STORE_LOCK。
+23. **提权 Administrator 下「只读目录」测试不可靠**：提权进程对只读目录仍可写，
+    断言「只读目录创建失败」会误判。需要稳定的失败路径时，用「父级是普通文件时
+    `create_dir_all` 必然失败」代替（`probe_data_dir_writable_fails_when_parent_is_a_file`）。
+24. **`std::fs::Metadata::clone_permissions()` 是 Unix-only**：Windows 上没有该方法，
+    跨平台复制权限用 `std::fs::File::set_permissions(metadata.permissions())`。
+25. **便携版数据根是 exe 旁的 `ClaudeSwitcherData` 子目录，不是 exe 目录**：
+    `WEBVIEW2_USER_DATA_FOLDER` 与全部用户数据都落在子目录；exe 目录 / Downloads /
+    Desktop 命中 `is_protected_from_hardening` 时跳过 icacls 加固。
+26. **通知 uuid 缺失绝不回退固定 "current" 键**：否则会把通知记到错误账号上；
+    取不到 uuid 直接跳过、不写状态。`resets_at` 先 `round_to_five_minutes`
+    （`div_euclid(300)`）收敛秒级抖动，5h/7d 两个窗口独立去重。
 
 ## 实机未验证项（改相关代码后优先测）
 

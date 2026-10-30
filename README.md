@@ -5,6 +5,7 @@
 - **桌面版**：`%APPDATA%\Claude` 整体快照/切换；
 - **环境安全**：14 项安全检查、一键修复、保镖 kill-switch、时区/地区锁定、Clash 规则托管、STUN/WebRTC 泄漏探测、指纹与 CLI 体检、加密快照、自动更新；
 - **多账号增强（v0.3.0）**：按终端并行多账号（每账号独立配置目录）、托盘一键切换、额度阈值提醒 + 一键切换、MCP 服务器管理、便携版 zip。
+- **缺陷/竞态收口（v0.4.0）**：便携版数据隔离到 `ClaudeSwitcherData` 子目录、账号库 `with_store` 互斥、独立用量缓存（不解密账号库）、并行终端播种/执行策略/非阻塞探测、对账不覆盖空凭据 + uuid/邮箱回退 + 收养开关、MCP 乐观并发 + 通用 cmd shim、通知 5h/7d 双窗口去重、托盘轻量读取，并新增命令行入口 `--list`/`--status`/`--switch`。
 
 基于 **Tauri 2 + Rust + React 19 + TypeScript** 构建，桌面壳为 Windows 原生 WebView2。
 
@@ -38,9 +39,9 @@
 | 项 | 状态 |
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
-| 安装包 | **Release v0.3.0**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计，SHA256 见 Release 说明 |
-| 测试 | `cargo test --lib` **207 passed / 0 failed / 0 ignored**；`cargo clippy --all-targets -- -D warnings` 零警告；`npx tsc --noEmit` 通过 |
-| 实测环境 | **Windows 11 Pro x64**（build 26300）；Windows 10 未实机验证 |
+| 安装包 | **Release v0.4.0**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计，SHA256 见 Release 说明 |
+| 测试 | `cargo test --lib` **250 passed / 0 failed / 0 ignored**；`cargo clippy --all-targets -- -D warnings` 零警告；`npx tsc --noEmit` 通过 |
+| 实测环境 | 无显示器环境本地构建；Windows 10/11 端到端实机验证项见文末清单 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
 
 ---
@@ -68,8 +69,9 @@ claude-switcher-windows/
 │   │   ├── processes.rs           # Claude Code CLI 进程检测/结束
 │   │   ├── net.rs                 # reqwest HTTP（Clash 控制器 + OAuth）
 │   │   ├── clash.rs               # Clash 节点状态/切换/延迟检查
-│   │   ├── usage.rs               # 用量统计 + 缓存（TTL + in-flight 合并）
-│   │   ├── tray.rs                # 托盘/弹窗定位
+│   │   ├── usage.rs               # 用量统计 + 独立 usage-cache.json
+│   │   ├── tray.rs                # 托盘/弹窗定位（轻量读取）
+│   │   ├── cli.rs                 # 命令行入口 --list/--status/--switch
 │   │   ├── export.rs              # 加密快照导出/导入（CSBK1：Argon2id + AES-GCM）
 │   │   ├── update.rs              # GitHub Release 版本检查
 │   │   ├── appconfig.rs           # 全局配置 appconfig.json（country/tz/locale/proxy_mode/proxy_group/webrtc）
@@ -102,6 +104,7 @@ claude-switcher-windows/
 │   │   ├── ClashModePanel.tsx     # Clash 模式/规则/WebRTC 策略/代理组
 │   │   ├── DesktopProfiles.tsx    # Claude Desktop 账号管理
 │   │   ├── QuotaReminder.tsx      # 额度阈值提醒 + 一键切换
+│   │   ├── ReconcileSettings.tsx  # 对账自动收养开关
 │   │   ├── McpPanel.tsx           # MCP 服务器管理
 │   │   ├── PrivacyTools.tsx       # open-safe / 代理诊断 / 指纹 / cli-info
 │   │   └── types.ts               # 前后端契约类型
@@ -110,6 +113,8 @@ claude-switcher-windows/
 │   ├── backend-interfaces.md      # 平台层契约
 │   ├── qa-report.md               # QA 报告（含第二轮全量复核的 19 项修复记录）
 │   ├── qa-v0.3.0.md               # v0.3.0 账号管理增强 QA 报告
+│   ├── qa-v0.3.1.md               # v0.3.1 PowerShell 路径补丁 QA 报告
+│   ├── qa-v0.4.0.md               # v0.4.0 缺陷/竞态收口 QA 报告
 │   ├── release-v0.1.0.md          # v0.1.0 发布记录
 │   └── prior-session-recovery.md  # 前序会话恢复报告
 ├── .github/workflows/
@@ -126,9 +131,10 @@ claude-switcher-windows/
 
 | 形态 | 入口 | 适用场景 |
 | --- | --- | --- |
-| **NSIS 安装版** | Release 中 `ClaudeSwitcher_0.3.0_x64-setup.exe` | 普通用户，双击安装（推荐） |
-| **MSI 安装版** | Release 中 `ClaudeSwitcher_0.3.0_x64_zh-CN.msi` | 企业分发 / 域管理 |
-| **便携版 zip** | Release 中 `ClaudeSwitcher-portable.zip` | 解压即用，数据随 exe 目录携带 |
+| **NSIS 安装版** | Release 中 `ClaudeSwitcher_0.4.0_x64-setup.exe` | 普通用户，双击安装（推荐） |
+| **MSI 安装版** | Release 中 `ClaudeSwitcher_0.4.0_x64_zh-CN.msi` | 企业分发 / 域管理 |
+| **便携版 zip** | Release 中 `ClaudeSwitcher-portable.zip` | 解压即用，数据随 exe 目录的 `ClaudeSwitcherData` 携带 |
+| **命令行** | exe 加 `--list` / `--status` / `--switch <名称>` | 终端脚本 / 无 GUI 调用 |
 | **开发模式** | `npm run tauri dev` | 二次开发，带热更新 |
 
 ### 这是什么、能做什么
@@ -165,14 +171,26 @@ Claude Code CLI 的登录凭据、全局配置和会话历史都散落在用户�
 
 ### 便携版
 
-解压 `ClaudeSwitcher-portable.zip`，在 exe 同目录放一个空的 `portable.flag`（zip 内已附带），双击 `ClaudeSwitcher.exe` 即可以便携模式运行：账号库、日志、配置与 WebView2 数据都落在 exe 目录，不写注册表/用户目录；整个目录拷走即迁移。
+解压 `ClaudeSwitcher-portable.zip`，exe 同目录已附带空的 `portable.flag`，双击 `ClaudeSwitcher.exe` 即以便携模式运行：账号库、日志、配置与 WebView2 数据全部落在 exe 旁的 **`ClaudeSwitcherData` 子目录**（不直接写 exe 目录，也不写注册表/用户目录）；整个目录拷走即迁移，删除即净。
+
+### 命令行入口
+
+发布版是 GUI 子系统，默认无控制台；在终端对 exe 加子命令时会自动附加父控制台再输出：
+
+```powershell
+.\ClaudeSwitcher.exe --list                 # 列出全部账号（当前账号 [*]）
+.\ClaudeSwitcher.exe --status               # 显示当前账号
+.\ClaudeSwitcher.exe --switch "Claude 主号"  # 按名称精确切换
+```
+
+若已有一个实例在运行，`--switch` 会经单实例机制转交给运行实例执行，不会启动第二个进程并发写账号库。命令行输出的真实渲染需在实机终端验证。
 
 ---
 
 ## 四、安装使用教程
 
 1. **确认是 64 位系统**：设置 → 系统 → 系统信息 →「系统类型」应含 **64 位操作系统，x64**。若是 ARM64 或 32 位，本工具跑不了。
-2. **下载安装包**：打开本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases) → 最新版，下载 `ClaudeSwitcher_0.3.0_x64-setup.exe`（推荐，NSIS 安装包）；也可用 `ClaudeSwitcher_0.3.0_x64_zh-CN.msi`；想免安装则下载 `ClaudeSwitcher-portable.zip`。SHA256 校验值在 Release 说明与 `SHA256SUMS.txt` 里。
+2. **下载安装包**：打开本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases) → 最新版，下载 `ClaudeSwitcher_0.4.0_x64-setup.exe`（推荐，NSIS 安装包）；也可用 `ClaudeSwitcher_0.4.0_x64_zh-CN.msi`；想免安装则下载 `ClaudeSwitcher-portable.zip`。SHA256 校验值在 Release 说明与 `SHA256SUMS.txt` 里。
 3. **双击安装包**，按提示点「下一步」直到安装完成。
 4. 若 Windows 弹出 **SmartScreen**「Windows 已保护你的电脑」，点「更多信息」→「仍要运行」。
    > 这是**未签名安装包**的正常提示。请只从本仓库 Release 下载，不要从来路不明的链接安装。
@@ -226,8 +244,8 @@ Compress-Archive -Path "$staging\*" -DestinationPath ClaudeSwitcher-portable.zip
 
 ```text
 src-tauri\target\release\claude-switcher.exe                       # 免安装可执行文件
-src-tauri\target\release\bundle\msi\ClaudeSwitcher_0.3.0_x64_zh-CN.msi
-src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.3.0_x64-setup.exe
+src-tauri\target\release\bundle\msi\ClaudeSwitcher_0.4.0_x64_zh-CN.msi
+src-tauri\target\release\bundle\nsis\ClaudeSwitcher_0.4.0_x64-setup.exe
 ClaudeSwitcher-portable.zip                                       # 便携版
 ```
 
