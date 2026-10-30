@@ -22,6 +22,7 @@ mod accounts;
 mod appconfig;
 mod checks;
 mod clash;
+mod cli;
 mod credentials;
 mod desktop;
 mod diagnostics;
@@ -435,22 +436,23 @@ fn set_telemetry_mode(mode: String) -> Result<(), String> {
         }
     };
 
-    let mut store_data = store::load_store()?;
-    store_data.telemetry_mode = parsed;
-    let runtime = store_data
-        .pending_new_account
-        .as_ref()
-        .map(|pending| pending.runtime.clone())
-        .or_else(|| {
-            store_data.current_profile_id.as_deref().and_then(|id| {
-                store_data
-                    .profiles
-                    .iter()
-                    .find(|profile| profile.id == id)
-                    .and_then(|profile| profile.runtime.clone())
-            })
-        });
-    store::save_store(&store_data)?;
+    // H-2：账号库读—改—写走 with_store 互斥；外部 settings 写入在锁外执行。
+    let runtime = store::with_store(|store_data| {
+        store_data.telemetry_mode = parsed;
+        Ok(store_data
+            .pending_new_account
+            .as_ref()
+            .map(|pending| pending.runtime.clone())
+            .or_else(|| {
+                store_data.current_profile_id.as_deref().and_then(|id| {
+                    store_data
+                        .profiles
+                        .iter()
+                        .find(|profile| profile.id == id)
+                        .and_then(|profile| profile.runtime.clone())
+                })
+            }))
+    })?;
     accounts::apply_profile_env_to_settings(parsed, runtime.as_ref())
 }
 
@@ -506,7 +508,6 @@ fn capture_current_profile_blocking(
         ));
     }
 
-    let mut store_data = store::load_store()?;
     let now = Utc::now();
     let runtime = store::default_runtime_for_profile(clean_name, None);
     let profile = StoredProfile {
@@ -527,17 +528,20 @@ fn capture_current_profile_blocking(
     };
     let summary = profile_summary_of(&profile, Some(""));
     let profile_id = profile.id.clone();
+    // H-2：账号库读—改—写走 with_store；隔离链接在锁外 best-effort。
     // 先把 profile 落进 store，再改 live 隔离链接：链接操作随时可能因
     // Windows 文件锁失败，但快照本身已完整保存——失败不再回滚 store
     // （回滚会让 live 链接指向 store 里已不存在的 profile，反而更乱），
     // 只记日志；UI 的 session_isolation 状态会提示"隔离未激活"，
     // 用户重新执行一次"切换"即可补上链接。
-    store_data.current_profile_id = Some(profile_id.clone());
-    // 捕获新账号后必须清缓存：OAuth/本地用量缓存里可能还留着上一个账号的数据
-    // （token 指纹能防串号，但 projects 目录也换了，本地统计必须重算）。
-    usage::clear_caches();
-    store_data.profiles.push(profile);
-    store::save_store(&store_data)?;
+    store::with_store(|store_data| {
+        store_data.current_profile_id = Some(profile_id.clone());
+        // 捕获新账号后必须清缓存：OAuth/本地用量缓存里可能还留着上一个账号的数据
+        // （token 指纹能防串号，但 projects 目录也换了，本地统计必须重算）。
+        usage::clear_caches();
+        store_data.profiles.push(profile);
+        Ok(())
+    })?;
     if let Err(e) = isolation::adopt_live_claude_local_state_for_profile(&profile_id)
         .and_then(|_| isolation::activate_profile_claude_local_state(&profile_id))
     {
@@ -583,93 +587,96 @@ fn prepare_new_account_login_blocking(
         return Err("必须选择新账号绑定的 Clash 节点".to_string());
     }
 
-    let mut store_data = store::load_store()?;
-    let mut warnings = Vec::new();
-    if store_data.pending_new_account.is_some() {
-        return Err("已有待完成的新号登录流程，请先完成保存或切回旧账号重新开始".to_string());
-    }
-    warnings.extend(processes::kill_claude_code_processes()?);
+    // H-2：新号准备是一次账号库事务，读—改—写全程持 with_store 锁。
+    store::with_store(|store_data| {
+        let mut warnings = Vec::new();
+        if store_data.pending_new_account.is_some() {
+            return Err("已有待完成的新号登录流程，请先完成保存或切回旧账号重新开始".to_string());
+        }
+        warnings.extend(processes::kill_claude_code_processes()?);
 
-    let backup = create_backup_with_label("before-new-account-login")?;
-    warnings.extend(refresh_current_profile_snapshot(
-        &mut store_data,
-        "__new_account_login__",
-    ));
-    if let Some(current_id) = store_data.current_profile_id.as_deref() {
-        warnings.extend(isolation::adopt_live_claude_local_state_for_profile(
-            current_id,
-        )?);
-    }
-
-    let (_, settings_json, _) = accounts::current_snapshot()?;
-    let rollback_from = load_backup_snapshot(&backup.path)?;
-    let clash_result = clash::switch_clash_node_internal(DEFAULT_CLASH_GROUP, clean_node)?;
-    if !clash_result.verified {
-        return Err(format!(
-            "Auto-Claude 切换到「{clean_node}」未被 Clash 确认，已停止准备新号。"
+        let backup = create_backup_with_label("before-new-account-login")?;
+        warnings.extend(refresh_current_profile_snapshot(
+            store_data,
+            "__new_account_login__",
         ));
-    }
-    clash::assert_clash_node_ready(DEFAULT_CLASH_GROUP, clean_node)?;
-    let mut runtime = store::default_runtime_for_profile(clean_name, Some(clean_node));
-    if timezone
-        .as_deref()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-    {
-        runtime.timezone = timezone.map(|value| value.trim().to_string());
-    }
-    if locale
-        .as_deref()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-    {
-        runtime.locale = locale.map(|value| value.trim().to_string());
-    }
-    if chrome_profile
-        .as_deref()
-        .map(|value| !value.trim().is_empty())
-        .unwrap_or(false)
-    {
-        runtime.chrome_profile = chrome_profile.map(|value| value.trim().to_string());
-    }
+        if let Some(current_id) = store_data.current_profile_id.as_deref() {
+            warnings.extend(isolation::adopt_live_claude_local_state_for_profile(
+                current_id,
+            )?);
+        }
 
-    let pending = PendingNewAccount {
-        id: format!("pending-{}", uuid::Uuid::new_v4()),
-        name: clean_name.to_string(),
-        notes,
-        group: DEFAULT_CLASH_GROUP.to_string(),
-        node: clean_node.to_string(),
-        runtime,
-        created_at: Utc::now(),
-    };
-    accounts::clean_live_account_for_new_login(settings_json, &rollback_from)?;
-    // 顺序关键：先保存 pending，再激活隔离链接。
-    // 旧顺序是「activate 失败就 Err、pending 尚未保存」——而此刻凭据已被清空、
-    // Clash 已切换，一旦 activate 失败（Windows 文件锁很常见），用户既没有
-    // pending 记录可取消切回，也无从重试，陷入"登录态已清空"的死局。
-    // 先落 pending 保证「取消切回」始终可用；activate 失败降级为 warning。
-    store_data.pending_new_account = Some(pending.clone());
-    store::save_store(&store_data)?;
-    match isolation::activate_profile_claude_local_state(&pending.id) {
-        Ok(items) => warnings.extend(items),
-        Err(e) => warnings.push(format!(
-            "新号隔离目录激活失败（不影响登录，可重新执行一次切换恢复）：{e}"
-        )),
-    }
-    if let Err(e) =
-        accounts::apply_profile_env_to_settings(store_data.telemetry_mode, Some(&pending.runtime))
-    {
-        warnings.push(format!(
-            "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
-        ));
-    }
-    // 新号流程已清空当前账号并换到全新的日志目录，旧账号缓存不能继续显示。
-    usage::clear_caches();
-    Ok(PrepareNewAccountResult {
-        pending,
-        backup,
-        clash: clash_result,
-        warnings,
+        let (_, settings_json, _) = accounts::current_snapshot()?;
+        let rollback_from = load_backup_snapshot(&backup.path)?;
+        let clash_result = clash::switch_clash_node_internal(DEFAULT_CLASH_GROUP, clean_node)?;
+        if !clash_result.verified {
+            return Err(format!(
+                "Auto-Claude 切换到「{clean_node}」未被 Clash 确认，已停止准备新号。"
+            ));
+        }
+        clash::assert_clash_node_ready(DEFAULT_CLASH_GROUP, clean_node)?;
+        let mut runtime = store::default_runtime_for_profile(clean_name, Some(clean_node));
+        if timezone
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        {
+            runtime.timezone = timezone.map(|value| value.trim().to_string());
+        }
+        if locale
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        {
+            runtime.locale = locale.map(|value| value.trim().to_string());
+        }
+        if chrome_profile
+            .as_deref()
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false)
+        {
+            runtime.chrome_profile = chrome_profile.map(|value| value.trim().to_string());
+        }
+
+        let pending = PendingNewAccount {
+            id: format!("pending-{}", uuid::Uuid::new_v4()),
+            name: clean_name.to_string(),
+            notes,
+            group: DEFAULT_CLASH_GROUP.to_string(),
+            node: clean_node.to_string(),
+            runtime,
+            created_at: Utc::now(),
+        };
+        accounts::clean_live_account_for_new_login(settings_json, &rollback_from)?;
+        // 顺序关键：先保存 pending，再激活隔离链接。
+        // 旧顺序是「activate 失败就 Err、pending 尚未保存」——而此刻凭据已被清空、
+        // Clash 已切换，一旦 activate 失败（Windows 文件锁很常见），用户既没有
+        // pending 记录可取消切回，也无从重试，陷入"登录态已清空"的死局。
+        // 先落 pending 保证「取消切回」始终可用；activate 失败降级为 warning。
+        store_data.pending_new_account = Some(pending.clone());
+        // with_store 在闭包返回 Ok 后统一 save，这里不再显式 save。
+        match isolation::activate_profile_claude_local_state(&pending.id) {
+            Ok(items) => warnings.extend(items),
+            Err(e) => warnings.push(format!(
+                "新号隔离目录激活失败（不影响登录，可重新执行一次切换恢复）：{e}"
+            )),
+        }
+        if let Err(e) = accounts::apply_profile_env_to_settings(
+            store_data.telemetry_mode,
+            Some(&pending.runtime),
+        ) {
+            warnings.push(format!(
+                "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
+            ));
+        }
+        // 新号流程已清空当前账号并换到全新的日志目录，旧账号缓存不能继续显示。
+        usage::clear_caches();
+        Ok(PrepareNewAccountResult {
+            pending,
+            backup,
+            clash: clash_result,
+            warnings,
+        })
     })
 }
 
@@ -679,60 +686,62 @@ async fn complete_new_account_login() -> Result<ProfileSummary, String> {
 }
 
 fn complete_new_account_login_blocking() -> Result<ProfileSummary, String> {
-    let mut store_data = store::load_store()?;
-    let pending = store_data
-        .pending_new_account
-        .clone()
-        .ok_or_else(|| "没有待完成的新号登录流程".to_string())?;
-    let (claude_json, settings_json, keychain_password) = accounts::current_snapshot()?;
-    let claude_json = claude_json.ok_or_else(|| {
-        "当前没有 ~/.claude.json，请先手动完成 Claude Code OAuth 登录".to_string()
-    })?;
-    let keychain_password = keychain_password.ok_or_else(|| {
-        format!("当前没有{CREDENTIAL_STORE_LABEL}登录态，请先完成 Claude OAuth 登录")
-    })?;
+    // H-2：读—改—写走 with_store。
+    store::with_store(|store_data| {
+        let pending = store_data
+            .pending_new_account
+            .clone()
+            .ok_or_else(|| "没有待完成的新号登录流程".to_string())?;
+        let (claude_json, settings_json, keychain_password) = accounts::current_snapshot()?;
+        let claude_json = claude_json.ok_or_else(|| {
+            "当前没有 ~/.claude.json，请先手动完成 Claude Code OAuth 登录".to_string()
+        })?;
+        let keychain_password = keychain_password.ok_or_else(|| {
+            format!("当前没有{CREDENTIAL_STORE_LABEL}登录态，请先完成 Claude OAuth 登录")
+        })?;
 
-    if store_data
-        .profiles
-        .iter()
-        .any(|profile| profile.id == pending.id)
-    {
-        return Err("这个待完成账号已经保存过".to_string());
-    }
-    let now = Utc::now();
-    let profile = StoredProfile {
-        id: pending.id.clone(),
-        name: pending.name.clone(),
-        notes: pending.notes.clone(),
-        created_at: pending.created_at,
-        updated_at: now,
-        last_switched_at: Some(now),
-        meta: usage::extract_meta(Some(&claude_json), Some(&keychain_password)),
-        claude_json,
-        settings_json,
-        encrypted_auth_settings: None,
-        keychain_password: Some(keychain_password),
-        last_used_percent: None,
-        clash: Some(store::ProfileClashBinding {
-            enabled: true,
-            group: pending.group.clone(),
-            node: pending.node.clone(),
-        }),
-        runtime: Some(pending.runtime.clone()),
-    };
-    let summary = profile_summary_of(&profile, Some(""));
-    // 链接激活失败不阻断保存：登录态已就绪是用户关心的结果，
-    // 链接未激活会由 get_status 的 session_isolation 状态显示，重新切换一次即可补上。
-    if let Err(e) = isolation::activate_profile_claude_local_state(&profile.id) {
-        log_error(&format!("新号隔离链接激活失败（已保存登录态）: {e}"));
-    }
-    store_data.current_profile_id = Some(profile.id.clone());
-    // 新号登录完成 = 账号已变，缓存全部作废（否则用量/套餐显示的还是旧账号）。
-    usage::clear_caches();
-    store_data.pending_new_account = None;
-    store_data.profiles.push(profile);
-    store::save_store(&store_data)?;
-    Ok(summary)
+        if store_data
+            .profiles
+            .iter()
+            .any(|profile| profile.id == pending.id)
+        {
+            return Err("这个待完成账号已经保存过".to_string());
+        }
+        let now = Utc::now();
+        let profile = StoredProfile {
+            id: pending.id.clone(),
+            name: pending.name.clone(),
+            notes: pending.notes.clone(),
+            created_at: pending.created_at,
+            updated_at: now,
+            last_switched_at: Some(now),
+            meta: usage::extract_meta(Some(&claude_json), Some(&keychain_password)),
+            claude_json,
+            settings_json,
+            encrypted_auth_settings: None,
+            keychain_password: Some(keychain_password),
+            last_used_percent: None,
+            clash: Some(store::ProfileClashBinding {
+                enabled: true,
+                group: pending.group.clone(),
+                node: pending.node.clone(),
+            }),
+            runtime: Some(pending.runtime.clone()),
+        };
+        let summary = profile_summary_of(&profile, Some(""));
+        // 链接激活失败不阻断保存：登录态已就绪是用户关心的结果，
+        // 链接未激活会由 get_status 的 session_isolation 状态显示，重新切换一次即可补上。
+        if let Err(e) = isolation::activate_profile_claude_local_state(&profile.id) {
+            log_error(&format!("新号隔离链接激活失败（已保存登录态）: {e}"));
+        }
+        store_data.current_profile_id = Some(profile.id.clone());
+        // 新号登录完成 = 账号已变，缓存全部作废（否则用量/套餐显示的还是旧账号）。
+        usage::clear_caches();
+        store_data.pending_new_account = None;
+        store_data.profiles.push(profile);
+        // with_store 在闭包返回 Ok 后统一 save。
+        Ok(summary)
+    })
 }
 
 /// 内部会触发一次完整切号（含进程结束等待、Clash 请求、链接重试），
@@ -743,22 +752,24 @@ async fn cancel_pending_new_account_login() -> Result<Option<SwitchResult>, Stri
 }
 
 fn cancel_pending_new_account_login_blocking() -> Result<Option<SwitchResult>, String> {
-    let mut store_data = store::load_store()?;
+    // 只读检查（不持锁）：确认有 pending、取当前账号 id。
+    let store_data = store::load_store()?;
     if store_data.pending_new_account.is_none() {
         return Err("没有待取消的新号登录流程".to_string());
     }
     let current_id = store_data.current_profile_id.clone();
 
     // 先尝试切回旧账号；切换失败时保留 pending，让用户可以重试取消。
-    // 原来的顺序是先清 pending 再切——一旦切号失败，pending 就永久丢了，
-    // 用户既回不到旧账号也重启不了新号流程。
-    if let Some(id) = current_id.clone() {
-        // 走同步实现：本命令自身也是 spawn_blocking 里的同步逻辑（见下方）。
+    if let Some(id) = current_id {
+        // 切回旧账号：switch 内部自己获取/释放 with_store，这里不能预先持锁
+        // （std Mutex 不可重入，会自死锁）。
         match switch_profile_blocking(id) {
             Ok(result) => {
-                let mut after = store::load_store()?;
-                after.pending_new_account = None;
-                store::save_store(&after)?;
+                // 切换成功后，窄临界区清 pending。
+                store::with_store(|after| {
+                    after.pending_new_account = None;
+                    Ok(())
+                })?;
                 return Ok(Some(result));
             }
             Err(e) => {
@@ -769,9 +780,11 @@ fn cancel_pending_new_account_login_blocking() -> Result<Option<SwitchResult>, S
         }
     }
 
-    // 没有旧账号可切：直接清 pending。
-    store_data.pending_new_account = None;
-    store::save_store(&store_data)?;
+    // 没有旧账号可切：窄临界区清 pending（H-2 走 with_store）。
+    store::with_store(|data| {
+        data.pending_new_account = None;
+        Ok(())
+    })?;
     Ok(None)
 }
 
@@ -783,7 +796,12 @@ fn cancel_pending_new_account_login_blocking() -> Result<Option<SwitchResult>, S
 /// 把 live 状态回写到正确的账号，必要时自动收养。详见 [`reconcile`]。
 fn refresh_current_profile_snapshot(store_data: &mut Store, _target_id: &str) -> Vec<String> {
     match accounts::current_snapshot() {
-        Ok(snapshot) => reconcile::reconcile_live_into_store(store_data, &snapshot, Utc::now()),
+        Ok(snapshot) => reconcile::reconcile_live_into_store(
+            store_data,
+            &snapshot,
+            crate::appconfig::load().auto_adopt_enabled,
+            Utc::now(),
+        ),
         Err(err) => vec![format!(
             "未能读取当前 live 快照，已跳过对账（不中断切换）：{err}"
         )],
@@ -875,152 +893,163 @@ async fn set_quota_reminder(enabled: bool, threshold: u8) -> Result<appconfig::A
     .await
 }
 
+/// H-6：设置「检测到未登记账号时自动收养」开关（默认开启）。
+#[tauri::command]
+async fn set_auto_adopt(enabled: bool) -> Result<appconfig::AppConfig, String> {
+    blocking(move || appconfig::update(|cfg| cfg.auto_adopt_enabled = enabled)).await
+}
+
 fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
-    let mut store_data = store::load_store()?;
-    if !store_data.profiles.iter().any(|p| p.id == id) {
-        return Err("找不到这个账号快照".to_string());
-    }
-    // 预检：目标快照可解密 / 配置目录可写 / Claude Code 在跑只提示。
-    // 通过后才开始动数据（此后每步都有备份/日志可回滚）。
-    let mut warnings = preflight_switch(&store_data, &id)?;
+    // H-2：整个切换是一次账号库事务，读—改—写全程持 with_store 锁。
+    // 内部调用（preflight/backup/reconcile/clash/accounts/isolation/keep）均不获取
+    // STORE_LOCK，无重入死锁；只读路径（read_lightweight/load_store）不持锁。
+    store::with_store(|store_data| {
+        if !store_data.profiles.iter().any(|p| p.id == id) {
+            return Err("找不到这个账号快照".to_string());
+        }
+        // 预检：目标快照可解密 / 配置目录可写 / Claude Code 在跑只提示。
+        // 通过后才开始动数据（此后每步都有备份/日志可回滚）。
+        let mut warnings = preflight_switch(store_data, &id)?;
 
-    let backup = create_backup_with_label(&format!("before-switch-to-{id}"))?;
-    // 切换事务日志：从「备份已建」起记录——此刻备份是回滚点，
-    // 之后任何中断都能按 backup_id 恢复。备份失败则什么都没改，不需要日志。
-    write_switch_journal(&SwitchJournal {
-        target_id: id.clone(),
-        step: "backup-created".to_string(),
-        backup_id: Some(backup.id.clone()),
-        started_at: Utc::now(),
-    });
-    // 跨身份保留：切换前把 keep-in-workspace.txt 列出的相对路径收进暂存（默认关闭）。
-    // 与上游一致：暂存失败（含上次还原残留的唯一副本）直接中止切换，不覆盖。
-    let keep_base = credentials::claude_dir()?;
-    let keep_report = keep::stage_keep(&keep_base)?;
-    if keep_report.count > 0 {
-        warnings.push(format!("跨身份保留：已暂存 {} 项", keep_report.count));
-    }
-    warnings.extend(
-        keep_report
-            .warnings
-            .into_iter()
-            .map(|w| format!("跨身份保留：{w}")),
-    );
+        let backup = create_backup_with_label(&format!("before-switch-to-{id}"))?;
+        // 切换事务日志：从「备份已建」起记录——此刻备份是回滚点，
+        // 之后任何中断都能按 backup_id 恢复。备份失败则什么都没改，不需要日志。
+        write_switch_journal(&SwitchJournal {
+            target_id: id.clone(),
+            step: "backup-created".to_string(),
+            backup_id: Some(backup.id.clone()),
+            started_at: Utc::now(),
+        });
+        // 跨身份保留：切换前把 keep-in-workspace.txt 列出的相对路径收进暂存（默认关闭）。
+        // 与上游一致：暂存失败（含上次还原残留的唯一副本）直接中止切换，不覆盖。
+        let keep_base = credentials::claude_dir()?;
+        let keep_report = keep::stage_keep(&keep_base)?;
+        if keep_report.count > 0 {
+            warnings.push(format!("跨身份保留：已暂存 {} 项", keep_report.count));
+        }
+        warnings.extend(
+            keep_report
+                .warnings
+                .into_iter()
+                .map(|w| format!("跨身份保留：{w}")),
+        );
 
-    warnings.extend(refresh_current_profile_snapshot(&mut store_data, &id));
-    if let Some(current_id) = store_data.current_profile_id.as_deref() {
-        warnings.extend(isolation::adopt_live_claude_local_state_for_profile(
-            current_id,
-        )?);
-    }
-    let idx = store_data
-        .profiles
-        .iter()
-        .position(|p| p.id == id)
-        .ok_or_else(|| "找不到这个账号快照".to_string())?;
-    let profile = store_data.profiles[idx].clone();
+        warnings.extend(refresh_current_profile_snapshot(store_data, &id));
+        if let Some(current_id) = store_data.current_profile_id.as_deref() {
+            warnings.extend(isolation::adopt_live_claude_local_state_for_profile(
+                current_id,
+            )?);
+        }
+        let idx = store_data
+            .profiles
+            .iter()
+            .position(|p| p.id == id)
+            .ok_or_else(|| "找不到这个账号快照".to_string())?;
+        let profile = store_data.profiles[idx].clone();
 
-    let clash_result = if let Some(binding) = &profile.clash {
-        if binding.enabled {
-            Some(clash::switch_clash_node_internal(
-                &binding.group,
-                &binding.node,
-            )?)
+        let clash_result = if let Some(binding) = &profile.clash {
+            if binding.enabled {
+                Some(clash::switch_clash_node_internal(
+                    &binding.group,
+                    &binding.node,
+                )?)
+            } else {
+                None
+            }
         } else {
             None
-        }
-    } else {
-        None
-    };
+        };
 
-    let rollback_from = load_backup_snapshot(&backup.path)?;
-    accounts::apply_account_material(
-        accounts::WriteMode::Merge,
-        Some(&profile.claude_json),
-        profile.settings_json.as_ref(),
-        profile.keychain_password.as_deref(),
-        &rollback_from,
-    )?;
+        let rollback_from = load_backup_snapshot(&backup.path)?;
+        accounts::apply_account_material(
+            accounts::WriteMode::Merge,
+            Some(&profile.claude_json),
+            profile.settings_json.as_ref(),
+            profile.keychain_password.as_deref(),
+            &rollback_from,
+        )?;
 
-    if let Err(e) =
-        accounts::apply_profile_env_to_settings(store_data.telemetry_mode, profile.runtime.as_ref())
-    {
-        warnings.push(format!(
-            "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
-        ));
-    }
-    // 关键：activate 失败不能阻断切号——此刻账号材料（凭据/JSON）已成功切到新账号，
-    // 若因 Windows 文件锁导致链接激活失败而返回 Err，前端会显示"切换失败"，
-    // 但磁盘上其实已经切过去了（UI 与实际状态相反）。降级为 warning，
-    // 用户按提示重新执行一次"切换"即可补上链接。
-    let mut link_mode = String::new();
-    match isolation::activate_profile_claude_local_state(&profile.id) {
-        Ok(items) => {
-            warnings.extend(items);
-            link_mode = isolation::session_isolation_status(Some(&profile.id))
-                .map(|s| s.link_mode)
-                .unwrap_or_default();
+        if let Err(e) = accounts::apply_profile_env_to_settings(
+            store_data.telemetry_mode,
+            profile.runtime.as_ref(),
+        ) {
+            warnings.push(format!(
+                "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
+            ));
         }
-        Err(e) => warnings.push(format!(
-            "session 隔离链接激活失败（账号材料已切换成功，重新执行一次切换可补上）：{e}"
-        )),
-    }
-    // 跨身份保留：把暂存文件合并回新账号目录。此刻账号材料已切成功，合并失败不回滚
-    // （否则 UI 显示失败、磁盘已切，状态相反），保留暂存并提示手动恢复。
-    match keep::merge_keep(&keep_base) {
-        Ok(report) => {
-            if report.count > 0 {
-                warnings.push(format!("跨身份保留：已合并 {} 项到新账号", report.count));
+        // 关键：activate 失败不能阻断切号——此刻账号材料（凭据/JSON）已成功切到新账号，
+        // 若因 Windows 文件锁导致链接激活失败而返回 Err，前端会显示"切换失败"，
+        // 但磁盘上其实已经切过去了（UI 与实际状态相反）。降级为 warning，
+        // 用户按提示重新执行一次"切换"即可补上链接。
+        let mut link_mode = String::new();
+        match isolation::activate_profile_claude_local_state(&profile.id) {
+            Ok(items) => {
+                warnings.extend(items);
+                link_mode = isolation::session_isolation_status(Some(&profile.id))
+                    .map(|s| s.link_mode)
+                    .unwrap_or_default();
             }
-            warnings.extend(
-                report
-                    .warnings
-                    .into_iter()
-                    .map(|w| format!("跨身份保留：{w}")),
-            );
+            Err(e) => warnings.push(format!(
+                "session 隔离链接激活失败（账号材料已切换成功，重新执行一次切换可补上）：{e}"
+            )),
         }
-        Err(e) => warnings.push(format!("跨身份保留合并失败（暂存已保留，可手动恢复）：{e}")),
-    }
-    // 记录切号结果与链接模式：排障时最需要的两条信息。
-    // 账号名只记 id 前 8 位（隐私：日志可能被用户直接贴给别人排障）。
-    // 用 chars().take() 而不是字节切片，id 含非 ASCII 时不会 panic。
-    log_info(&format!(
-        "切号成功 → {}（链接模式：{}，Clash：{}）",
-        profile.id.chars().take(8).collect::<String>(),
-        if link_mode.is_empty() {
-            "未激活"
-        } else {
-            &link_mode
-        },
-        clash_result
-            .as_ref()
-            .map(|c| format!(
-                "{}（{}）",
-                c.node,
-                if c.verified { "已确认" } else { "未确认" }
-            ))
-            .unwrap_or_else(|| "未绑定".to_string())
-    ));
+        // 跨身份保留：把暂存文件合并回新账号目录。此刻账号材料已切成功，合并失败不回滚
+        // （否则 UI 显示失败、磁盘已切，状态相反），保留暂存并提示手动恢复。
+        match keep::merge_keep(&keep_base) {
+            Ok(report) => {
+                if report.count > 0 {
+                    warnings.push(format!("跨身份保留：已合并 {} 项到新账号", report.count));
+                }
+                warnings.extend(
+                    report
+                        .warnings
+                        .into_iter()
+                        .map(|w| format!("跨身份保留：{w}")),
+                );
+            }
+            Err(e) => warnings.push(format!("跨身份保留合并失败（暂存已保留，可手动恢复）：{e}")),
+        }
+        // 记录切号结果与链接模式：排障时最需要的两条信息。
+        // 账号名只记 id 前 8 位（隐私：日志可能被用户直接贴给别人排障）。
+        // 用 chars().take() 而不是字节切片，id 含非 ASCII 时不会 panic。
+        log_info(&format!(
+            "切号成功 → {}（链接模式：{}，Clash：{}）",
+            profile.id.chars().take(8).collect::<String>(),
+            if link_mode.is_empty() {
+                "未激活"
+            } else {
+                &link_mode
+            },
+            clash_result
+                .as_ref()
+                .map(|c| format!(
+                    "{}（{}）",
+                    c.node,
+                    if c.verified { "已确认" } else { "未确认" }
+                ))
+                .unwrap_or_else(|| "未绑定".to_string())
+        ));
 
-    store_data.current_profile_id = Some(profile.id.clone());
-    // 切号成功 = 账号已变，立即作废全部缓存。
-    // token 指纹能防「拿新 token 查到旧账号」，但 projects 目录也换了，
-    // 本地用量统计（45s 缓存）同样必须重算——不清就会显示旧账号的用量。
-    usage::clear_caches();
-    store_data.profiles[idx].last_switched_at = Some(Utc::now());
-    store_data.profiles[idx].updated_at = Utc::now();
-    store::save_store(&store_data)?;
-    // 事务正常完成：清掉切换日志（残留日志 = 上次切换中断的信号）。
-    clear_switch_journal();
+        store_data.current_profile_id = Some(profile.id.clone());
+        // 切号成功 = 账号已变，立即作废全部缓存。
+        // token 指纹能防「拿新 token 查到旧账号」，但 projects 目录也换了，
+        // 本地用量统计（45s 缓存）同样必须重算——不清就会显示旧账号的用量。
+        usage::clear_caches();
+        store_data.profiles[idx].last_switched_at = Some(Utc::now());
+        store_data.profiles[idx].updated_at = Utc::now();
+        // with_store 在闭包返回 Ok 后统一 save，这里不再显式 save。
+        // 事务正常完成：清掉切换日志（残留日志 = 上次切换中断的信号）。
+        clear_switch_journal();
 
-    Ok(SwitchResult {
-        switched_to: profile.name,
-        backup,
-        clash: clash_result,
-        restart_hint: format!(
-            "切换已写入磁盘和{CREDENTIAL_STORE_LABEL}；请重启正在运行的 Claude Code 会话。"
-        ),
-        warnings,
+        Ok(SwitchResult {
+            switched_to: profile.name,
+            backup,
+            clash: clash_result,
+            restart_hint: format!(
+                "切换已写入磁盘和{CREDENTIAL_STORE_LABEL}；请重启正在运行的 Claude Code 会话。"
+            ),
+            warnings,
+        })
     })
 }
 
@@ -1077,31 +1106,33 @@ fn set_profile_clash_binding(
     group: String,
     node: String,
 ) -> Result<(), String> {
-    let mut store_data = store::load_store()?;
-    let profile = store_data
-        .profiles
-        .iter_mut()
-        .find(|p| p.id == id)
-        .ok_or_else(|| "找不到这个账号快照".to_string())?;
-    let group = group.trim();
-    let node = node.trim();
-    if enabled {
-        if group.is_empty() {
-            return Err("Clash 组不能为空".to_string());
+    // H-2：读—改—写走 with_store；校验失败返回 Err 时不保存。
+    store::with_store(|store_data| {
+        let profile = store_data
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| "找不到这个账号快照".to_string())?;
+        let group = group.trim();
+        let node = node.trim();
+        if enabled {
+            if group.is_empty() {
+                return Err("Clash 组不能为空".to_string());
+            }
+            if node.is_empty() {
+                return Err("Clash 节点不能为空".to_string());
+            }
+            profile.clash = Some(store::ProfileClashBinding {
+                enabled,
+                group: group.to_string(),
+                node: node.to_string(),
+            });
+        } else {
+            profile.clash = None;
         }
-        if node.is_empty() {
-            return Err("Clash 节点不能为空".to_string());
-        }
-        profile.clash = Some(store::ProfileClashBinding {
-            enabled,
-            group: group.to_string(),
-            node: node.to_string(),
-        });
-    } else {
-        profile.clash = None;
-    }
-    profile.updated_at = Utc::now();
-    store::save_store(&store_data)
+        profile.updated_at = Utc::now();
+        Ok(())
+    })
 }
 
 #[tauri::command]
@@ -1111,9 +1142,6 @@ fn set_profile_runtime_binding(
     locale: Option<String>,
     chrome_profile: Option<String>,
 ) -> Result<(), String> {
-    let mut store_data = store::load_store()?;
-    let current = store_data.current_profile_id.as_deref() == Some(id.as_str());
-    let telemetry_mode = store_data.telemetry_mode;
     let runtime = store::ProfileRuntimeBinding {
         timezone: timezone
             .map(|value| value.trim().to_string())
@@ -1125,14 +1153,19 @@ fn set_profile_runtime_binding(
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty()),
     };
-    let profile = store_data
-        .profiles
-        .iter_mut()
-        .find(|p| p.id == id)
-        .ok_or_else(|| "找不到这个账号快照".to_string())?;
-    profile.runtime = Some(runtime.clone());
-    profile.updated_at = Utc::now();
-    store::save_store(&store_data)?;
+    // H-2：读—改—写走 with_store；外部 settings 写入在锁外执行。
+    let (current, telemetry_mode) = store::with_store(|store_data| {
+        let current = store_data.current_profile_id.as_deref() == Some(id.as_str());
+        let telemetry_mode = store_data.telemetry_mode;
+        let profile = store_data
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| "找不到这个账号快照".to_string())?;
+        profile.runtime = Some(runtime.clone());
+        profile.updated_at = Utc::now();
+        Ok((current, telemetry_mode))
+    })?;
     if current {
         accounts::apply_profile_env_to_settings(telemetry_mode, Some(&runtime))?;
     }
@@ -1145,12 +1178,12 @@ async fn delete_profile(id: String, delete_sessions: Option<bool>) -> Result<(),
 }
 
 fn delete_profile_blocking(id: String, delete_sessions: bool) -> Result<(), String> {
-    let mut store_data = store::load_store()?;
-    // 必须在 retain 之前判断，否则删完就查不到了。
-    let was_current = store_data.current_profile_id.as_deref() == Some(id.as_str());
-    if !store_data.profiles.iter().any(|p| p.id == id) {
+    // 只读预检（不持锁）：确认账号存在、是否当前。
+    let (profiles_meta, current_id) = store::read_lightweight()?;
+    if !profiles_meta.iter().any(|p| p.id == id) {
         return Err("找不到这个账号快照".to_string());
     }
+    let was_current = current_id.as_deref() == Some(id.as_str());
 
     // ── 预检：删会话历史是有破坏性的多步操作，先确认前提再动任何东西 ──
     // 顺序：先预检 → 取消链接 → 删目录 → 删快照。
@@ -1179,20 +1212,22 @@ fn delete_profile_blocking(id: String, delete_sessions: bool) -> Result<(), Stri
         }
     }
 
-    // ── 正式删除 ──
-    let before = store_data.profiles.len();
-    store_data.profiles.retain(|p| p.id != id);
-    if store_data.profiles.len() == before {
-        return Err("找不到这个账号快照".to_string());
-    }
-    if was_current {
-        store_data.current_profile_id = None;
-    }
-    // 注意：取消链接发生在此之前。若这里 save_store 失败，live 链接已移除但
+    // ── 正式删除（H-2：读—改—写走 with_store，外部链接/目录操作在锁外）──
+    store::with_store(|store_data| {
+        let before = store_data.profiles.len();
+        store_data.profiles.retain(|p| p.id != id);
+        if store_data.profiles.len() == before {
+            return Err("找不到这个账号快照".to_string());
+        }
+        if was_current {
+            store_data.current_profile_id = None;
+        }
+        Ok(())
+    })
+    // 注意：取消链接发生在此之前。若这里保存失败，live 链接已移除但
     // 快照还在——下次对该账号「切换」会重新激活链接，可接受；
     // 但错误信息要说明，否则用户会以为状态完好。
-    store::save_store(&store_data)
-        .map_err(|e| format!("保存 store 失败（隔离链接已取消，下次切换该账号会重建）：{e}"))?;
+    .map_err(|e| format!("保存 store 失败（隔离链接已取消，下次切换该账号会重建）：{e}"))?;
 
     if has_sessions {
         fs::remove_dir_all(&sessions_dir).map_err(|e| {
@@ -1213,20 +1248,22 @@ fn delete_profile_blocking(id: String, delete_sessions: bool) -> Result<(), Stri
 
 #[tauri::command]
 fn rename_profile(id: String, name: String, notes: Option<String>) -> Result<(), String> {
-    let mut store_data = store::load_store()?;
     let clean_name = name.trim();
     if clean_name.is_empty() {
         return Err("账号名称不能为空".to_string());
     }
-    let profile = store_data
-        .profiles
-        .iter_mut()
-        .find(|p| p.id == id)
-        .ok_or_else(|| "找不到这个账号快照".to_string())?;
-    profile.name = clean_name.to_string();
-    profile.notes = notes;
-    profile.updated_at = Utc::now();
-    store::save_store(&store_data)
+    // H-2：读—改—写走 with_store。
+    store::with_store(|store_data| {
+        let profile = store_data
+            .profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| "找不到这个账号快照".to_string())?;
+        profile.name = clean_name.to_string();
+        profile.notes = notes;
+        profile.updated_at = Utc::now();
+        Ok(())
+    })
 }
 
 // ───────────────────────── 备份 ─────────────────────────
@@ -2211,18 +2248,38 @@ pub fn run() {
         guard::run_guard_loop();
     }
 
-    // 便携模式（P2-4）：WebView2 用户数据目录必须在 WebView2 创建前设置，
-    // 指向 exe 目录，使内核缓存也随便携 zip 一起携带。
-    if let Some(portable_root) = paths::portable_root() {
-        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &portable_root);
+    let args: Vec<String> = std::env::args().collect();
+    let cli_command = cli::parse(&args);
+
+    // 只读 CLI 子命令：附加控制台执行后直接退出，不初始化 GUI、不写账号库。
+    if let Some(cmd @ (cli::CliCommand::List | cli::CliCommand::Status)) = &cli_command {
+        let code = cli::run_readonly(cmd);
+        std::process::exit(code);
+    }
+    // 便携模式（H-1）：WebView2 用户数据目录必须在 WebView2 创建前设置，
+    // 指向数据子目录（exe/ClaudeSwitcherData），而非 exe 目录本身，避免污染程序目录。
+    if let Some(data_dir) = paths::portable_data_dir() {
+        std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &data_dir);
+    }
+
+    // 启动早期探测数据目录可写（H-1）：解压到 Program Files 等只读位置时
+    // 弹明确原生提示并退出，而不是静默失败。
+    if let Err(error) = paths::probe_data_dir_writable() {
+        platform::imp::show_startup_error("无法启动 Claude Switcher", &error);
+        std::process::exit(1);
     }
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
-        // 单实例：双击两次只留一个托盘图标，也避免并发写 store。
-        .plugin(tauri_plugin_single_instance::init(|app, _argv, _cwd| {
-            tray::show_main_window(app);
+        // 单实例：第二个进程的 argv 会回调到运行实例——--switch 转交执行，
+        // 其余情况唤起主窗口；也避免两个进程并发写账号库。
+        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+            if let Some(cli::CliCommand::Switch(name)) = cli::parse(&argv) {
+                cli::forward_switch(app, &name);
+            } else {
+                tray::show_main_window(app);
+            }
         }))
         .on_window_event(|window, event| {
             // 主窗口点 X → 隐藏到托盘（退出走托盘菜单）。
@@ -2233,7 +2290,16 @@ pub fn run() {
                 }
             }
         })
-        .setup(|app| {
+        .setup(move |app| {
+            // CLI --switch 且未被单实例插件转交（说明本进程是唯一实例）：
+            // 执行切换、打印结果后立即退出，不安装托盘、不显示主窗口。
+            if let Some(cli::CliCommand::Switch(name)) = &cli_command {
+                let code = cli::run_switch_first_instance(name);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+                std::process::exit(code);
+            }
+
             if let Err(error) = tray::install_tray_handlers(app) {
                 log_error(&format!("初始化托盘失败: {error}"));
             }
@@ -2268,6 +2334,7 @@ pub fn run() {
             delete_mcp_server,
             get_quota_reminder,
             set_quota_reminder,
+            set_auto_adopt,
             get_clash_status,
             get_claude_usage,
             switch_clash_node,

@@ -233,9 +233,13 @@ pub fn import_store_encrypted_blocking(src: &Path, password: &str) -> Result<Imp
         backup_label = backup_path.to_string_lossy().to_string();
     }
 
-    // save_store 会用本机主密钥重新加密每个账号的凭据——这正是跨机迁移的关键。
+    // H-2：账号库整体替换走 with_store 互斥；save 会用本机主密钥重新加密每个账号
+    // 的凭据——这正是跨机迁移的关键。
     let profiles = parsed.profiles.len();
-    store::save_store(&parsed)?;
+    store::with_store(|current| {
+        *current = parsed;
+        Ok(())
+    })?;
     Ok(ImportResult {
         imported_bytes: plaintext.len(),
         profiles_imported: profiles,

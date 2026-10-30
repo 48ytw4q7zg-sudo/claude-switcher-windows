@@ -305,12 +305,12 @@ pub fn capture_desktop_profile(
     paths::ensure_app_dirs()?;
     let id = Uuid::new_v4().simple().to_string();
     let snapshot = desktop_snapshot_dir(&id)?;
-    let mut store = store::load_store()?;
-    let profile = capture_desktop_profile_into(name, notes, &live, &snapshot, &mut store, &|| {
-        claude_desktop_running()
-    })?;
-    store::save_store(&store)?;
-    Ok(profile)
+    // H-2：账号库读—改—写走 with_store（外部 copy/running 检查在闭包内，随事务一起）。
+    store::with_store(|store| {
+        capture_desktop_profile_into(name, notes, &live, &snapshot, store, &|| {
+            claude_desktop_running()
+        })
+    })
 }
 
 /// [`capture_desktop_profile`] 的可注入版本：活目录、快照目录、store 与
@@ -379,19 +379,19 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
     let live = desktop_live_dir()?;
     let accounts = desktop_accounts_dir()?;
     let backup_root = live_backup_root()?;
-    let mut store = store::load_store()?;
-    let warnings = switch_desktop_profile_in(
-        id,
-        &live,
-        &accounts,
-        &mut store,
-        &|_names| kill_desktop_processes(),
-        &|| claude_desktop_running(),
-        &backup_root,
-        &copy_dir_recursive,
-    )?;
-    store::save_store(&store)?;
-    Ok(warnings)
+    // H-2：读—改—写走 with_store。
+    store::with_store(|store| {
+        switch_desktop_profile_in(
+            id,
+            &live,
+            &accounts,
+            store,
+            &|_names| kill_desktop_processes(),
+            &|| claude_desktop_running(),
+            &backup_root,
+            &copy_dir_recursive,
+        )
+    })
 }
 
 /// [`switch_desktop_profile`] 的可注入版本：`kill`/`running`/`copy` 均可替换，
@@ -630,27 +630,31 @@ fn switch_desktop_profile_in(
 /// 删除 Desktop 账号登记；`also_files` 为 true 时连快照目录一起删除。
 /// 登记不存在视为幂等成功。
 pub fn delete_desktop_profile(id: &str, also_files: bool) -> Result<(), String> {
-    let mut store = store::load_store()?;
-    let Some(pos) = store.desktop_profiles.iter().position(|p| p.id == id) else {
-        return Ok(());
-    };
-    let profile = store.desktop_profiles.remove(pos);
-    // 删的是当前账号：清掉当前标记，避免下次切换尝试回存到不存在的快照。
-    if store.current_desktop_profile_id.as_deref() == Some(id) {
-        store.current_desktop_profile_id = None;
-    }
-    store::save_store(&store)?;
+    // H-2：读—改—写走 with_store；返回被删 profile（供锁外删物理文件）。
+    let removed = store::with_store(|store| {
+        let Some(pos) = store.desktop_profiles.iter().position(|p| p.id == id) else {
+            return Ok(None); // 幂等：登记不存在，直接成功
+        };
+        let profile = store.desktop_profiles.remove(pos);
+        // 删的是当前账号：清掉当前标记，避免下次切换尝试回存到不存在的快照。
+        if store.current_desktop_profile_id.as_deref() == Some(id) {
+            store.current_desktop_profile_id = None;
+        }
+        Ok(Some(profile))
+    })?;
 
-    if also_files {
-        let snapshot = desktop_snapshot_dir(&profile.id)?;
-        if snapshot.exists() {
-            fsx::retry_io(|| fs::remove_dir_all(&snapshot)).map_err(|e| {
-                format!(
-                    "删除快照目录失败 {}: {}",
-                    snapshot.display(),
-                    fsx::humanize_io_error(&e)
-                )
-            })?;
+    if let Some(profile) = removed {
+        if also_files {
+            let snapshot = desktop_snapshot_dir(&profile.id)?;
+            if snapshot.exists() {
+                fsx::retry_io(|| fs::remove_dir_all(&snapshot)).map_err(|e| {
+                    format!(
+                        "删除快照目录失败 {}: {}",
+                        snapshot.display(),
+                        fsx::humanize_io_error(&e)
+                    )
+                })?;
+            }
         }
     }
     Ok(())
@@ -662,17 +666,17 @@ pub fn rename_desktop_profile(id: &str, name: &str) -> Result<DesktopProfile, St
     if name.is_empty() {
         return Err("账号名称不能为空".to_string());
     }
-    let mut store = store::load_store()?;
-    let profile = store
-        .desktop_profiles
-        .iter_mut()
-        .find(|p| p.id == id)
-        .ok_or_else(|| format!("未找到桌面账号快照: {id}"))?;
-    profile.name = name;
-    profile.updated_at = Utc::now();
-    let cloned = profile.clone();
-    store::save_store(&store)?;
-    Ok(cloned)
+    // H-2：读—改—写走 with_store。
+    store::with_store(|store| {
+        let profile = store
+            .desktop_profiles
+            .iter_mut()
+            .find(|p| p.id == id)
+            .ok_or_else(|| format!("未找到桌面账号快照: {id}"))?;
+        profile.name = name;
+        profile.updated_at = Utc::now();
+        Ok(profile.clone())
+    })
 }
 
 // ───────────────────────── 单测 ─────────────────────────
