@@ -8,10 +8,11 @@ use std::sync::{Mutex, OnceLock};
 use std::time::Duration as StdDuration;
 
 use chrono::{DateTime, Duration, Utc};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::credentials;
+use crate::fsx;
 use crate::net;
 use crate::paths;
 use crate::store;
@@ -729,6 +730,8 @@ pub struct RecommendedAccount {
     pub id: String,
     pub name: String,
     pub last_used_percent: Option<f64>,
+    /// 缓存用量数据距现在的整分钟数；无缓存数据时为 None。
+    pub minutes_ago: Option<i64>,
 }
 
 /// P2-1：阈值提醒结果。
@@ -742,42 +745,125 @@ pub struct QuotaReminder {
     pub recommended: Option<RecommendedAccount>,
 }
 
-/// 把当前账号的 5 小时用量百分比缓存到其 profile（仅在变化时写盘）。
-/// best-effort：失败不影响主流程。
-fn record_current_usage_percent(percent: f64) {
-    let Ok(mut store_data) = store::load_store() else {
-        return;
-    };
-    let Some(current_id) = store_data.current_profile_id.clone() else {
-        return;
-    };
-    let Some(profile) = store_data.profiles.iter_mut().find(|p| p.id == current_id) else {
-        return;
-    };
-    // 保留一位小数，避免微小波动反复写盘。
-    let rounded = (percent * 10.0).round() / 10.0;
-    if profile.last_used_percent == Some(rounded) {
-        return;
-    }
-    profile.last_used_percent = Some(rounded);
-    profile.updated_at = Utc::now();
-    let _ = store::save_store(&store_data);
+/// H-2：独立用量缓存（不含密钥），按 account_uuid 记录最近一次 5h/7d 用量。
+///
+/// 托盘与后台线程只读这个 JSON，**不再解密/重写账号库**；账号库的
+/// `last_used_percent` 字段保留兼容，不再由本模块写入。
+#[derive(Default, Serialize, Deserialize)]
+pub struct UsageCache {
+    #[serde(default)]
+    pub by_account: BTreeMap<String, UsagePoint>,
 }
 
-/// 纯函数：在候选（id, name, 缓存百分比）中选余量最多（百分比最小）的账号。
-fn pick_most_remaining<'a>(
-    candidates: &[(&'a str, &'a str, f64)],
-) -> Option<(&'a str, &'a str, f64)> {
-    candidates
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UsagePoint {
+    #[serde(default)]
+    pub five_hour_pct: Option<f64>,
+    #[serde(default)]
+    pub seven_day_pct: Option<f64>,
+    pub at: DateTime<Utc>,
+}
+
+/// 用量缓存新鲜度上限：记录时刻距今不超过该分钟数才算可用。
+pub const FRESH_MAX_MINUTES: i64 = 60;
+
+/// 纯函数：用量点是否新鲜（now - at ≤ 60 分钟）。
+pub fn is_fresh(point: &UsagePoint, now: DateTime<Utc>) -> bool {
+    now.signed_duration_since(point.at) <= Duration::minutes(FRESH_MAX_MINUTES)
+}
+
+/// 纯函数：从指定路径读用量缓存；缺失→默认，损坏→默认（不 panic）。
+fn load_usage_cache_from(path: &Path) -> UsageCache {
+    match std::fs::read_to_string(path) {
+        Ok(raw) => serde_json::from_str(&raw).unwrap_or_else(|e| {
+            crate::log_error(&format!("用量缓存文件损坏，已忽略: {e}"));
+            UsageCache::default()
+        }),
+        Err(_) => UsageCache::default(),
+    }
+}
+
+fn load_usage_cache() -> UsageCache {
+    match paths::usage_cache_path() {
+        Ok(path) => load_usage_cache_from(&path),
+        Err(_) => UsageCache::default(),
+    }
+}
+
+/// 纯函数：把用量缓存原子写到指定路径。
+fn save_usage_cache_to(path: &Path, cache: &UsageCache) -> Result<(), String> {
+    let raw = serde_json::to_string_pretty(cache).map_err(|e| e.to_string())?;
+    fsx::write_atomically(path, &raw).map_err(|e| format!("写入用量缓存失败: {e}"))
+}
+
+fn save_usage_cache(cache: &UsageCache) -> Result<(), String> {
+    let path = paths::usage_cache_path()?;
+    save_usage_cache_to(&path, cache)
+}
+
+/// H-2：把 snapshot 里当前账号的 5h/7d 用量落进独立缓存。
+///
+/// 用 read_lightweight 取当前账号 account_uuid（不解密）；拿不到 current 或 uuid
+/// 时静默跳过。读盘失败等异常返回 Err，由调用方 best-effort 处理。
+pub fn record_usage_from_snapshot(snapshot: &ClaudeUsageSnapshot) -> Result<(), String> {
+    let (profiles, current_id) = store::read_lightweight()?;
+    let Some(current_id) = current_id else {
+        return Ok(());
+    };
+    let Some(uuid) = profiles
         .iter()
-        .copied()
+        .find(|p| p.id == current_id)
+        .and_then(|p| p.account_uuid.clone())
+    else {
+        return Ok(());
+    };
+
+    let mut cache = load_usage_cache();
+    cache.by_account.insert(
+        uuid,
+        UsagePoint {
+            five_hour_pct: snapshot.session.used_percent,
+            seven_day_pct: snapshot.weekly.used_percent,
+            at: Utc::now(),
+        },
+    );
+    save_usage_cache(&cache)
+}
+
+/// 纯函数：在轻量账号列表 + 用量缓存中挑「排除当前、数据新鲜、5h 百分比最低」的备选账号。
+fn pick_recommended(
+    profiles: &[store::LightProfile],
+    current_id: Option<&str>,
+    cache: &UsageCache,
+    now: DateTime<Utc>,
+) -> Option<RecommendedAccount> {
+    profiles
+        .iter()
+        .filter(|p| Some(p.id.as_str()) != current_id)
+        .filter_map(|p| {
+            let uuid = p.account_uuid.as_ref()?;
+            let point = cache.by_account.get(uuid)?;
+            if !is_fresh(point, now) {
+                return None;
+            }
+            // five_hour_pct 为 None 视为不可用（拿不到百分就没法比余量）。
+            let pct = point.five_hour_pct?;
+            Some((p.id.as_str(), p.name.as_str(), pct, point.at))
+        })
         .min_by(|a, b| a.2.partial_cmp(&b.2).unwrap_or(std::cmp::Ordering::Equal))
+        .map(|(id, name, pct, at)| RecommendedAccount {
+            id: id.to_string(),
+            name: name.to_string(),
+            last_used_percent: Some(pct),
+            minutes_ago: Some((now - at).num_minutes()),
+        })
 }
 
 /// P2-1：阈值提醒（阻塞，调用方走 blocking）。
 ///
 /// 只做提醒 + 推荐，**不做后台自动换号**：其他账号用量会过时、后台刷新令牌风险高，
-/// 真正切换由用户点「一键切换」触发。
+/// 真正切换由用户点「一键切换」触发。推荐候选来自独立用量缓存（H-2），
+/// 本函数不加载/解密/重写账号库。
 pub fn quota_reminder_blocking() -> Result<QuotaReminder, String> {
     let config = crate::appconfig::load();
     let threshold = config.quota_reminder_threshold;
@@ -792,8 +878,9 @@ pub fn quota_reminder_blocking() -> Result<QuotaReminder, String> {
 
     let snapshot = claude_usage_snapshot()?;
     let current_percent = snapshot.session.used_percent;
-    if let Some(p) = current_percent {
-        record_current_usage_percent(p);
+    // 落独立用量缓存（best-effort：失败只记日志，不阻断提醒）。
+    if let Err(e) = record_usage_from_snapshot(&snapshot) {
+        crate::log_error(&format!("记录用量缓存失败: {e}"));
     }
 
     let crossed = current_percent
@@ -801,22 +888,18 @@ pub fn quota_reminder_blocking() -> Result<QuotaReminder, String> {
         .unwrap_or(false);
 
     let recommended = if crossed {
-        let store_data = store::load_store()?;
-        let current_id = store_data.current_profile_id;
-        let candidates: Vec<(&str, &str, f64)> = store_data
-            .profiles
-            .iter()
-            .filter(|p| Some(p.id.as_str()) != current_id.as_deref())
-            .filter_map(|p| {
-                p.last_used_percent
-                    .map(|pct| (p.id.as_str(), p.name.as_str(), pct))
-            })
-            .collect();
-        pick_most_remaining(&candidates).map(|(id, name, pct)| RecommendedAccount {
-            id: id.to_string(),
-            name: name.to_string(),
-            last_used_percent: Some(pct),
-        })
+        match store::read_lightweight() {
+            Ok((profiles, current_id)) => pick_recommended(
+                &profiles,
+                current_id.as_deref(),
+                &load_usage_cache(),
+                Utc::now(),
+            ),
+            Err(e) => {
+                crate::log_error(&format!("读取账号轻量元数据失败，跳过账号推荐: {e}"));
+                None
+            }
+        }
     } else {
         None
     };
@@ -900,10 +983,148 @@ mod tests {
     }
 
     #[test]
-    fn pick_most_remaining_returns_lowest_percent() {
-        let candidates = [("a", "A", 80.0), ("b", "B", 40.0), ("c", "C", 60.0)];
-        assert_eq!(pick_most_remaining(&candidates), Some(("b", "B", 40.0)));
-        assert_eq!(pick_most_remaining(&[]), None);
+    fn usage_cache_roundtrip_through_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("usage-cache.json");
+        let at = Utc::now() - Duration::minutes(3);
+        let mut cache = UsageCache::default();
+        cache.by_account.insert(
+            "uuid-a".to_string(),
+            UsagePoint {
+                five_hour_pct: Some(42.5),
+                seven_day_pct: Some(11.0),
+                at,
+            },
+        );
+        save_usage_cache_to(&path, &cache).unwrap();
+        let loaded = load_usage_cache_from(&path);
+        let point = loaded.by_account.get("uuid-a").expect("应有 uuid-a");
+        assert_eq!(point.five_hour_pct, Some(42.5));
+        assert_eq!(point.seven_day_pct, Some(11.0));
+        assert_eq!(point.at, at);
+    }
+
+    #[test]
+    fn usage_cache_missing_or_corrupt_file_returns_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.json");
+        assert!(load_usage_cache_from(&missing).by_account.is_empty());
+
+        let corrupt = dir.path().join("corrupt.json");
+        std::fs::write(&corrupt, "{ not json ").unwrap();
+        assert!(load_usage_cache_from(&corrupt).by_account.is_empty());
+    }
+
+    #[test]
+    fn is_fresh_boundary_is_sixty_minutes() {
+        let now = Utc::now();
+        let fresh = UsagePoint {
+            five_hour_pct: Some(1.0),
+            seven_day_pct: None,
+            at: now - Duration::minutes(60),
+        };
+        let stale = UsagePoint {
+            five_hour_pct: Some(1.0),
+            seven_day_pct: None,
+            at: now - Duration::minutes(61),
+        };
+        assert!(is_fresh(&fresh, now));
+        assert!(!is_fresh(&stale, now));
+        assert!(is_fresh(
+            &UsagePoint {
+                five_hour_pct: None,
+                seven_day_pct: None,
+                at: now,
+            },
+            now
+        ));
+    }
+
+    fn light(id: &str, uuid: Option<&str>) -> store::LightProfile {
+        store::LightProfile {
+            id: id.to_string(),
+            name: format!("name-{id}"),
+            account_uuid: uuid.map(str::to_string),
+            email: None,
+        }
+    }
+
+    #[test]
+    fn pick_recommended_excludes_current_and_stale_picks_lowest_fresh_pct() {
+        let now = Utc::now();
+        let profiles = vec![
+            light("cur", Some("u-cur")), // 当前账号：无论如何排除
+            light("a", Some("u-a")),     // 新鲜、80%
+            light("b", Some("u-b")),     // 新鲜、40% → 应被选中
+            light("c", Some("u-c")),     // 过期：排除
+            light("d", Some("u-d")),     // 新鲜但 five=None：排除
+            light("e", None),            // 无 uuid：排除
+        ];
+        let mut cache = UsageCache::default();
+        cache.by_account.insert(
+            "u-cur".into(),
+            UsagePoint {
+                five_hour_pct: Some(99.0),
+                seven_day_pct: None,
+                at: now - Duration::minutes(2),
+            },
+        );
+        cache.by_account.insert(
+            "u-a".into(),
+            UsagePoint {
+                five_hour_pct: Some(80.0),
+                seven_day_pct: None,
+                at: now - Duration::minutes(5),
+            },
+        );
+        cache.by_account.insert(
+            "u-b".into(),
+            UsagePoint {
+                five_hour_pct: Some(40.0),
+                seven_day_pct: Some(30.0),
+                at: now - Duration::minutes(7),
+            },
+        );
+        cache.by_account.insert(
+            "u-c".into(),
+            UsagePoint {
+                five_hour_pct: Some(10.0),
+                seven_day_pct: None,
+                at: now - Duration::minutes(90),
+            },
+        );
+        cache.by_account.insert(
+            "u-d".into(),
+            UsagePoint {
+                five_hour_pct: None,
+                seven_day_pct: None,
+                at: now - Duration::minutes(1),
+            },
+        );
+
+        let picked = pick_recommended(&profiles, Some("cur"), &cache, now).expect("应有候选");
+        assert_eq!(picked.id, "b");
+        assert_eq!(picked.last_used_percent, Some(40.0));
+        // at=now-7min → 整分钟 7。
+        assert_eq!(picked.minutes_ago, Some(7));
+    }
+
+    #[test]
+    fn pick_recommended_no_fresh_candidate_returns_none() {
+        let now = Utc::now();
+        let profiles = vec![light("a", Some("u-a")), light("b", None)];
+        let mut cache = UsageCache::default();
+        cache.by_account.insert(
+            "u-a".into(),
+            UsagePoint {
+                five_hour_pct: Some(50.0),
+                seven_day_pct: None,
+                at: now - Duration::minutes(61),
+            },
+        );
+        assert!(pick_recommended(&profiles, None, &cache, now).is_none());
+        // 空缓存也是 None。
+        assert!(pick_recommended(&profiles, None, &UsageCache::default(), now).is_none());
     }
 
     #[test]

@@ -10,6 +10,7 @@ use tauri::{
     AppHandle, Manager, PhysicalPosition, Position, WebviewUrl, WebviewWindow, WebviewWindowBuilder,
 };
 
+use crate::store;
 use crate::usage;
 
 /// 弹窗逻辑尺寸（logical px），创建窗口与定位共用，不再两处硬编码。
@@ -31,6 +32,10 @@ pub fn refresh_tray_status(app: &tauri::AppHandle) -> Result<(), String> {
         return Ok(());
     };
     let tray_usage = usage::claude_usage_snapshot()?;
+    // H-2：把当前账号用量落进独立 usage-cache.json（best-effort，不碰账号库）。
+    if let Err(e) = usage::record_usage_from_snapshot(&tray_usage) {
+        crate::log_error(&format!("记录用量缓存失败: {e}"));
+    }
     let session = usage::compact_token_count(tray_usage.session.totals.total_tokens);
     let weekly = usage::compact_token_count(tray_usage.weekly.totals.total_tokens);
     let mut tooltip = format!("Claude Switcher\n近 5 小时: {session}\n近 7 天: {weekly}");
@@ -197,29 +202,46 @@ fn account_list_needs_submenu(profile_count: usize) -> bool {
     profile_count > MENU_FLAT_MAX_PROFILES
 }
 
+/// 纯函数：由轻量账号列表生成 (menu_id, label) 行；当前账号打 ●。
+fn account_menu_rows(
+    profiles: &[store::LightProfile],
+    current_id: Option<&str>,
+) -> Vec<(String, String)> {
+    profiles
+        .iter()
+        .map(|profile| {
+            let is_current = current_id == Some(profile.id.as_str());
+            (
+                format!("{SWITCH_MENU_ID_PREFIX}{}", profile.id),
+                account_menu_label(&profile.name, is_current),
+            )
+        })
+        .collect()
+}
+
 /// 构建托盘右键菜单：账号列表（当前账号 ● 标记，点击一键切换）+ 打开/刷新/退出。
-/// best-effort：任一构造步骤失败都返回 Err，由调用方打日志，不影响托盘本体。
+/// best-effort：轻量读取失败时只记日志并返回不含账号项的菜单，不解密账号库、不 panic。
 fn build_tray_menu<R: tauri::Runtime>(
     app: &AppHandle<R>,
     tray: &tauri::tray::TrayIcon<R>,
 ) -> Result<(), String> {
-    let store_data = crate::store::load_store().unwrap_or_default();
-    let current_id = store_data.current_profile_id;
+    let (profiles, current_id) = match store::read_lightweight() {
+        Ok(value) => value,
+        Err(e) => {
+            crate::log_error(&format!(
+                "读取账号轻量元数据失败，托盘菜单不含账号列表: {e}"
+            ));
+            (Vec::new(), None)
+        }
+    };
+    let current_id = current_id.as_deref();
 
-    // 账号菜单项（按当前 store 动态生成）。
-    let account_items: Vec<tauri::menu::MenuItem<R>> = store_data
-        .profiles
-        .iter()
-        .map(|profile| {
-            let is_current = current_id.as_deref() == Some(profile.id.as_str());
-            tauri::menu::MenuItem::with_id(
-                app,
-                format!("{SWITCH_MENU_ID_PREFIX}{}", profile.id),
-                account_menu_label(&profile.name, is_current),
-                true,
-                None::<&str>,
-            )
-            .map_err(|e| format!("创建账号菜单项失败: {e}"))
+    // 账号菜单项（按轻量元数据动态生成；不解密 keychain）。
+    let account_items: Vec<tauri::menu::MenuItem<R>> = account_menu_rows(&profiles, current_id)
+        .into_iter()
+        .map(|(id, label)| {
+            tauri::menu::MenuItem::with_id(app, id, label, true, None::<&str>)
+                .map_err(|e| format!("创建账号菜单项失败: {e}"))
         })
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -419,5 +441,36 @@ mod menu_tests {
     #[test]
     fn switch_id_prefix_stable() {
         assert_eq!(SWITCH_MENU_ID_PREFIX, "tray-switch-");
+    }
+
+    #[test]
+    fn account_rows_prefix_ids_and_mark_current() {
+        let profiles = vec![
+            store::LightProfile {
+                id: "a".into(),
+                name: "美国号".into(),
+                account_uuid: Some("u-a".into()),
+                email: None,
+            },
+            store::LightProfile {
+                id: "b".into(),
+                name: "日本号".into(),
+                account_uuid: None,
+                email: None,
+            },
+        ];
+        let rows = account_menu_rows(&profiles, Some("a"));
+        assert_eq!(
+            rows[0],
+            ("tray-switch-a".to_string(), "● 美国号".to_string())
+        );
+        assert_eq!(rows[1], ("tray-switch-b".to_string(), "日本号".to_string()));
+
+        // 无 current 时不打 ●。
+        let rows = account_menu_rows(&profiles, None);
+        assert_eq!(rows[0].1, "美国号");
+        assert_eq!(rows[1].0, "tray-switch-b");
+        // 空列表 → 空行。
+        assert!(account_menu_rows(&[], None).is_empty());
     }
 }
