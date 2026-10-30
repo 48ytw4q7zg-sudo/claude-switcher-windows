@@ -94,12 +94,16 @@ pub fn classify_live_identity(
     }
 
     // 2) uuid 没命中 → 邮箱大小写不敏感回退（trim 后再比）。
+    // J-4①：邮箱回退只对「库里 meta.account_uuid 为空」的老账号生效。老账号即使内嵌
+    // claude_json 里带 accountUuid，其 store 级 uuid 仍为空，应允许靠邮箱认亲；而带
+    // meta uuid 的 profile 若 uuid 不匹配，绝不能再靠邮箱“认亲”，一律走 Unknown 收养。
     let live_email = live_email.map(str::trim).filter(|e| !e.is_empty());
     if let Some(email) = live_email {
         if let Some(p) = profiles.iter().find(|p| {
-            profile_account_email(p)
-                .map(|e| e.eq_ignore_ascii_case(email))
-                .unwrap_or(false)
+            p.meta.account_uuid.is_none()
+                && profile_account_email(p)
+                    .map(|e| e.eq_ignore_ascii_case(email))
+                    .unwrap_or(false)
         }) {
             return Some(current_or_other(p, current_id));
         }
@@ -245,6 +249,16 @@ fn lookup_string<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
 /// 不会因一次「没读到 keychain」的刷新被错误重置。
 ///
 /// claude_json / settings_json / updated_at 仍照常整体刷新。
+/// 从 keychain 凭据 blob 解析 `claudeAiOauth.expiresAt`（毫秒 epoch）。
+///
+/// 兼容嵌套 `{ "claudeAiOauth": { ... } }` 与扁平 `{ ... }` 两种形状
+/// （与 [`crate::usage`] 里读取 accessToken 的处理一致）。
+fn oauth_expires_at_ms(blob: &str) -> Option<u64> {
+    let parsed: Value = serde_json::from_str(blob).ok()?;
+    let oauth = parsed.get("claudeAiOauth").unwrap_or(&parsed);
+    oauth.get("expiresAt").and_then(|v| v.as_u64())
+}
+
 fn write_live_into_profile(
     profile: &mut StoredProfile,
     claude_json: &Value,
@@ -253,9 +267,26 @@ fn write_live_into_profile(
     now: DateTime<Utc>,
 ) {
     // live 凭据是否真的可用：Some 且 trim 后非空。
-    let live_cred: Option<&str> = keychain_password
+    let live_cred_raw: Option<&str> = keychain_password
         .as_deref()
         .filter(|raw| !raw.trim().is_empty());
+
+    // J-4③：能解析双方 claudeAiOauth.expiresAt（毫秒）时，live 比 stored 更旧说明
+    // live 是更老的 token（陈旧快照），不覆盖已存凭据，按「没有 live 凭据」处理。
+    let stale = match live_cred_raw {
+        Some(live) => match (
+            oauth_expires_at_ms(live),
+            profile
+                .keychain_password
+                .as_deref()
+                .and_then(oauth_expires_at_ms),
+        ) {
+            (Some(live_at), Some(stored_at)) => live_at < stored_at,
+            _ => false,
+        },
+        None => false,
+    };
+    let live_cred = if stale { None } else { live_cred_raw };
 
     if let Some(cred) = live_cred {
         profile.keychain_password = Some(cred.to_string());
@@ -265,7 +296,10 @@ fn write_live_into_profile(
     let effective_cred = live_cred.or(profile.keychain_password.as_deref());
     profile.meta = crate::usage::extract_meta(Some(claude_json), effective_cred);
     profile.claude_json = claude_json.clone();
-    profile.settings_json = settings_json.clone();
+    // J-4②：live 没有 settings（None）时不覆盖已存 settings，只在 live 真给了值时更新。
+    if let Some(settings) = settings_json {
+        profile.settings_json = Some(settings.clone());
+    }
     profile.updated_at = now;
 }
 

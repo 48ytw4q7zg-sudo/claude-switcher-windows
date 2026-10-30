@@ -44,6 +44,10 @@ pub struct AppConfig {
     /// 关闭时只提示「检测到未登记账号」，不自动新建账号。
     #[serde(default = "default_auto_adopt_enabled")]
     pub auto_adopt_enabled: bool,
+    /// F-6：WSL 集成实验开关，**默认关闭**。仅在用户显式开启并选择发行版后，
+    /// 才向该 WSL 发行版写入凭据；不开启则不做任何 WSL 操作。
+    #[serde(default)]
+    pub wsl_integration_enabled: bool,
 }
 
 /// H-6：自动收养默认开启。
@@ -70,6 +74,7 @@ impl Default for AppConfig {
             // 与 serde default 保持一致（90），否则缺字段解析与 Default 不一致。
             quota_reminder_threshold: default_quota_reminder_threshold(),
             auto_adopt_enabled: default_auto_adopt_enabled(),
+            wsl_integration_enabled: false,
         }
     }
 }

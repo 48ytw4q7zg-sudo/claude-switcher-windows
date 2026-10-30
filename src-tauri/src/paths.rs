@@ -76,6 +76,20 @@ pub fn portable_data_dir() -> Option<PathBuf> {
     portable_root().map(|root| root.join(PORTABLE_DATA_SUBDIR))
 }
 
+/// F-7：完整便携版固定 WebView2 运行时所在子目录名（exe 旁）。
+pub const FIXED_WEBVIEW2_SUBDIR: &str = "webview2";
+
+/// F-7：若便携根下的 `webview2` 目录里存在 `msedgewebview2.exe`，返回该目录。
+/// 仅在「完整便携版」里命中；普通便携版/安装版无此目录 → None（回退系统已装 WebView2）。
+pub fn fixed_webview2_dir() -> Option<PathBuf> {
+    let dir = portable_root()?.join(FIXED_WEBVIEW2_SUBDIR);
+    if dir.join("msedgewebview2.exe").is_file() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
 /// 本工具私有数据目录：
 /// - 便携模式（exe 旁有 `portable.flag`）→ exe 目录；
 /// - 常规安装 → `~/.claude-switcher`。

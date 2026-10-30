@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::BTreeMap;
 
 use crate::credentials;
 use crate::jsonio::write_json_pretty;
@@ -89,6 +90,30 @@ pub struct ProfileMeta {
     pub rate_limit_tier: Option<String>,
 }
 
+/// F-5：第三方供应商账号（Anthropic 兼容端点）。
+///
+/// 与 OAuth 账号（[`StoredProfile`]）并列：通过 `ANTHROPIC_BASE_URL` +
+/// `ANTHROPIC_AUTH_TOKEN` 指向自定义端点。auth token 用 store 主密钥加密落盘，
+/// 明文不进 store；`managed_env_keys` 记录本功能写入 settings.json 的全部 env 键，
+/// 切走时按此清理，避免残留。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderProfile {
+    pub id: String,
+    pub name: String,
+    /// 供应商基础 URL（写入 ANTHROPIC_BASE_URL）。
+    pub base_url: String,
+    /// 加密后的 auth token（AES-GCM），明文不落盘。
+    pub encrypted_auth_token: String,
+    /// 模型相关 env（如 ANTHROPIC_MODEL / ANTHROPIC_SMALL_FAST_MODEL），不含密钥。
+    #[serde(default)]
+    pub model_env: BTreeMap<String, String>,
+    /// 本功能管理的 env 键（基础认证键 + 模型键），切走时按此删除。
+    #[serde(default)]
+    pub managed_env_keys: Vec<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// Claude Desktop 桌面版（`%APPDATA%\Claude`）的账号快照元数据。
 ///
 /// 与 `StoredProfile`（Claude Code CLI）并列存在：CLI 接管 `~/.claude` 下的
@@ -156,6 +181,12 @@ pub struct Store {
     /// 否则每次切换都把活账号静默回退到上次 capture 的状态。
     #[serde(default)]
     pub current_desktop_profile_id: Option<String>,
+    /// F-5：第三方供应商账号列表（旧 store 无此字段时反序列化为空）。
+    #[serde(default)]
+    pub provider_profiles: Vec<ProviderProfile>,
+    /// F-5：当前生效的供应商账号 id；为 None 表示当前走 OAuth 账号。
+    #[serde(default)]
+    pub current_provider_id: Option<String>,
 }
 
 impl Default for Store {
@@ -167,6 +198,8 @@ impl Default for Store {
             telemetry_mode: default_telemetry_mode(),
             desktop_profiles: Vec::new(),
             current_desktop_profile_id: None,
+            provider_profiles: Vec::new(),
+            current_provider_id: None,
         }
     }
 }
@@ -209,6 +242,8 @@ pub struct ProfileSummary {
     pub meta: ProfileMeta,
     pub clash: Option<ProfileClashBinding>,
     pub runtime: Option<ProfileRuntimeBinding>,
+    /// F-3：访问令牌状态（纯本地按 expiresAt 计算）；无 keychain blob 时为 None。
+    pub token_status: Option<crate::token_status::TokenStatus>,
     pub is_current: bool,
 }
 
@@ -679,12 +714,66 @@ pub fn save_store(store: &Store) -> Result<(), String> {
 /// 前写者刚落盘的改动（表现为切换被回滚 / 账号丢失）。
 static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// 在账号库互斥保护下执行一次「读—改—写」（H-2）。
+// 重入检测（J-2）：`with_store` 闭包内再调 `with_store` 会在同一线程上
+// 二次获取不可重入的进程锁 / OS 文件锁而自死锁。用 thread_local 标记
+// 提前识别，立即返回错误而非挂死。
+thread_local! {
+    static IN_STORE_TX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// 进入即标记当前线程正处于一次账号库事务，Drop 时复位。
+struct ReentryGuard;
+
+impl ReentryGuard {
+    fn enter() -> Result<ReentryGuard, String> {
+        if IN_STORE_TX.with(std::cell::Cell::get) {
+            return Err("with_store 不可嵌套调用".to_string());
+        }
+        IN_STORE_TX.with(|cell| cell.set(true));
+        Ok(ReentryGuard)
+    }
+}
+
+impl Drop for ReentryGuard {
+    fn drop(&mut self) {
+        IN_STORE_TX.with(|cell| cell.set(false));
+    }
+}
+
+/// 跨进程文件锁（J-1，fs4）：在 app_data_dir 的 `store.lock` 上取排他锁，
+/// 与进程内 [`STORE_LOCK`] 配合，覆盖 load → 闭包 → save 全程。
+/// 句柄关闭（Drop）即释放 OS 锁。
+// 字段仅用于持有句柄、靠其 Drop 释放锁，从不直接读取；显式允许 dead_code。
+#[allow(dead_code)]
+struct CrossProcessLock(std::fs::File);
+
+impl CrossProcessLock {
+    fn acquire() -> Result<CrossProcessLock, String> {
+        paths::ensure_app_dirs()?;
+        let lock_path = paths::app_data_dir()?.join("store.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| format!("无法创建账号库锁文件「{}」：{e}", lock_path.display()))?;
+        // 显式用 fs4 的排他锁（std::fs::File 在新工具链上也有同名 inherent 方法，
+        // 全限定语法确保走 fs4 而非 std）。
+        fs4::FileExt::lock(&file).map_err(|e| format!("获取账号库跨进程锁失败: {e}"))?;
+        Ok(CrossProcessLock(file))
+    }
+}
+
+/// 在账号库互斥保护下执行一次「读—改—写」（H-2 / J-1 / J-2）。
 ///
+/// - 先做重入检测（嵌套立即 Err，不死锁），再取跨进程文件锁，最后取进程内 Mutex。
 /// - 持锁期间 load → 闭包修改 → `Ok` 时 save；`Err` 时不保存（旧数据保留）。
 /// - 锁中毒（某线程持锁时 panic）用 `into_inner()` 恢复：账号库是单一真相源，
 ///   不能因一次 panic 让后续所有写操作永久失败。
 pub fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<T, String> {
+    let _reentry = ReentryGuard::enter()?;
+    let _process_lock = CrossProcessLock::acquire()?;
     let _guard = STORE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -942,5 +1031,50 @@ mod tests {
             TelemetryMode::EssentialOnly.env_key(),
             Some(ENV_DISABLE_NONESSENTIAL_TRAFFIC)
         );
+    }
+
+    /// J-2 重入检测：同一线程已在事务中时，第二次进入立即报错而非死锁；
+    /// Drop 复位后可再次进入。thread_local 按线程隔离，不影响其他测试。
+    #[test]
+    fn reentry_guard_blocks_nested_entry() {
+        let first = ReentryGuard::enter();
+        assert!(first.is_ok(), "首次进入应成功");
+        let second = ReentryGuard::enter();
+        assert!(second.is_err(), "嵌套进入应立即报错");
+        if let Err(message) = second {
+            assert!(message.contains("不可嵌套"));
+        }
+        drop(first);
+        let third = ReentryGuard::enter();
+        assert!(third.is_ok(), "Drop 复位后应能再次进入");
+    }
+
+    /// J-1 跨进程锁：fs4 排他锁在临时目录隔离验证——已持锁时第二个句柄
+    /// try_lock 失败；释放后可再次获取。不碰真实账号库。
+    #[test]
+    fn fs4_exclusive_lock_blocks_second_handle_in_tempdir() {
+        let dir = tempfile::tempdir().expect("创建临时目录");
+        let lock_path = dir.path().join("store.lock");
+        let file1 = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("打开锁文件");
+        fs4::FileExt::lock(&file1).expect("获取排他锁");
+
+        let file2 = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .expect("打开第二个句柄");
+        assert!(
+            fs4::FileExt::try_lock(&file2).is_err(),
+            "锁已被持有时第二个句柄 try_lock 必须失败"
+        );
+
+        drop(file1);
+        fs4::FileExt::lock(&file2).expect("释放后应能再次获取锁");
     }
 }

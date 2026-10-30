@@ -18,7 +18,13 @@ use crate::platform::imp;
 /// rename 不进来，目标数据整体丢失。这里写的是 `store.private.json` 和
 /// `.credentials.json`，代价太大，因此失败就原样报错，旧文件保持不变。
 pub fn rename_with_retry(from: &Path, to: &Path) -> io::Result<()> {
-    retry_io(|| fs::rename(from, to))
+    let result = retry_io(|| fs::rename(from, to));
+    if result.is_err() {
+        // J-5：所有重试都失败时，清理临时文件（from 在所有调用点都是临时文件），
+        // 绝不删目标（旧数据必须保留）。删除本身 best-effort，不掩盖原始错误。
+        let _ = fs::remove_file(from);
+    }
+    result
 }
 
 /// 带锁重试的删除（目录）。

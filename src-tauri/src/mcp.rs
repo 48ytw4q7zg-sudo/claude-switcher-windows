@@ -14,7 +14,6 @@
 //! 本轮不依赖它；若日后确认 CLI 支持 `add-json`，可优先走 CLI（由 CLI 负责
 //! 并发安全与格式化），文件乐观并发作为兜底/项目作用域路径。
 
-use std::collections::HashSet;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -22,7 +21,6 @@ use std::time::SystemTime;
 
 use serde::Serialize;
 use serde_json::{json, Value};
-use sysinfo::{ProcessesToUpdate, System};
 
 use crate::jsonio;
 
@@ -360,13 +358,14 @@ fn modify_json_optimistic(
     mut apply: impl FnMut(&mut Value) -> Result<bool, String>,
 ) -> Result<bool, String> {
     for _attempt in 0..MAX_OPT_CONFLICT_RETRIES {
+        // J-5①：先 stat 再读文件，让快照反映读取时刻的真实状态；旧实现先读后 stat，
+        // 读取与快照之间存在窗口。单测在 apply 内改写原文件（此时快照已取）来触发冲突。
+        let before = file_state(path);
         let mut parsed =
             jsonio::read_json_optional(path.to_path_buf())?.unwrap_or_else(|| json!({}));
         if !parsed.is_object() {
             return Err("目标文件根节点不是 JSON 对象".to_string());
         }
-        // 先快照，再 apply——单测正是利用「apply 内外部改写原文件」触发冲突。
-        let before = file_state(path);
         let changed = apply(&mut parsed)?;
         if !changed {
             return Ok(false);
@@ -388,27 +387,14 @@ fn modify_json_optimistic(
     ))
 }
 
-/// 纯函数：给定进程名集合（小写、已去 `.exe`），是否命中 Claude Code。
-fn claude_running_in(names: &HashSet<String>) -> bool {
-    names.iter().any(|n| n == "claude")
-}
-
-/// 检测 Claude Code 是否正在运行（sysinfo 枚举进程名，小写去 `.exe`）。
+/// 检测 Claude Code 是否正在运行。
 ///
-/// MCP 配置改完后若 Claude Code 会话还活着，需要重启会话才生效——
+/// J-5③：复用 [`processes::claude_code_running`](crate::processes::claude_code_running)
+/// （精确匹配、排除桌面版与本工具自身，比本模块旧的「进程名等于 claude」更准确，
+/// 能区分桌面版）。MCP 改完后若 Claude Code 会话还活着，需要重启会话才生效——
 /// 仅用于记录提示，不阻断写入。
 fn claude_running() -> bool {
-    let mut system = System::new();
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    let names: HashSet<String> = system
-        .processes()
-        .values()
-        .map(|p| {
-            let name = p.name().to_string_lossy().to_string().to_lowercase();
-            name.strip_suffix(".exe").unwrap_or(&name).to_string()
-        })
-        .collect();
-    claude_running_in(&names)
+    crate::processes::claude_code_running()
 }
 
 /// 读取某作用域的 `mcpServers`（文件缺失 / 无字段返回空对象）。
@@ -661,17 +647,6 @@ mod tests {
                 .iter()
                 .any(|w| w.contains("明文"))
         );
-    }
-
-    #[test]
-    fn claude_running_in_matches_only_claude() {
-        let mut set = HashSet::new();
-        assert!(!claude_running_in(&set));
-        set.insert("node".to_string());
-        set.insert("claudia".to_string());
-        assert!(!claude_running_in(&set), "claudia 不应误命中");
-        set.insert("claude".to_string());
-        assert!(claude_running_in(&set));
     }
 
     #[test]

@@ -66,17 +66,30 @@ fn save_notify_state(state: &NotifyState) -> Result<(), String> {
     fsx::write_atomically(&path, &raw).map_err(|e| format!("写入 notify-state 失败: {e}"))
 }
 
-/// 把重置时间向下取整到 5 分钟边界（300 秒），秒级抖动收敛到同一 key。
-fn round_to_five_minutes(dt: DateTime<Utc>) -> DateTime<Utc> {
-    let rounded = dt.timestamp().div_euclid(300) * 300;
-    DateTime::<Utc>::from_timestamp(rounded, 0).unwrap_or(dt)
-}
+/// 同一重置周期判定的容差（秒）：两次报告的重置时间相差不超过 10 分钟即视为同一周期。
+const RESET_PERIOD_TOLERANCE_SECS: i64 = 10 * 60;
 
-/// 重置周期 key：Some→取整后 RFC3339；None→固定占位串。
+/// 重置周期 key：Some→原始 RFC3339；None→固定占位串。
+///
+/// J-6：不再向下取整。去重判定改用 [`same_reset_period`] 的容差比较，
+/// 避免「取整后 key 因 5 分钟边界翻转而误判为新周期」。
 fn reset_key_of(reset: Option<DateTime<Utc>>) -> String {
     match reset {
-        Some(reset) => round_to_five_minutes(reset).to_rfc3339(),
+        Some(reset) => reset.to_rfc3339(),
         None => "unknown-reset".to_string(),
+    }
+}
+
+/// 两个周期 key 是否属于同一重置周期（J-6）。
+///
+/// 两者都能解析为时间时，绝对时间差 ≤ 10 分钟即同一周期（覆盖服务器秒级~分钟级
+/// 抖动、取整边界等）；任一无法解析（如占位串 `unknown-reset`）则回退到字符串相等，
+/// 保留对无法解析时间的字符串回退。
+fn same_reset_period(record_key: &str, current_key: &str) -> bool {
+    let parse = |s: &str| DateTime::parse_from_rfc3339(s).ok();
+    match (parse(record_key), parse(current_key)) {
+        (Some(a), Some(b)) => (a - b).num_seconds().abs() <= RESET_PERIOD_TOLERANCE_SECS,
+        _ => record_key == current_key,
     }
 }
 
@@ -99,7 +112,7 @@ fn levels_to_notify(
     current_reset_key: &str,
 ) -> Vec<u8> {
     let seen = match record_reset_key {
-        Some(key) if key == current_reset_key => already,
+        Some(key) if same_reset_period(key, current_reset_key) => already,
         _ => &[][..],
     };
     QUOTA_THRESHOLDS
@@ -192,14 +205,14 @@ pub fn evaluate_quota_notification(app: &tauri::AppHandle) -> Result<QuotaNotify
 
     // 更新记录（任一窗口周期变化则先清该窗口已通知档位）。
     let record = state.quota.entry(account_uuid).or_default();
-    if record.reset_key != session_reset_key {
+    if !same_reset_period(&record.reset_key, &session_reset_key) {
         record.reset_key = session_reset_key;
         record.notified_levels.clear();
     }
     record
         .notified_levels
         .extend(session_to_notify.iter().copied());
-    if record.weekly_reset_key != weekly_reset_key {
+    if !same_reset_period(&record.weekly_reset_key, &weekly_reset_key) {
         record.weekly_reset_key = weekly_reset_key;
         record.weekly_notified_levels.clear();
     }
@@ -272,26 +285,28 @@ mod tests {
     }
 
     #[test]
-    fn round_to_five_minutes_collapses_seconds_jitter() {
-        let base = DateTime::parse_from_rfc3339("2026-10-30T12:07:42Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        let later = DateTime::parse_from_rfc3339("2026-10-30T12:09:59Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        // 两者落在同一个 5 分钟桶里 → 同一 key。
-        assert_eq!(reset_key_of(Some(base)), reset_key_of(Some(later)));
-        // 取整后落在 5 分钟边界上。
-        assert_eq!(round_to_five_minutes(base).timestamp() % 300, 0);
-        let expected = DateTime::parse_from_rfc3339("2026-10-30T12:05:00Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_eq!(round_to_five_minutes(base), expected);
-        // 12:10:00 边界之后进入新桶。
-        let next = DateTime::parse_from_rfc3339("2026-10-30T12:10:01Z")
-            .unwrap()
-            .with_timezone(&Utc);
-        assert_ne!(reset_key_of(Some(base)), reset_key_of(Some(next)));
+    fn same_period_within_tolerance_despite_jitter() {
+        let base = "2026-10-30T12:07:42Z";
+        // 相差 2 分 17 秒（旧取整逻辑会分到不同 5 分钟桶）→ 容差内仍同一周期。
+        let nearby = "2026-10-30T12:09:59Z";
+        assert!(same_reset_period(base, nearby));
+        // 恰好 10 分钟 → 同一周期（含边界）。
+        let at_limit = "2026-10-30T12:17:42Z";
+        assert!(same_reset_period(base, at_limit));
+        // 超过 10 分钟 → 不同周期。
+        let beyond = "2026-10-30T12:17:43Z";
+        assert!(!same_reset_period(base, beyond));
+        // 数小时后的下一次重置 → 明确不同周期。
+        let next_reset = "2026-10-30T17:07:42Z";
+        assert!(!same_reset_period(base, next_reset));
+    }
+
+    #[test]
+    fn same_period_falls_back_to_string_equality_when_unparseable() {
+        // 占位串无法解析 → 回退字符串相等。
+        assert!(same_reset_period("unknown-reset", "unknown-reset"));
+        assert!(!same_reset_period("unknown-reset", "2026-10-30T12:07:42Z"));
+        assert!(!same_reset_period("2026-10-30T12:07:42Z", "unknown-reset"));
     }
 
     #[test]

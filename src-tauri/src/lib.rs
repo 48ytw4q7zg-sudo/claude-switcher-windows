@@ -26,6 +26,7 @@ mod cli;
 mod credentials;
 mod desktop;
 mod diagnostics;
+mod dirbinding;
 mod egress;
 mod export;
 mod fsx;
@@ -35,23 +36,30 @@ mod jsonio;
 mod keep;
 mod links;
 mod mcp;
+mod naming;
 mod net;
 mod notify_state;
 mod parallel;
 mod paths;
 mod platform;
 mod processes;
+mod provider;
 mod reconcile;
 mod region;
 mod rules;
+mod sanitize;
+mod shortcuts;
 mod store;
 mod stun;
 // 测试共享基础设施（环境锁 / 环境还原器）。
 #[cfg(test)]
 mod test_support;
+mod token_status;
 mod tray;
 mod update;
 mod usage;
+mod userpath;
+mod wsl;
 
 use std::collections::BTreeMap;
 use std::fs;
@@ -233,6 +241,12 @@ async fn blocking<T: Send + 'static>(
 #[tauri::command]
 fn get_platform() -> &'static str {
     "windows"
+}
+
+/// F-7：获取用户默认 UI 语言（多语言默认跟随系统）。
+#[tauri::command]
+fn get_system_language() -> String {
+    platform::imp::user_default_ui_language()
 }
 
 /// 应用内版本检查（GitHub Releases latest）。网络请求，走 blocking 壳。
@@ -479,6 +493,10 @@ fn profile_summary_of(profile: &StoredProfile, current_id: Option<&str>) -> Prof
         meta: profile.meta.clone(),
         clash: profile.clash.clone(),
         runtime: profile.runtime.clone(),
+        token_status: profile
+            .keychain_password
+            .as_deref()
+            .map(token_status::token_status_from_blob),
         is_current: current_id == Some(profile.id.as_str()),
     }
 }
@@ -687,7 +705,7 @@ async fn complete_new_account_login() -> Result<ProfileSummary, String> {
 
 fn complete_new_account_login_blocking() -> Result<ProfileSummary, String> {
     // H-2：读—改—写走 with_store。
-    store::with_store(|store_data| {
+    let result = store::with_store(|store_data| {
         let pending = store_data
             .pending_new_account
             .clone()
@@ -741,7 +759,14 @@ fn complete_new_account_login_blocking() -> Result<ProfileSummary, String> {
         store_data.profiles.push(profile);
         // with_store 在闭包返回 Ok 后统一 save。
         Ok(summary)
-    })
+    });
+    // F-2：新账号落库成功后重建开始菜单快捷方式（best-effort，不阻断主流程）。
+    if result.is_ok() {
+        if let Err(e) = shortcuts::sync_all_shortcuts() {
+            log_error(&format!("同步开始菜单快捷方式失败: {e}"));
+        }
+    }
+    result
 }
 
 /// 内部会触发一次完整切号（含进程结束等待、Clash 请求、链接重试），
@@ -907,9 +932,19 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
         if !store_data.profiles.iter().any(|p| p.id == id) {
             return Err("找不到这个账号快照".to_string());
         }
+        // F-5：切回 OAuth 账号前，先清掉当前供应商写入的受管 env（若有），避免供应商
+        // 认证键与 OAuth 材料并存。清不掉不阻断（OAuth 材料仍会落盘），仅记录日志。
+        if let Err(e) = provider::clear_active_provider_env(store_data) {
+            log_error(&format!("清理供应商 env 失败（不阻断切换）: {e}"));
+        }
         // 预检：目标快照可解密 / 配置目录可写 / Claude Code 在跑只提示。
         // 通过后才开始动数据（此后每步都有备份/日志可回滚）。
         let mut warnings = preflight_switch(store_data, &id)?;
+
+        // J-3 同步点：全局切换到该账号之前，先扫描并行目录里已刷新的凭据并回写
+        // （仅 mtime 晚于 updated_at，身份不一致拒绝回写）。复用已借用的 store，
+        // 不嵌套取锁。
+        warnings.extend(parallel::scan_parallel_credential_changes_into(store_data));
 
         let backup = create_backup_with_label(&format!("before-switch-to-{id}"))?;
         // 切换事务日志：从「备份已建」起记录——此刻备份是回滚点，
@@ -947,19 +982,6 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
             .ok_or_else(|| "找不到这个账号快照".to_string())?;
         let profile = store_data.profiles[idx].clone();
 
-        let clash_result = if let Some(binding) = &profile.clash {
-            if binding.enabled {
-                Some(clash::switch_clash_node_internal(
-                    &binding.group,
-                    &binding.node,
-                )?)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
         let rollback_from = load_backup_snapshot(&backup.path)?;
         accounts::apply_account_material(
             accounts::WriteMode::Merge,
@@ -977,6 +999,27 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
                 "隐私 env 注入失败（可在设置里重选遥测模式重试）：{e}"
             ));
         }
+        // J-2：Clash 节点切换必须放在账号材料应用成功之后。旧代码在材料应用前就切节点，
+        // 一旦材料应用失败，节点已被切走、账号却没切，留下错误的网络出口。
+        // 此刻材料已落盘，若 Clash 切换失败按 warning 处理（不能返回 Err 让 UI 显示
+        // 「切换失败」而磁盘其实已切，与 activate/keep 失败同一处理原则）。
+        let clash_result = if let Some(binding) = &profile.clash {
+            if binding.enabled {
+                match clash::switch_clash_node_internal(&binding.group, &binding.node) {
+                    Ok(result) => Some(result),
+                    Err(e) => {
+                        warnings.push(format!(
+                            "Clash 节点切换失败（账号材料已切换成功，可在网络恢复后手动切换节点）：{e}"
+                        ));
+                        None
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // 关键：activate 失败不能阻断切号——此刻账号材料（凭据/JSON）已成功切到新账号，
         // 若因 Windows 文件锁导致链接激活失败而返回 Err，前端会显示"切换失败"，
         // 但磁盘上其实已经切过去了（UI 与实际状态相反）。降级为 warning，
@@ -1243,7 +1286,146 @@ fn delete_profile_blocking(id: String, delete_sessions: bool) -> Result<(), Stri
             sessions_dir.to_string_lossy()
         ));
     }
+    // F-2：删除成功后重建快捷方式（被删账号的 .lnk 随之消失）。
+    if let Err(e) = shortcuts::sync_all_shortcuts() {
+        log_error(&format!("同步开始菜单快捷方式失败: {e}"));
+    }
     Ok(())
+}
+
+/// F-2：手动重建全部开始菜单快捷方式，返回写出数量。
+#[tauri::command]
+async fn rebuild_start_menu_shortcuts() -> Result<usize, String> {
+    blocking(shortcuts::sync_all_shortcuts).await
+}
+
+/// F-2：全部清理开始菜单快捷方式（卸载撤销）。
+#[tauri::command]
+async fn clear_start_menu_shortcuts() -> Result<(), String> {
+    blocking(shortcuts::remove_all_shortcuts).await
+}
+
+/// F-1：把工具 bin 目录追加到用户 PATH（REG_EXPAND_SZ，幂等）。
+#[tauri::command]
+async fn add_to_user_path(bin_dir: String) -> Result<bool, String> {
+    blocking(move || userpath::add_bin_to_user_path(&bin_dir)).await
+}
+
+/// F-1：从用户 PATH 移除工具 bin 目录（撤销）。
+#[tauri::command]
+async fn remove_from_user_path(bin_dir: String) -> Result<bool, String> {
+    blocking(move || userpath::remove_bin_from_user_path(&bin_dir)).await
+}
+
+/// F-1：为指定目录创建账号绑定标记。
+#[tauri::command]
+async fn bind_directory(dir: String, account_name: String) -> Result<String, String> {
+    blocking(move || {
+        dirbinding::write_account_marker(std::path::Path::new(&dir), &account_name)
+            .map(|p| p.to_string_lossy().to_string())
+    })
+    .await
+}
+
+/// F-1：移除指定目录的账号绑定标记。
+#[tauri::command]
+async fn unbind_directory(dir: String) -> Result<(), String> {
+    blocking(move || dirbinding::remove_account_marker(std::path::Path::new(&dir))).await
+}
+
+/// F-1：返回 cs.exe 所在目录（当前 exe 同目录），供 PATH 操作使用。
+#[tauri::command]
+fn get_tool_bin_dir() -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("定位当前程序失败: {e}"))?;
+    let parent = exe.parent().ok_or_else(|| "无法定位程序目录".to_string())?;
+    Ok(parent.to_string_lossy().to_string())
+}
+
+/// F-5：新建第三方供应商账号（auth token 加密落盘）。
+#[tauri::command]
+async fn create_provider(
+    name: String,
+    base_url: String,
+    auth_token: String,
+    model_env: std::collections::BTreeMap<String, String>,
+) -> Result<store::ProviderProfile, String> {
+    blocking(move || provider::create_provider_blocking(name, base_url, auth_token, model_env))
+        .await
+}
+
+/// F-5：列出全部供应商。
+#[tauri::command]
+async fn list_providers() -> Result<Vec<store::ProviderProfile>, String> {
+    blocking(provider::list_providers_blocking).await
+}
+
+/// F-5：删除供应商（当前生效则先清受管 env）。
+#[tauri::command]
+async fn delete_provider(id: String) -> Result<(), String> {
+    blocking(move || provider::delete_provider_blocking(id)).await
+}
+
+/// F-5：切换到供应商（先删旧键再写新键）。
+#[tauri::command]
+async fn switch_to_provider(id: String) -> Result<(), String> {
+    blocking(move || provider::switch_to_provider_blocking(id)).await
+}
+
+/// F-5：连通性测试（5 秒超时，不回显令牌）。
+#[tauri::command]
+async fn test_provider_connection(base_url: String) -> Result<String, String> {
+    blocking(move || provider::test_provider_connection(base_url)).await
+}
+
+/// F-5：当前生效供应商 id（无则 null）。
+#[tauri::command]
+async fn get_active_provider_id() -> Result<Option<String>, String> {
+    blocking(|| Ok(store::load_store()?.current_provider_id)).await
+}
+
+/// F-6：开启/关闭 WSL 集成实验开关（默认关闭）。
+#[tauri::command]
+async fn set_wsl_integration_enabled(enabled: bool) -> Result<bool, String> {
+    blocking(move || {
+        appconfig::update(|cfg| cfg.wsl_integration_enabled = enabled)?;
+        Ok(enabled)
+    })
+    .await
+}
+
+/// F-6：列出本机 WSL 发行版。
+#[tauri::command]
+async fn list_wsl_distros() -> Result<Vec<String>, String> {
+    blocking(wsl::list_wsl_distros_blocking).await
+}
+
+/// F-6：把当前账号凭据写入指定发行版（实验开关未开则拒绝）。
+#[tauri::command]
+async fn write_wsl_credentials(distro: String) -> Result<(), String> {
+    blocking(move || {
+        let store_data = store::load_store()?;
+        let current_id = store_data
+            .current_profile_id
+            .as_deref()
+            .ok_or_else(|| "当前没有可写入 WSL 的账号".to_string())?;
+        let profile = store_data
+            .profiles
+            .iter()
+            .find(|p| p.id == current_id)
+            .ok_or_else(|| "找不到当前账号".to_string())?;
+        let blob = profile
+            .keychain_password
+            .as_deref()
+            .ok_or_else(|| "当前账号没有可写入 WSL 的凭据".to_string())?;
+        wsl::write_wsl_credentials_blocking(distro, blob.to_string())
+    })
+    .await
+}
+
+/// F-6：删除指定发行版里的凭据。
+#[tauri::command]
+async fn clear_wsl_credentials(distro: String) -> Result<(), String> {
+    blocking(move || wsl::clear_wsl_credentials(&distro)).await
 }
 
 #[tauri::command]
@@ -1253,7 +1435,7 @@ fn rename_profile(id: String, name: String, notes: Option<String>) -> Result<(),
         return Err("账号名称不能为空".to_string());
     }
     // H-2：读—改—写走 with_store。
-    store::with_store(|store_data| {
+    let result = store::with_store(|store_data| {
         let profile = store_data
             .profiles
             .iter_mut()
@@ -1263,7 +1445,14 @@ fn rename_profile(id: String, name: String, notes: Option<String>) -> Result<(),
         profile.notes = notes;
         profile.updated_at = Utc::now();
         Ok(())
-    })
+    });
+    // F-2：改名成功后重建快捷方式（旧名文件随目录清空被移除）。
+    if result.is_ok() {
+        if let Err(e) = shortcuts::sync_all_shortcuts() {
+            log_error(&format!("同步开始菜单快捷方式失败: {e}"));
+        }
+    }
+    result
 }
 
 // ───────────────────────── 备份 ─────────────────────────
@@ -1688,6 +1877,59 @@ fn get_diagnostic_info_blocking(include_network: bool) -> Result<Value, String> 
         payload["network"] = json!({ "included": false });
     }
     Ok(payload)
+}
+
+/// F-7：生成脱敏诊断包 zip（含诊断信息 + 日志，全部脱敏）。
+/// 返回 zip 文件路径。默认不做网络检查，保证断网也能生成。
+#[tauri::command]
+async fn build_diagnostic_bundle(include_network: Option<bool>) -> Result<String, String> {
+    blocking(move || build_diagnostic_bundle_blocking(include_network.unwrap_or(false))).await
+}
+
+fn build_diagnostic_bundle_blocking(include_network: bool) -> Result<String, String> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    // 1) 收集诊断信息并脱敏。
+    let mut info = get_diagnostic_info_blocking(include_network)?;
+    sanitize::redact_json(&mut info);
+    let info_text =
+        serde_json::to_string_pretty(&info).map_err(|e| format!("序列化诊断信息失败: {e}"))?;
+
+    // 2) 读取日志并脱敏（日志可能含邮箱）。
+    let log_path = p::app_data_dir()?.join("logs").join("claude-switcher.log");
+    let log_text = if log_path.exists() {
+        let raw = fs::read_to_string(&log_path).unwrap_or_default();
+        sanitize::redact_emails_in_text(&raw)
+    } else {
+        "（无日志文件）".to_string()
+    };
+
+    // 3) 打包 zip 到 app_data_dir/diagnostic-bundle-<时间戳>.zip。
+    let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
+    let zip_path = p::app_data_dir()?.join(format!("diagnostic-bundle-{timestamp}.zip"));
+    let file = fs::File::create(&zip_path).map_err(|e| format!("创建诊断包文件失败: {e}"))?;
+    let mut writer = zip::ZipWriter::new(file);
+    let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+
+    writer
+        .start_file("diagnostic-info.json", options)
+        .map_err(|e| format!("写入诊断信息条目失败: {e}"))?;
+    writer
+        .write_all(info_text.as_bytes())
+        .map_err(|e| format!("写入诊断信息内容失败: {e}"))?;
+
+    writer
+        .start_file("claude-switcher.log", options)
+        .map_err(|e| format!("写入日志条目失败: {e}"))?;
+    writer
+        .write_all(log_text.as_bytes())
+        .map_err(|e| format!("写入日志内容失败: {e}"))?;
+
+    writer
+        .finish()
+        .map_err(|e| format!("完成诊断包 zip 失败: {e}"))?;
+    Ok(zip_path.to_string_lossy().to_string())
 }
 
 /// 一键打开 Windows「开发者设置」页（降级到 junction/硬链接时的引导）。
@@ -2239,6 +2481,12 @@ fn install_panic_hook() {
     }));
 }
 
+/// 控制台子系统 `cs.exe` 的入口（J-1）：在已自带控制台的进程中同步执行
+/// CLI 子命令，返回真实退出码（由 bin 用 `std::process::exit` 透传）。
+pub fn cli_console(args: &[String]) -> i32 {
+    cli::run_console(args)
+}
+
 pub fn run() {
     install_panic_hook();
 
@@ -2260,6 +2508,11 @@ pub fn run() {
     // 指向数据子目录（exe/ClaudeSwitcherData），而非 exe 目录本身，避免污染程序目录。
     if let Some(data_dir) = paths::portable_data_dir() {
         std::env::set_var("WEBVIEW2_USER_DATA_FOLDER", &data_dir);
+    }
+    // F-7 完整便携版：若 exe 旁带固定 WebView2 运行时，在 WebView2 创建前指向它，
+    // 使目标机器即使没装 WebView2 也能运行；无此目录则回退系统已安装的 WebView2。
+    if let Some(runtime_dir) = paths::fixed_webview2_dir() {
+        std::env::set_var("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER", &runtime_dir);
     }
 
     // 启动早期探测数据目录可写（H-1）：解压到 Program Files 等只读位置时
@@ -2317,6 +2570,7 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             get_platform,
+            get_system_language,
             get_status,
             check_for_update,
             export_store_encrypted,
@@ -2343,6 +2597,23 @@ pub fn run() {
             set_profile_runtime_binding,
             delete_profile,
             rename_profile,
+            rebuild_start_menu_shortcuts,
+            clear_start_menu_shortcuts,
+            add_to_user_path,
+            remove_from_user_path,
+            get_tool_bin_dir,
+            bind_directory,
+            unbind_directory,
+            create_provider,
+            list_providers,
+            delete_provider,
+            switch_to_provider,
+            test_provider_connection,
+            get_active_provider_id,
+            set_wsl_integration_enabled,
+            list_wsl_distros,
+            write_wsl_credentials,
+            clear_wsl_credentials,
             create_backup,
             list_backups,
             restore_backup,
@@ -2353,6 +2624,7 @@ pub fn run() {
             hide_main_window_cmd,
             get_logs_dir,
             get_diagnostic_info,
+            build_diagnostic_bundle,
             open_developer_settings,
             open_logs_dir,
             get_claude_config_dir,

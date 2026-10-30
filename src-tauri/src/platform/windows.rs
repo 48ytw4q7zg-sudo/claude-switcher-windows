@@ -55,6 +55,29 @@ pub fn powershell_path() -> PathBuf {
     PathBuf::from(root).join("System32\\WindowsPowerShell\\v1.0\\powershell.exe")
 }
 
+/// F-7：读取用户默认 UI 语言，返回前端可识别的语言码（zh-CN / zh-TW / en）。
+///
+/// 精确匹配常见 LANGID，其余按主语言段（低 10 位）判断，无法识别时回退 en。
+pub fn user_default_ui_language() -> String {
+    use windows_sys::Win32::Globalization::GetUserDefaultUILanguage;
+    let lang_id = unsafe { GetUserDefaultUILanguage() };
+    let exact = match lang_id {
+        0x0804 | 0x1004 | 0x0004 => Some("zh-CN"),
+        0x0404 | 0x0c04 | 0x1404 => Some("zh-TW"),
+        0x0409 => Some("en"),
+        _ => None,
+    };
+    if let Some(code) = exact {
+        return code.to_string();
+    }
+    match lang_id & 0x3ff {
+        0x04 => "zh-CN",
+        0x09 => "en",
+        _ => "en",
+    }
+    .to_string()
+}
+
 /// 当前进程 PID（用于进程检测时排除自身，替代 spawn tasklist）。
 pub fn current_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
@@ -125,9 +148,27 @@ fn is_protected_from_hardening(dir: &Path) -> bool {
     false
 }
 
+/// J-7 白名单：仅当目录是本工具自有的数据目录（目录名为 `.claude-switcher`
+/// 或 `ClaudeSwitcherData`）时才允许做 ACL 加固。任何其它目录一律跳过，
+/// 防止用户把自定义普通文件夹指给工具时被误断继承锁死。
+fn is_app_owned_data_dir(dir: &Path) -> bool {
+    matches!(
+        dir.file_name().and_then(|name| name.to_str()),
+        Some(".claude-switcher") | Some("ClaudeSwitcherData")
+    )
+}
+
 pub fn secure_app_data_dir(dir: &Path) -> bool {
-    // H-1：exe 目录 / Downloads / 桌面绝不加固。返回 true 视为「无需处理」，
-    // 避免每次启动都重试并刷日志。
+    // J-7 白名单优先：非本工具目录直接跳过（返回 true 视为无需处理）。
+    if !is_app_owned_data_dir(dir) {
+        crate::log_info(&format!(
+            "数据目录「{}」不是本工具自有数据目录（白名单外），已跳过 ACL 加固",
+            dir.display()
+        ));
+        return true;
+    }
+    // H-1：exe 目录 / Downloads / 桌面绝不加固（黑名单保留作第二道保险）。
+    // 返回 true 视为「无需处理」，避免每次启动都重试并刷日志。
     if is_protected_from_hardening(dir) {
         crate::log_info(&format!(
             "数据目录「{}」属于受保护位置（exe 目录/下载/桌面），已跳过 ACL 加固",
@@ -765,7 +806,58 @@ pub fn start_detached(program: &str, args: &[&str]) -> Result<(), String> {
 /// 返回 true 表示已成功附加。
 pub fn attach_parent_console() -> bool {
     use windows_sys::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
-    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) != 0 }
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) == 0 } {
+        return false;
+    }
+    // AttachConsole 只把进程接到父控制台，不会重设标准句柄。GUI 子系统进程默认
+    // 没有标准输出/错误句柄（GetStdHandle 返回 NULL/INVALID），需打开一个
+    // CONOUT$ 并 SetStdHandle。但已被重定向（> 文件 / 管道）的句柄必须原样保留，
+    // 绝不能覆盖，否则会丢掉用户的重定向。
+    if let Some(console_out) = open_console_output() {
+        use windows_sys::Win32::System::Console::{STD_ERROR_HANDLE, STD_OUTPUT_HANDLE};
+        ensure_std_handle(STD_OUTPUT_HANDLE, console_out);
+        ensure_std_handle(STD_ERROR_HANDLE, console_out);
+    }
+    true
+}
+
+/// 打开当前控制台的活动屏幕缓冲区（`CONOUT$`），返回原生句柄。
+fn open_console_output() -> Option<windows_sys::Win32::Foundation::HANDLE> {
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+    };
+    let name: Vec<u16> = "CONOUT$".encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe {
+        CreateFileW(
+            name.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        None
+    } else {
+        Some(handle)
+    }
+}
+
+/// 仅当指定标准句柄当前没有可用值（NULL 或 INVALID_HANDLE_VALUE）时，才把它接到
+/// 控制台句柄；已重定向到文件/管道的句柄原样保留。
+fn ensure_std_handle(
+    which: windows_sys::Win32::System::Console::STD_HANDLE,
+    console_handle: windows_sys::Win32::Foundation::HANDLE,
+) {
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::System::Console::{GetStdHandle, SetStdHandle};
+    let current = unsafe { GetStdHandle(which) };
+    if current.is_null() || current == INVALID_HANDLE_VALUE {
+        let _ = unsafe { SetStdHandle(which, console_handle) };
+    }
 }
 
 /// 弹一个原生模态消息框（启动致命错误用，如数据目录只读）。

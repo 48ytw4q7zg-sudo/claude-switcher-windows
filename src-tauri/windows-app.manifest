@@ -1,11 +1,18 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <!--
-  应用清单（C-6）：
-  - Common-Controls 6.0 依赖必须保留（Tauri 对话框相关 API 依赖它）。
-  - asInvoker：不请求提权（工具只操作当前用户数据）。
-  - supportedOS：Win10/11 GUID（避免 compat 层误判）。
-  - longPathAware：系统开启 LongPathsEnabled 后长路径才真正生效；
-    未开启时行为与之前一致，无副作用。
+  Application manifest (C-6).
+  - Keep the Common-Controls 6.0 dependency (required by Tauri dialog APIs).
+  - asInvoker: never request elevation (the tool only touches current-user data).
+  - supportedOS: Windows 10/11 GUID (avoids wrong compatibility-layer decisions).
+  - longPathAware: long paths take effect once the system LongPathsEnabled is on;
+    with it off, behaviour is unchanged (no side effects).
+
+  This file MUST stay pure ASCII. rc.exe decodes a UTF-8 source but re-encodes an
+  RT_MANIFEST blob to the system ANSI code page when no /c 65001 flag is passed
+  (tauri-winres/embed-resource pass none). Any non-ASCII byte here would be stored
+  in that ANSI code page while the header still declares UTF-8, which makes the
+  activation context fail with "invalid XML syntax" and the exe won't start.
+  See AGENTS.md pitfall #27.
 -->
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
   <assemblyIdentity version="{{VERSION}}" name="io.github.48ytw4q7zg-sudo.claude-switcher" type="win32"/>

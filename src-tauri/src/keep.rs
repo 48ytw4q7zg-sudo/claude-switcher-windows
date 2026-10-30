@@ -143,16 +143,8 @@ fn invalid_component_reason(rel: &str) -> Option<String> {
             return Some("含 Windows 非法字符".to_string());
         }
         // 保留设备名：写这些名会被重定向到设备，拷不出内容。
-        // `CONIN$` / `CONOUT$` 的 `$` 是名字的一部分，不能截断；
-        // 设备名后面允许跟扩展名（`NUL.txt` 的设备名仍是 `NUL`），
-        // 所以用第一个 `.` 前的整段来比。
-        let stem = component.split('.').next().unwrap_or(component);
-        const RESERVED: [&str; 27] = [
-            "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$", "COM1", "COM2", "COM3", "COM4",
-            "COM5", "COM6", "COM7", "COM8", "COM9", "COM¹", "COM²", "COM³", "LPT1", "LPT2", "LPT3",
-            "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
-        ];
-        if RESERVED.contains(&stem.to_uppercase().as_str()) {
+        // 规则（含扩展名形态、CONIN$/CONOUT$、大小写不敏感）抽在 naming 模块公共函数。
+        if crate::naming::is_reserved_device_name(component) {
             return Some("是 Windows 保留设备名".to_string());
         }
         // 尾点/尾空格：Windows 静默去掉，暂存目录与合并目标会指向不同路径。

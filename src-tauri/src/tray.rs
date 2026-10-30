@@ -31,6 +31,10 @@ pub fn refresh_tray_status(app: &tauri::AppHandle) -> Result<(), String> {
     let Some(tray) = app.tray_by_id("main") else {
         return Ok(());
     };
+    // J-3 同步点：托盘刷新时扫描并行目录凭据变化并回写（best-effort，不阻断刷新）。
+    if let Err(e) = crate::parallel::scan_parallel_credential_changes() {
+        crate::log_error(&format!("扫描并行凭据变化失败（已忽略）: {e}"));
+    }
     let tray_usage = usage::claude_usage_snapshot()?;
     // H-2：把当前账号用量落进独立 usage-cache.json（best-effort，不碰账号库）。
     if let Err(e) = usage::record_usage_from_snapshot(&tray_usage) {

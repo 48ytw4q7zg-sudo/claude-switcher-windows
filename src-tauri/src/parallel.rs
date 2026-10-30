@@ -45,7 +45,7 @@ fn seed_if_missing(dir: &Path, file_name: &str, content: &str) -> Result<bool, S
 /// 绝不能用账号库里的旧值覆盖回去（否则刚刷新的令牌被打回旧值，下次切号又把
 /// 这个旧值同步给全局，形成互相踢下线）。已存在时改为把磁盘上的现行凭据原文
 /// best-effort 回写账号库，让库跟随终端里的新令牌。
-fn ensure_parallel_account_dir(profile: &StoredProfile) -> Result<PathBuf, String> {
+pub(crate) fn ensure_parallel_account_dir(profile: &StoredProfile) -> Result<PathBuf, String> {
     let dir = parallel_account_dir(&profile.id)?;
     std::fs::create_dir_all(&dir).map_err(|e| format!("创建并行配置目录失败: {e}"))?;
 
@@ -77,12 +77,68 @@ fn ensure_parallel_account_dir(profile: &StoredProfile) -> Result<PathBuf, Strin
     Ok(dir)
 }
 
+/// 从凭据 blob 本地解析账号 uuid（纯本地，不联网）。
+///
+/// 复用 [`crate::usage::extract_meta`]：它在 `claude_json` 缺失时会从 blob 的
+/// `claudeAiOauth`（或扁平根）读取 `accountUuid`。本地确实无法解析时返回 None，
+/// 调用方据此走保守路径，**绝不在回写路径做阻塞联网**。
+fn credential_blob_account_uuid(blob: &str) -> Option<String> {
+    crate::usage::extract_meta(None, Some(blob)).account_uuid
+}
+
+/// J-3：凭据文件是否比 profile 的更新时间更新（mtime 晚于 updated_at）。
+/// 抽成纯函数以便单测覆盖陈旧文件过滤，不依赖真实目录。
+fn is_credential_file_newer(
+    mtime: std::time::SystemTime,
+    updated_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    mtime > std::time::SystemTime::from(updated_at)
+}
+
+/// 某 profile 已登记的账号 uuid：优先 `meta.account_uuid`，回退内嵌
+/// `claude_json.oauthAccount.accountUuid`。
+fn stored_profile_uuid(profile: &StoredProfile) -> Option<&str> {
+    profile.meta.account_uuid.as_deref().or_else(|| {
+        profile
+            .claude_json
+            .get("oauthAccount")
+            .and_then(|v| v.get("accountUuid"))
+            .and_then(|v| v.as_str())
+    })
+}
+
+/// J-3 核心：在已借用的 profile 上做身份校验并回写凭据。
+///
+/// 先从磁盘 blob 本地解析 accountUuid，与该 profile 已登记 uuid 比对：
+/// - 两者都能解析且**不一致** → 拒绝回写，返回提示「该并行目录已换成别的账号，
+///   可收养为新账号」，绝不覆盖；
+/// - 一致（或本地无法解析 uuid）→ 沿用原 best-effort 回写，值不同才更新。
+///
+/// 纯本地、不联网。返回 Some(提示) 时调用方负责展示/记录。
+fn verify_and_apply_credential(profile: &mut StoredProfile, raw: &str) -> Option<String> {
+    let disk_uuid = credential_blob_account_uuid(raw);
+    let stored_uuid = stored_profile_uuid(profile);
+    if let (Some(disk), Some(stored)) = (disk_uuid.as_deref(), stored_uuid) {
+        if disk != stored {
+            return Some(format!(
+                "并行目录「{}」已换成别的账号（磁盘账号 {disk} ≠ 登记账号 {stored}），已拒绝回写以免覆盖；可在界面把它收养为新账号。",
+                profile.name
+            ));
+        }
+    }
+    let same = matches!(&profile.keychain_password, Some(cur) if cur == raw);
+    if !same {
+        profile.keychain_password = Some(raw.to_string());
+        profile.updated_at = chrono::Utc::now();
+    }
+    None
+}
+
 /// 把并行终端里已刷新过的 `.credentials.json` 原文回写到账号库（best-effort）。
 ///
 /// 并行终端里 claude 刷新令牌后，磁盘上的 `.credentials.json` 是新的，但账号库里
-/// 快照的 `keychain_password` 还是旧的。下次切号/备份/导出时若拿旧快照覆盖，会把刚
-/// 刷新的令牌废掉。这里在开并行终端时检测一次：文件已存在且与库中值不同，就把新值
-/// 同步回去并刷新 `updated_at`。
+/// 快照的 `keychain_password` 还是旧的。J-3 起回写前先做身份校验，身份不一致拒绝
+/// 回写（见 [`verify_and_apply_credential`]）。
 ///
 /// 整个函数 best-effort：任何内部错误都只记日志、不向上抛——开终端不能因为同步失败
 /// 而被阻断。找不到对应 profile 视为 no-op。
@@ -91,10 +147,8 @@ fn sync_parallel_credentials_back(profile_id: &str, raw_cred: &str) {
         let Some(profile) = s.profiles.iter_mut().find(|p| p.id == profile_id) else {
             return Ok(());
         };
-        let same = matches!(&profile.keychain_password, Some(cur) if cur == raw_cred);
-        if !same {
-            profile.keychain_password = Some(raw_cred.to_string());
-            profile.updated_at = chrono::Utc::now();
+        if let Some(warn) = verify_and_apply_credential(profile, raw_cred) {
+            crate::log_error(&warn);
         }
         Ok::<(), String>(())
     });
@@ -103,6 +157,54 @@ fn sync_parallel_credentials_back(profile_id: &str, raw_cred: &str) {
             "回写并行终端凭据到账号库失败（best-effort，已忽略）: profile={profile_id}, err={e}"
         ));
     }
+}
+
+/// J-3 同步点：扫描 `accounts/*/.credentials.json`，把并行终端刷新的令牌回写账号库。
+///
+/// 仅处理 **mtime 晚于 profile.updated_at** 的凭据文件；身份校验（含「可收养为新账号」
+/// 拒绝）复用 [`verify_and_apply_credential`]。该版本接收已借用的 store，供
+/// `switch_profile_blocking`（已持 with_store 锁，不能再嵌套取锁）调用。
+pub(crate) fn scan_parallel_credential_changes_into(store_data: &mut store::Store) -> Vec<String> {
+    let Ok(accounts_root) = crate::paths::app_data_dir().map(|d| d.join("accounts")) else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(&accounts_root) else {
+        return Vec::new();
+    };
+    let mut messages = Vec::new();
+    for entry in entries.filter_map(|e| e.ok()) {
+        let profile_id = entry.file_name().to_string_lossy().to_string();
+        let cred_path = entry.path().join(".credentials.json");
+        if !cred_path.exists() {
+            continue;
+        }
+        let Ok(mtime) = std::fs::metadata(&cred_path).and_then(|m| m.modified()) else {
+            continue;
+        };
+        let Some(profile) = store_data.profiles.iter_mut().find(|p| p.id == profile_id) else {
+            continue;
+        };
+        // 仅处理 mtime 晚于 updated_at 的（陈旧文件跳过）。
+        if !is_credential_file_newer(mtime, profile.updated_at) {
+            continue;
+        }
+        let Ok(raw) = std::fs::read_to_string(&cred_path) else {
+            continue;
+        };
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        if let Some(msg) = verify_and_apply_credential(profile, raw) {
+            messages.push(msg);
+        }
+    }
+    messages
+}
+
+/// J-3 同步点（托盘刷新用）：在一次 with_store 事务内扫描并回写并行凭据变化。
+pub fn scan_parallel_credential_changes() -> Result<Vec<String>, String> {
+    store::with_store(|s| Ok(scan_parallel_credential_changes_into(s)))
 }
 
 /// 从全局 `~/.claude/skills` 复制共享 skills 到账号目录（best-effort，不阻断）。
@@ -380,5 +482,87 @@ mod tests {
         assert!(launch_verdict(None, false).is_ok());
         // Some(false) 语义上「不算已退出」→ Ok。
         assert!(launch_verdict(Some(false), false).is_ok());
+    }
+
+    // ── J-3 并行回写身份校验 ──
+
+    fn make_test_profile(stored_uuid: Option<&str>) -> StoredProfile {
+        let now = chrono::Utc::now();
+        let meta = crate::store::ProfileMeta {
+            account_uuid: stored_uuid.map(str::to_string),
+            ..Default::default()
+        };
+        StoredProfile {
+            id: "p1".to_string(),
+            name: "测试号".to_string(),
+            notes: None,
+            created_at: now,
+            updated_at: now,
+            last_switched_at: None,
+            claude_json: serde_json::json!({}),
+            settings_json: None,
+            encrypted_auth_settings: None,
+            keychain_password: Some("old-raw".to_string()),
+            meta,
+            last_used_percent: None,
+            clash: None,
+            runtime: None,
+        }
+    }
+
+    fn blob_with_uuid(uuid: &str) -> String {
+        serde_json::json!({
+            "claudeAiOauth": { "accountUuid": uuid, "accessToken": "x" }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn credential_blob_account_uuid_reads_nested_oauth() {
+        assert_eq!(
+            credential_blob_account_uuid(&blob_with_uuid("abc")).as_deref(),
+            Some("abc")
+        );
+        assert_eq!(credential_blob_account_uuid("not-json"), None);
+    }
+
+    #[test]
+    fn rejects_write_when_identity_mismatch_and_keeps_old_credential() {
+        let mut profile = make_test_profile(Some("stored-uuid"));
+        let raw = blob_with_uuid("different-disk");
+        let warn = verify_and_apply_credential(&mut profile, &raw);
+        assert!(warn.is_some(), "身份不一致必须返回提示");
+        assert!(warn.unwrap().contains("收养"));
+        assert_eq!(
+            profile.keychain_password.as_deref(),
+            Some("old-raw"),
+            "拒绝回写时原凭据绝不能被覆盖"
+        );
+    }
+
+    #[test]
+    fn applies_when_identity_matches() {
+        let mut profile = make_test_profile(Some("same-uuid"));
+        let raw = blob_with_uuid("same-uuid");
+        assert!(verify_and_apply_credential(&mut profile, &raw).is_none());
+        assert_eq!(profile.keychain_password.as_deref(), Some(raw.as_str()));
+    }
+
+    #[test]
+    fn best_effort_apply_when_disk_uuid_unparseable() {
+        let mut profile = make_test_profile(Some("stored-uuid"));
+        let raw = serde_json::json!({ "no_uuid": true }).to_string();
+        // 本地无法解析磁盘 uuid → 不阻断，best-effort 回写。
+        assert!(verify_and_apply_credential(&mut profile, &raw).is_none());
+        assert_eq!(profile.keychain_password.as_deref(), Some(raw.as_str()));
+    }
+
+    #[test]
+    fn mtime_filter_only_processes_newer_credential() {
+        let now = chrono::Utc::now();
+        let newer = std::time::SystemTime::from(now) + std::time::Duration::from_secs(60);
+        let older = std::time::SystemTime::from(now) - std::time::Duration::from_secs(60);
+        assert!(is_credential_file_newer(newer, now), "mtime 更晚应处理");
+        assert!(!is_credential_file_newer(older, now), "陈旧文件应跳过");
     }
 }

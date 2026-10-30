@@ -7,6 +7,9 @@ dist/
 # Tauri/Rust build output
 src-tauri/target/
 
+# Tauri externalBin staging (cs.exe copied here with target-triple suffix at build time)
+src-tauri/binaries/
+
 # Local app/runtime data
 .DS_Store
 *.log

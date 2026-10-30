@@ -1,6 +1,6 @@
 [package]
 name = "claude-switcher"
-version = "0.4.0"
+version = "0.5.0"
 description = "Claude Code local account switcher (Windows)"
 authors = ["48ytw4q7zg-sudo"]
 edition = "2021"
@@ -18,6 +18,12 @@ strip = "symbols"
 [lib]
 name = "claude_switcher_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+# J-1：控制台子系统小程序 cs.exe。**绝不**设置 windows_subsystem（用默认控制台），
+# 与主程序共用同一个库，同步执行并以真实退出码退出。
+[[bin]]
+name = "cs"
+path = "src/bin/cs.rs"
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
@@ -66,6 +72,8 @@ reqwest = { version = "0.12", default-features = false, features = [
 # 进程检测（Claude Code CLI 是否在运行）：跨平台取 exe 名与命令行，
 # 替代 Windows 上 PowerShell Get-CimInstance（慢、OEM 代码页乱码）。
 sysinfo = "0.33"
+# F-7：诊断包 zip（脱敏后打包）。关掉默认特性，只留 deflate 压缩，体积最小。
+zip = { version = "2", default-features = false, features = ["deflate"] }
 
 # Windows：store 加密主密钥存到 Windows Credential Manager（与 macOS Keychain 对等）。
 # Claude Code 本身的 OAuth 凭据在 Windows 上是 ~/.claude/.credentials.json 文件，无需 keyring。
@@ -77,12 +85,15 @@ keyring = { version = "3", features = ["windows-native"] }
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    "Win32_Security",
     "Win32_System_IO",
     "Win32_System_Ioctl",
     "Win32_System_Threading",
     "Win32_System_WindowsProgramming",
     # CLI 入口（--list/--status/--switch）：GUI 子系统附加到父控制台。
     "Win32_System_Console",
+    # F-7 多语言：读取用户默认 UI 语言（GetUserDefaultUILanguage）。
+    "Win32_Globalization",
     # 只读位置启动时弹原生 MessageBox 明确提示。
     "Win32_UI_WindowsAndMessaging",
 ] }
@@ -91,6 +102,8 @@ junction = "1"
 # 开机自启：直接写 HKCU\...\Run，替代 reg.exe 子进程（后者的错误信息是本地化
 # 字符串，中文系统上「删除一个不存在的值」会被误判成失败）。
 winreg = "0.52"
+fs4 = "1.1.0"
+mslnk = "0.1.8"
 
 [dev-dependencies]
 tempfile = "3"

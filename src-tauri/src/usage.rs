@@ -136,6 +136,13 @@ fn string_field<'a>(value: &'a Value, path: &[&str]) -> Option<&'a str> {
     cur.as_str()
 }
 
+/// 兄弟键回退：依次尝试每个键（同级、非嵌套），返回第一个字符串值。
+/// 与 [`string_field`]（嵌套路径）区分，避免把备选键当成下钻路径。
+fn first_string_field<'a>(value: &'a Value, keys: &[&str]) -> Option<&'a str> {
+    keys.iter()
+        .find_map(|key| value.get(*key).and_then(|v| v.as_str()))
+}
+
 fn collect_jsonl_files(dir: &Path, files: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
     if !dir.exists() {
         return Ok(());
@@ -665,7 +672,13 @@ pub fn extract_meta(
             let oauth = parsed.get("claudeAiOauth").unwrap_or(&parsed);
             meta.has_oauth_account = true;
             if meta.email.is_none() {
-                meta.email = string_field(oauth, &["email", "accountEmail", "username"])
+                meta.email = first_string_field(oauth, &["email", "accountEmail", "username"])
+                    .map(ToOwned::to_owned);
+            }
+            // J-3：claude_json 没给 uuid 时，从凭据 blob 本地解析 accountUuid
+            // （兼容驼峰/下划线两种命名），供并行回写身份校验复用，全程不联网。
+            if meta.account_uuid.is_none() {
+                meta.account_uuid = first_string_field(oauth, &["accountUuid", "account_uuid"])
                     .map(ToOwned::to_owned);
             }
             meta.has_trusted_device_token = oauth.get("trustedDeviceToken").is_some();

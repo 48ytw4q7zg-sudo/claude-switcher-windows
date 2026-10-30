@@ -151,6 +151,49 @@ pub fn forward_switch(app: &tauri::AppHandle, name: &str) {
     }
 }
 
+/// 控制台子系统入口（cs.exe，J-1）。
+///
+/// cs 是默认控制台程序，启动时已自带控制台、标准句柄有效，因此这里直接解析
+/// 子命令并执行；`run_readonly` / `run_switch_first_instance` 内部的
+/// `AttachConsole` 会因已有控制台而失败，但不影响输出（句柄本就有效）。
+/// 返回真实进程退出码，由 bin 用 `std::process::exit` 透传。
+pub fn run_console(args: &[String]) -> i32 {
+    // cs run [透传参数...]：在当前目录绑定的账号下启动 claude（F-1）。
+    if let Some(position) = args.iter().position(|a| a == "run") {
+        let extra: Vec<String> = args[position + 1..].to_vec();
+        let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        return match crate::dirbinding::run_bound_account(&start, &extra) {
+            Ok(code) => code,
+            Err(e) => {
+                println!("{e}");
+                let _ = std::io::stdout().flush();
+                1
+            }
+        };
+    }
+    match parse(args) {
+        Some(CliCommand::List) => run_readonly(&CliCommand::List),
+        Some(CliCommand::Status) => run_readonly(&CliCommand::Status),
+        Some(CliCommand::Switch(name)) => run_switch_first_instance(&name),
+        None => {
+            print_usage();
+            2
+        }
+    }
+}
+
+/// 打印用法（无子命令时）。
+fn print_usage() {
+    println!(
+        "Claude Switcher (cs)\n\
+         用法:\n\
+         \x20 cs --list              列出已保存账号\n\
+         \x20 cs --status            显示当前全局账号\n\
+         \x20 cs --switch <名称>     切换到指定账号\n\
+         \x20 cs run                 在当前目录绑定账号下启动 claude"
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
