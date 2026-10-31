@@ -1447,7 +1447,7 @@ async fn list_wsl_distros() -> Result<Vec<String>, String> {
 #[tauri::command]
 async fn write_wsl_credentials(distro: String) -> Result<wsl::WslSyncReport, String> {
     blocking(move || {
-        let (current_id, blob) = {
+        let (current_id, blob, profile_uuid) = {
             let store_data = store::load_store()?;
             let current_id = store_data
                 .current_profile_id
@@ -1462,10 +1462,12 @@ async fn write_wsl_credentials(distro: String) -> Result<wsl::WslSyncReport, Str
                 .keychain_password
                 .clone()
                 .ok_or_else(|| "当前账号没有可写入 WSL 的凭据".to_string())?;
-            (current_id, blob)
+            // K-4：账号库登记的 uuid，用于核对 WSL 里的凭据是否属于同一账号。
+            let profile_uuid = profile.meta.account_uuid.clone();
+            (current_id, blob, profile_uuid)
         };
-        let report = wsl::sync_to_wsl_blocking(distro, blob)?;
-        // WSL 副本更新：回写账号库。
+        let report = wsl::sync_to_wsl_blocking(distro, blob, profile_uuid)?;
+        // WSL 副本更新**且身份已核对一致**才回写账号库。
         if let Some(remote_blob) = report.remote_newer_blob.clone() {
             store::with_store(|data| {
                 if let Some(profile) = data.profiles.iter_mut().find(|p| p.id == current_id) {

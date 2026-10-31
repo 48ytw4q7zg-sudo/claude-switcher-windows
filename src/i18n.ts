@@ -89,6 +89,8 @@ const en: Dict = {
   'perm.ask.hint': 'Ask each time',
   'perm.rule.placeholder': 'e.g. Bash(npm run build)',
   'perm.hooks': 'Hooks ({n})',
+  'perm.hooks.note':
+    'This list is authoritative: hooks you remove here are removed on save. Hooks whose command line cannot be read are kept untouched, as are unrecognized fields such as timeout.',
   'perm.noHooks': 'No hooks.',
   'perm.event': 'Event e.g. Stop',
   'perm.matcher': 'Matcher (optional)',
@@ -173,6 +175,8 @@ const zh: Dict = {
   'perm.ask.hint': '每次先询问',
   'perm.rule.placeholder': '例如 Bash(npm run build)',
   'perm.hooks': '钩子 hooks（{n}）',
+  'perm.hooks.note':
+    '此列表是权威的：在这里删掉的钩子保存时会被真正删除。读不出命令行的钩子、以及 timeout 等本编辑器不认识的字段会原样保留，不会被改动。',
   'perm.noHooks': '暂无钩子。',
   'perm.event': '事件 如 Stop',
   'perm.matcher': '匹配器（可空）',

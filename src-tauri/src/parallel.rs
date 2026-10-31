@@ -109,13 +109,15 @@ fn stored_profile_uuid(profile: &StoredProfile) -> Option<&str> {
 
 /// J-3/K-1 核心：在已借用的 profile 上做身份校验并按需回写凭据。
 ///
-/// `disk_uuid` 为已解析到的磁盘账号 uuid（本地解析或网络 profile 核对），
+/// `disk_uuid` 为已核对到的磁盘账号 uuid（本地解析或网络 profile 核对），
 /// `conservative_when_unknown` 决定磁盘 uuid 缺失时的策略：
-/// - 两者都能解析且**不一致** → 拒绝回写，返回提示「该并行目录已换成别的账号，
+/// - 两边都能解析且**不一致** → 拒绝回写，返回提示「该并行目录已换成别的账号，
 ///   可收养为新账号」，绝不覆盖；
+/// - **账号库未登记 uuid** 而磁盘能解析出 uuid → 无法证明是同一账号，拒绝回写
+///   （否则用户 `/login` 换了号，新凭据会被写进原账号快照，之后切回去就串号）；
 /// - `disk_uuid=None` 且 `conservative_when_unknown=true`（后台网络路径）→
 ///   查不到身份，保守不覆盖，留待下次托盘刷新再试；
-/// - 其余（一致，或本地路径 uuid 缺失）→ best-effort 回写，值不同才更新。
+/// - 其余（一致）→ best-effort 回写，值不同才更新。
 ///
 /// 返回 Some(提示) 时调用方负责展示/记录。
 fn verify_and_apply_credential_inner(
@@ -125,17 +127,30 @@ fn verify_and_apply_credential_inner(
     conservative_when_unknown: bool,
 ) -> Option<String> {
     let stored_uuid = stored_profile_uuid(profile);
-    if let (Some(disk), Some(stored)) = (disk_uuid, stored_uuid) {
-        if disk != stored {
+    match (disk_uuid, stored_uuid) {
+        // 两边都能解析：一致才放行，不一致拒绝。
+        (Some(disk), Some(stored)) if disk == stored => {}
+        (Some(disk), Some(stored)) => {
             return Some(format!(
                 "并行目录「{}」已换成别的账号（磁盘账号 {disk} ≠ 登记账号 {stored}），已拒绝回写以免覆盖；可在界面把它收养为新账号。",
                 profile.name
             ));
         }
-    }
-    if disk_uuid.is_none() && conservative_when_unknown {
-        // 网络核对查不到身份：保守不覆盖，下次托盘刷新再试。
-        return None;
+        // 账号库未登记 uuid，磁盘却能解析出 uuid：无法证明是同一账号，拒绝。
+        // 老账号快照可能没有 uuid，此时宁可保守也不冒串号风险。
+        (Some(disk), None) => {
+            return Some(format!(
+                "账号「{}」未登记账号 uuid，无法确认并行目录里的凭据（{disk}）属于它，已拒绝回写；请重新捕获该账号后再试。",
+                profile.name
+            ));
+        }
+        // 磁盘 uuid 解析不到。
+        (None, _) => {
+            if conservative_when_unknown {
+                // 网络核对查不到身份：保守不覆盖，下次托盘刷新再试。
+                return None;
+            }
+        }
     }
     let same = matches!(&profile.keychain_password, Some(cur) if cur == raw);
     if !same {
@@ -679,14 +694,29 @@ mod tests {
     }
 
     #[test]
-    fn checked_applies_when_stored_uuid_unknown_but_network_resolves() {
+    fn checked_refuses_when_stored_uuid_unknown_but_network_resolves() {
         let mut profile = make_test_profile(None);
         let raw = "new-raw-cred";
-        // 库内未登记 uuid，但网络能核对到身份 → 无冲突，允许回写。
-        assert!(
-            verify_and_apply_credential_checked(&mut profile, raw, Some("network-uuid")).is_none()
+        // 账号库未登记 uuid，网络却能核对到身份：无法证明是同一账号。
+        // 早先这里放行回写——等于把并行终端里换号后的凭据写进原账号快照，
+        // 之后切回该账号就会写入别人的登录态。必须拒绝。
+        let warn = verify_and_apply_credential_checked(&mut profile, raw, Some("network-uuid"));
+        assert!(warn.is_some(), "账号库无 uuid 时必须拒绝回写");
+        assert!(warn.unwrap().contains("未登记"));
+        assert_eq!(
+            profile.keychain_password.as_deref(),
+            Some("old-raw"),
+            "无法确认身份时绝不能覆盖原凭据"
         );
-        assert_eq!(profile.keychain_password.as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn checked_refuses_when_stored_uuid_unknown_and_disk_uuid_unknown() {
+        // 两边都解析不到 uuid：后台路径保守不覆盖，也不报错（留待下次重试）。
+        let mut profile = make_test_profile(None);
+        let warn = verify_and_apply_credential_checked(&mut profile, "new-raw-cred", None);
+        assert!(warn.is_none());
+        assert_eq!(profile.keychain_password.as_deref(), Some("old-raw"));
     }
 
     #[test]

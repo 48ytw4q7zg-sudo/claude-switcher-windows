@@ -75,6 +75,9 @@ pub fn extract_permissions(root: &Value) -> PermissionRules {
 ///
 /// 结构：`hooks.<Event>[]`，每个元素是 `{matcher?: string, hooks: [{type, command}]}`。
 /// 非预期结构（缺 hooks 数组/命令非字符串）跳过该条，不报错。
+///
+/// 只提取 `type == "command"`（或缺 `type`）的钩子：其他类型即便也带 `command`
+/// 字段，也不是本编辑器能编辑的本地命令行，混进来会在保存时被改坏。
 pub fn extract_hooks(root: &Value) -> Vec<HookEntry> {
     let Some(hooks_map) = root.get("hooks").and_then(Value::as_object) else {
         return Vec::new();
@@ -94,6 +97,12 @@ pub fn extract_hooks(root: &Value) -> Vec<HookEntry> {
                 continue;
             };
             for hook in hooks {
+                // type 存在且不是 command → 不是本地命令行，跳过。
+                if let Some(kind) = hook.get("type").and_then(Value::as_str) {
+                    if kind != "command" {
+                        continue;
+                    }
+                }
                 let command = hook.get("command").and_then(Value::as_str);
                 if let Some(command) = command {
                     out.push(HookEntry {
@@ -263,7 +272,12 @@ fn merge_permissions_into(obj: &mut serde_json::Map<String, Value>, rules: &Perm
     obj.insert("permissions".to_string(), Value::Object(perms));
 }
 
-/// 合并钩子：逐个分组更新 command，保留分组里其他字段与无法识别的分组。
+/// 合并钩子：逐个分组更新 command，保留分组里其他字段与无法识别的钩子。
+///
+/// 语义：**编辑器列表对它展示过的 (event, matcher) 分组是权威的**——
+/// 用户删掉一条就得真的删掉（否则保存后 Claude 仍执行已删除的钩子）。
+/// 但分组内**解析不出 command 的钩子**（编辑器根本看不到）必须原样保留，
+/// 否则一次保存就静默弄丢用户手写的配置。
 fn merge_hooks_into(obj: &mut serde_json::Map<String, Value>, entries: &[HookEntry]) {
     // 期望的 (event, matcher) → [command]，用于就地更新已有的钩子对象。
     let mut wanted: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
@@ -272,10 +286,6 @@ fn merge_hooks_into(obj: &mut serde_json::Map<String, Value>, entries: &[HookEnt
             .entry((entry.event.clone(), entry.matcher.clone()))
             .or_default()
             .push(entry.command.clone());
-    }
-    if entries.is_empty() {
-        obj.remove("hooks");
-        return;
     }
     // 从现有结构出发，只改 command，其他字段（timeout 等）原样保留。
     let mut hooks = obj
@@ -321,6 +331,44 @@ fn merge_hooks_into(obj: &mut serde_json::Map<String, Value>, entries: &[HookEnt
             groups.push(Value::Object(group));
         }
     }
+    // 用户在编辑器里删掉了某事件/某 matcher 下的全部钩子：残留分组必须删除，
+    // 否则保存后 Claude Code 仍会执行用户以为已删除的钩子。
+    // 例外：分组里含「解析不出 command」的钩子时保留——编辑器从未展示过它，
+    // 删掉就是静默丢失用户手写的配置。
+    for (event, value) in hooks.iter_mut() {
+        let Some(groups) = value.as_array_mut() else {
+            continue;
+        };
+        groups.retain(|group| {
+            let matcher = group.get("matcher").and_then(Value::as_str).unwrap_or("");
+            // 编辑器展示过 → 以编辑器为准（删了就真删）。
+            if wanted.contains_key(&(event.clone(), matcher.to_string())) {
+                return true;
+            }
+            // 没展示过：只有含「读不出 command」的钩子时才保留。
+            group
+                .get("hooks")
+                .and_then(Value::as_array)
+                .is_some_and(|list| {
+                    list.iter()
+                        .any(|hook| hook.get("command").and_then(Value::as_str).is_none())
+                })
+        });
+    }
+    // 事件下已无分组：删掉空数组，别留空壳。
+    let empty_events: Vec<String> = hooks
+        .iter()
+        .filter(|(_, value)| value.as_array().is_some_and(|a| a.is_empty()))
+        .map(|(event, _)| event.clone())
+        .collect();
+    for event in empty_events {
+        hooks.remove(&event);
+    }
+    // hooks 空了（用户删光了所有可见钩子、也没有隐藏分组）才整块删除。
+    if hooks.is_empty() {
+        obj.remove("hooks");
+        return;
+    }
     obj.insert("hooks".to_string(), Value::Object(hooks));
 }
 
@@ -364,6 +412,20 @@ mod tests {
         assert_eq!(rules.allow, vec!["a".to_string()]);
         assert_eq!(rules.deny, vec!["b".to_string()]);
         assert_eq!(rules.ask, vec!["c".to_string()]);
+    }
+
+    #[test]
+    fn extract_hooks_skips_non_command_hook_types() {
+        // 非 command 类型即便带 command 字段也不是本地命令行，不能被编辑器接管。
+        let root = json!({"hooks": {"Stop": [{"hooks": [
+            {"type": "command", "command": "keep-me"},
+            {"type": "prompt", "command": "ignore-me"},
+            {"type": "http", "command": "ignore-me-too"},
+            {"command": "no-type-also-ok"}
+        ]}]}});
+        let hooks = extract_hooks(&root);
+        let commands: Vec<&str> = hooks.iter().map(|h| h.command.as_str()).collect();
+        assert_eq!(commands, vec!["keep-me", "no-type-also-ok"]);
     }
 
     #[test]
@@ -426,6 +488,138 @@ mod tests {
         };
         let warnings = validate_hook(&entry);
         assert!(warnings.iter().any(|w| w.contains("空钩子")));
+    }
+
+    #[test]
+    fn apply_editor_removes_stale_hook_group_user_deleted() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "keep"}]},
+                    {"matcher": "Edit", "hooks": [{"type": "command", "command": "drop-me"}]}
+                ]
+            }
+        });
+        // 用户删掉了 Edit 分组的那条钩子，只保留 Bash。
+        let hooks = vec![HookEntry {
+            event: "Stop".to_string(),
+            matcher: "Bash".to_string(),
+            command: "keep".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        let groups = root["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "用户删掉的分组必须被移除");
+        assert_eq!(groups[0]["matcher"], json!("Bash"));
+        assert_eq!(groups[0]["hooks"][0]["command"], json!("keep"));
+    }
+
+    #[test]
+    fn apply_editor_keeps_hook_events_it_never_showed() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "a"}]}],
+                // 编辑器看不到这条（没有 command 字段），必须原样保留。
+                "PreToolUse": [{"matcher": "Bash", "hooks": [{"no_command": true}]}]
+            }
+        });
+        let hooks = vec![HookEntry {
+            event: "Stop".to_string(),
+            matcher: String::new(),
+            command: "a".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        assert!(
+            root["hooks"].get("PreToolUse").is_some(),
+            "含解析不出 command 的钩子的分组必须保留，否则一次保存就丢用户配置"
+        );
+        assert_eq!(
+            root["hooks"]["PreToolUse"][0]["hooks"][0],
+            json!({"no_command": true})
+        );
+        assert!(root["hooks"].get("Stop").is_some(), "编辑过的事件不能被动");
+    }
+
+    #[test]
+    fn apply_editor_removes_hook_the_user_deleted_from_a_shown_event() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "keep"}]},
+                    {"matcher": "Edit", "hooks": [{"type": "command", "command": "deleted-by-user"}]}
+                ]
+            }
+        });
+        // 编辑器展示了两个分组，用户删掉 Edit 那条后保存。
+        // 编辑器看得见的分组必须真的被删掉——否则保存后 Claude 仍执行已删除的钩子。
+        let hooks = vec![HookEntry {
+            event: "Stop".to_string(),
+            matcher: "Bash".to_string(),
+            command: "keep".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        let groups = root["hooks"]["Stop"].as_array().unwrap();
+        assert_eq!(groups.len(), 1, "用户删除的分组必须移除");
+        assert_eq!(groups[0]["matcher"], json!("Bash"));
+        assert_eq!(groups[0]["hooks"][0]["command"], json!("keep"));
+    }
+
+    #[test]
+    fn apply_editor_removes_event_when_all_its_shown_hooks_deleted() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "only"}]}],
+                "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "keep-me"}]}]
+            }
+        });
+        // 编辑器展示了 Stop 与 PreToolUse；用户把 Stop 全删、只留 PreToolUse。
+        let hooks = vec![HookEntry {
+            event: "PreToolUse".to_string(),
+            matcher: "Bash".to_string(),
+            command: "keep-me".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        assert!(
+            root["hooks"].get("Stop").is_none(),
+            "编辑器展示过、且用户已删空的事件必须移除"
+        );
+        assert!(root["hooks"].get("PreToolUse").is_some());
+    }
+
+    #[test]
+    fn apply_editor_keeps_hidden_hooks_when_user_deletes_all_visible_ones() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "visible"}]}],
+                // 编辑器看不到这条（没有 command 字段）。
+                "Notification": [{"hooks": [{"no_command": true}]}]
+            }
+        });
+        // 用户删光了所有可见钩子（entries 为空）。
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &[]).expect("apply");
+        assert!(
+            root["hooks"].get("Stop").is_none(),
+            "用户删光的可见分组必须移除"
+        );
+        assert!(
+            root["hooks"].get("Notification").is_some(),
+            "删空可见钩子时不能连带删掉编辑器看不到的隐藏分组"
+        );
+        assert_eq!(
+            root["hooks"]["Notification"][0]["hooks"][0],
+            json!({"no_command": true})
+        );
+    }
+
+    #[test]
+    fn apply_editor_removes_hooks_block_only_when_nothing_left() {
+        let mut root =
+            json!({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "a"}]}]}});
+        // 没有隐藏分组时，删光可见钩子应整块移除 hooks。
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &[]).expect("apply");
+        assert!(
+            root.get("hooks").is_none(),
+            "既无可见也无隐藏钩子时应删除整个 hooks 块"
+        );
     }
 
     #[test]
@@ -583,23 +777,31 @@ mod tests {
     }
 
     #[test]
-    fn apply_editor_keeps_other_hook_events_when_editing_one() {
+    fn apply_editor_updates_only_the_edited_group_and_keeps_other_shown_groups() {
         let mut root = json!({
             "hooks": {
                 "Stop": [{"hooks": [{"type": "command", "command": "old-stop"}]}],
                 "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "keep-pre"}]}]
             }
         });
-        let hooks = vec![HookEntry {
-            event: "Stop".to_string(),
-            matcher: String::new(),
-            command: "new-stop".to_string(),
-        }];
+        // 两个分组编辑器都展示过，用户只改 Stop 的 command，PreToolUse 原样带回。
+        let hooks = vec![
+            HookEntry {
+                event: "Stop".to_string(),
+                matcher: String::new(),
+                command: "new-stop".to_string(),
+            },
+            HookEntry {
+                event: "PreToolUse".to_string(),
+                matcher: "Bash".to_string(),
+                command: "keep-pre".to_string(),
+            },
+        ];
         apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
         assert_eq!(
             root["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
             json!("keep-pre"),
-            "未编辑的事件分组不能被清空"
+            "未改动的分组内容不能被清空"
         );
         assert_eq!(
             root["hooks"]["Stop"][0]["hooks"][0]["command"],

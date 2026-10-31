@@ -145,6 +145,7 @@ export function PermissionPanel() {
           <ShieldCheck size={16} />
           <span>{t('perm.hooks', { n: hooks.length })}</span>
         </div>
+        <p className="mcp-env">{t('perm.hooks.note')}</p>
         <div className="mcp-list">
           {hooks.length === 0 && <p className="muted">{t('perm.noHooks')}</p>}
           {hooks.map((hook, idx) => (

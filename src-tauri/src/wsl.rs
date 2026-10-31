@@ -230,6 +230,21 @@ fn should_write_local_credentials(local: &str, remote: Option<&str>) -> bool {
     }
 }
 
+/// 纯函数：能否把 WSL 里的凭据回写账号库（K-4 身份核对）。
+///
+/// 过期时间只说明「哪份令牌更新」，**不说明是不是同一个账号**。WSL 里可能登着
+/// 别的账号（用户在里面 `/login` 过），此时把它的凭据回写进当前账号快照就是串号。
+/// 判定规则：
+/// - 账号库登记了 uuid 且 WSL blob 能解析出 uuid → 一致才允许；
+/// - 任一边解析不到 uuid → 无法证明同一账号，拒绝（`None` 表示无法判定）。
+///
+/// 返回 `Some(true)` 允许回写、`Some(false)` 明确拒绝、`None` 无法判定。
+fn remote_blob_matches_profile(remote: &str, profile_uuid: Option<&str>) -> Option<bool> {
+    let remote_uuid = crate::usage::extract_meta(None, Some(remote)).account_uuid?;
+    let stored = profile_uuid?;
+    Some(remote_uuid == stored)
+}
+
 /// 把凭据 blob 写入指定发行版（stdin + umask + chmod，不闪窗、带超时）。
 pub fn write_credentials_to_wsl(distro: &str, blob: &str) -> Result<(), String> {
     validate_distro(distro)?;
@@ -275,9 +290,11 @@ pub struct WslSyncReport {
     pub home: String,
     /// WSL 内是否已有凭据。
     pub had_existing: bool,
-    /// WSL 副本更新时的原 blob（供 lib 层回写账号库），否则 None。
+    /// WSL 副本更新**且身份已核对为同一账号**时的原 blob（供 lib 层回写账号库）。
+    /// 身份不一致或无法判定时为 None——此时绝不回写，避免把 WSL 里别的账号
+    /// 凭据写进当前账号快照。
     pub remote_newer_blob: Option<String>,
-    /// 需向用户展示的提示（两处各一份、0600 限制等）。
+    /// 需向用户展示的提示（两处各一份、0600 限制、身份未核对等）。
     pub warnings: Vec<String>,
 }
 
@@ -285,7 +302,14 @@ pub struct WslSyncReport {
 ///
 /// 顺序：探测家目录 → 回读现有凭据并按过期时间对账 → 写入本机凭据 →
 /// 同步 ~/.claude.json → 返回报告。实验开关未开启直接拒绝。
-pub fn sync_to_wsl_blocking(distro: String, local_blob: String) -> Result<WslSyncReport, String> {
+///
+/// `profile_uuid` 是账号库为当前账号登记的 uuid，用于核对 WSL 里的凭据是否
+/// 属于同一个账号；没有它就不做任何回写。
+pub fn sync_to_wsl_blocking(
+    distro: String,
+    local_blob: String,
+    profile_uuid: Option<String>,
+) -> Result<WslSyncReport, String> {
     let config = crate::appconfig::load();
     if !config.wsl_integration_enabled {
         return Err("WSL 集成实验开关未开启，已拒绝写入".to_string());
@@ -309,8 +333,21 @@ pub fn sync_to_wsl_blocking(distro: String, local_blob: String) -> Result<WslSyn
             wsl_home.home
         ));
         if remote_blob_is_newer(&local_blob, remote) {
-            remote_newer_blob = Some(remote.clone());
-            warnings.push("WSL 内凭据过期时间更晚，已将其回写账号库".to_string());
+            // 过期更晚只说明令牌更新，还要核对是不是同一个账号才敢回写。
+            match remote_blob_matches_profile(remote, profile_uuid.as_deref()) {
+                Some(true) => {
+                    remote_newer_blob = Some(remote.clone());
+                    warnings.push("WSL 内凭据更新且账号一致，已将其回写账号库".to_string());
+                }
+                Some(false) => warnings.push(
+                    "WSL 内凭据属于另一个账号，已拒绝回写账号库（请在该发行版里切换到本账号）"
+                        .to_string(),
+                ),
+                None => warnings.push(
+                    "无法核对 WSL 内凭据的账号身份，已跳过回写（请在界面重新捕获该账号）"
+                        .to_string(),
+                ),
+            }
         }
     }
 
@@ -319,7 +356,7 @@ pub fn sync_to_wsl_blocking(distro: String, local_blob: String) -> Result<WslSyn
     if should_write_local_credentials(&local_blob, existing.as_deref()) {
         write_credentials_to_wsl(&name, &local_blob)?;
     } else {
-        warnings.push("WSL 内凭据更新，未用本机旧副本覆盖它（已改为回写账号库）".to_string());
+        warnings.push("WSL 内凭据更新，未用本机旧副本覆盖它".to_string());
     }
 
     // 4. 同步 ~/.claude.json（失败只告警，不阻断凭据写入）。
@@ -464,5 +501,42 @@ mod tests {
             "{\"a\":1}",
             Some("{\"b\":2}")
         ));
+    }
+
+    // ── K-4 回写前的身份核对 ──
+
+    fn blob_with_account_uuid(uuid: &str) -> String {
+        serde_json::json!({"claudeAiOauth": {"accountUuid": uuid}}).to_string()
+    }
+
+    #[test]
+    fn allows_writeback_only_when_remote_matches_profile() {
+        let remote = blob_with_account_uuid("same-uuid");
+        assert_eq!(
+            remote_blob_matches_profile(&remote, Some("same-uuid")),
+            Some(true),
+            "账号一致才允许回写"
+        );
+        assert_eq!(
+            remote_blob_matches_profile(&remote, Some("other-uuid")),
+            Some(false),
+            "账号不一致必须拒绝——否则把 WSL 里别的账号凭据写进当前快照"
+        );
+    }
+
+    #[test]
+    fn writeback_is_undecidable_when_either_uuid_missing() {
+        let with_uuid = blob_with_account_uuid("disk-uuid");
+        // 账号库没登记 uuid → 无法判定，不得回写。
+        assert_eq!(remote_blob_matches_profile(&with_uuid, None), None);
+        // 远端 blob 解析不出 uuid → 同样无法判定。
+        assert_eq!(
+            remote_blob_matches_profile("{\"claudeAiOauth\":{}}", Some("stored")),
+            None
+        );
+        assert_eq!(
+            remote_blob_matches_profile("not json", Some("stored")),
+            None
+        );
     }
 }

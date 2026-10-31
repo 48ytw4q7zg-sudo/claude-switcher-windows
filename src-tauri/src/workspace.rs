@@ -285,6 +285,45 @@ fn paths_for(kind: &WorkspaceKind, id: &str, claude_dir: &Path) -> (PathBuf, Pat
     }
 }
 
+/// 校验资产 id：必须是一个安全的**相对**路径片段序列。
+///
+/// 扫描产出的 id 天然合法（`skills/<目录名>`、`commands/nested/deep`），但
+/// [`set_workspace_enabled`] 的 id 来自前端，直接拼进路径会让 `Path::join`
+/// 丢弃基路径（绝对 id）或逃出配置目录（`../`）。这里集中拒绝：
+/// 空、绝对/盘符/UNC 前缀、`.`/`..` 分量、反斜杠、控制字符。
+pub fn validate_asset_id(id: &str) -> Result<(), String> {
+    let trimmed = id.trim();
+    if trimmed.is_empty() {
+        return Err("资产 id 不能为空".to_string());
+    }
+    if trimmed.contains('\\') {
+        return Err("资产 id 不能包含反斜杠，请使用正斜杠分隔".to_string());
+    }
+    if trimmed.chars().any(char::is_control) {
+        return Err("资产 id 含非法控制字符".to_string());
+    }
+    if trimmed.starts_with('/') || trimmed.starts_with("//") {
+        return Err("资产 id 不能是绝对路径".to_string());
+    }
+    // Windows 盘符（C:）与 UNC（\\?\, \\?\UNC\）前缀。
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+        return Err("资产 id 不能带盘符".to_string());
+    }
+    if trimmed.starts_with(r"\\") || trimmed.starts_with("//?/") {
+        return Err("资产 id 不能是 UNC/verbatim 路径".to_string());
+    }
+    for part in trimmed.split('/') {
+        match part {
+            "" | "." | ".." => {
+                return Err("资产 id 不能含空段、. 或 .. 分量".to_string());
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
 /// 启用/停用指定资产，返回更新后的视图。
 ///
 /// 幂等：已是目标状态时返回明确错误；源缺失或目标已被占用（同名项存在）时
@@ -294,8 +333,16 @@ pub fn set_workspace_enabled(
     id: &str,
     enable: bool,
 ) -> Result<WorkspaceItem, String> {
+    // 安全边界：id 直接决定要改名的路径，必须先校验。
+    validate_asset_id(id)?;
     let claude_dir = credentials::claude_dir()?;
     let (active, disabled) = paths_for(&kind, id, &claude_dir);
+    // 双保险：拼出来的路径必须仍在配置目录内。
+    for candidate in [&active, &disabled] {
+        if !candidate.starts_with(&claude_dir) {
+            return Err("资产路径越出配置目录，已停止".to_string());
+        }
+    }
     let (from, to) = if enable {
         (&disabled, &active)
     } else {
@@ -468,5 +515,63 @@ mod tests {
         assert!(!act.exists());
         fsx::retry_io(|| fs::rename(&dis, &act)).unwrap();
         assert!(act.exists());
+    }
+
+    // ── id 安全校验：越界 id 绝不能被拼成 rename 目标 ──
+
+    #[test]
+    fn validate_asset_id_accepts_normal_and_nested_ids() {
+        assert!(validate_asset_id("tdd").is_ok());
+        assert!(validate_asset_id("api-designer").is_ok());
+        assert!(
+            validate_asset_id("nested/deep").is_ok(),
+            "嵌套命令是合法 id"
+        );
+        assert!(validate_asset_id("CLAUDE").is_ok());
+    }
+
+    #[test]
+    fn validate_asset_id_rejects_traversal_and_absolute() {
+        assert!(validate_asset_id("").is_err());
+        assert!(validate_asset_id("   ").is_err());
+        assert!(validate_asset_id("../outside").is_err());
+        assert!(validate_asset_id("a/../../b").is_err());
+        assert!(validate_asset_id(".").is_err());
+        assert!(validate_asset_id("a//b").is_err());
+        assert!(validate_asset_id("/etc/passwd").is_err());
+        assert!(validate_asset_id("C:/Windows/x").is_err());
+        assert!(validate_asset_id(r"C:\Windows\x").is_err());
+        assert!(validate_asset_id(r"\\server\share").is_err());
+        assert!(validate_asset_id("a\\b").is_err(), "反斜杠一律拒绝");
+        assert!(validate_asset_id("bad\u{0000}id").is_err());
+    }
+
+    #[test]
+    fn paths_for_absolute_id_drops_the_base_dir() {
+        // 校验必须在 paths_for 之前挡住绝对 id：Path::join 会丢弃基路径。
+        let root = Path::new("C:\\Users\\me\\.claude");
+        let (active, _) = paths_for(&WorkspaceKind::Command, "C:/Windows/evil", root);
+        assert!(
+            !active.starts_with(root),
+            "绝对 id 会丢弃基路径，必须靠 validate_asset_id 事先拒绝（got {}）",
+            active.display()
+        );
+        assert!(validate_asset_id("C:/Windows/evil").is_err());
+    }
+
+    #[test]
+    fn paths_for_traversal_id_builds_an_escaping_path() {
+        let root = Path::new("C:\\Users\\me\\.claude");
+        let (active, _) = paths_for(&WorkspaceKind::Command, "../evil", root);
+        // `..` 在 Path::starts_with 眼里只是普通组件，所以 starts_with 仍为 true——
+        // 但拼出来的路径含 ParentDir，交给 rename 就会写到配置目录外面。
+        assert!(
+            active
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir)),
+            ".. id 会生成含 ParentDir 的路径，必须靠 validate_asset_id 事先拒绝（got {}）",
+            active.display()
+        );
+        assert!(validate_asset_id("../evil").is_err());
     }
 }
