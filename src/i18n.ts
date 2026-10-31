@@ -31,7 +31,7 @@ const en: Dict = {
   'integ.bind.unbind': 'Unbind directory',
   'integ.menu.title': 'Start menu shortcuts',
   'integ.menu.intro':
-    'Create one Start menu shortcut per account (--switch "<name>"). Shortcuts are rebuilt to stay in sync after rename/delete.',
+    'Create one Start menu shortcut per account (--switch-id <id>). Shortcuts are rebuilt to stay in sync after rename/delete.',
   'integ.menu.rebuild': 'Rebuild shortcuts',
   'integ.menu.clear': 'Clear all shortcuts',
   'integ.diag.title': 'Diagnostic bundle',
@@ -87,7 +87,7 @@ const zh: Dict = {
   'integ.bind.unbind': '解绑目录',
   'integ.menu.title': '开始菜单快捷方式',
   'integ.menu.intro':
-    '为每个账号生成一个开始菜单快捷方式（--switch "<名称>"）；重命名/删除后重建以保持同步。',
+    '为每个账号生成一个开始菜单快捷方式（--switch-id <id>）；重命名/删除后重建以保持同步。',
   'integ.menu.rebuild': '重建快捷方式',
   'integ.menu.clear': '全部清理',
   'integ.diag.title': '诊断包',
