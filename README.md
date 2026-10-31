@@ -39,8 +39,8 @@
 | 项 | 状态 |
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
-| 安装包 | **Release v0.4.0**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计，SHA256 见 Release 说明 |
-| 测试 | `cargo test --lib` **250 passed / 0 failed / 0 ignored**；`cargo clippy --all-targets -- -D warnings` 零警告；`npx tsc --noEmit` 通过 |
+| 安装包 | **Release v0.5.0**（v0.6.0 合并后由 `.github/workflows/windows-build.yml` 自动构建 MSI + NSIS + 便携 zip），产物来源可审计，SHA256 见 Release 说明 |
+| 测试 | `cargo test --lib` **369 passed / 0 failed / 0 ignored**；`cargo clippy --all-targets -- -D warnings` 零警告；`npx tsc --noEmit` 通过 |
 | 实测环境 | 无显示器环境本地构建；Windows 10/11 端到端实机验证项见文末清单 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
 
@@ -84,6 +84,17 @@ claude-switcher-windows/
 │   │   ├── checks.rs              # 14 项安全检查 + 静默总检 + 一键修复
 │   │   ├── keep.rs                # 跨身份保留 keep-in-workspace（stage/merge）
 │   │   ├── diagnostics.rs         # open-safe / 代理诊断 / 指纹 / cli-info
+│   │   ├── bin/cs.rs              # 控制台子系统 cs.exe（--list/--status/--switch/run）
+│   │   ├── dirbinding.rs          # 目录绑定标记 + cs run（CLAUDE_CONFIG_DIR）
+│   │   ├── userpath.rs            # 用户 PATH（HKCU，REG_EXPAND_SZ + WM_SETTINGCHANGE）
+│   │   ├── shortcuts.rs           # 开始菜单 .lnk（每账号 --switch-id）
+│   │   ├── naming.rs              # 文件名合法化 + 保留设备名
+│   │   ├── token_status.rs        # 令牌状态纯函数（有效/即将过期/已过期/未知）
+│   │   ├── provider.rs            # 第三方供应商（加密 token，受管 env 键）
+│   │   ├── wsl.rs                 # WSL 实验集成（stdin 传凭据，默认关）
+│   │   ├── sanitize.rs            # 诊断脱敏（敏感键/令牌形态/邮箱/用户名路径）
+│   │   ├── workspace.rs           # Skills/命令/子代理/CLAUDE.md 启用停用
+│   │   ├── permissions.rs         # 权限与钩子编辑器（合并写入，保留未托管字段）
 │   │   └── platform/              # ★ Windows 平台适配（唯一允许写 cfg 的地方）
 │   │       ├── mod.rs             # 平台入口（非 Windows 目标直接编译报错）
 │   │       └── windows.rs         # 全部 Win32 细节
@@ -107,6 +118,11 @@ claude-switcher-windows/
 │   │   ├── ReconcileSettings.tsx  # 对账自动收养开关
 │   │   ├── McpPanel.tsx           # MCP 服务器管理
 │   │   ├── PrivacyTools.tsx       # open-safe / 代理诊断 / 指纹 / cli-info
+│   │   ├── IntegrationPanel.tsx   # PATH / 目录绑定 / 开始菜单 / 诊断包
+│   │   ├── ProviderPanel.tsx      # 第三方供应商
+│   │   ├── WslPanel.tsx           # WSL 集成（实验）
+│   │   ├── WorkspacePanel.tsx     # 工作区资产管理
+│   │   ├── PermissionPanel.tsx    # 权限与钩子编辑器
 │   │   └── types.ts               # 前后端契约类型
 ├── docs/
 │   ├── upstream-baseline.md       # 双上游基线记录 + 功能对等矩阵 + 升级审查流程
