@@ -43,6 +43,8 @@ import { initI18n, t } from './i18n';
 import { IntegrationPanel } from './components/IntegrationPanel';
 import { ProviderPanel } from './components/ProviderPanel';
 import { WslPanel } from './components/WslPanel';
+import { WorkspacePanel } from './components/WorkspacePanel';
+import { PermissionPanel } from './components/PermissionPanel';
 
 const WINDOW_LABEL = (() => {
   if (new URLSearchParams(window.location.search).get('window') === 'tray-popup') {
@@ -1601,6 +1603,10 @@ function App() {
       <ProviderPanel />
 
       <WslPanel />
+
+      <WorkspacePanel />
+
+      <PermissionPanel />
 
       <section className="profiles">
         <div className="section-title">

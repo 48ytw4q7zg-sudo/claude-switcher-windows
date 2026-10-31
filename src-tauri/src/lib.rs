@@ -41,6 +41,7 @@ mod net;
 mod notify_state;
 mod parallel;
 mod paths;
+mod permissions;
 mod platform;
 mod processes;
 mod provider;
@@ -59,6 +60,7 @@ mod tray;
 mod update;
 mod usage;
 mod userpath;
+mod workspace;
 mod wsl;
 
 use std::collections::BTreeMap;
@@ -1324,6 +1326,37 @@ async fn add_to_user_path(bin_dir: String) -> Result<userpath::PathUpdateResult,
 #[tauri::command]
 async fn remove_from_user_path(bin_dir: String) -> Result<userpath::PathUpdateResult, String> {
     blocking(move || userpath::remove_bin_from_user_path(&bin_dir)).await
+}
+
+/// 列出工作区资产（技能/命令/子代理/CLAUDE.md）。
+#[tauri::command]
+async fn list_workspace_items() -> Result<Vec<workspace::WorkspaceItem>, String> {
+    blocking(workspace::list_workspace_items).await
+}
+
+/// 启用/停用工作区资产（重命名实现，可逆）。
+#[tauri::command]
+async fn set_workspace_item_enabled(
+    kind: workspace::WorkspaceKind,
+    id: String,
+    enabled: bool,
+) -> Result<workspace::WorkspaceItem, String> {
+    blocking(move || workspace::set_workspace_enabled(kind, &id, enabled)).await
+}
+
+/// 读取权限与钩子编辑器数据（含校验告警）。
+#[tauri::command]
+async fn read_permission_editor() -> Result<permissions::PermissionEditorData, String> {
+    blocking(permissions::read_permission_editor).await
+}
+
+/// 保存权限与钩子编辑器数据（乐观并发写入）。
+#[tauri::command]
+async fn save_permission_editor(
+    permissions: permissions::PermissionRules,
+    hooks: Vec<permissions::HookEntry>,
+) -> Result<(), String> {
+    blocking(move || permissions::save_permission_editor(permissions, hooks)).await
 }
 
 /// F-1：为指定目录创建账号绑定标记。
@@ -2676,6 +2709,10 @@ pub fn run() {
             is_portable_mode,
             add_to_user_path,
             remove_from_user_path,
+            list_workspace_items,
+            set_workspace_item_enabled,
+            read_permission_editor,
+            save_permission_editor,
             get_tool_bin_dir,
             bind_directory,
             unbind_directory,
