@@ -3,14 +3,13 @@ import { invoke } from '@tauri-apps/api/core';
 import { Globe, Loader2, Plug, Trash2 } from 'lucide-react';
 import { useI18n } from '../i18n';
 
-interface ProviderProfile {
+// K-3：后端 ProviderView（不含加密令牌）。
+interface ProviderView {
   id: string;
   name: string;
   base_url: string;
   model_env: Record<string, string>;
-  managed_env_keys: string[];
-  created_at: string;
-  updated_at: string;
+  is_current: boolean;
 }
 
 /** 把每行 KEY=VALUE 解析成 map（忽略空行与无 '=' 的行）。 */
@@ -29,7 +28,7 @@ function parseModelEnv(text: string): Record<string, string> {
 /** F-5：第三方供应商管理。 */
 export function ProviderPanel() {
   const { t } = useI18n();
-  const [providers, setProviders] = useState<ProviderProfile[]>([]);
+  const [providers, setProviders] = useState<ProviderView[]>([]);
   const [activeId, setActiveId] = useState<string | null>(null);
   const [name, setName] = useState('');
   const [baseUrl, setBaseUrl] = useState('');
@@ -41,7 +40,7 @@ export function ProviderPanel() {
 
   const refresh = useCallback(async () => {
     const [list, active] = await Promise.all([
-      invoke<ProviderProfile[]>('list_providers'),
+      invoke<ProviderView[]>('list_providers'),
       invoke<string | null>('get_active_provider_id'),
     ]);
     setProviders(list);

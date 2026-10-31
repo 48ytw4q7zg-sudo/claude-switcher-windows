@@ -137,6 +137,67 @@ pub fn resolves_to_cmd_shim(command: &str) -> bool {
     resolves_to_cmd_shim_with(command, &path_env, &pathext)
 }
 
+/// 纯函数：给定 PATH / PATHEXT，返回 command 解析到的第一个真实可执行文件路径。
+///
+/// 与 [`resolves_to_cmd_shim_with`] 相同的解析规则，但返回路径而非布尔：
+/// - 含路径分隔符：有扩展名则直接检查该文件；无扩展名按 PATHEXT 顺序补全；
+/// - 裸名：对 PATH 目录 × PATHEXT 顺序，第一个存在的文件即返回。
+///
+/// 找不到任何真实文件返回 None。
+fn resolve_executable_on_path_with(
+    command: &str,
+    path_env: &str,
+    pathext: &str,
+) -> Option<PathBuf> {
+    let raw = command.trim().trim_matches('"');
+    if raw.is_empty() {
+        return None;
+    }
+    let pathexts = parse_pathext(pathext);
+    let has_sep = raw.contains('/') || raw.contains('\\');
+
+    if has_sep {
+        let p = Path::new(raw);
+        // 有扩展名：信任显式路径，仅在文件真实存在时返回。
+        if p.extension().is_some() {
+            return p.is_file().then(|| p.to_path_buf());
+        }
+        // 无扩展名：按 PATHEXT 补全并检查存在。
+        for ext in &pathexts {
+            let candidate = PathBuf::from(format!("{raw}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+        return None;
+    }
+
+    // 裸名：PATH 目录顺序 × PATHEXT 扩展名顺序，第一个命中即返回。
+    for dir in path_env.split(';') {
+        let dir = dir.trim();
+        if dir.is_empty() {
+            continue;
+        }
+        for ext in &pathexts {
+            let candidate = Path::new(dir).join(format!("{raw}{ext}"));
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+/// 按当前进程 PATH / PATHEXT 解析 command 的真实可执行文件路径；找不到返回 None。
+///
+/// 供 `cs run`（K-2）直接 `Command::new(路径)` 启动 claude，避免 `cmd /c` 对
+/// `& | ^ %` 等参数的二次解析风险。
+pub fn resolve_executable_on_path(command: &str) -> Option<PathBuf> {
+    let path_env = std::env::var("PATH").unwrap_or_default();
+    let pathext = std::env::var("PATHEXT").unwrap_or_default();
+    resolve_executable_on_path_with(command, &path_env, &pathext)
+}
+
 /// 内部纯逻辑：按给定 shim 判定谓词包装 stdio 启动器（便于单测注入假 PATH）。
 fn normalize_mcp_stdio_with(server: &mut Value, is_shim: impl Fn(&str) -> bool) {
     let is_stdio = match server.get("type").and_then(|t| t.as_str()) {
@@ -353,7 +414,7 @@ fn write_temp_in_dir(path: &Path, contents: &str) -> Result<PathBuf, String> {
 ///    [`MAX_OPT_CONFLICT_RETRIES`] 次；仍冲突返回 Err（绝不覆盖外部改动）。
 ///
 /// 返回 `Ok(true)` = 成功写入一次；`Ok(false)` = apply 判定无改动、未落盘。
-fn modify_json_optimistic(
+pub(crate) fn modify_json_optimistic(
     path: &Path,
     mut apply: impl FnMut(&mut Value) -> Result<bool, String>,
 ) -> Result<bool, String> {
@@ -546,6 +607,39 @@ mod tests {
         assert!(
             !resolves_to_cmd_shim_with("nobody-here", &path_env, pathext),
             "PATH 上不存在的命令不包装"
+        );
+    }
+
+    #[test]
+    fn resolve_executable_returns_first_real_path() {
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        File::create(d1.path().join("node.exe")).unwrap();
+        File::create(d2.path().join("npx.cmd")).unwrap();
+        let path_env = format!("{};{}", d1.path().display(), d2.path().display());
+        let pathext = ".COM;.EXE;.BAT;.CMD";
+
+        // 裸名：返回 PATH 上第一个命中的真实文件完整路径（扩展名按 PATHEXT 原样拼写）。
+        assert_eq!(
+            resolve_executable_on_path_with("node", &path_env, pathext),
+            Some(d1.path().join("node.EXE"))
+        );
+        assert_eq!(
+            resolve_executable_on_path_with("npx", &path_env, pathext),
+            Some(d2.path().join("npx.CMD"))
+        );
+        // 不存在 → None。
+        assert_eq!(
+            resolve_executable_on_path_with("ghost", &path_env, pathext),
+            None
+        );
+        // 无扩展名的相对路径按 PATHEXT 补全。
+        let d3 = tempfile::tempdir().unwrap();
+        File::create(d3.path().join("launcher.cmd")).unwrap();
+        let raw = format!("{}\\launcher", d3.path().display());
+        assert_eq!(
+            resolve_executable_on_path_with(&raw, "", ".EXE;.CMD"),
+            Some(d3.path().join("launcher.CMD"))
         );
     }
 

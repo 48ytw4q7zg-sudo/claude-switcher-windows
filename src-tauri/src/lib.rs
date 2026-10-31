@@ -614,6 +614,8 @@ fn prepare_new_account_login_blocking(
         warnings.extend(processes::kill_claude_code_processes()?);
 
         let backup = create_backup_with_label("before-new-account-login")?;
+        // K-3：开新号向导前先清供应商 env，避免供应商的键被写进 OAuth 账号快照。
+        provider::clear_active_provider_env(store_data)?;
         warnings.extend(refresh_current_profile_snapshot(
             store_data,
             "__new_account_login__",
@@ -1299,6 +1301,13 @@ async fn rebuild_start_menu_shortcuts() -> Result<usize, String> {
     blocking(shortcuts::sync_all_shortcuts).await
 }
 
+/// K-5：是否运行于便携模式（exe 旁有 portable.flag）。便携版移动 exe 后，
+/// 旧快捷方式指向的目标路径会失效，界面据此提示重新同步。
+#[tauri::command]
+async fn is_portable_mode() -> Result<bool, String> {
+    blocking(|| Ok(paths::portable_root().is_some())).await
+}
+
 /// F-2：全部清理开始菜单快捷方式（卸载撤销）。
 #[tauri::command]
 async fn clear_start_menu_shortcuts() -> Result<(), String> {
@@ -1307,13 +1316,13 @@ async fn clear_start_menu_shortcuts() -> Result<(), String> {
 
 /// F-1：把工具 bin 目录追加到用户 PATH（REG_EXPAND_SZ，幂等）。
 #[tauri::command]
-async fn add_to_user_path(bin_dir: String) -> Result<bool, String> {
+async fn add_to_user_path(bin_dir: String) -> Result<userpath::PathUpdateResult, String> {
     blocking(move || userpath::add_bin_to_user_path(&bin_dir)).await
 }
 
 /// F-1：从用户 PATH 移除工具 bin 目录（撤销）。
 #[tauri::command]
-async fn remove_from_user_path(bin_dir: String) -> Result<bool, String> {
+async fn remove_from_user_path(bin_dir: String) -> Result<userpath::PathUpdateResult, String> {
     blocking(move || userpath::remove_bin_from_user_path(&bin_dir)).await
 }
 
@@ -1353,9 +1362,9 @@ async fn create_provider(
         .await
 }
 
-/// F-5：列出全部供应商。
+/// F-5/K-3：列出全部供应商视图（不含加密令牌）。
 #[tauri::command]
-async fn list_providers() -> Result<Vec<store::ProviderProfile>, String> {
+async fn list_providers() -> Result<Vec<provider::ProviderView>, String> {
     blocking(provider::list_providers_blocking).await
 }
 
@@ -1399,25 +1408,41 @@ async fn list_wsl_distros() -> Result<Vec<String>, String> {
     blocking(wsl::list_wsl_distros_blocking).await
 }
 
-/// F-6：把当前账号凭据写入指定发行版（实验开关未开则拒绝）。
+/// F-6/K-4：把当前账号凭据同步到指定发行版，返回对账报告（实验开关未开则拒绝）。
+///
+/// 若 WSL 内副本更新，先把它回写当前账号库，再返回报告给前端展示。
 #[tauri::command]
-async fn write_wsl_credentials(distro: String) -> Result<(), String> {
+async fn write_wsl_credentials(distro: String) -> Result<wsl::WslSyncReport, String> {
     blocking(move || {
-        let store_data = store::load_store()?;
-        let current_id = store_data
-            .current_profile_id
-            .as_deref()
-            .ok_or_else(|| "当前没有可写入 WSL 的账号".to_string())?;
-        let profile = store_data
-            .profiles
-            .iter()
-            .find(|p| p.id == current_id)
-            .ok_or_else(|| "找不到当前账号".to_string())?;
-        let blob = profile
-            .keychain_password
-            .as_deref()
-            .ok_or_else(|| "当前账号没有可写入 WSL 的凭据".to_string())?;
-        wsl::write_wsl_credentials_blocking(distro, blob.to_string())
+        let (current_id, blob) = {
+            let store_data = store::load_store()?;
+            let current_id = store_data
+                .current_profile_id
+                .clone()
+                .ok_or_else(|| "当前没有可写入 WSL 的账号".to_string())?;
+            let profile = store_data
+                .profiles
+                .iter()
+                .find(|p| p.id == current_id)
+                .ok_or_else(|| "找不到当前账号".to_string())?;
+            let blob = profile
+                .keychain_password
+                .clone()
+                .ok_or_else(|| "当前账号没有可写入 WSL 的凭据".to_string())?;
+            (current_id, blob)
+        };
+        let report = wsl::sync_to_wsl_blocking(distro, blob)?;
+        // WSL 副本更新：回写账号库。
+        if let Some(remote_blob) = report.remote_newer_blob.clone() {
+            store::with_store(|data| {
+                if let Some(profile) = data.profiles.iter_mut().find(|p| p.id == current_id) {
+                    profile.keychain_password = Some(remote_blob);
+                    profile.updated_at = chrono::Utc::now();
+                }
+                Ok(())
+            })?;
+        }
+        Ok(report)
     })
     .await
 }
@@ -1886,26 +1911,66 @@ async fn build_diagnostic_bundle(include_network: Option<bool>) -> Result<String
     blocking(move || build_diagnostic_bundle_blocking(include_network.unwrap_or(false))).await
 }
 
-fn build_diagnostic_bundle_blocking(include_network: bool) -> Result<String, String> {
-    use std::io::Write;
-    use zip::write::SimpleFileOptions;
+/// K-7：导出前预览脱敏后的诊断内容（不写盘、不打包）。
+#[derive(Debug, Clone, serde::Serialize)]
+struct DiagnosticPreview {
+    info_json: String,
+    log_text: String,
+}
 
+/// K-7：返回脱敏后的诊断信息与日志，供用户先确认再打包。
+#[tauri::command]
+async fn preview_diagnostic_bundle(
+    include_network: Option<bool>,
+) -> Result<DiagnosticPreview, String> {
+    blocking(move || {
+        let (info_json, log_text) =
+            collect_redacted_diagnostic_content(include_network.unwrap_or(false))?;
+        Ok(DiagnosticPreview {
+            info_json,
+            log_text,
+        })
+    })
+    .await
+}
+
+/// K-7：收集并脱敏诊断包内容（不写盘），返回 (诊断信息 JSON, 日志文本)。
+/// 供预览与实际打包共用，保证用户看到的就是会被导出的内容。
+fn collect_redacted_diagnostic_content(include_network: bool) -> Result<(String, String), String> {
     // 1) 收集诊断信息并脱敏。
     let mut info = get_diagnostic_info_blocking(include_network)?;
     sanitize::redact_json(&mut info);
     let info_text =
         serde_json::to_string_pretty(&info).map_err(|e| format!("序列化诊断信息失败: {e}"))?;
 
-    // 2) 读取日志并脱敏（日志可能含邮箱）。
+    // 2) 读取日志并脱敏（日志可能含邮箱/令牌）。
     let log_path = p::app_data_dir()?.join("logs").join("claude-switcher.log");
     let log_text = if log_path.exists() {
         let raw = fs::read_to_string(&log_path).unwrap_or_default();
-        sanitize::redact_emails_in_text(&raw)
+        sanitize::redact_text(&raw, &sanitize_current_user())
     } else {
         "（无日志文件）".to_string()
     };
+    Ok((info_text, log_text))
+}
 
-    // 3) 打包 zip 到 app_data_dir/diagnostic-bundle-<时间戳>.zip。
+/// 当前用户名（供 redact_text 替换路径），取不到时返回空串。
+fn sanitize_current_user() -> String {
+    dirs::home_dir()
+        .and_then(|home| {
+            home.file_name()
+                .map(|name| name.to_string_lossy().to_string())
+        })
+        .unwrap_or_default()
+}
+
+fn build_diagnostic_bundle_blocking(include_network: bool) -> Result<String, String> {
+    use std::io::Write;
+    use zip::write::SimpleFileOptions;
+
+    let (info_text, log_text) = collect_redacted_diagnostic_content(include_network)?;
+
+    // 打包 zip 到 app_data_dir/diagnostic-bundle-<时间戳>.zip。
     let timestamp = Utc::now().format("%Y%m%d-%H%M%S").to_string();
     let zip_path = p::app_data_dir()?.join(format!("diagnostic-bundle-{timestamp}.zip"));
     let file = fs::File::create(&zip_path).map_err(|e| format!("创建诊断包文件失败: {e}"))?;
@@ -2527,13 +2592,13 @@ pub fn run() {
         .plugin(tauri_plugin_notification::init())
         // 单实例：第二个进程的 argv 会回调到运行实例——--switch 转交执行，
         // 其余情况唤起主窗口；也避免两个进程并发写账号库。
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
-            if let Some(cli::CliCommand::Switch(name)) = cli::parse(&argv) {
-                cli::forward_switch(app, &name);
-            } else {
-                tray::show_main_window(app);
-            }
-        }))
+        .plugin(tauri_plugin_single_instance::init(
+            |app, argv, _cwd| match cli::parse(&argv) {
+                Some(cli::CliCommand::Switch(name)) => cli::forward_switch(app, &name),
+                Some(cli::CliCommand::SwitchId(id)) => cli::forward_switch_id(app, &id),
+                _ => tray::show_main_window(app),
+            },
+        ))
         .on_window_event(|window, event| {
             // 主窗口点 X → 隐藏到托盘（退出走托盘菜单）。
             if window.label() == "main" {
@@ -2546,11 +2611,20 @@ pub fn run() {
         .setup(move |app| {
             // CLI --switch 且未被单实例插件转交（说明本进程是唯一实例）：
             // 执行切换、打印结果后立即退出，不安装托盘、不显示主窗口。
-            if let Some(cli::CliCommand::Switch(name)) = &cli_command {
-                let code = cli::run_switch_first_instance(name);
-                use std::io::Write;
-                let _ = std::io::stdout().flush();
-                std::process::exit(code);
+            match &cli_command {
+                Some(cli::CliCommand::Switch(name)) => {
+                    let code = cli::run_switch_first_instance(name);
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(code);
+                }
+                Some(cli::CliCommand::SwitchId(id)) => {
+                    let code = cli::run_switch_id_first_instance(id);
+                    use std::io::Write;
+                    let _ = std::io::stdout().flush();
+                    std::process::exit(code);
+                }
+                _ => {}
             }
 
             if let Err(error) = tray::install_tray_handlers(app) {
@@ -2599,6 +2673,7 @@ pub fn run() {
             rename_profile,
             rebuild_start_menu_shortcuts,
             clear_start_menu_shortcuts,
+            is_portable_mode,
             add_to_user_path,
             remove_from_user_path,
             get_tool_bin_dir,
@@ -2625,6 +2700,7 @@ pub fn run() {
             get_logs_dir,
             get_diagnostic_info,
             build_diagnostic_bundle,
+            preview_diagnostic_bundle,
             open_developer_settings,
             open_logs_dir,
             get_claude_config_dir,

@@ -26,6 +26,26 @@ const PATH_VALUE_NAME: &str = "Path";
 const BROADCAST_TIMEOUT_MS: u32 = 5000;
 const BACKUP_DIR_NAME: &str = ".claude-switcher";
 const BACKUP_FILE_NAME: &str = "path-backup.txt";
+/// K-6：旧工具按 2047 字符截断 PATH，超过即给出警告。
+const MAX_PATH_LENGTH_WARN: usize = 2047;
+
+/// K-6：PATH 增删结果，带可能的长度警告（前端据此提示，不阻断写入）。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct PathUpdateResult {
+    pub changed: bool,
+    pub warning: Option<String>,
+}
+
+/// 纯函数：PATH 长度超过旧工具截断阈值（2047）时返回警告。
+fn path_length_warning(text: &str) -> Option<String> {
+    if text.chars().count() > MAX_PATH_LENGTH_WARN {
+        Some(format!(
+            "PATH 长度已超过 {MAX_PATH_LENGTH_WARN} 字符，部分旧工具可能截断，建议清理无用条目"
+        ))
+    } else {
+        None
+    }
+}
 
 /// 归一化一个 PATH 条目用于比较：去首尾空白、去尾反斜杠、转 ASCII 小写。
 /// 这样 `C:\Tools\bin` 与 `c:\tools\bin\` 会被视为同一项。
@@ -139,36 +159,48 @@ fn broadcast_environment_change() -> bool {
     lresult != 0
 }
 
-/// 把 `bin_dir` 追加到用户 PATH（已存在则幂等跳过）。返回是否实际修改。
-pub fn add_bin_to_user_path(bin_dir: &str) -> Result<bool, String> {
+/// 把 `bin_dir` 追加到用户 PATH（已存在则幂等跳过）。返回是否实际修改及长度警告。
+pub fn add_bin_to_user_path(bin_dir: &str) -> Result<PathUpdateResult, String> {
     let entry = bin_dir.trim();
     if entry.is_empty() {
         return Err("要写入 PATH 的目录为空".to_string());
     }
     let current = read_user_path()?.unwrap_or_default();
     let Some(updated) = add_to_path(&current, entry) else {
-        return Ok(false);
+        return Ok(PathUpdateResult {
+            changed: false,
+            warning: None,
+        });
     };
     backup_user_path(&current)?;
     write_user_path(&updated)?;
     let _ = broadcast_environment_change();
-    Ok(true)
+    Ok(PathUpdateResult {
+        changed: true,
+        warning: path_length_warning(&updated),
+    })
 }
 
-/// 从用户 PATH 中移除 `bin_dir`（不存在则无变化）。返回是否实际修改。
-pub fn remove_bin_from_user_path(bin_dir: &str) -> Result<bool, String> {
+/// 从用户 PATH 中移除 `bin_dir`（不存在则无变化）。返回是否实际修改及长度警告。
+pub fn remove_bin_from_user_path(bin_dir: &str) -> Result<PathUpdateResult, String> {
     let entry = bin_dir.trim();
     if entry.is_empty() {
         return Err("要从 PATH 移除的目录为空".to_string());
     }
     let current = read_user_path()?.unwrap_or_default();
     let Some(updated) = remove_from_path(&current, entry) else {
-        return Ok(false);
+        return Ok(PathUpdateResult {
+            changed: false,
+            warning: None,
+        });
     };
     backup_user_path(&current)?;
     write_user_path(&updated)?;
     let _ = broadcast_environment_change();
-    Ok(true)
+    Ok(PathUpdateResult {
+        changed: true,
+        warning: path_length_warning(&updated),
+    })
 }
 
 #[cfg(test)]
@@ -241,5 +273,16 @@ mod tests {
     fn normalize_entry_handles_case_slash_and_whitespace() {
         assert_eq!(normalize_entry("  C:\\X\\ "), "c:\\x");
         assert_eq!(normalize_entry("c:\\x\\"), "c:\\x");
+    }
+
+    #[test]
+    fn length_warning_only_over_threshold() {
+        assert_eq!(path_length_warning("a".repeat(2047).as_str()), None);
+        assert!(path_length_warning("a".repeat(2048).as_str()).is_some());
+    }
+
+    #[test]
+    fn no_change_result_has_no_warning() {
+        assert_eq!(add_to_path("a;b", "b"), None, "重复项不产生修改");
     }
 }

@@ -107,24 +107,35 @@ fn stored_profile_uuid(profile: &StoredProfile) -> Option<&str> {
     })
 }
 
-/// J-3 核心：在已借用的 profile 上做身份校验并回写凭据。
+/// J-3/K-1 核心：在已借用的 profile 上做身份校验并按需回写凭据。
 ///
-/// 先从磁盘 blob 本地解析 accountUuid，与该 profile 已登记 uuid 比对：
+/// `disk_uuid` 为已解析到的磁盘账号 uuid（本地解析或网络 profile 核对），
+/// `conservative_when_unknown` 决定磁盘 uuid 缺失时的策略：
 /// - 两者都能解析且**不一致** → 拒绝回写，返回提示「该并行目录已换成别的账号，
 ///   可收养为新账号」，绝不覆盖；
-/// - 一致（或本地无法解析 uuid）→ 沿用原 best-effort 回写，值不同才更新。
+/// - `disk_uuid=None` 且 `conservative_when_unknown=true`（后台网络路径）→
+///   查不到身份，保守不覆盖，留待下次托盘刷新再试；
+/// - 其余（一致，或本地路径 uuid 缺失）→ best-effort 回写，值不同才更新。
 ///
-/// 纯本地、不联网。返回 Some(提示) 时调用方负责展示/记录。
-fn verify_and_apply_credential(profile: &mut StoredProfile, raw: &str) -> Option<String> {
-    let disk_uuid = credential_blob_account_uuid(raw);
+/// 返回 Some(提示) 时调用方负责展示/记录。
+fn verify_and_apply_credential_inner(
+    profile: &mut StoredProfile,
+    raw: &str,
+    disk_uuid: Option<&str>,
+    conservative_when_unknown: bool,
+) -> Option<String> {
     let stored_uuid = stored_profile_uuid(profile);
-    if let (Some(disk), Some(stored)) = (disk_uuid.as_deref(), stored_uuid) {
+    if let (Some(disk), Some(stored)) = (disk_uuid, stored_uuid) {
         if disk != stored {
             return Some(format!(
                 "并行目录「{}」已换成别的账号（磁盘账号 {disk} ≠ 登记账号 {stored}），已拒绝回写以免覆盖；可在界面把它收养为新账号。",
                 profile.name
             ));
         }
+    }
+    if disk_uuid.is_none() && conservative_when_unknown {
+        // 网络核对查不到身份：保守不覆盖，下次托盘刷新再试。
+        return None;
     }
     let same = matches!(&profile.keychain_password, Some(cur) if cur == raw);
     if !same {
@@ -134,29 +145,57 @@ fn verify_and_apply_credential(profile: &mut StoredProfile, raw: &str) -> Option
     None
 }
 
-/// 把并行终端里已刷新过的 `.credentials.json` 原文回写到账号库（best-effort）。
+/// J-3：本地解析磁盘 uuid 后做身份校验（纯本地、不联网）。
+///
+/// 本地无法解析 uuid 时沿用 best-effort 回写（`conservative=false`），
+/// 供持锁的 in-store 扫描路径使用——那里不能做阻塞联网。
+/// 返回 Some(提示) 时调用方负责展示/记录。
+fn verify_and_apply_credential(profile: &mut StoredProfile, raw: &str) -> Option<String> {
+    let disk_uuid = credential_blob_account_uuid(raw);
+    verify_and_apply_credential_inner(profile, raw, disk_uuid.as_deref(), false)
+}
+
+/// K-1：用已核对好的磁盘 uuid（网络 profile）做身份校验，查不到身份时保守不覆盖。
+fn verify_and_apply_credential_checked(
+    profile: &mut StoredProfile,
+    raw: &str,
+    disk_uuid: Option<&str>,
+) -> Option<String> {
+    verify_and_apply_credential_inner(profile, raw, disk_uuid, true)
+}
+
+/// 把并行终端里已刷新过的 `.credentials.json` 原文回写到账号库（best-effort，K-1 后台化）。
 ///
 /// 并行终端里 claude 刷新令牌后，磁盘上的 `.credentials.json` 是新的，但账号库里
-/// 快照的 `keychain_password` 还是旧的。J-3 起回写前先做身份校验，身份不一致拒绝
-/// 回写（见 [`verify_and_apply_credential`]）。
+/// 快照的 `keychain_password` 还是旧的。真实凭据 blob 不含 uuid，本地校验恒为空操作，
+/// 因此 K-1 起整个回写放进**后台线程**：
+/// 1. 用 access token 调 OAuth profile 端点核对磁盘账号 uuid（带超时与 token 指纹缓存）；
+/// 2. 进 `with_store` 做身份校验：身份不一致拒绝回写；查不到身份保守不覆盖，
+///    留待下次托盘刷新；一致才更新。
 ///
-/// 整个函数 best-effort：任何内部错误都只记日志、不向上抛——开终端不能因为同步失败
-/// 而被阻断。找不到对应 profile 视为 no-op。
+/// 立即返回、不阻塞开终端。任何内部错误都只记日志；找不到对应 profile 视为 no-op。
 fn sync_parallel_credentials_back(profile_id: &str, raw_cred: &str) {
-    let result = store::with_store(|s| {
-        let Some(profile) = s.profiles.iter_mut().find(|p| p.id == profile_id) else {
-            return Ok(());
-        };
-        if let Some(warn) = verify_and_apply_credential(profile, raw_cred) {
-            crate::log_error(&warn);
+    let (id, raw) = (profile_id.to_string(), raw_cred.to_string());
+    std::thread::spawn(move || {
+        // 网络核对（约 4 秒超时，命中缓存则更快）；失败 → None。
+        let disk_uuid = crate::usage::oauth_account_uuid_for_blob(&raw);
+        let result = store::with_store(|s| {
+            let Some(profile) = s.profiles.iter_mut().find(|p| p.id == id) else {
+                return Ok(());
+            };
+            if let Some(warn) =
+                verify_and_apply_credential_checked(profile, &raw, disk_uuid.as_deref())
+            {
+                crate::log_error(&warn);
+            }
+            Ok::<(), String>(())
+        });
+        if let Err(e) = result {
+            crate::log_error(&format!(
+                "回写并行终端凭据到账号库失败（best-effort，已忽略）: profile={id}, err={e}"
+            ));
         }
-        Ok::<(), String>(())
     });
-    if let Err(e) = result {
-        crate::log_error(&format!(
-            "回写并行终端凭据到账号库失败（best-effort，已忽略）: profile={profile_id}, err={e}"
-        ));
-    }
 }
 
 /// J-3 同步点：扫描 `accounts/*/.credentials.json`，把并行终端刷新的令牌回写账号库。
@@ -555,6 +594,59 @@ mod tests {
         // 本地无法解析磁盘 uuid → 不阻断，best-effort 回写。
         assert!(verify_and_apply_credential(&mut profile, &raw).is_none());
         assert_eq!(profile.keychain_password.as_deref(), Some(raw.as_str()));
+    }
+
+    // ── K-1 后台网络核对路径 ──
+
+    #[test]
+    fn checked_conservative_skips_write_when_identity_unknown() {
+        let mut profile = make_test_profile(Some("stored-uuid"));
+        let raw = "new-raw-cred";
+        // 网络查不到身份（None）→ 保守不覆盖，也无警告。
+        let warn = verify_and_apply_credential_checked(&mut profile, raw, None);
+        assert!(warn.is_none());
+        assert_eq!(
+            profile.keychain_password.as_deref(),
+            Some("old-raw"),
+            "查不到身份时绝不能覆盖原凭据"
+        );
+    }
+
+    #[test]
+    fn checked_rejects_write_when_network_identity_mismatches() {
+        let mut profile = make_test_profile(Some("stored-uuid"));
+        let raw = "new-raw-cred";
+        // 网络核对到的 uuid 与登记 uuid 不一致 → 拒绝回写并提示收养。
+        let warn = verify_and_apply_credential_checked(&mut profile, raw, Some("other-uuid"));
+        assert!(warn.is_some());
+        assert!(warn.unwrap().contains("收养"));
+        assert_eq!(
+            profile.keychain_password.as_deref(),
+            Some("old-raw"),
+            "身份不一致时原凭据不能被覆盖"
+        );
+    }
+
+    #[test]
+    fn checked_applies_when_network_identity_matches() {
+        let mut profile = make_test_profile(Some("same-uuid"));
+        let raw = "new-raw-cred";
+        // 网络 uuid 与登记一致 → 回写新凭据。
+        assert!(
+            verify_and_apply_credential_checked(&mut profile, raw, Some("same-uuid")).is_none()
+        );
+        assert_eq!(profile.keychain_password.as_deref(), Some(raw));
+    }
+
+    #[test]
+    fn checked_applies_when_stored_uuid_unknown_but_network_resolves() {
+        let mut profile = make_test_profile(None);
+        let raw = "new-raw-cred";
+        // 库内未登记 uuid，但网络能核对到身份 → 无冲突，允许回写。
+        assert!(
+            verify_and_apply_credential_checked(&mut profile, raw, Some("network-uuid")).is_none()
+        );
+        assert_eq!(profile.keychain_password.as_deref(), Some(raw));
     }
 
     #[test]

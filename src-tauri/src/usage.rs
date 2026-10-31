@@ -360,6 +360,24 @@ pub fn cached_oauth_profile(access_token: &str) -> Result<Value, String> {
     )
 }
 
+/// K-1：从凭据 blob 解析 access token，经 OAuth profile 端点核对并返回账号 uuid。
+///
+/// 与本地 [`extract_meta`] 不同，真实 `.credentials.json` 的 `claudeAiOauth` 通常
+/// 不含 uuid（只有令牌/过期/订阅字段），因此需用 access token 调
+/// `/api/oauth/profile` 取 `account.uuid`。该调用：
+/// - 复用 [`cached_oauth_profile`] 的 token 指纹缓存（TTL 内不重复请求）；
+/// - 底层请求带 4 秒超时（直连 + 代理各一次），不会无限挂起；
+/// - 任何解析/网络失败都返回 None，由调用方走保守路径，绝不 panic。
+pub fn oauth_account_uuid_for_blob(raw: &str) -> Option<String> {
+    let access_token = oauth_access_token_from_raw(raw).ok()?;
+    let value = cached_oauth_profile(&access_token).ok()?;
+    value
+        .get("account")
+        .and_then(|account| account.get("uuid"))
+        .and_then(|uuid| uuid.as_str())
+        .map(str::to_string)
+}
+
 fn apply_oauth_usage(snapshot: &mut ClaudeUsageSnapshot) -> Result<(), String> {
     let Some(raw) = credentials::read_password()? else {
         return Err("没有 Claude OAuth 凭据".to_string());

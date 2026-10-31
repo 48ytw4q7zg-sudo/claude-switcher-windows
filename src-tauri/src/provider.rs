@@ -2,16 +2,19 @@
 //!
 //! 供应商通过 settings.json 的 `env` 注入 `ANTHROPIC_BASE_URL` +
 //! `ANTHROPIC_AUTH_TOKEN`（及模型相关 env）指向自定义端点。本模块只改
-//! [ProviderProfile::managed_env_keys] 记录的键，切换时**先删旧键再写新键**，
-//! 避免残留；auth token 加密落盘，连通测试 5 秒超时且错误不回显令牌；切回
-//! OAuth 时清掉全部受管键。
+//! [`ProviderProfile::managed_env_keys`] 记录的键。K-3 起：
+//! - 切换把「删旧键 + 写新键」合并为一次 settings.json 原子落盘（不再两次写）；
+//! - settings 读改写走乐观并发（复用 [`crate::mcp::modify_json_optimistic`]）；
+//! - Base URL 用 [`url::Url`] 校验：禁内嵌账号密码，除本机地址外必须 https；
+//! - 列表返回不含密文的 [`ProviderView`]；
+//! - auth token 加密落盘，连通测试 5 秒超时且错误不回显令牌；切回 OAuth 清受管键。
 
 use std::collections::BTreeMap;
 use std::time::Duration;
 
+use serde::Serialize;
 use serde_json::json;
 
-use crate::jsonio::{read_json_optional, write_json_pretty};
 use crate::paths;
 use crate::store::{self, ProviderProfile};
 
@@ -21,6 +24,37 @@ pub const BASE_URL_KEY: &str = "ANTHROPIC_BASE_URL";
 pub const AUTH_TOKEN_KEY: &str = "ANTHROPIC_AUTH_TOKEN";
 /// 连通测试超时（秒）。
 const CONNECT_TIMEOUT_SECS: u64 = 5;
+
+/// K-3：供应商的前端视图（不含加密令牌，密文绝不发给前端）。
+#[derive(Debug, Clone, Serialize)]
+pub struct ProviderView {
+    pub id: String,
+    pub name: String,
+    pub base_url: String,
+    pub model_env: BTreeMap<String, String>,
+    /// 是否为当前生效供应商。
+    pub is_current: bool,
+}
+
+/// K-3：校验供应商 Base URL。
+///
+/// 规则：
+/// - 必须是合法 URL；
+/// - 禁止内嵌账号密码（`https://user:pass@host`）；
+/// - 除本机地址（`localhost` / `127.0.0.1` / `[::1]`）允许 http 外，其余必须 https；
+/// - 返回去掉末尾斜杠的归一化 URL，保证落盘与去重口径一致。
+pub fn validate_base_url(raw: &str) -> Result<String, String> {
+    let trimmed = raw.trim();
+    let url = url::Url::parse(trimmed).map_err(|e| format!("Base URL 无效: {e}"))?;
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err("Base URL 不能内嵌账号密码".to_string());
+    }
+    let is_local = matches!(url.host_str(), Some("localhost" | "127.0.0.1" | "[::1]"));
+    if url.scheme() != "https" && !(url.scheme() == "http" && is_local) {
+        return Err("除本机地址（localhost/127.0.0.1/[::1]）外必须使用 https".to_string());
+    }
+    Ok(url.as_str().trim_end_matches('/').to_string())
+}
 
 /// 计算受管 env 键：基础认证键 + 模型 env 键（去重、保持稳定顺序）。
 pub fn managed_keys_for(model_env: &BTreeMap<String, String>) -> Vec<String> {
@@ -33,37 +67,50 @@ pub fn managed_keys_for(model_env: &BTreeMap<String, String>) -> Vec<String> {
     keys
 }
 
-/// 改 settings.json 的 env：先删 `remove_keys`，再写 `set`（全部原子落盘）。
+/// 改 settings.json 的 env：先删 `remove_keys`，再写 `set`，一次乐观并发落盘。
+///
+/// K-3：复用 [`crate::mcp::modify_json_optimistic`]——读改写期间若 Claude Code
+/// 也改了 settings.json（mtime/size 变化），会重读合并重试，绝不覆盖外部改动。
+/// 无实际变化时不写磁盘。
 fn mutate_settings_env(
     remove_keys: &[String],
     set: &BTreeMap<String, String>,
 ) -> Result<(), String> {
     let path = paths::claude_settings_path()?;
-    let mut settings = read_json_optional(path.clone())?.unwrap_or_else(|| json!({}));
-    if !settings.is_object() {
-        settings = json!({});
-    }
-    let obj = settings
-        .as_object_mut()
-        .ok_or_else(|| "settings.json 顶层不是对象".to_string())?;
-    let env = obj.entry("env").or_insert_with(|| json!({}));
-    if !env.is_object() {
-        *env = json!({});
-    }
-    let env_obj = env
-        .as_object_mut()
-        .ok_or_else(|| "settings.env 不是对象".to_string())?;
-    for key in remove_keys {
-        env_obj.remove(key);
-    }
-    for (key, value) in set {
-        env_obj.insert(key.clone(), json!(value));
-    }
-    write_json_pretty(path, &settings)
+    crate::mcp::modify_json_optimistic(&path, |settings| {
+        if !settings.is_object() {
+            *settings = json!({});
+        }
+        let root = settings
+            .as_object_mut()
+            .ok_or_else(|| "settings.json 顶层不是对象".to_string())?;
+        let env = root.entry("env").or_insert_with(|| json!({}));
+        if !env.is_object() {
+            *env = json!({});
+        }
+        let env_obj = env
+            .as_object_mut()
+            .ok_or_else(|| "settings.env 不是对象".to_string())?;
+        let mut changed = false;
+        for key in remove_keys {
+            if env_obj.remove(key).is_some() {
+                changed = true;
+            }
+        }
+        for (key, value) in set {
+            let new_value = json!(value);
+            if env_obj.get(key) != Some(&new_value) {
+                env_obj.insert(key.clone(), new_value);
+                changed = true;
+            }
+        }
+        Ok(changed)
+    })?;
+    Ok(())
 }
 
-/// 写入某个供应商的全部受管 env（先删后写，保证无旧键残留）。
-fn apply_provider_env(profile: &ProviderProfile, auth_token: &str) -> Result<(), String> {
+/// 构造某供应商要写入的 env 键值（base url + auth token + 模型 env）。
+fn provider_env_set(profile: &ProviderProfile, auth_token: &str) -> BTreeMap<String, String> {
     let mut set = BTreeMap::new();
     set.insert(
         BASE_URL_KEY.to_string(),
@@ -73,7 +120,18 @@ fn apply_provider_env(profile: &ProviderProfile, auth_token: &str) -> Result<(),
     for (key, value) in &profile.model_env {
         set.insert(key.clone(), value.clone());
     }
-    mutate_settings_env(&profile.managed_env_keys, &set)
+    set
+}
+
+/// K-3：原子切换供应商——把旧供应商的受管键删除与新供应商键写入合并为一次
+/// settings.json 落盘（`old_managed_keys` 为空时即首次启用）。
+fn switch_provider_env(
+    old_managed_keys: &[String],
+    new_profile: &ProviderProfile,
+    auth_token: &str,
+) -> Result<(), String> {
+    let set = provider_env_set(new_profile, auth_token);
+    mutate_settings_env(old_managed_keys, &set)
 }
 
 /// 删除某个供应商的全部受管 env。
@@ -89,14 +147,15 @@ pub fn create_provider_blocking(
     model_env: BTreeMap<String, String>,
 ) -> Result<ProviderProfile, String> {
     let name = name.trim().to_string();
-    let base_url = base_url.trim().to_string();
     let auth_token = auth_token.trim().to_string();
     if name.is_empty() {
         return Err("供应商名称不能为空".to_string());
     }
-    if base_url.is_empty() {
+    if base_url.trim().is_empty() {
         return Err("Base URL 不能为空".to_string());
     }
+    // K-3：scheme/内嵌账号密码/本机地址校验，并归一化（去末尾斜杠）。
+    let base_url = validate_base_url(&base_url)?;
     if auth_token.is_empty() {
         return Err("Auth Token 不能为空".to_string());
     }
@@ -131,36 +190,45 @@ pub fn create_provider_blocking(
     })
 }
 
-/// 列出全部供应商（只读，不持锁）。
-pub fn list_providers_blocking() -> Result<Vec<ProviderProfile>, String> {
-    Ok(store::load_store()?.provider_profiles)
-}
-
-/// 删除供应商：若它当前生效先清掉受管 env，再从账号库移除。
-pub fn delete_provider_blocking(id: String) -> Result<(), String> {
-    // 先取出要删的供应商（若当前生效，锁外清 env）。
-    let snapshot = store::load_store()?;
-    let target = snapshot
+/// 列出全部供应商视图（K-3：不含加密令牌，只读不持锁）。
+pub fn list_providers_blocking() -> Result<Vec<ProviderView>, String> {
+    let data = store::load_store()?;
+    Ok(data
         .provider_profiles
         .iter()
-        .find(|p| p.id == id)
-        .cloned();
-    let Some(target) = target else {
-        return Err("找不到这个供应商账号".to_string());
-    };
-    if snapshot.current_provider_id.as_deref() == Some(id.as_str()) {
-        remove_provider_env(&target)?;
-    }
+        .map(|profile| ProviderView {
+            id: profile.id.clone(),
+            name: profile.name.clone(),
+            base_url: profile.base_url.clone(),
+            model_env: profile.model_env.clone(),
+            is_current: data.current_provider_id.as_deref() == Some(profile.id.as_str()),
+        })
+        .collect())
+}
+
+/// 删除供应商：K-3 起整个流程（含清受管 env）都在 `with_store` 内完成，
+/// 避免锁外改 settings.json 与别的线程交叉写。
+pub fn delete_provider_blocking(id: String) -> Result<(), String> {
     store::with_store(|data| {
-        if data.current_provider_id.as_deref() == Some(id.as_str()) {
+        let Some(index) = data.provider_profiles.iter().position(|p| p.id == id) else {
+            return Err("找不到这个供应商账号".to_string());
+        };
+        let target = data.provider_profiles[index].clone();
+        let is_current = data.current_provider_id.as_deref() == Some(id.as_str());
+        if is_current {
+            // 锁内清 env：mutate 只动 settings 文件，不获取 STORE_LOCK，无重入死锁。
+            remove_provider_env(&target)?;
             data.current_provider_id = None;
         }
-        data.provider_profiles.retain(|p| p.id != id);
+        data.provider_profiles.remove(index);
         Ok(())
     })
 }
 
-/// 切换到指定供应商：若已有供应商生效先删旧键，再写新键并登记当前供应商。
+/// 切换到指定供应商：K-3 起把删旧键 + 写新键合并为一次原子落盘，再登记当前供应商。
+///
+/// 旧实现先 remove（写一次）再 apply（再写一次），第二次失败时旧键已删而
+/// current_provider_id 仍指旧供应商，界面与实际配置不一致。现在只写一次。
 pub fn switch_to_provider_blocking(id: String) -> Result<(), String> {
     store::with_store(|data| {
         if data.current_provider_id.as_deref() == Some(id.as_str()) {
@@ -172,19 +240,19 @@ pub fn switch_to_provider_blocking(id: String) -> Result<(), String> {
             .find(|p| p.id == id)
             .cloned()
             .ok_or_else(|| "找不到这个供应商账号".to_string())?;
-        // 先删旧供应商的受管键（若存在），再写新键——避免两个供应商的键混在一起。
-        if let Some(active_id) = data.current_provider_id.as_deref() {
-            if let Some(active) = data
+        // 旧供应商的受管键（首次启用时为空）。
+        let old_keys: Vec<String> = match data.current_provider_id.as_deref() {
+            Some(active_id) => data
                 .provider_profiles
                 .iter()
                 .find(|p| p.id == active_id)
-                .cloned()
-            {
-                remove_provider_env(&active)?;
-            }
-        }
+                .map(|p| p.managed_env_keys.clone())
+                .unwrap_or_default(),
+            None => Vec::new(),
+        };
         let token = store::decrypt_secret(&target.encrypted_auth_token)?;
-        apply_provider_env(&target, &token)?;
+        // 一次落盘：删旧键 + 写新键。
+        switch_provider_env(&old_keys, &target, &token)?;
         data.current_provider_id = Some(target.id.clone());
         Ok(())
     })
@@ -294,5 +362,48 @@ mod tests {
         assert!(env.get(AUTH_TOKEN_KEY).is_none());
         assert_eq!(env["KEEP"], json!("1"));
         assert_eq!(env["NEW"], json!("2"));
+    }
+
+    // ── K-3 Base URL 校验 ──
+
+    #[test]
+    fn validate_base_url_accepts_https_and_trims_trailing_slash() {
+        assert_eq!(
+            validate_base_url("https://api.example.com/v1/").unwrap(),
+            "https://api.example.com/v1"
+        );
+    }
+
+    #[test]
+    fn validate_base_url_allows_local_http() {
+        assert_eq!(
+            validate_base_url("http://127.0.0.1:8080").unwrap(),
+            "http://127.0.0.1:8080"
+        );
+        assert_eq!(
+            validate_base_url("http://localhost:3000/").unwrap(),
+            "http://localhost:3000"
+        );
+        assert_eq!(
+            validate_base_url("http://[::1]:9000").unwrap(),
+            "http://[::1]:9000"
+        );
+    }
+
+    #[test]
+    fn validate_base_url_rejects_non_local_http() {
+        assert!(validate_base_url("http://api.example.com").is_err());
+    }
+
+    #[test]
+    fn validate_base_url_rejects_embedded_credentials() {
+        assert!(validate_base_url("https://user:pass@api.example.com").is_err());
+        assert!(validate_base_url("https://user@api.example.com").is_err());
+    }
+
+    #[test]
+    fn validate_base_url_rejects_garbage_and_unknown_scheme() {
+        assert!(validate_base_url("not a url").is_err());
+        assert!(validate_base_url("ftp://api.example.com").is_err());
     }
 }

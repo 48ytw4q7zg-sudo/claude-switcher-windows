@@ -16,6 +16,8 @@ pub enum CliCommand {
     Status,
     /// 后接账号名称（精确匹配）。
     Switch(String),
+    /// K-5：后接账号 id（UUID），改名/引号不影响，开始菜单快捷方式专用。
+    SwitchId(String),
 }
 
 /// 从 argv 解析子命令（不假设 argv[0] 之外的位置）。无匹配返回 None。
@@ -30,6 +32,11 @@ pub fn parse(args: &[String]) -> Option<CliCommand> {
                 let name = iter.next().cloned().unwrap_or_default();
                 return Some(CliCommand::Switch(name));
             }
+            "--switch-id" => {
+                // K-5：id 缺省为空串，resolve 时给出明确错误。
+                let id = iter.next().cloned().unwrap_or_default();
+                return Some(CliCommand::SwitchId(id));
+            }
             _ => {}
         }
     }
@@ -43,7 +50,7 @@ pub fn run_readonly(cmd: &CliCommand) -> i32 {
         CliCommand::List => print_list(),
         CliCommand::Status => print_status(),
         // 写路径不应走这里；保守返回参数错误码。
-        CliCommand::Switch(_) => 2,
+        CliCommand::Switch(_) | CliCommand::SwitchId(_) => 2,
     };
     let _ = std::io::stdout().flush();
     if !attached {
@@ -151,6 +158,58 @@ pub fn forward_switch(app: &tauri::AppHandle, name: &str) {
     }
 }
 
+/// K-5：校验账号 id 确实存在（trim 后比较），返回该 id。
+pub fn resolve_profile_id_by_id(raw_id: &str) -> Result<String, String> {
+    let clean = raw_id.trim();
+    if clean.is_empty() {
+        return Err("--switch-id 缺少账号 id".to_string());
+    }
+    let (profiles, _) = store::read_lightweight()?;
+    if profiles.iter().any(|p| p.id == clean) {
+        Ok(clean.to_string())
+    } else {
+        Err(format!(
+            "找不到 id 为「{clean}」的账号，可用 --list 查看已保存账号"
+        ))
+    }
+}
+
+/// K-5：唯一实例下按 id 执行切换并打印结果，返回退出码。
+pub fn run_switch_id_first_instance(raw_id: &str) -> i32 {
+    let _attached = imp::attach_parent_console();
+    let id = match resolve_profile_id_by_id(raw_id) {
+        Ok(id) => id,
+        Err(e) => {
+            println!("{e}");
+            let _ = std::io::stdout().flush();
+            return 1;
+        }
+    };
+    match crate::switch_profile_blocking(id.clone()) {
+        Ok(result) => {
+            println!(
+                "已切换到「{}」。{}",
+                result.switched_to, result.restart_hint
+            );
+            let _ = std::io::stdout().flush();
+            0
+        }
+        Err(e) => {
+            println!("切换失败: {e}");
+            let _ = std::io::stdout().flush();
+            1
+        }
+    }
+}
+
+/// K-5：已有实例运行时，按 id 把切换请求转交给运行实例。
+pub fn forward_switch_id(app: &tauri::AppHandle, raw_id: &str) {
+    match resolve_profile_id_by_id(raw_id) {
+        Ok(id) => crate::tray::handle_tray_switch(app, &id),
+        Err(e) => crate::log_error(&format!("CLI 转交切换失败: {e}")),
+    }
+}
+
 /// 控制台子系统入口（cs.exe，J-1）。
 ///
 /// cs 是默认控制台程序，启动时已自带控制台、标准句柄有效，因此这里直接解析
@@ -159,14 +218,15 @@ pub fn forward_switch(app: &tauri::AppHandle, name: &str) {
 /// 返回真实进程退出码，由 bin 用 `std::process::exit` 透传。
 pub fn run_console(args: &[String]) -> i32 {
     // cs run [透传参数...]：在当前目录绑定的账号下启动 claude（F-1）。
-    if let Some(position) = args.iter().position(|a| a == "run") {
-        let extra: Vec<String> = args[position + 1..].to_vec();
+    // K-2：只把第一个参数（argv[1]）当子命令，避免账号名恰好叫 run 时误判。
+    if args.get(1).map(String::as_str) == Some("run") {
+        let extra: Vec<String> = args[2..].to_vec();
         let start = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         return match crate::dirbinding::run_bound_account(&start, &extra) {
             Ok(code) => code,
             Err(e) => {
-                println!("{e}");
-                let _ = std::io::stdout().flush();
+                eprintln!("{e}");
+                let _ = std::io::stderr().flush();
                 1
             }
         };
@@ -175,6 +235,7 @@ pub fn run_console(args: &[String]) -> i32 {
         Some(CliCommand::List) => run_readonly(&CliCommand::List),
         Some(CliCommand::Status) => run_readonly(&CliCommand::Status),
         Some(CliCommand::Switch(name)) => run_switch_first_instance(&name),
+        Some(CliCommand::SwitchId(id)) => run_switch_id_first_instance(&id),
         None => {
             print_usage();
             2
@@ -190,6 +251,7 @@ fn print_usage() {
          \x20 cs --list              列出已保存账号\n\
          \x20 cs --status            显示当前全局账号\n\
          \x20 cs --switch <名称>     切换到指定账号\n\
+         \x20 cs --switch-id <id>    按账号 id 切换（开始菜单快捷方式用）\n\
          \x20 cs run                 在当前目录绑定账号下启动 claude"
     );
 }
@@ -224,6 +286,24 @@ mod tests {
             parse(&argv(&["exe", "--switch"])),
             Some(CliCommand::Switch(String::new()))
         );
+    }
+
+    #[test]
+    fn parse_switch_id_consumes_only_next_token() {
+        assert_eq!(
+            parse(&argv(&["exe", "--switch-id", "uuid-123", "--list"])),
+            Some(CliCommand::SwitchId("uuid-123".to_string()))
+        );
+        assert_eq!(
+            parse(&argv(&["exe", "--switch-id"])),
+            Some(CliCommand::SwitchId(String::new()))
+        );
+    }
+
+    #[test]
+    fn resolve_switch_id_rejects_blank_before_touching_store() {
+        assert!(resolve_profile_id_by_id("   ").is_err());
+        assert!(resolve_profile_id_by_id("").is_err());
     }
 
     #[test]

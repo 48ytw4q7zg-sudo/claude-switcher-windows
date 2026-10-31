@@ -821,6 +821,30 @@ pub fn attach_parent_console() -> bool {
     true
 }
 
+/// K-2：本进程吞掉 Ctrl+C / Ctrl+Break，把控制权交给同一控制台里的子进程 claude。
+///
+/// 控制台的 Ctrl 信号会发给该控制台的所有进程；cs.exe 若不装处理器会先退出，
+/// 而 claude 仍在后台运行并和 shell 抢占输入。这里装一个自定义处理器：
+/// - 对 CTRL_C_EVENT / CTRL_BREAK_EVENT 返回 TRUE（1），表示已处理，阻止默认终止；
+/// - 其他事件返回 FALSE（0），保持系统默认处理。
+///
+/// 注意不能用 `SetConsoleCtrlHandler(None, TRUE)` 那种「进程级忽略」——该标志会被
+/// 子进程继承，导致 claude 也收不到 Ctrl+C。
+///
+/// 返回是否安装成功（一般仅在无控制台时失败）。
+pub fn install_console_ctrl_swallow() -> bool {
+    use windows_sys::Win32::System::Console::{
+        SetConsoleCtrlHandler, CTRL_BREAK_EVENT, CTRL_C_EVENT, PHANDLER_ROUTINE,
+    };
+
+    unsafe extern "system" fn swallow(ctrl: u32) -> i32 {
+        i32::from(ctrl == CTRL_C_EVENT || ctrl == CTRL_BREAK_EVENT)
+    }
+
+    let handler: PHANDLER_ROUTINE = Some(swallow);
+    unsafe { SetConsoleCtrlHandler(handler, 1) != 0 }
+}
+
 /// 打开当前控制台的活动屏幕缓冲区（`CONOUT$`），返回原生句柄。
 fn open_console_output() -> Option<windows_sys::Win32::Foundation::HANDLE> {
     use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};

@@ -12,6 +12,33 @@ export function WslPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  // K-4：同步报告的告警（两处各一份、家目录/用户、0600 限制等）。
+  const [warnings, setWarnings] = useState<string[]>([]);
+
+  interface WslSyncReport {
+    distro: string;
+    user: string;
+    home: string;
+    had_existing: boolean;
+    warnings: string[];
+  }
+
+  const writeCredentials = async () => {
+    setBusy('write');
+    setError(null);
+    setWarnings([]);
+    try {
+      const report = await invoke<WslSyncReport>('write_wsl_credentials', { distro });
+      setNote(
+        `${t('wsl.write')} → ${report.user}@${report.home}`,
+      );
+      setWarnings(report.warnings);
+    } catch (e) {
+      setError(String(e));
+    } finally {
+      setBusy(null);
+    }
+  };
 
   const refreshDistros = useCallback(async () => {
     const list = await invoke<string[]>('list_wsl_distros');
@@ -110,13 +137,7 @@ export function WslPanel() {
           <button
             className="primary"
             disabled={busy !== null || !enabled || !distro}
-            onClick={() =>
-              run(
-                'write',
-                () => invoke('write_wsl_credentials', { distro }),
-                t('wsl.write'),
-              )
-            }
+            onClick={writeCredentials}
           >
             {busy === 'write' ? <Loader2 className="spin" /> : <Terminal />}
             {t('wsl.write')}
@@ -138,6 +159,13 @@ export function WslPanel() {
         </div>
       </div>
       {note && <div className="inline-success">{note}</div>}
+      {warnings.length > 0 && (
+        <div className="inline-warnings">
+          {warnings.map((w, i) => (
+            <p key={i}>{w}</p>
+          ))}
+        </div>
+      )}
       {error && <div className="inline-error">{error}</div>}
     </section>
   );

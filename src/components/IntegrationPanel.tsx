@@ -26,9 +26,40 @@ export function IntegrationPanel() {
   const [busy, setBusy] = useState<string | null>(null);
   const [message, setMessage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // K-5：便携模式下移动 exe 后旧快捷方式会失效。
+  const [portable, setPortable] = useState(false);
+  // K-6：PATH 长度警告（超 2047 字符）。
+  const [pathWarning, setPathWarning] = useState<string | null>(null);
+  // K-7：诊断包脱敏预览（确认后才允许打包）。
+  const [diagPreview, setDiagPreview] = useState<string | null>(null);
+
+  interface PathUpdateResult {
+    changed: boolean;
+    warning: string | null;
+  }
+
+  const updatePath = useCallback(
+    async (id: string, add: boolean, success: string) => {
+      setBusy(id);
+      setError(null);
+      setPathWarning(null);
+      try {
+        const cmd = add ? 'add_to_user_path' : 'remove_from_user_path';
+        const result = await invoke<PathUpdateResult>(cmd, { binDir });
+        setMessage(success);
+        setPathWarning(result.warning);
+      } catch (e) {
+        setError(String(e));
+      } finally {
+        setBusy(null);
+      }
+    },
+    [binDir],
+  );
 
   useEffect(() => {
     invoke<string>('get_tool_bin_dir').then(setBinDir).catch(() => undefined);
+    invoke<boolean>('is_portable_mode').then(setPortable).catch(() => undefined);
   }, []);
 
   const run = useCallback(
@@ -65,13 +96,7 @@ export function IntegrationPanel() {
           <button
             className="primary"
             disabled={busy !== null || !binDir}
-            onClick={() =>
-              run(
-                'path-add',
-                () => invoke('add_to_user_path', { binDir }),
-                t('integ.path.add'),
-              )
-            }
+            onClick={() => updatePath('path-add', true, t('integ.path.add'))}
           >
             {busy === 'path-add' ? <Loader2 className="spin" /> : <Pin />}
             {t('integ.path.add')}
@@ -79,18 +104,13 @@ export function IntegrationPanel() {
           <button
             className="ghost"
             disabled={busy !== null || !binDir}
-            onClick={() =>
-              run(
-                'path-remove',
-                () => invoke('remove_from_user_path', { binDir }),
-                t('integ.path.remove'),
-              )
-            }
+            onClick={() => updatePath('path-remove', false, t('integ.path.remove'))}
           >
             {busy === 'path-remove' ? <Loader2 className="spin" /> : <Pin />}
             {t('integ.path.remove')}
           </button>
         </div>
+        {pathWarning && <p className="inline-warnings">{pathWarning}</p>}
       </div>
 
       {/* 目录绑定 */}
@@ -155,6 +175,11 @@ export function IntegrationPanel() {
           <span>{t('integ.menu.title')}</span>
         </div>
         <p className="telemetry-intro">{t('integ.menu.intro')}</p>
+        {portable && (
+          <p className="inline-warnings">
+            便携版移动程序文件夹后，旧快捷方式会失效，请在新位置重新点一次「重建」。
+          </p>
+        )}
         <div className="quota-controls">
           <button
             className="primary"
@@ -196,8 +221,32 @@ export function IntegrationPanel() {
         <p className="telemetry-intro">{t('integ.diag.intro')}</p>
         <div className="quota-controls">
           <button
-            className="primary"
+            className="ghost"
             disabled={busy !== null}
+            onClick={async () => {
+              setBusy('diag-preview');
+              setError(null);
+              try {
+                const preview = await invoke<{ info_json: string; log_text: string }>(
+                  'preview_diagnostic_bundle',
+                  { includeNetwork: false },
+                );
+                setDiagPreview(
+                  `${preview.info_json}\n\n===== 日志 =====\n${preview.log_text}`,
+                );
+              } catch (e) {
+                setError(String(e));
+              } finally {
+                setBusy(null);
+              }
+            }}
+          >
+            {busy === 'diag-preview' ? <Loader2 className="spin" /> : <Package />}
+            预览脱敏结果
+          </button>
+          <button
+            className="primary"
+            disabled={busy !== null || !diagPreview}
             onClick={() =>
               run(
                 'diag',
@@ -215,6 +264,9 @@ export function IntegrationPanel() {
             {t('integ.diag.build')}
           </button>
         </div>
+        {diagPreview && (
+          <pre className="diag-preview-box">{diagPreview}</pre>
+        )}
       </div>
 
       {message && <div className="inline-success">{message}</div>}

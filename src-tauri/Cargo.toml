@@ -55,6 +55,8 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 rand = "0.8"
 base64 = "0.22"
+# K-3：供应商 Base URL 校验（scheme/内嵌账号密码/本机地址判定）。
+url = "2"
 # HTTP：Claude OAuth usage/profile 与 Clash 控制器都走 reqwest。
 # - system-proxy：读 Windows 注册表里的系统代理（Clash Verge「系统代理」开关就是它），
 #   以及 HTTP_PROXY/HTTPS_PROXY 环境变量。**这是默认特性**，但我们关了 default-features，
