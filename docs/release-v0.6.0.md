@@ -4,9 +4,9 @@
 
 | 文件 | 大小 | SHA256 |
 | --- | --- | --- |
-| `ClaudeSwitcher_0.6.0_x64_zh-CN.msi` | 见 Release 资产 | 见 `SHA256SUMS.txt` |
-| `ClaudeSwitcher_0.6.0_x64-setup.exe` | 见 Release 资产 | 见 `SHA256SUMS.txt` |
-| `ClaudeSwitcher-portable.zip` | 见 Release 资产 | 见 `SHA256SUMS.txt` |
+| `ClaudeSwitcher_0.6.0_x64_zh-CN.msi` | 10,735,616 字节 (10.24 MiB) | `d6cd9284c7383a553a756435346b2f0ec75b9b892c81b311182c77da782b0687` |
+| `ClaudeSwitcher_0.6.0_x64-setup.exe` | 7,503,413 字节 (7.16 MiB) | `49e3003deee02e47f25f3f6566f15428d4041ed29050ddd4e3e2a50a364b1090` |
+| `ClaudeSwitcher-portable.zip` | 8,825,508 字节 (8.42 MiB) | `64671b9019f09e07dd927dbc16e99f2a8c7e625694e833f9559475e8c8cddf40` |
 
 校验方式（任选其一）：
 
