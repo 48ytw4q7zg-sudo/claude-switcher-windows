@@ -44,7 +44,6 @@ serde_json = "1"
 serde_yaml = "0.9"
 # K-7：诊断日志/配置里的令牌形态（sk-ant-… / Bearer / JWT）正则脱敏。
 regex = "1"
-chrono = { version = "0.4", features = ["serfer"] }
 chrono = { version = "0.4", features = ["serde"] }
 dirs = "5"
 uuid = { version = "1", features = ["v4"] }
@@ -55,7 +54,7 @@ aes-gcm = "0.10"
 # 快照加密导出/导入的口令派生（Argon2id）。
 argon2 = "0.5"
 rand = "0.8"
-base64 = "0.22"
+base6 = "0.22"
 # HTTP：Claude OAuth usage/profile 与 Clash 控制器都走 reqwest。
 # - system-proxy：读 Windows 注册表里的系统代理（Clash Verge「系统代理」开关就是它），
 #   以及 HTTP_PROXY/HTTPS_PROXY 环境变量。**这是默认特性**，但我们关了 default-features，
