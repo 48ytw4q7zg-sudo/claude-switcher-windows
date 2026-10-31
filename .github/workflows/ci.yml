@@ -51,21 +51,9 @@ jobs:
       - name: Frontend build
         run: npm run build
 
-      # externalBin 鸡生蛋：clippy/test/tauri build 都会跑 build.rs 校验 sidecar 存在，
-      # 而 cs 本身要靠 cargo 构建。先落 0 字节占位（只查 .exists()），再构建真实 cs
-      # 覆盖占位。须与 windows-build.yml 的同名步骤保持一致。
-      - name: Stage cs external binary
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
-          $sidecar = "src-tauri/binaries/cs-x86_64-pc-windows-msvc.exe"
-          if (-not (Test-Path $sidecar)) {
-            New-Item -ItemType File -Path $sidecar | Out-Null
-          }
-          cargo build --release --bin cs --manifest-path src-tauri/Cargo.toml
-          Copy-Item "src-tauri/target/release/cs.exe" $sidecar -Force
-          Get-Item $sidecar | Select-Object Name,Length
-
+      # cs.exe 是本包第二个 [[bin]]（src/bin/cs.rs），由后续 tauri build 自动编译并打包；
+      # 不再使用 bundle.externalBin 与占位文件（externalBin 与 cargo 二进制重复打包会触发
+      # WiX ICE30）。
       - name: Rust fmt
         working-directory: src-tauri
         run: cargo fmt --check

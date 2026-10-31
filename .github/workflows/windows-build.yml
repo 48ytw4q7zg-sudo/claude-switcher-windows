@@ -41,27 +41,11 @@ jobs:
       - name: Install frontend dependencies
         run: npm ci
 
-      # J-1：先单独构建 cs 控制台程序，再以 target-triple 后缀放进 externalBin 目录。
-      # tauri.conf.json 的 bundle.externalBin = ["binaries/cs"] 会在 MSI/NSIS 安装目录
-      # 里落成 cs.exe（与主程序同目录，PATH 指向该目录即可全局使用）。
-      #
-      # 鸡生蛋：tauri-build 的 build.rs 在编译本 crate 任何目标（含 --bin cs）之前，
-      # 都会校验 sidecar 路径 binaries/cs-<triple>.exe 存在，缺失即 panic
-      # （resource path ... doesn't exist）。而该文件要等 cs 构建完才能产出。
-      # 因此先落一个 0 字节占位文件让 build.rs 的存在性校验通过（它只查 .exists()，
-      # 不校验是否为有效 PE），再构建 cs，最后用真实 cs.exe 覆盖占位。
-      - name: Stage cs external binary
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force src-tauri/binaries | Out-Null
-          $sidecar = "src-tauri/binaries/cs-x86_64-pc-windows-msvc.exe"
-          if (-not (Test-Path $sidecar)) {
-            New-Item -ItemType File -Path $sidecar | Out-Null
-          }
-          cargo build --release --bin cs --manifest-path src-tauri/Cargo.toml
-          Copy-Item "src-tauri/target/release/cs.exe" $sidecar -Force
-          Get-Item $sidecar | Select-Object Name,Length
-
+      # cs.exe 由 src/bin/cs.rs 作为本包的第二个 [[bin]] 产出；`tauri build` 会编译
+      # 全部二进制并自动把 target/release/cs.exe 打进 MSI/NSIS 安装目录（与主程序同目录，
+      # PATH 指向该目录即可全局使用）。不再使用 bundle.externalBin：externalBin 会把同一
+      # 份 cs.exe 再复制到临时目录生成第二个组件，与 cargo 二进制组件撞名触发 WiX ICE30
+      # （两个组件向同一目录安装 cs.exe，破坏组件引用计数）。
       - name: Build app
         run: npm run tauri build
 

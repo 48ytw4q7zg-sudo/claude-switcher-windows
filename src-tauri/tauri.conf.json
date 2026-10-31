@@ -38,7 +38,6 @@
     "publisher": "48ytw4q7zg-sudo",
     "copyright": "Copyright (c) 2026 48ytw4q7zg-sudo",
     "targets": "all",
-    "externalBin": ["binaries/cs"],
     "windows": {
       "webviewInstallMode": {
         "type": "embedBootstrapper"
