@@ -38,10 +38,7 @@ pub fn is_sensitive_key(key: &str) -> bool {
 
 /// 取当前用户名（来自 home 目录名），用于替换路径中的 `\Users\<user>`。
 fn current_user_name() -> Option<String> {
-    dirs::home_dir()?
-        .file_name()?
-        .to_str()
-        .map(str::to_string)
+    dirs::home_dir()?.file_name()?.to_str().map(str::to_string)
 }
 
 /// 令牌形态正则：sk-ant-… / Bearer … / JWT（eyJ 三段）。
@@ -89,7 +86,7 @@ fn redact_json_for_user(value: &mut Value, user: &str) {
                     .keys()
                     .filter_map(|key| {
                         let new_key = redact_text(key, user);
-                        (new_key != key).then_some((key.clone(), new_key))
+                        (&new_key != key).then_some((key.clone(), new_key))
                     })
                     .collect();
                 for (old_key, new_key) in renames {

@@ -30,9 +30,7 @@ const BACKUP_FILE_NAME: &str = "path-backup.txt";
 /// 归一化一个 PATH 条目用于比较：去首尾空白、去尾反斜杠、转 ASCII 小写。
 /// 这样 `C:\Tools\bin` 与 `c:\tools\bin\` 会被视为同一项。
 fn normalize_entry(part: &str) -> String {
-    part.trim()
-        .trim_end_matches('\\')
-        .to_ascii_lowercase()
+    part.trim().trim_end_matches('\\').to_ascii_lowercase()
 }
 
 /// 纯函数：把 `entry` 追加到 `current`。
@@ -117,8 +115,7 @@ fn backup_user_path(original: &str) -> Result<(), String> {
     if backup.exists() {
         return Ok(());
     }
-    fsx::write_atomically(&backup, original)
-        .map_err(|e| format!("备份用户 PATH 失败: {e}"))
+    fsx::write_atomically(&backup, original).map_err(|e| format!("备份用户 PATH 失败: {e}"))
 }
 
 /// 广播 WM_SETTINGCHANGE，让 Explorer / 新进程感知环境变量变化。
@@ -217,10 +214,7 @@ mod tests {
 
     #[test]
     fn remove_is_case_insensitive() {
-        assert_eq!(
-            remove_from_path("A;B;C", "a"),
-            Some("B;C".to_string())
-        );
+        assert_eq!(remove_from_path("A;B;C", "a"), Some("B;C".to_string()));
     }
 
     #[test]
@@ -232,10 +226,7 @@ mod tests {
 
     #[test]
     fn remove_preserves_empty_segments_when_another_entry_removed() {
-        assert_eq!(
-            remove_from_path("a;;b", "a"),
-            Some(";b".to_string())
-        );
+        assert_eq!(remove_from_path("a;;b", "a"), Some(";b".to_string()));
     }
 
     #[test]
