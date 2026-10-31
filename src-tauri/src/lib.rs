@@ -2404,12 +2404,13 @@ async fn lock_region(apply: bool) -> Result<RegionLockReport, String> {
 /// set-client：安装后更换代理客户端。
 #[tauri::command]
 fn set_client(mode: String) -> Result<(), String> {
-    const ALLOWED: [&str; 7] = [
+    const ALLOWED: [&str; 8] = [
         "clash-verge",
         "sing-box",
         "clashx",
         "surge",
         "wireguard",
+        "flclash",
         "other",
         "auto",
     ];

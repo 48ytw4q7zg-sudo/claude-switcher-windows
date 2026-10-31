@@ -285,31 +285,30 @@ fn judge_rules_pinned(mode: &str, outcome: RulesCheck) -> (&'static str, String)
     }
 }
 
-/// 12. 客户端语言：跟随系统区域格式；锁定 locale_target 后须与之一致。
+/// 12. 客户端语言：Windows 读不到 Claude 内部语言，按上游做法比对系统 UI 语言。
+///
+/// 与上游 `Format-OptionalResult '客户端语言'` 一致：不一致时是 **warn** 而非 fail——
+/// 系统 UI 语言不必然等于客户端界面语言，报 fail 会让「静默总检」在无害差异上失败。
+/// 比较按主语言段（`zh-CN` vs `zh-TW` 视为一致）。
 fn judge_client_language(
-    culture: Result<&str, &str>,
+    ui_lang: Result<&str, &str>,
     locale_target: Option<&str>,
 ) -> (&'static str, String) {
-    match culture {
-        Err(e) => ("warn", format!("读取系统语言失败：{e}")),
+    let primary = |lang: &str| lang.split(['-', '_']).next().unwrap_or(lang).to_lowercase();
+    match ui_lang {
+        Err(e) => ("warn", format!("读取系统界面语言失败：{e}")),
         Ok(cur) => match locale_target {
             Some(t) if !t.is_empty() => {
-                if cur.eq_ignore_ascii_case(t) {
-                    ("ok", format!("跟随系统（{cur}）"))
-                } else {
-                    ("fail", format!("系统界面语言为 {cur}，与目标 {t} 不一致"))
-                }
-            }
-            _ => {
-                if cur.to_lowercase().starts_with("en") {
-                    ("ok", format!("跟随系统（英文 {cur}）"))
+                if primary(cur) == primary(t) {
+                    ("ok", format!("系统界面语言 {cur} 与目标 {t} 主语言一致"))
                 } else {
                     (
                         "warn",
-                        format!("当前系统界面语言为 {cur}（未锁定目标地区）"),
+                        format!("系统界面语言 {cur} 与目标 {t} 主语言不同（Windows 侧无法读取 Claude 内部语言）"),
                     )
                 }
             }
+            _ => ("warn", format!("当前系统界面语言 {cur}（未锁定目标地区）")),
         },
     }
 }
@@ -448,6 +447,7 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
     let egress = egress::detect_egress_blocking();
     let tz = imp::current_timezone_id();
     let culture = imp::current_culture();
+    let ui_lang = imp::current_ui_language();
     let bindings = imp::ipv6_bindings();
     let dns = resolve_claude_ai();
     let stun_result = match &egress {
@@ -555,7 +555,7 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
             "client_language",
             "客户端语言",
             judge_client_language(
-                culture.as_deref().map_err(|e| e.as_str()),
+                ui_lang.as_deref().map_err(|e| e.as_str()),
                 cfg.locale_target.as_deref(),
             ),
         ),
@@ -1008,11 +1008,16 @@ mod tests {
 
     #[test]
     fn client_language_table() {
+        // 主语言一致即 ok（不要求地区子段也相同）。
         assert_eq!(judge_client_language(Ok("en-US"), Some("en-US")).0, "ok");
-        assert_eq!(judge_client_language(Ok("zh-CN"), Some("en-US")).0, "fail");
-        // 未锁定目标：英文跟随系统即 ok（上游 en* 判定）。
-        assert_eq!(judge_client_language(Ok("en-GB"), None).0, "ok");
+        assert_eq!(judge_client_language(Ok("en-GB"), Some("en-US")).0, "ok");
+        assert_eq!(judge_client_language(Ok("zh-CN"), Some("zh-TW")).0, "ok");
+        // 主语言不同：Windows 侧读不到 Claude 内部语言，按上游降级为 warn。
+        assert_eq!(judge_client_language(Ok("zh-CN"), Some("en-US")).0, "warn");
+        // 未锁定目标：只提示，不算通过。
+        assert_eq!(judge_client_language(Ok("en-GB"), None).0, "warn");
         assert_eq!(judge_client_language(Ok("zh-CN"), None).0, "warn");
+        // 读不到语言：同样 warn（不能当成 fail 阻断总检）。
         assert_eq!(judge_client_language(Err("访问被拒绝"), None).0, "warn");
     }
 

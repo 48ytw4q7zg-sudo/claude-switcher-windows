@@ -7,6 +7,8 @@
 //! Windows 专项校验：钩子命令里的路径分隔符（`/` vs `\`）、是否需要
 //! `cmd /c` 包装（.cmd/.bat/npm shim），在读取与保存时给出明确提示。
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -203,35 +205,123 @@ pub fn validate_hook(entry: &HookEntry) -> Vec<String> {
     warnings
 }
 
-/// 由扁平钩子列表重建 `hooks` 值（按 event/matcher 分组合并）。
-pub fn build_hooks_value(entries: &[HookEntry]) -> Value {
-    let mut map = serde_json::Map::new();
-    for entry in entries {
-        let event_arr = map
-            .entry(entry.event.clone())
-            .or_insert_with(|| Value::Array(Vec::new()));
-        let groups = event_arr.as_array_mut().unwrap();
-        let existing = groups.iter_mut().find(|g| {
-            let m = g.get("matcher").and_then(Value::as_str).unwrap_or("");
-            m == entry.matcher
-        });
-        let hook_obj = json!({"type": "command", "command": entry.command});
-        if let Some(group) = existing {
-            group
-                .get_mut("hooks")
-                .and_then(Value::as_array_mut)
-                .unwrap()
-                .push(hook_obj);
+/// 纯函数：把编辑器结果合并进 settings 根对象，只改 managed 部分。
+///
+/// 其余键（`permissions.defaultMode`、`additionalDirectories`、hook 对象上的
+/// `timeout` 等本功能不认识的字段，以及无法解析的 hook 分组）**原样保留**。
+/// 编辑器看不到这些内容，一旦替换整个 `permissions`/`hooks` 子树就会静默
+/// 删掉用户手写的配置。
+pub fn apply_editor_to_settings(
+    root: &mut Value,
+    permissions: &PermissionRules,
+    hooks: &[HookEntry],
+) -> Result<(), String> {
+    let obj = root
+        .as_object_mut()
+        .ok_or_else(|| "settings 不是 JSON 对象".to_string())?;
+    merge_permissions_into(obj, permissions);
+    merge_hooks_into(obj, hooks);
+    Ok(())
+}
+
+/// 合并权限列表：只替换 allow/deny/ask 三个键，全空时删除这三个键。
+fn merge_permissions_into(obj: &mut serde_json::Map<String, Value>, rules: &PermissionRules) {
+    let all_empty = rules.allow.is_empty() && rules.deny.is_empty() && rules.ask.is_empty();
+    if all_empty {
+        // 可能整个 permissions 块都只有这三个键，此时连块一起删掉，保持干净。
+        let only_managed = obj
+            .get("permissions")
+            .and_then(Value::as_object)
+            .is_none_or(|perms| {
+                perms
+                    .keys()
+                    .all(|key| matches!(key.as_str(), "allow" | "deny" | "ask"))
+            });
+        if only_managed {
+            obj.remove("permissions");
+            return;
+        }
+    }
+    let perms = obj
+        .entry("permissions")
+        .or_insert_with(|| json!({}))
+        .as_object_mut()
+        .map(std::mem::take)
+        .unwrap_or_default();
+    let mut perms = perms;
+    for (key, list) in [
+        ("allow", &rules.allow),
+        ("deny", &rules.deny),
+        ("ask", &rules.ask),
+    ] {
+        if list.is_empty() {
+            perms.remove(key);
         } else {
-            let mut group = serde_json::Map::new();
-            if !entry.matcher.is_empty() {
-                group.insert("matcher".to_string(), Value::String(entry.matcher.clone()));
+            perms.insert(key.to_string(), json!(list));
+        }
+    }
+    obj.insert("permissions".to_string(), Value::Object(perms));
+}
+
+/// 合并钩子：逐个分组更新 command，保留分组里其他字段与无法识别的分组。
+fn merge_hooks_into(obj: &mut serde_json::Map<String, Value>, entries: &[HookEntry]) {
+    // 期望的 (event, matcher) → [command]，用于就地更新已有的钩子对象。
+    let mut wanted: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
+    for entry in entries {
+        wanted
+            .entry((entry.event.clone(), entry.matcher.clone()))
+            .or_default()
+            .push(entry.command.clone());
+    }
+    if entries.is_empty() {
+        obj.remove("hooks");
+        return;
+    }
+    // 从现有结构出发，只改 command，其他字段（timeout 等）原样保留。
+    let mut hooks = obj
+        .get("hooks")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    // 逐事件把命令列表写回：已有分组更新 command，缺失分组补建。
+    for ((event, matcher), commands) in &wanted {
+        let groups = hooks
+            .entry(event.clone())
+            .or_insert_with(|| Value::Array(Vec::new()))
+            .as_array_mut();
+        let Some(groups) = groups else { continue };
+        let target = groups.iter_mut().find(|group| {
+            group.get("matcher").and_then(Value::as_str).unwrap_or("") == matcher.as_str()
+        });
+        if let Some(group) = target {
+            if let Some(hook_list) = group.get_mut("hooks").and_then(Value::as_array_mut) {
+                // 就地更新每条 command；数量不足时补建最小对象。
+                for (index, command) in commands.iter().enumerate() {
+                    if let Some(slot) = hook_list.get_mut(index) {
+                        if let Some(hook_obj) = slot.as_object_mut() {
+                            hook_obj.insert("command".to_string(), Value::String(command.clone()));
+                            continue;
+                        }
+                    }
+                    hook_list.push(json!({"type": "command", "command": command}));
+                }
+                // 用户删掉了多余的钩子：截断到期望长度。
+                hook_list.truncate(commands.len());
             }
-            group.insert("hooks".to_string(), Value::Array(vec![hook_obj]));
+        } else {
+            let hook_list: Vec<Value> = commands
+                .iter()
+                .map(|command| json!({"type": "command", "command": command}))
+                .collect();
+            let mut group = serde_json::Map::new();
+            if !matcher.is_empty() {
+                group.insert("matcher".to_string(), Value::String(matcher.clone()));
+            }
+            group.insert("hooks".to_string(), Value::Array(hook_list));
             groups.push(Value::Object(group));
         }
     }
-    Value::Object(map)
+    obj.insert("hooks".to_string(), Value::Object(hooks));
 }
 
 /// 保存编辑器结果：先校验，再乐观并发写入。
@@ -251,20 +341,7 @@ pub fn save_permission_editor(
     }
     let settings_path = paths::claude_settings_path()?;
     mcp::modify_json_optimistic(&settings_path, |root| {
-        let obj = root.as_object_mut().ok_or("settings 不是 JSON 对象")?;
-        let all_empty = permissions.allow.is_empty()
-            && permissions.deny.is_empty()
-            && permissions.ask.is_empty();
-        if all_empty {
-            obj.remove("permissions");
-        } else {
-            obj.insert("permissions".to_string(), json!(permissions));
-        }
-        if hooks.is_empty() {
-            obj.remove("hooks");
-        } else {
-            obj.insert("hooks".to_string(), build_hooks_value(&hooks));
-        }
+        apply_editor_to_settings(root, &permissions, &hooks)?;
         Ok(true)
     })?;
     Ok(())
@@ -352,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn build_hooks_round_trips_back_to_structure() {
+    fn saved_hooks_round_trip_back_to_structure() {
         let entries = vec![
             HookEntry {
                 event: "Stop".to_string(),
@@ -370,8 +447,11 @@ mod tests {
                 command: "echo c".to_string(),
             },
         ];
-        let value = build_hooks_value(&entries);
-        let reparsed = extract_hooks(&json!({"hooks": value}));
+        // 走真实保存路径：从空 settings 出发，保存后必须能读回同样的分组结构。
+        let mut root = json!({});
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &entries)
+            .expect("apply into empty settings");
+        let reparsed = extract_hooks(&root);
         assert_eq!(reparsed, entries);
     }
 
@@ -388,5 +468,142 @@ mod tests {
             command: String::new(),
         }];
         assert!(save_permission_editor(PermissionRules::default(), bad_hooks).is_err());
+    }
+
+    fn rules(allow: &[&str]) -> PermissionRules {
+        PermissionRules {
+            allow: allow.iter().map(|s| s.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn apply_editor_keeps_unknown_permission_keys() {
+        let mut root = json!({
+            "permissions": {
+                "allow": ["Bash(npm test)"],
+                "defaultMode": "acceptEdits",
+                "additionalDirectories": ["../shared"]
+            },
+            "env": {"KEEP": "1"}
+        });
+        apply_editor_to_settings(&mut root, &rules(&["Bash(cargo test)"]), &[]).expect("apply");
+        let perms = &root["permissions"];
+        assert_eq!(perms["allow"], json!(["Bash(cargo test)"]));
+        // 本功能不认识但用户手写的键必须原样保留，替换整个子树会把它们删掉。
+        assert_eq!(perms["defaultMode"], json!("acceptEdits"));
+        assert_eq!(perms["additionalDirectories"], json!(["../shared"]));
+        assert_eq!(root["env"]["KEEP"], json!("1"));
+    }
+
+    #[test]
+    fn apply_editor_keeps_unknown_hook_fields() {
+        let mut root = json!({
+            "hooks": {"Stop": [{"hooks": [{"type": "command", "command": "old", "timeout": 30}]}]}
+        });
+        let hooks = vec![HookEntry {
+            event: "Stop".to_string(),
+            matcher: String::new(),
+            command: "new".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        let hook = &root["hooks"]["Stop"][0]["hooks"][0];
+        assert_eq!(hook["command"], json!("new"));
+        // type / timeout 是编辑器不管理的字段，保存后必须仍在。
+        assert_eq!(hook["type"], json!("command"));
+        assert_eq!(hook["timeout"], json!(30));
+    }
+
+    #[test]
+    fn apply_editor_keeps_unparseable_hook_groups() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [{"matcher": "Bash", "hooks": [{"command": "keep-me"}]}],
+                "Notification": [{"hooks": [{"no_command": true}]}]
+            }
+        });
+        // 只编辑 Stop：Notification 分组没有 command 字段，编辑器根本看不到它。
+        let hooks = vec![HookEntry {
+            event: "Stop".to_string(),
+            matcher: "Bash".to_string(),
+            command: "updated".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        assert_eq!(
+            root["hooks"]["Stop"][0]["hooks"][0]["command"],
+            json!("updated")
+        );
+        assert_eq!(
+            root["hooks"]["Notification"][0]["hooks"][0],
+            json!({"no_command": true}),
+            "无法解析的钩子分组必须原样保留，不能被替换掉"
+        );
+    }
+
+    #[test]
+    fn apply_editor_drops_only_managed_lists_when_emptied() {
+        let mut root =
+            json!({"permissions": {"allow": ["a"], "deny": ["b"], "defaultMode": "plan"}});
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &[]).expect("apply");
+        // allow/deny/ask 被清空 → 三个键消失；defaultMode 保留。
+        let perms = root["permissions"].as_object().expect("permissions object");
+        assert!(!perms.contains_key("allow"));
+        assert!(!perms.contains_key("deny"));
+        assert!(!perms.contains_key("ask"));
+        assert_eq!(perms["defaultMode"], json!("plan"));
+    }
+
+    #[test]
+    fn apply_editor_removes_permissions_block_when_only_managed_keys() {
+        let mut root = json!({"permissions": {"allow": ["a"], "deny": ["b"]}});
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &[]).expect("apply");
+        assert!(
+            root.get("permissions").is_none(),
+            "只剩受管键时整块删除，避免留下空对象"
+        );
+    }
+
+    #[test]
+    fn apply_editor_truncates_removed_hooks_within_group() {
+        let mut root = json!({
+            "hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": "one"},
+                {"type": "command", "command": "two"}
+            ]}]}
+        });
+        let hooks = vec![HookEntry {
+            event: "Stop".to_string(),
+            matcher: String::new(),
+            command: "only".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        let list = root["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "用户删掉第二条后必须截断，不能残留旧命令");
+        assert_eq!(list[0]["command"], json!("only"));
+    }
+
+    #[test]
+    fn apply_editor_keeps_other_hook_events_when_editing_one() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "old-stop"}]}],
+                "PreToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "keep-pre"}]}]
+            }
+        });
+        let hooks = vec![HookEntry {
+            event: "Stop".to_string(),
+            matcher: String::new(),
+            command: "new-stop".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        assert_eq!(
+            root["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            json!("keep-pre"),
+            "未编辑的事件分组不能被清空"
+        );
+        assert_eq!(
+            root["hooks"]["Stop"][0]["hooks"][0]["command"],
+            json!("new-stop")
+        );
     }
 }

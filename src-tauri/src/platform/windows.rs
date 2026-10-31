@@ -78,9 +78,61 @@ pub fn user_default_ui_language() -> String {
     .to_string()
 }
 
+/// 当前系统界面语言（CurrentUICulture，如 "zh-CN" / "en-US"）。
+///
+/// 第 12 项「客户端语言」检查用它：Windows 上读不到 Claude 内部的界面语言设置，
+/// 只能按上游做法比对系统 UI 语言（上游用 `[CultureInfo]::CurrentUICulture.Name`）。
+pub fn current_ui_language() -> Result<String, String> {
+    let json =
+        run_ps("[System.Globalization.CultureInfo]::CurrentUICulture.Name | ConvertTo-Json")?;
+    parse_ui_language(&json)
+}
+
+fn parse_ui_language(json: &str) -> Result<String, String> {
+    let trimmed = json.trim();
+    let name: String = serde_json::from_str(trimmed)
+        .map_err(|e| format!("UI 语言解析失败: {e}; 原文: {trimmed}"))?;
+    let name = name.trim();
+    if name.is_empty() {
+        return Err("UI 语言为空".to_string());
+    }
+    Ok(name.to_string())
+}
+
 /// 当前进程 PID（用于进程检测时排除自身，替代 spawn tasklist）。
 pub fn current_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
+}
+
+/// MSIX/Store 安装的 Claude Desktop 包族名（PackageFamilyName）列表。
+///
+/// MSIX 版 Claude 的数据不落在 `%APPDATA%\Claude`，而在
+/// `%LOCALAPPDATA%\Claude-Data\<PackageFamilyName>\`。`Get-AppxPackage` 在受限
+/// 账户/策略禁用环境下会直接抛错，这里整体兜住并返回空列表（调用方据此回退）。
+pub fn claude_appx_families() -> Vec<String> {
+    let script = "@(Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue).PackageFamilyName | ConvertTo-Json";
+    let json = match run_ps(script) {
+        Ok(json) => json,
+        Err(_) => return Vec::new(),
+    };
+    parse_package_families(&json)
+}
+
+/// 解析 `PackageFamilyName` 的 JSON 输出：数组、单值或空。
+fn parse_package_families(json: &str) -> Vec<String> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    match serde_json::from_str::<serde_json::Value>(trimmed) {
+        Ok(serde_json::Value::Array(items)) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .collect(),
+        Ok(serde_json::Value::String(one)) if !one.is_empty() => vec![one],
+        _ => Vec::new(),
+    }
 }
 
 /// 当前用户名（GetUserNameW，比 USERNAME 环境变量更可靠）。
@@ -1225,6 +1277,31 @@ mod tests {
         assert!(!parse_task_exists("false").unwrap());
         assert!(parse_task_exists("  true  ").unwrap());
         assert!(parse_task_exists("null").is_err());
+    }
+
+    #[test]
+    fn parse_ui_language_reads_json_string() {
+        assert_eq!(parse_ui_language("\"zh-CN\"").unwrap(), "zh-CN");
+        assert_eq!(parse_ui_language("  \"en-US\"  ").unwrap(), "en-US");
+        assert!(parse_ui_language("not-json").is_err());
+        assert!(parse_ui_language("\"\"").is_err());
+    }
+
+    #[test]
+    fn parse_package_families_handles_array_single_and_empty() {
+        assert_eq!(
+            parse_package_families(r#"["Claude_abc123", "Claude_def456"]"#),
+            vec!["Claude_abc123".to_string(), "Claude_def456".to_string()]
+        );
+        assert_eq!(
+            parse_package_families(r#""Claude_abc123""#),
+            vec!["Claude_abc123".to_string()]
+        );
+        assert!(parse_package_families("").is_empty());
+        assert!(parse_package_families("not-json").is_empty());
+        // null / 空串：Get-AppxPackage 没装 Claude 时的 ConvertTo-Json 输出。
+        assert!(parse_package_families("null").is_empty());
+        assert!(parse_package_families(r#""""#).is_empty());
     }
 
     #[test]

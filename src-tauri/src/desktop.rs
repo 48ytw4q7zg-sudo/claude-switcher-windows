@@ -45,12 +45,72 @@ const GRACEFUL_WAIT_INTERVAL_MS: u64 = 500;
 
 // ───────────────────────── 路径 ─────────────────────────
 
-/// Claude Desktop 活数据目录：`%APPDATA%\Claude`（macOS 上为 `config_dir()/Claude`，
-/// 即 `~/Library/Application Support/Claude`，行为对齐）。
+/// MSIX 版 Claude 的数据根目录名（拼在 `%LOCALAPPDATA%` 下）。
+const MSIX_DATA_DIR_NAME: &str = "Claude-Data";
+/// MSIX 数据目录下包族子目录的前缀（`claude_<hash>`）。
+const MSIX_DIR_PREFIX: &str = "claude_";
+
+/// 纯函数：按上游 `Find-ClaudeDataPath` 的优先级解析 Claude Desktop 活数据目录。
+///
+/// 1. `%APPDATA%\Claude` 存在（传统 EXE 安装）→ 用它；
+/// 2. 否则按 AppX 包族名找 `%LOCALAPPDATA%\Claude-Data\<PackageFamilyName>`；
+/// 3. 再退到 `Claude-Data\` 下**唯一**的 `claude_*` 子目录；
+/// 4. 都没有 → 回落到 `%APPDATA%\Claude`（让调用方给出明确的「未安装」错误）。
+///
+/// 三个输入全部可注入，测试不必依赖真实环境或 MSIX 安装。
+fn resolve_desktop_live_dir(
+    appdata_claude: &Path,
+    msix_root: &Path,
+    appx_families: &[String],
+) -> PathBuf {
+    // 1. 传统安装优先：MSIX 与 EXE 并存时以真实在用的目录为准。
+    if appdata_claude.is_dir() {
+        return appdata_claude.to_path_buf();
+    }
+    // 2. AppX 包族名精确命中。
+    for family in appx_families {
+        let candidate = msix_root.join(family);
+        if candidate.is_dir() {
+            return candidate;
+        }
+    }
+    // 3. 只有一个 claude_* 子目录时也能唯一定位。
+    if let Ok(entries) = fs::read_dir(msix_root) {
+        let mut matches: Vec<PathBuf> = entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.is_dir()
+                    && p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.to_ascii_lowercase().starts_with(MSIX_DIR_PREFIX))
+            })
+            .collect();
+        if matches.len() == 1 {
+            return matches.remove(0);
+        }
+    }
+    // 4. 回落（调用方据此报「未安装」）。
+    appdata_claude.to_path_buf()
+}
+
+/// Claude Desktop 活数据目录：MSIX 感知。
+///
+/// 上游 `Find-ClaudeDataPath` 的行为基准：先 `%APPDATA%\Claude`，再按
+/// `Get-AppxPackage` 的 PackageFamilyName 找 `%LOCALAPPDATA%\Claude-Data\*`。
 pub fn desktop_live_dir() -> Result<PathBuf, String> {
     let config = dirs::config_dir()
         .ok_or_else(|| "无法定位应用配置目录（%APPDATA% / config_dir）".to_string())?;
-    Ok(config.join(DESKTOP_DIR_NAME))
+    let legacy = config.join(DESKTOP_DIR_NAME);
+    if legacy.is_dir() {
+        return Ok(legacy);
+    }
+    // 传统目录不存在时才查 MSIX（多一次 PowerShell 调用，只在首次用到）。
+    let local = dirs::data_local_dir()
+        .ok_or_else(|| "无法定位本地数据目录（%LOCALAPPDATA%）".to_string())?;
+    let msix_root = local.join(MSIX_DATA_DIR_NAME);
+    let families = imp::claude_appx_families();
+    Ok(resolve_desktop_live_dir(&legacy, &msix_root, &families))
 }
 
 /// 快照根目录 `~/.claude-switcher/desktop-accounts`。
@@ -685,6 +745,66 @@ pub fn rename_desktop_profile(id: &str, name: &str) -> Result<DesktopProfile, St
 mod tests {
     use super::*;
     use std::fs;
+
+    // ── MSIX 数据目录发现（上游 Find-ClaudeDataPath 行为基准）──
+
+    #[test]
+    fn live_dir_prefers_legacy_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("Claude");
+        std::fs::create_dir_all(&legacy).unwrap();
+        let msix_root = dir.path().join("Claude-Data");
+        std::fs::create_dir_all(msix_root.join("Claude_family1")).unwrap();
+        // 传统目录存在时优先，即使 MSIX 目录也在。
+        assert_eq!(
+            resolve_desktop_live_dir(&legacy, &msix_root, &["Claude_family1".to_string()]),
+            legacy
+        );
+    }
+
+    #[test]
+    fn live_dir_uses_msix_package_family() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("Claude");
+        let msix_root = dir.path().join("Claude-Data");
+        let family = "Claude_1.2.3_x64__abc";
+        std::fs::create_dir_all(msix_root.join(family)).unwrap();
+        assert_eq!(
+            resolve_desktop_live_dir(&legacy, &msix_root, &[family.to_string()]),
+            msix_root.join(family)
+        );
+    }
+
+    #[test]
+    fn live_dir_falls_back_to_single_claude_data_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("Claude");
+        let msix_root = dir.path().join("Claude-Data");
+        let only = msix_root.join("claude_1.2.3_x64__zzz");
+        std::fs::create_dir_all(&only).unwrap();
+        // AppX 查询失败（空列表）但只有一个 claude_* 目录时也能定位。
+        assert_eq!(resolve_desktop_live_dir(&legacy, &msix_root, &[]), only);
+    }
+
+    #[test]
+    fn live_dir_ambiguous_msix_dirs_fall_back_to_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("Claude");
+        let msix_root = dir.path().join("Claude-Data");
+        std::fs::create_dir_all(msix_root.join("claude_a")).unwrap();
+        std::fs::create_dir_all(msix_root.join("claude_b")).unwrap();
+        // 多个候选且没有 AppX 命中：回落 legacy，让调用方报「未安装」。
+        assert_eq!(resolve_desktop_live_dir(&legacy, &msix_root, &[]), legacy);
+    }
+
+    #[test]
+    fn live_dir_nothing_found_falls_back_to_legacy() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("Claude");
+        let msix_root = dir.path().join("Claude-Data");
+        std::fs::create_dir_all(&msix_root).unwrap();
+        assert_eq!(resolve_desktop_live_dir(&legacy, &msix_root, &[]), legacy);
+    }
 
     /// 造一个带嵌套目录 / 空目录 / 文件的假活目录。
     fn sample_live(root: &Path) -> PathBuf {

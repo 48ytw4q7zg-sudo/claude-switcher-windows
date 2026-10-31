@@ -89,6 +89,9 @@ fn required_process(mode: &str) -> Option<&'static str> {
         "sing-box" => Some("sing-box"),
         "clashx" => Some("clashx"),
         "surge" => Some("surge"),
+        // FlClash 的内核进程名是 FlClashCore（上游 `Test-ProxyAlive` 判定
+        // `FlClashCore`/`FlClash` 两个进程）。
+        "flclash" => Some("flclashcore"),
         // wireguard 不按进程判定：GUI（wireguard.exe）开着≠隧道在线，真实判定走
         // `WireGuardTunnel$*` 服务查询（见 client_up_for），与上游 PS 一致。
         "wireguard" | "auto" | "other" => None,
@@ -445,6 +448,20 @@ mod tests {
         // 未知模式回退到 verge-mihomo
         assert!(client_alive_in("some-unknown", &running));
         assert!(!client_alive_in("some-unknown", &empty));
+    }
+
+    #[test]
+    fn flclash_core_process_counts_as_alive() {
+        let mut running = HashSet::new();
+        running.insert("flclashcore".to_string());
+        assert!(client_alive_in("flclash", &running));
+        assert!(!client_alive_in("flclash", &HashSet::new()));
+        // flclash 不能用其他客户端的内核进程冒充。
+        assert!(!client_alive_in("flclash", &{
+            let mut other = HashSet::new();
+            other.insert("verge-mihomo".to_string());
+            other
+        }));
     }
 
     #[test]

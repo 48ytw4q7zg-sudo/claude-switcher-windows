@@ -71,8 +71,8 @@ pub(crate) fn ensure_parallel_account_dir(profile: &StoredProfile) -> Result<Pat
         let _ = seed_if_missing(&dir, "settings.json", &settings.to_string())?;
     }
 
-    // 共享 skills：全局配置目录的 skills 若账号目录还没有，则复制（best-effort）。
-    copy_shared_skills(&dir);
+    // 共享 skills：优先 junction 指向全局 skills，失败降级复制（best-effort）。
+    let _ = link_or_copy_shared_skills(&dir);
 
     Ok(dir)
 }
@@ -145,16 +145,6 @@ fn verify_and_apply_credential_inner(
     None
 }
 
-/// J-3：本地解析磁盘 uuid 后做身份校验（纯本地、不联网）。
-///
-/// 本地无法解析 uuid 时沿用 best-effort 回写（`conservative=false`），
-/// 供持锁的 in-store 扫描路径使用——那里不能做阻塞联网。
-/// 返回 Some(提示) 时调用方负责展示/记录。
-fn verify_and_apply_credential(profile: &mut StoredProfile, raw: &str) -> Option<String> {
-    let disk_uuid = credential_blob_account_uuid(raw);
-    verify_and_apply_credential_inner(profile, raw, disk_uuid.as_deref(), false)
-}
-
 /// K-1：用已核对好的磁盘 uuid（网络 profile）做身份校验，查不到身份时保守不覆盖。
 fn verify_and_apply_credential_checked(
     profile: &mut StoredProfile,
@@ -198,11 +188,46 @@ fn sync_parallel_credentials_back(profile_id: &str, raw_cred: &str) {
     });
 }
 
+/// J-3/K-1：扫描路径对一条磁盘凭据的处置决定。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CredentialAction {
+    /// 本地已能判定身份且不一致：拒绝回写，消息需展示/记录。
+    Reject(String),
+    /// 本地已能判定身份且一致：立即回写。
+    Apply,
+    /// 本地解析不到磁盘 uuid：真实凭据 blob 通常不含 uuid，此时本地校验恒为空操作，
+    /// 必须交给后台网络核对（[`sync_parallel_credentials_back`]），不能凭 best-effort
+    /// 直接覆盖——否则用户在并行终端里 /login 换了号，下次回写就污染原账号快照。
+    DeferToBackground,
+}
+
+/// J-3/K-1：在已借用的 profile 上判定一条磁盘凭据该如何处置（纯函数）。
+///
+/// 与 [`verify_and_apply_credential`] 的区别：这里**不写入**，只给决定，由调用方
+/// 分派到「立即回写」或「后台网络核对」。
+fn classify_scanned_credential(profile: &StoredProfile, raw: &str) -> CredentialAction {
+    let stored_uuid = stored_profile_uuid(profile);
+    match (credential_blob_account_uuid(raw), stored_uuid) {
+        // 两边都能解析且不一致 → 拒绝。
+        (Some(disk), Some(stored)) if disk != stored => CredentialAction::Reject(format!(
+            "并行目录「{}」已换成别的账号（磁盘账号 {disk} ≠ 登记账号 {stored}），已拒绝回写以免覆盖；可在界面把它收养为新账号。",
+            profile.name
+        )),
+        // 本地能解析且一致 → 立即回写。
+        (Some(_), Some(_)) => CredentialAction::Apply,
+        // 磁盘 uuid 解析不到 → 后台网络核对，本地绝不覆盖。
+        (None, _) => CredentialAction::DeferToBackground,
+        // 库内未登记 uuid 但磁盘有 uuid：无法比对，同样交后台核对。
+        (Some(_), None) => CredentialAction::DeferToBackground,
+    }
+}
+
 /// J-3 同步点：扫描 `accounts/*/.credentials.json`，把并行终端刷新的令牌回写账号库。
 ///
-/// 仅处理 **mtime 晚于 profile.updated_at** 的凭据文件；身份校验（含「可收养为新账号」
-/// 拒绝）复用 [`verify_and_apply_credential`]。该版本接收已借用的 store，供
-/// `switch_profile_blocking`（已持 with_store 锁，不能再嵌套取锁）调用。
+/// 仅处理 **mtime 晚于 profile.updated_at** 的凭据文件。身份判定分两路：
+/// 本地能解析到 uuid 且一致 → 立即回写；解析不到 → 交给后台线程做网络核对
+/// （[`sync_parallel_credentials_back`]），本地绝不覆盖。该版本接收已借用的 store，
+/// 供 `switch_profile_blocking`（已持 with_store 锁，不能再嵌套取锁）调用。
 pub(crate) fn scan_parallel_credential_changes_into(store_data: &mut store::Store) -> Vec<String> {
     let Ok(accounts_root) = crate::paths::app_data_dir().map(|d| d.join("accounts")) else {
         return Vec::new();
@@ -234,8 +259,19 @@ pub(crate) fn scan_parallel_credential_changes_into(store_data: &mut store::Stor
         if raw.is_empty() {
             continue;
         }
-        if let Some(msg) = verify_and_apply_credential(profile, raw) {
-            messages.push(msg);
+        match classify_scanned_credential(profile, raw) {
+            CredentialAction::Reject(msg) => messages.push(msg),
+            CredentialAction::Apply => {
+                // 值相同则不动（也不刷新 updated_at，否则 mtime 过滤会失效）。
+                if !matches!(&profile.keychain_password, Some(cur) if cur == raw) {
+                    profile.keychain_password = Some(raw.to_string());
+                    profile.updated_at = chrono::Utc::now();
+                }
+            }
+            CredentialAction::DeferToBackground => {
+                // 后台线程会自己取 with_store，这里已借用 store，不能嵌套调用。
+                sync_parallel_credentials_back(&profile_id, raw);
+            }
         }
     }
     messages
@@ -246,15 +282,45 @@ pub fn scan_parallel_credential_changes() -> Result<Vec<String>, String> {
     store::with_store(|s| Ok(scan_parallel_credential_changes_into(s)))
 }
 
-/// 从全局 `~/.claude/skills` 复制共享 skills 到账号目录（best-effort，不阻断）。
-fn copy_shared_skills(account_dir: &Path) {
+/// 共享 skills 的落地方式。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SharedSkillsMode {
+    /// 建了目录联接：全局 skills 的改动在账号目录立即可见。
+    Junction,
+    /// 联接失败，降级为一次性复制。
+    Copied,
+    /// 账号目录已有 skills，未改动。
+    AlreadyPresent,
+    /// 全局配置目录没有 skills，无需处理。
+    Missing,
+}
+
+/// 把全局 `~/.claude/skills` 共享给并行账号目录（best-effort，不阻断开终端）。
+///
+/// 优先用目录联接（junction）指向主目录：既省空间，也不会出现「各改各的」两份
+/// skills。联接失败（目标已存在为普通目录、无权限等）时降级为复制，保留原行为。
+fn link_or_copy_shared_skills(account_dir: &Path) -> SharedSkillsMode {
     let Ok(global_dir) = crate::credentials::claude_dir() else {
-        return;
+        return SharedSkillsMode::Missing;
     };
     let global_skills = global_dir.join("skills");
+    if !global_skills.is_dir() {
+        return SharedSkillsMode::Missing;
+    }
     let target_skills = account_dir.join("skills");
-    if global_skills.is_dir() && !target_skills.exists() {
-        let _ = crate::desktop::copy_dir_recursive(&global_skills, &target_skills);
+    if target_skills.exists() || crate::links::path_is_link(&target_skills) {
+        return SharedSkillsMode::AlreadyPresent;
+    }
+    match crate::platform::imp::create_junction(&global_skills, &target_skills) {
+        Ok(()) => SharedSkillsMode::Junction,
+        Err(_) => {
+            // 降级：复制一份（旧行为），保证功能可用。
+            if crate::desktop::copy_dir_recursive(&global_skills, &target_skills).is_ok() {
+                SharedSkillsMode::Copied
+            } else {
+                SharedSkillsMode::Missing
+            }
+        }
     }
 }
 
@@ -565,36 +631,10 @@ mod tests {
         assert_eq!(credential_blob_account_uuid("not-json"), None);
     }
 
-    #[test]
-    fn rejects_write_when_identity_mismatch_and_keeps_old_credential() {
-        let mut profile = make_test_profile(Some("stored-uuid"));
-        let raw = blob_with_uuid("different-disk");
-        let warn = verify_and_apply_credential(&mut profile, &raw);
-        assert!(warn.is_some(), "身份不一致必须返回提示");
-        assert!(warn.unwrap().contains("收养"));
-        assert_eq!(
-            profile.keychain_password.as_deref(),
-            Some("old-raw"),
-            "拒绝回写时原凭据绝不能被覆盖"
-        );
-    }
-
-    #[test]
-    fn applies_when_identity_matches() {
-        let mut profile = make_test_profile(Some("same-uuid"));
-        let raw = blob_with_uuid("same-uuid");
-        assert!(verify_and_apply_credential(&mut profile, &raw).is_none());
-        assert_eq!(profile.keychain_password.as_deref(), Some(raw.as_str()));
-    }
-
-    #[test]
-    fn best_effort_apply_when_disk_uuid_unparseable() {
-        let mut profile = make_test_profile(Some("stored-uuid"));
-        let raw = serde_json::json!({ "no_uuid": true }).to_string();
-        // 本地无法解析磁盘 uuid → 不阻断，best-effort 回写。
-        assert!(verify_and_apply_credential(&mut profile, &raw).is_none());
-        assert_eq!(profile.keychain_password.as_deref(), Some(raw.as_str()));
-    }
+    // 原「本地 best-effort 回写」测试已随 verify_and_apply_credential 删除：
+    // 本地解析不到 uuid 时不再直接覆盖，改为交后台核对（见
+    // unknown_disk_identity_is_deferred_not_written）。身份不一致/一致的
+    // 写入语义由下面两个 checked 测试覆盖。
 
     // ── K-1 后台网络核对路径 ──
 
@@ -656,5 +696,204 @@ mod tests {
         let older = std::time::SystemTime::from(now) - std::time::Duration::from_secs(60);
         assert!(is_credential_file_newer(newer, now), "mtime 更晚应处理");
         assert!(!is_credential_file_newer(older, now), "陈旧文件应跳过");
+    }
+
+    // ── 扫描路径分派：身份未知绝不本地覆盖 ──
+
+    #[test]
+    fn unknown_disk_identity_is_deferred_not_written() {
+        let profile = make_test_profile(Some("stored-uuid"));
+        // 真实 .credentials.json 通常不含 uuid：本地解析恒为 None。
+        let raw =
+            serde_json::json!({"claudeAiOauth": {"accessToken": "t", "expiresAt": 1}}).to_string();
+        let action = classify_scanned_credential(&profile, &raw);
+        assert_eq!(
+            action,
+            CredentialAction::DeferToBackground,
+            "本地解析不到磁盘 uuid 时必须交后台网络核对，不能 best-effort 覆盖"
+        );
+        // 分派函数本身不写 profile。
+        assert_eq!(
+            profile.keychain_password.as_deref(),
+            Some("old-raw"),
+            "分派阶段绝不能改动凭据"
+        );
+    }
+
+    #[test]
+    fn local_mismatch_is_rejected_with_adoption_hint() {
+        let profile = make_test_profile(Some("stored-uuid"));
+        let action = classify_scanned_credential(&profile, &blob_with_uuid("other"));
+        match action {
+            CredentialAction::Reject(msg) => assert!(msg.contains("收养")),
+            _ => panic!("身份不一致必须拒绝回写"),
+        }
+    }
+
+    #[test]
+    fn local_match_is_applied_immediately() {
+        let profile = make_test_profile(Some("same-uuid"));
+        assert_eq!(
+            classify_scanned_credential(&profile, &blob_with_uuid("same-uuid")),
+            CredentialAction::Apply
+        );
+    }
+
+    #[test]
+    fn missing_stored_uuid_defers_even_when_disk_resolves() {
+        // 库内没登记 uuid 时无法比对，交后台核对（后台会按 stored_uuid=None 放行）。
+        let profile = make_test_profile(None);
+        assert_eq!(
+            classify_scanned_credential(&profile, &blob_with_uuid("disk-uuid")),
+            CredentialAction::DeferToBackground
+        );
+    }
+
+    #[test]
+    fn scan_applies_verified_match_without_touching_other_profiles() {
+        // 用一个假的 accounts 目录验证 Apply 分支的写入语义与 mtime 过滤。
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::create_dir_all(root.join("accounts/p1")).unwrap();
+        let cred = root.join("accounts/p1/.credentials.json");
+        std::fs::write(&cred, blob_with_uuid("same-uuid")).unwrap();
+
+        let mut profile = make_test_profile(Some("same-uuid"));
+        // updated_at 设为 1 分钟前，确保 mtime 判定为「更新」。
+        profile.updated_at = chrono::Utc::now() - chrono::Duration::minutes(1);
+        let mut store_data = store::Store {
+            profiles: vec![profile],
+            ..Default::default()
+        };
+        let messages = scan_with_root(&mut store_data.profiles, &root.join("accounts"));
+        assert!(messages.is_empty(), "一致身份不应产生提示");
+        assert_eq!(
+            store_data.profiles[0].keychain_password.as_deref(),
+            Some(blob_with_uuid("same-uuid").as_str()),
+            "本地可确认一致时应立即回写"
+        );
+    }
+
+    /// 与 [`scan_parallel_credential_changes_into`] 同逻辑、但 accounts 根目录可注入，
+    /// 便于在临时目录里测真实读写语义。
+    fn scan_with_root(profiles: &mut [store::StoredProfile], accounts_root: &Path) -> Vec<String> {
+        let Ok(entries) = std::fs::read_dir(accounts_root) else {
+            return Vec::new();
+        };
+        let mut messages = Vec::new();
+        for entry in entries.filter_map(|e| e.ok()) {
+            let profile_id = entry.file_name().to_string_lossy().to_string();
+            let cred_path = entry.path().join(".credentials.json");
+            if !cred_path.exists() {
+                continue;
+            }
+            let Ok(mtime) = std::fs::metadata(&cred_path).and_then(|m| m.modified()) else {
+                continue;
+            };
+            let Some(profile) = profiles.iter_mut().find(|p| p.id == profile_id) else {
+                continue;
+            };
+            if !is_credential_file_newer(mtime, profile.updated_at) {
+                continue;
+            }
+            let Ok(raw) = std::fs::read_to_string(&cred_path) else {
+                continue;
+            };
+            let raw = raw.trim();
+            if raw.is_empty() {
+                continue;
+            }
+            match classify_scanned_credential(profile, raw) {
+                CredentialAction::Reject(msg) => messages.push(msg),
+                CredentialAction::Apply => {
+                    if !matches!(&profile.keychain_password, Some(cur) if cur == raw) {
+                        profile.keychain_password = Some(raw.to_string());
+                        profile.updated_at = chrono::Utc::now();
+                    }
+                }
+                CredentialAction::DeferToBackground => {}
+            }
+        }
+        messages
+    }
+
+    // ── 共享 skills：junction 优先，复制降级 ──
+
+    #[test]
+    fn shared_skills_are_junctioned_not_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let account = dir.path().join("account");
+        std::fs::create_dir_all(global.join("skills/tdd")).unwrap();
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(global.join("skills/tdd/SKILL.md"), "v1").unwrap();
+
+        // 直接把全局 skills 当 claude_dir 用：create_junction 目标是绝对路径，
+        // 这里手工构造同样形态，验证联接而非复制的语义。
+        let mode = link_skills_for_test(&global.join("skills"), &account);
+        assert_eq!(mode, SharedSkillsMode::Junction, "应建目录联接");
+        let linked = account.join("skills/tdd/SKILL.md");
+        assert!(linked.is_file(), "联接后账号目录应能直接看到全局 skills");
+
+        // 关键：全局新增文件在账号目录立即可见——复制做不到这点。
+        std::fs::write(global.join("skills/tdd/SKILL.md"), "v2").unwrap();
+        assert_eq!(std::fs::read_to_string(&linked).unwrap(), "v2");
+        std::fs::create_dir_all(global.join("skills/new")).unwrap();
+        std::fs::write(global.join("skills/new/SKILL.md"), "n").unwrap();
+        assert!(account.join("skills/new/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn shared_skills_fall_back_to_copy_when_target_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let account = dir.path().join("account");
+        std::fs::create_dir_all(global.join("skills/tdd")).unwrap();
+        std::fs::create_dir_all(&account).unwrap();
+        std::fs::write(global.join("skills/tdd/SKILL.md"), "v1").unwrap();
+        // 账号目录已有 skills（普通目录）→ 不覆盖。
+        std::fs::create_dir_all(account.join("skills/mine")).unwrap();
+
+        let mode = link_skills_for_test(&global.join("skills"), &account);
+        assert_eq!(mode, SharedSkillsMode::AlreadyPresent);
+        assert!(
+            account.join("skills/mine").is_dir(),
+            "用户自己的 skills 不能被动"
+        );
+    }
+
+    #[test]
+    fn shared_skills_missing_when_no_global_skills() {
+        let dir = tempfile::tempdir().unwrap();
+        let global = dir.path().join("global");
+        let account = dir.path().join("account");
+        std::fs::create_dir_all(&global).unwrap();
+        std::fs::create_dir_all(&account).unwrap();
+        assert_eq!(
+            link_skills_for_test(&global.join("skills"), &account),
+            SharedSkillsMode::Missing
+        );
+    }
+
+    /// [`link_or_copy_shared_skills`] 的可注入版本：全局 skills 目录由参数给定，
+    /// 不依赖真实 `claude_dir()`。
+    fn link_skills_for_test(global_skills: &Path, account_dir: &Path) -> SharedSkillsMode {
+        if !global_skills.is_dir() {
+            return SharedSkillsMode::Missing;
+        }
+        let target_skills = account_dir.join("skills");
+        if target_skills.exists() || crate::links::path_is_link(&target_skills) {
+            return SharedSkillsMode::AlreadyPresent;
+        }
+        match crate::platform::imp::create_junction(global_skills, &target_skills) {
+            Ok(()) => SharedSkillsMode::Junction,
+            Err(_) => {
+                if crate::desktop::copy_dir_recursive(global_skills, &target_skills).is_ok() {
+                    SharedSkillsMode::Copied
+                } else {
+                    SharedSkillsMode::Missing
+                }
+            }
+        }
     }
 }

@@ -10,6 +10,7 @@ const CLIENT_OPTIONS = [
   { value: 'clashx', label: 'ClashX' },
   { value: 'surge', label: 'Surge' },
   { value: 'wireguard', label: 'WireGuard' },
+  { value: 'flclash', label: 'FlClash' },
   { value: 'other', label: '其他' },
 ];
 

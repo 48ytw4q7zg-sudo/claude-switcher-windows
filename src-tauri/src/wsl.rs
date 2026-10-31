@@ -218,6 +218,18 @@ fn remote_blob_is_newer(local: &str, remote: &str) -> bool {
     }
 }
 
+/// 纯函数：是否应当把本机凭据写入 WSL。
+///
+/// WSL 里那份更新（过期更晚）时**不能写**：本机账号库里的快照可能已经落后于 WSL
+/// 内 claude 刚刷新过的令牌，此时写进去等于把新令牌打回旧值，下次在 WSL 里又要
+/// 重新登录。真正的更新方向是把远端那份回写账号库。
+fn should_write_local_credentials(local: &str, remote: Option<&str>) -> bool {
+    match remote {
+        Some(remote) => !remote_blob_is_newer(local, remote),
+        None => true,
+    }
+}
+
 /// 把凭据 blob 写入指定发行版（stdin + umask + chmod，不闪窗、带超时）。
 pub fn write_credentials_to_wsl(distro: &str, blob: &str) -> Result<(), String> {
     validate_distro(distro)?;
@@ -302,8 +314,13 @@ pub fn sync_to_wsl_blocking(distro: String, local_blob: String) -> Result<WslSyn
         }
     }
 
-    // 3. 写入本机凭据。
-    write_credentials_to_wsl(&name, &local_blob)?;
+    // 3. 写入本机凭据。远端那份更新时**跳过**——否则会把 WSL 里刚刷新的令牌
+    //    打回账号库里的旧值，用户下次在 WSL 里还得重新登录。
+    if should_write_local_credentials(&local_blob, existing.as_deref()) {
+        write_credentials_to_wsl(&name, &local_blob)?;
+    } else {
+        warnings.push("WSL 内凭据更新，未用本机旧副本覆盖它（已改为回写账号库）".to_string());
+    }
 
     // 4. 同步 ~/.claude.json（失败只告警，不阻断凭据写入）。
     if let Err(e) = sync_claude_json_to_wsl(&name) {
@@ -412,5 +429,40 @@ mod tests {
         assert_eq!(blob_expiry_ms(&blob_with_expiry(1234)), Some(1234));
         assert_eq!(blob_expiry_ms("{\"expiresAt\":5678}"), Some(5678));
         assert_eq!(blob_expiry_ms("not json"), None);
+    }
+
+    // ── 写入判定：远端更新时绝不能覆盖 ──
+
+    #[test]
+    fn skips_write_when_remote_credential_is_newer() {
+        let local = blob_with_expiry(1000);
+        let remote = blob_with_expiry(2000);
+        assert!(
+            !should_write_local_credentials(&local, Some(&remote)),
+            "远端凭据更新时写本机旧值会把 WSL 里刷新的令牌打回旧值"
+        );
+    }
+
+    #[test]
+    fn writes_when_remote_missing_or_older() {
+        let local = blob_with_expiry(2000);
+        let older = blob_with_expiry(1000);
+        assert!(
+            should_write_local_credentials(&local, None),
+            "远端缺失应写入"
+        );
+        assert!(
+            should_write_local_credentials(&local, Some(&older)),
+            "本机更新时应覆盖旧远端"
+        );
+    }
+
+    #[test]
+    fn writes_when_neither_side_has_expiry() {
+        // 两边都解析不到过期时间时无法比较，保持原有写入行为（不能因此阻断同步）。
+        assert!(should_write_local_credentials(
+            "{\"a\":1}",
+            Some("{\"b\":2}")
+        ));
     }
 }
