@@ -7,7 +7,7 @@
 //! Windows 专项校验：钩子命令里的路径分隔符（`/` vs `\`）、是否需要
 //! `cmd /c` 包装（.cmd/.bat/npm shim），在读取与保存时给出明确提示。
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -288,11 +288,15 @@ fn merge_permissions_into(obj: &mut serde_json::Map<String, Value>, rules: &Perm
 /// 合并钩子：逐个分组更新 command，保留分组里其他字段与无法识别的钩子。
 ///
 /// 语义：**编辑器列表对它展示过的 (event, matcher) 分组是权威的**——
-/// 用户删掉一条就得真的删掉（否则保存后 Claude 仍执行已删除的钩子）。
-/// 但分组内**解析不出 command 的钩子**（编辑器根本看不到）必须原样保留，
-/// 否则一次保存就静默弄丢用户手写的配置。
+/// 用户删掉一条就得真的删掉（否则保存后 Claude 仍执行已删除的钩子）；
+/// 删光一个分组里的全部可见钩子时，该分组的可见部分消失，只留隐藏项。
+/// 但分组内编辑器**看不到的钩子**（type 非 command、或读不出 command）
+/// 必须原样保留，否则一次保存就静默弄丢用户手写的配置。
+///
+/// 结构不完整的分组（`hooks` 缺失/非数组、事件值本身不是数组）一律原样保留：
+/// 编辑器解析不了它，就没有资格删它。
 fn merge_hooks_into(obj: &mut serde_json::Map<String, Value>, entries: &[HookEntry]) {
-    // 期望的 (event, matcher) → [command]，用于就地更新已有的钩子对象。
+    // 期望的 (event, matcher) → [command]。
     let mut wanted: BTreeMap<(String, String), Vec<String>> = BTreeMap::new();
     for entry in entries {
         wanted
@@ -306,82 +310,102 @@ fn merge_hooks_into(obj: &mut serde_json::Map<String, Value>, entries: &[HookEnt
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    // 逐事件把命令列表写回：已有分组更新 command，缺失分组补建。
+
+    // 1. 对每个已存在分组按「可编辑身份」重建。
+    //    取不到 commands 的（用户删光了该分组的可见钩子）按空列表处理——
+    //    可见钩子全部移除、隐藏项保留。这一步必须覆盖**全部**已有分组，不能只
+    //    处理 wanted 里的：否则删光某一组的可见钩子时，那个分组根本不会被更新，
+    //    用户以为删掉的钩子保存后仍在执行。
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    // 原本含可编辑钩子的 (event, matcher)：这是「编辑器展示过它」的判据。
+    // rebuild 之后原结构就没了，必须先记下来，供第 3 步决定能否删除空分组。
+    let mut was_editable_group: HashSet<(String, String)> = HashSet::new();
+    for (event, value) in hooks.iter_mut() {
+        let Some(groups) = value.as_array_mut() else {
+            continue; // 畸形事件值：原样保留
+        };
+        for group in groups.iter_mut() {
+            let matcher = group
+                .get("matcher")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            seen.insert((event.clone(), matcher.clone()));
+            let commands = wanted
+                .get(&(event.clone(), matcher.clone()))
+                .cloned()
+                .unwrap_or_default();
+            // 结构不完整的分组不重建，原样保留。
+            let Some(hook_list) = group.get_mut("hooks").and_then(Value::as_array_mut) else {
+                continue;
+            };
+            // rebuild 前先判断：原本是否有编辑器能看到的钩子。
+            if hook_list.iter().any(is_editable_hook) {
+                was_editable_group.insert((event.clone(), matcher.clone()));
+            }
+            rebuild_hook_list(hook_list, &commands);
+        }
+    }
+
+    // 2. wanted 里还没出现的 (event, matcher)：用户新建的分组，补建。
     for ((event, matcher), commands) in &wanted {
+        if seen.contains(&(event.clone(), matcher.clone())) {
+            continue;
+        }
         let groups = hooks
             .entry(event.clone())
             .or_insert_with(|| Value::Array(Vec::new()))
             .as_array_mut();
         let Some(groups) = groups else { continue };
-        let target = groups.iter_mut().find(|group| {
-            group.get("matcher").and_then(Value::as_str).unwrap_or("") == matcher.as_str()
-        });
-        if let Some(group) = target {
-            if let Some(hook_list) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-                // 逐个可见钩子按「可编辑身份」写回，不按索引：
-                // 同一分组里可能混着编辑器看不到的项（type 非 command、或读不出
-                // command）。按索引对齐会把可见命令写到隐藏项头上，截断也会
-                // 连带删掉它们。这里只动可见槽位，隐藏项原位不动。
-                let mut visible_index = 0usize;
-                for slot in hook_list.iter_mut() {
-                    if !is_editable_hook(slot) {
-                        continue;
-                    }
-                    match commands.get(visible_index) {
-                        Some(command) => {
-                            if let Some(hook_obj) = slot.as_object_mut() {
-                                hook_obj
-                                    .insert("command".to_string(), Value::String(command.clone()));
-                            }
-                            visible_index += 1;
-                        }
-                        // 用户删掉了这条：先标记，稍后统一移除。
-                        None => slot["__deleted__"] = json!(true),
-                    }
-                }
-                // 数量不够：补建最小对象（追加在末尾）。
-                for command in commands.iter().skip(visible_index) {
-                    hook_list.push(json!({"type": "command", "command": command}));
-                }
-                // 移除被标记的可见钩子，隐藏项不受影响。
-                hook_list.retain(|hook| !hook["__deleted__"].as_bool().unwrap_or(false));
-            }
-        } else {
-            let hook_list: Vec<Value> = commands
-                .iter()
-                .map(|command| json!({"type": "command", "command": command}))
-                .collect();
-            let mut group = serde_json::Map::new();
-            if !matcher.is_empty() {
-                group.insert("matcher".to_string(), Value::String(matcher.clone()));
-            }
-            group.insert("hooks".to_string(), Value::Array(hook_list));
-            groups.push(Value::Object(group));
+        let hook_list: Vec<Value> = commands
+            .iter()
+            .map(|command| json!({"type": "command", "command": command}))
+            .collect();
+        let mut group = serde_json::Map::new();
+        if !matcher.is_empty() {
+            group.insert("matcher".to_string(), Value::String(matcher.clone()));
         }
+        group.insert("hooks".to_string(), Value::Array(hook_list));
+        groups.push(Value::Object(group));
     }
-    // 用户在编辑器里删掉了某事件/某 matcher 下的全部钩子：残留分组必须删除，
-    // 否则保存后 Claude Code 仍会执行用户以为已删除的钩子。
-    // 例外：分组里含「解析不出 command」的钩子时保留——编辑器从未展示过它，
-    // 删掉就是静默丢失用户手写的配置。
-    for (event, value) in hooks.iter_mut() {
-        let Some(groups) = value.as_array_mut() else {
+
+    // 3. 重建后一个钩子都不剩、且原本含可编辑钩子的分组才删除。
+    //    「原本可编辑」是「编辑器展示过它」的判据——不能看 wanted：用户删光某组
+    //    的全部可见钩子后，wanted 里已经没有这个 (event, matcher) 了，但它确实
+    //    被展示过，删空了就该删。
+    //    原本就只有隐藏项的分组（编辑器从未展示）即使可见部分被删空也保留。
+    let mut stale: Vec<(String, usize)> = Vec::new();
+    for (event, value) in hooks.iter() {
+        let Some(groups) = value.as_array() else {
             continue;
         };
-        groups.retain(|group| {
+        for (index, group) in groups.iter().enumerate() {
             let matcher = group.get("matcher").and_then(Value::as_str).unwrap_or("");
-            // 编辑器展示过 → 以编辑器为准（删了就真删）。
-            if wanted.contains_key(&(event.clone(), matcher.to_string())) {
-                return true;
-            }
-            // 没展示过：只有含「读不出 command」的钩子时才保留。
-            group
+            // 已经空了、且原本不含可编辑钩子 → 隐藏分组，保留。
+            let emptied = group
                 .get("hooks")
                 .and_then(Value::as_array)
-                .is_some_and(|list| {
-                    list.iter()
-                        .any(|hook| hook.get("command").and_then(Value::as_str).is_none())
-                })
-        });
+                .is_none_or(|list| list.is_empty());
+            if !emptied {
+                continue;
+            }
+            // 空了：看它原本是否被编辑器展示过。用 wanted 判定会漏掉「删光」的分组，
+            // 因此这里改为：该分组此前有可编辑钩子（由 rebuild 前的结构决定）。
+            // rebuild 已把它清空，所以用「该 (event, matcher) 曾出现在 wanted 或
+            // 者原结构含可编辑钩子」判断——后者无法在 rebuild 后恢复，改为在
+            // rebuild 阶段记录。
+            if was_editable_group.contains(&(event.clone(), matcher.to_string())) {
+                stale.push((event.clone(), index));
+            }
+        }
+    }
+    // 按 index 倒序删，避免位移。
+    for (event, index) in stale.iter().rev() {
+        if let Some(groups) = hooks.get_mut(event).and_then(Value::as_array_mut) {
+            if *index < groups.len() {
+                groups.remove(*index);
+            }
+        }
     }
     // 事件下已无分组：删掉空数组，别留空壳。
     let empty_events: Vec<String> = hooks
@@ -400,6 +424,38 @@ fn merge_hooks_into(obj: &mut serde_json::Map<String, Value>, entries: &[HookEnt
     obj.insert("hooks".to_string(), Value::Object(hooks));
 }
 
+/// 按「可编辑身份」重建一个分组的钩子列表。
+///
+/// 可见槽（[`is_editable_hook`]）按顺序消费 `commands`：有就更新 command，
+/// 用完了说明用户删掉了它——不放进新列表。隐藏槽原样透传，位置不变。
+/// `commands` 比可见槽多时，多出来的补建最小对象追加到末尾。
+///
+/// 不用 `__deleted__` 之类的临时字段标记：用户配置里可能本来就有同名字段，
+/// 会把该留的钩子删掉。
+fn rebuild_hook_list(hook_list: &mut Vec<Value>, commands: &[String]) {
+    let mut visible_index = 0usize;
+    let mut rebuilt: Vec<Value> = Vec::with_capacity(hook_list.len());
+    for slot in hook_list.drain(..) {
+        if !is_editable_hook(&slot) {
+            rebuilt.push(slot); // 隐藏项原位保留
+            continue;
+        }
+        // 用户删掉了这条可见钩子：commands 用完了，直接不放进新列表。
+        if let Some(command) = commands.get(visible_index) {
+            let mut slot = slot;
+            if let Some(hook_obj) = slot.as_object_mut() {
+                hook_obj.insert("command".to_string(), Value::String(command.clone()));
+            }
+            rebuilt.push(slot);
+            visible_index += 1;
+        }
+    }
+    for command in commands.iter().skip(visible_index) {
+        rebuilt.push(json!({"type": "command", "command": command}));
+    }
+    *hook_list = rebuilt;
+}
+
 /// 保存编辑器结果：先校验，再乐观并发写入。
 ///
 /// 校验只产生告警（允许保存），但空命令/空规则会被拒绝，避免写入无效配置。
@@ -414,6 +470,10 @@ pub fn save_permission_editor(
     }
     if hooks.iter().any(|h| h.command.trim().is_empty()) {
         return Err("存在空钩子命令，请先删除再保存".to_string());
+    }
+    // 事件名是 hooks 的顶层键，空串会写出一个永不被触发的无效分组。
+    if hooks.iter().any(|h| h.event.trim().is_empty()) {
+        return Err("存在空钩子事件名（如 Stop / PreToolUse），请填写或删除该条".to_string());
     }
     let settings_path = paths::claude_settings_path()?;
     mcp::modify_json_optimistic(&settings_path, |root| {
@@ -516,6 +576,20 @@ mod tests {
         };
         let warnings = validate_hook(&entry);
         assert!(warnings.iter().any(|w| w.contains("空钩子")));
+    }
+
+    #[test]
+    fn save_rejects_blank_hook_event() {
+        // 事件名是 hooks 的顶层键，空串会写出永不被触发的无效分组。
+        let blank_event = vec![HookEntry {
+            event: "  ".to_string(),
+            matcher: String::new(),
+            command: "echo hi".to_string(),
+        }];
+        assert!(
+            save_permission_editor(PermissionRules::default(), blank_event).is_err(),
+            "空事件名必须被拒绝"
+        );
     }
 
     #[test]
@@ -707,6 +781,96 @@ mod tests {
         assert_eq!(list.len(), 2, "只应删掉用户删的那条可见钩子");
         assert_eq!(list[0]["command"], json!("keep"));
         assert_eq!(list[1], json!({"no_command": true}));
+    }
+
+    #[test]
+    fn apply_editor_keeps_prompt_type_hook_it_never_showed() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "visible"}]}],
+                // 编辑器按 type 跳过它，从不展示。
+                "PreToolUse": [{"matcher": "Bash", "hooks": [
+                    {"type": "prompt", "command": "user-written-prompt-hook"}
+                ]}]
+            }
+        });
+        let hooks = vec![HookEntry {
+            event: "Stop".to_string(),
+            matcher: String::new(),
+            command: "visible".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        assert!(
+            root["hooks"].get("PreToolUse").is_some(),
+            "type=prompt 的钩子编辑器看不到，保存时必须保留——否则用户改一条 allow 规则就删掉它"
+        );
+        assert_eq!(
+            root["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            json!("user-written-prompt-hook")
+        );
+    }
+
+    #[test]
+    fn apply_editor_keeps_hidden_hook_when_last_visible_one_in_group_deleted() {
+        // 混合分组里删掉最后一条可见钩子，隐藏的 prompt 钩子不能连带消失。
+        let mut root = json!({
+            "hooks": {
+                "Stop": [{"hooks": [
+                    {"type": "command", "command": "visible"},
+                    {"type": "prompt", "command": "hidden-prompt"}
+                ]}]
+            }
+        });
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &[]).expect("apply");
+        let list = root["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "只删可见钩子，隐藏 prompt 钩子必须留下");
+        assert_eq!(list[0]["command"], json!("hidden-prompt"));
+    }
+
+    #[test]
+    fn apply_editor_keeps_malformed_hook_group() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": "visible"}]}],
+                // 畸形分组：hooks 缺失 / 非数组 / 元素不是对象。
+                "Weird": [{"matcher": "X"}],
+                "Weirder": [{"hooks": "not-an-array"}],
+                "Weirdest": "not-an-array-at-all"
+            }
+        });
+        let hooks = vec![HookEntry {
+            event: "Stop".to_string(),
+            matcher: String::new(),
+            command: "visible".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        assert!(
+            root["hooks"].get("Weird").is_some(),
+            "畸形分组不能被保存动作删掉"
+        );
+        assert!(root["hooks"].get("Weirder").is_some());
+        assert!(root["hooks"].get("Weirdest").is_some());
+    }
+
+    #[test]
+    fn apply_editor_ignores_user_deleted_lookalike_field() {
+        // 用户配置里本就有 "__deleted__": true 的可编辑钩子：它必须被保留，
+        // 不能被保存逻辑的临时标记机制误删。
+        let mut root = json!({
+            "hooks": {"Stop": [{"hooks": [
+                {"type": "command", "command": "keep-me", "__deleted__": true}
+            ]}]}
+        });
+        let hooks = vec![HookEntry {
+            event: "Stop".to_string(),
+            matcher: String::new(),
+            command: "keep-me".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        let list = root["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(list.len(), 1, "带 __deleted__ 字段的钩子不能被误删");
+        assert_eq!(list[0]["command"], json!("keep-me"));
+        assert_eq!(list[0]["__deleted__"], json!(true), "用户字段原样保留");
     }
 
     #[test]

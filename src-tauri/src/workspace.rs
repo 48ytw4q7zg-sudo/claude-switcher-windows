@@ -318,6 +318,14 @@ pub fn validate_asset_id(id: &str) -> Result<(), String> {
             "" | "." | ".." => {
                 return Err("资产 id 不能含空段、. 或 .. 分量".to_string());
             }
+            // 冒号是 NTFS 备用数据流（ADS）分隔符，会让 rename 写到另一个流里。
+            _ if part.contains(':') => {
+                return Err("资产 id 不能含冒号（NTFS 会当成备用数据流）".to_string());
+            }
+            // 保留设备名（CON/NUL/COM1…）不能作为文件名分量。
+            _ if crate::naming::is_reserved_device_name(part) => {
+                return Err(format!("资产 id 含 Windows 保留设备名「{part}」"));
+            }
             _ => {}
         }
     }
@@ -544,6 +552,27 @@ mod tests {
         assert!(validate_asset_id(r"\\server\share").is_err());
         assert!(validate_asset_id("a\\b").is_err(), "反斜杠一律拒绝");
         assert!(validate_asset_id("bad\u{0000}id").is_err());
+        // 保留设备名：CON.md 之类会让 rename 落到设备上。
+        assert!(validate_asset_id("CON").is_err());
+        assert!(validate_asset_id("nul.md").is_err());
+        assert!(validate_asset_id("dir/COM1").is_err());
+        // 冒号：NTFS 备用数据流（ADS）。
+        assert!(validate_asset_id("a:b").is_err());
+        assert!(validate_asset_id("dir/x:stream").is_err());
+    }
+
+    #[test]
+    fn validate_asset_id_still_accepts_ordinary_nested_ids() {
+        // 上面新增的拒绝规则不能误伤正常资产名。
+        assert!(validate_asset_id("tdd").is_ok());
+        assert!(validate_asset_id("api-designer").is_ok());
+        assert!(validate_asset_id("nested/deep").is_ok());
+        assert!(
+            validate_asset_id("console-helper").is_ok(),
+            "含 con 子串但不是保留名"
+        );
+        assert!(validate_asset_id("v1.2.3").is_ok(), "点号不是 ADS 分隔符");
+        assert!(validate_asset_id("美国号").is_ok());
     }
 
     #[test]

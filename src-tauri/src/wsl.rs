@@ -239,9 +239,26 @@ fn should_write_local_credentials(local: &str, remote: Option<&str>) -> bool {
 /// - 任一边解析不到 uuid → 无法证明同一账号，拒绝（`None` 表示无法判定）。
 ///
 /// 返回 `Some(true)` 允许回写、`Some(false)` 明确拒绝、`None` 无法判定。
+///
+/// 注意：真实 `.credentials.json` 通常**不含** uuid（与 parallel 的 K-1 同一事实），
+/// 因此本地解析不到时调用方应改用 [`remote_blob_matches_profile_via_network`]
+/// 走 OAuth profile 端点核对，否则合法回写会被一律跳过。
 fn remote_blob_matches_profile(remote: &str, profile_uuid: Option<&str>) -> Option<bool> {
     let remote_uuid = crate::usage::extract_meta(None, Some(remote)).account_uuid?;
     let stored = profile_uuid?;
+    Some(remote_uuid == stored)
+}
+
+/// 本地解析不到 uuid 时，用 WSL blob 的 access token 调 OAuth profile 端点核对身份。
+///
+/// 复用 [`crate::usage::oauth_account_uuid_for_blob`]（带超时与 token 指纹缓存），
+/// 与 parallel 的 K-1 后台核对同源。任何失败都返回 None，由调用方走保守路径。
+fn remote_blob_matches_profile_via_network(
+    remote: &str,
+    profile_uuid: Option<&str>,
+) -> Option<bool> {
+    let stored = profile_uuid?;
+    let remote_uuid = crate::usage::oauth_account_uuid_for_blob(remote)?;
     Some(remote_uuid == stored)
 }
 
@@ -334,7 +351,14 @@ pub fn sync_to_wsl_blocking(
         ));
         if remote_blob_is_newer(&local_blob, remote) {
             // 过期更晚只说明令牌更新，还要核对是不是同一个账号才敢回写。
-            match remote_blob_matches_profile(remote, profile_uuid.as_deref()) {
+            // 先本地解析；真实凭据 blob 通常不含 uuid，本地解析不到时回退到
+            // OAuth profile 端点核对（与 parallel 的 K-1 同源），否则合法回写
+            // 会被一律跳过、K-4 功能不可达。
+            let verdict =
+                remote_blob_matches_profile(remote, profile_uuid.as_deref()).or_else(|| {
+                    remote_blob_matches_profile_via_network(remote, profile_uuid.as_deref())
+                });
+            match verdict {
                 Some(true) => {
                     remote_newer_blob = Some(remote.clone());
                     warnings.push("WSL 内凭据更新且账号一致，已将其回写账号库".to_string());
@@ -536,6 +560,35 @@ mod tests {
         );
         assert_eq!(
             remote_blob_matches_profile("not json", Some("stored")),
+            None
+        );
+    }
+
+    #[test]
+    fn network_fallback_is_tried_when_local_parse_finds_no_uuid() {
+        // 真实凭据 blob 不含 uuid：本地判 None，必须回退到网络核对，
+        // 否则 K-4「WSL 更新 → 回写账号库」永远不可达。
+        let real_shaped_blob =
+            serde_json::json!({"claudeAiOauth": {"accessToken": "t", "expiresAt": 1}}).to_string();
+        assert_eq!(
+            remote_blob_matches_profile(&real_shaped_blob, Some("stored")),
+            None,
+            "本地解析不到 uuid"
+        );
+        // 网络路径：没有可用令牌/网络时同样返回 None，但不该 panic。
+        assert_eq!(
+            remote_blob_matches_profile_via_network(&real_shaped_blob, Some("stored")),
+            None,
+            "无网络时保守返回 None"
+        );
+        // 账号库没登记 uuid 时网络路径也必须拒绝（无从比对）。
+        assert_eq!(
+            remote_blob_matches_profile_via_network(&real_shaped_blob, None),
+            None
+        );
+        // 完全没有 accessToken 时不可能核对身份。
+        assert_eq!(
+            remote_blob_matches_profile_via_network("{\"claudeAiOauth\":{}}", Some("stored")),
             None
         );
     }
