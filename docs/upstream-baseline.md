@@ -12,10 +12,25 @@
 | A. CLI 切换器 | https://github.com/VallierDev/claude-switcher | Claude Code **CLI**（`~/.claude`、`~/.claude.json`、OAuth 凭据） | Tauri 2 + Rust + React | [`68979843313a0cb7da3cda32765184436ba9598e`](https://github.com/VallierDev/claude-switcher/commit/68979843313a0cb7da3cda32765184436ba9598e) |
 | B. 环境/桌面版 | https://github.com/YOURSJEYO/claude-switcher | Claude **桌面版**（`%APPDATA%\Claude`）+ 环境安全 | bash/PowerShell 核心 + Swift/macOS + WPF Windows Beta | [`870c4ca0754234965878ef58144d7a755d965037`](https://github.com/YOURSJEYO/claude-switcher/commit/870c4ca0754234965878ef58144d7a755d965037) |
 
-记录日期：2026-10-27。许可：基线 A 未声明 LICENSE；基线 B 为 MIT。
+记录日期：2026-10-27（v0.6.0 于 2026-10-31 复核上游 `main`）。许可：基线 A 未声明 LICENSE；基线 B 为 MIT。
 
 > 关于仓库名：用户链接里的 `claude-switch` 是笔误，经 `gh api users/YOURSJEYO/repos`
 > 核实真实仓库名为 `claude-switcher`。
+
+### 1.1 上游基线之后的增量（v0.6.0 对等范围）
+
+基线 B 固定于 `870c4ca`，但上游 `main` 仍在演进（v0.6.0 复核时为 `f37cb26`，
+含标签 v1.0.0~v1.7.1）。新增内容已逐项对照，Windows 相关增量及本仓库处置：
+
+| 上游新增 | 上游位置 | 本仓库处置 |
+| --- | --- | --- |
+| MSIX Claude 数据目录发现 | `Find-ClaudeDataPath` | 已对等：`desktop::resolve_desktop_live_dir` + `platform::claude_appx_families` |
+| FlClash 客户端识别 | `Test-ProxyAlive` | 已对等：`guard::required_process` 加 `flclash → flclashcore` |
+| 客户端语言按系统 UI 语言、不一致降 warn | `Invoke-CheckDetail` | 已对等：`platform::current_ui_language` + `judge_client_language` |
+| 48h 出口 IP 变化计数 | `Add-IpHistory` / `iphistory.log` | **未实现**：仅影响 warn 档文案，不改变 fail 判定；见 `docs/qa-v0.6.0.md` |
+| Claude 由 Appx/AUMID 兜底启动 | `Find-ClaudeAumid` | 未实现：本仓库 Desktop 切换不负责拉起 Claude |
+| 切换目录改用暂存+换位（不先删活目录） | `Switch-DataDir` | 已有等价保护：先 staging 备份再清空，失败自动回滚 |
+| 优雅关闭后再强杀 | `Stop-ClaudeApp` | 已对等：`kill_desktop_processes` 两段式 |
 
 ### 1.1 关键决定反转（以用户最新指令为准）
 
