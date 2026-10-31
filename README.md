@@ -39,8 +39,8 @@
 | 项 | 状态 |
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
-| 安装包 | **Release v0.5.0**（v0.6.0 合并后由 `.github/workflows/windows-build.yml` 自动构建 MSI + NSIS + 便携 zip），产物来源可审计，SHA256 见 Release 说明 |
-| 测试 | `cargo test --lib` **387 passed / 0 failed / 0 ignored**；`cargo clippy --all-targets -- -D warnings` 零警告；`npx tsc --noEmit` 通过 |
+| 安装包 | **Release v0.6.0**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计，SHA256 见 Release 说明 |
+| 测试 | `cargo test --lib` **394 passed / 0 failed / 0 ignored**；`cargo clippy --all-targets -- -D warnings` 零警告；`npx tsc --noEmit` 通过 |
 | 实测环境 | 无显示器环境本地构建；Windows 10/11 端到端实机验证项见文末清单 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
 

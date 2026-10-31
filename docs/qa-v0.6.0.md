@@ -79,7 +79,7 @@ v0.5.0（HEAD=f1800c5 之后的 3edc96f）交付 J-1~J-8 缺陷与 F-1~F-7 功�
 | --- | --- |
 | `cargo fmt --check` | 通过 |
 | `cargo clippy --all-targets -- -D warnings` | 零警告 |
-| `cargo test --lib` | **387 passed / 0 failed / 0 ignored**（v0.5.0 后 346 → 387，新增 41） |
+| `cargo test --lib` | **394 passed / 0 failed / 0 ignored**（v0.5.0 后 346 → 394，新增 48） |
 | `npx tsc --noEmit` | 通过 |
 | `npm run tauri build` | 本地已产出 MSI（10.22 MiB）+ NSIS（7.15 MiB）；合并后由 CI 出正式产物 |
 
@@ -167,4 +167,64 @@ v0.5.0（HEAD=f1800c5 之后的 3edc96f）交付 J-1~J-8 缺陷与 F-1~F-7 功�
   均不被该账号支持；随后账号额度耗尽（提示 2026-11-17 恢复）。
 - 按 §D fallback，改用一次独立合格审查者（独立上下文、只读、不嵌套派发）
   完成两轮审查，失败证据与结论一并记录在此。
+
+## 第二轮复核发现并修复的问题
+
+第一轮修复后做了第二轮复核，结论 With fixes。以下问题均已修复。
+
+### N1：retain 谓词与 is_editable_hook 不一致（permissions.rs）
+
+- 问题：清理残留分组时只保护「读不出 command」的钩子。`type=prompt/http`
+  且带 command 字符串的钩子编辑器按类型跳过、从不展示，却会被判为可删除——
+  用户改一条 allow 规则保存，手写的 prompt 钩子就没了。
+- 修复：谓词改为 `!is_editable_hook(hook)`，与提取判定完全一致；
+  `hooks` 缺失/非数组的畸形分组、事件值非数组一律原样保留。
+- 测试：`apply_editor_keeps_prompt_type_hook_it_never_showed`、
+  `apply_editor_keeps_malformed_hook_group`。
+
+### 删光最后一组可见钩子时该组不被更新（permissions.rs）
+
+- 问题：写回只遍历 `wanted` 里的分组。用户删掉某组全部可见钩子后，
+  `wanted` 里已没有这个 `(event, matcher)`，该分组根本不被处理——
+  用户以为删掉的钩子保存后仍在执行。
+- 修复：重写为三段式——先对**全部**已有分组按可编辑身份重建
+  （`rebuild_hook_list`），再补建 wanted 里缺失的新分组，最后清理
+  「重建后为空、且原本含可编辑钩子」的分组。是否展示过由 rebuild 前记录的
+  `was_editable_group` 判定，不再从 wanted 反推。
+- 测试：`apply_editor_keeps_hidden_hook_when_last_visible_one_in_group_deleted`、
+  `apply_editor_removes_stale_hook_group_user_deleted`、
+  `apply_editor_removes_hook_the_user_deleted_from_a_shown_event`、
+  `apply_editor_removes_event_when_all_its_shown_hooks_deleted`。
+- 说明：这一条是**测试先抓到的**——修复过程中首轮实现让
+  `apply_editor_keeps_hidden_hook_when_last_visible_one_in_group_deleted`
+  失败（残留 2 条而非 1 条），据此定位到上述根因。
+
+### WSL 身份核对在真实场景恒不可达（wsl.rs）
+
+- 问题：`remote_blob_matches_profile` 只做本地解析，而真实
+  `.credentials.json` 通常不含 uuid（parallel 的 K-1 正是为此才建网络核对）。
+  结果几乎恒返回 None，K-4「WSL 更新 → 回写账号库」功能不可达，
+  每次同步都弹「无法核对身份」。
+- 修复：本地解析不到时回退 `remote_blob_matches_profile_via_network`
+  （OAuth profile 端点，与 K-1 同源，带超时与 token 指纹缓存）；
+  `or_else` 保证本地能判定时不多发请求。
+- 测试：`network_fallback_is_tried_when_local_parse_finds_no_uuid`。
+
+### 其他
+
+- `__deleted__` 临时标记可能撞上用户同名字段 → 改为重建 Vec，不用标记字段。
+  测试：`apply_editor_ignores_user_deleted_lookalike_field`。
+- workspace id 未拒保留设备名（CON/NUL → CON.md）与 ADS 冒号 →
+  复用 `naming::is_reserved_device_name` + 冒号检查，并补「不误伤合法 id」
+  的反向断言。
+- 空钩子事件名未校验（会写出永不被触发的空分组）→ `save_permission_editor`
+  拒绝空 event。测试：`save_rejects_blank_hook_event`。
+
+### 复核确认已闭环、无新问题的项
+
+Critical 1（跨账号回写）、Critical 2（WSL 串号）、Important 4
+（workspace id 边界）、Minor 5（in-flight 去重）经第二轮逐条复核，
+确认修复正确且未引入新缺陷；并行四个身份分支、去重、混合分组、
+id 校验均有测试覆盖。
+
 
