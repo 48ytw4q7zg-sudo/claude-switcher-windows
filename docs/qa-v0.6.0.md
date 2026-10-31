@@ -79,9 +79,9 @@ v0.5.0（HEAD=f1800c5 之后的 3edc96f）交付 J-1~J-8 缺陷与 F-1~F-7 功�
 | --- | --- |
 | `cargo fmt --check` | 通过 |
 | `cargo clippy --all-targets -- -D warnings` | 零警告 |
-| `cargo test --lib` | **369 passed / 0 failed / 0 ignored**（v0.5.0 后 346 → 369，新增 23） |
+| `cargo test --lib` | **387 passed / 0 failed / 0 ignored**（v0.5.0 后 346 → 387，新增 41） |
 | `npx tsc --noEmit` | 通过 |
-| `npm run tauri build` | 由 CI（windows-latest）构建 MSI + NSIS + 便携 zip |
+| `npm run tauri build` | 本地已产出 MSI（10.22 MiB）+ NSIS（7.15 MiB）；合并后由 CI 出正式产物 |
 
 ## 独立审查
 
@@ -99,3 +99,72 @@ v0.5.0（HEAD=f1800c5 之后的 3edc96f）交付 J-1~J-8 缺陷与 F-1~F-7 功�
 - MSIX 版 Claude Desktop 的数据目录（本机未安装 MSIX 版）。
 - 安装包升级/卸载回归、托盘菜单、并行终端 wt/cmd 拉起、Toast 通知。
 - F-4 凭据锁（原 P2-2）：仍待 Process Monitor 实机调研，本轮不实现、不加猜测锁。
+
+## 独立审查发现并修复的问题
+
+第一轮审查给出 ready-to-merge: No，发现 2 个 Critical。均已修复并补回归测试。
+
+### Critical 1：账号库未登记 uuid 时跨账号覆盖（parallel.rs）
+
+- 问题：`verify_and_apply_credential_inner` 的身份判断要求磁盘与账号库**都**解析出
+  uuid。老账号快照没登记 uuid 时，后台网络核对到另一个账号的 uuid 也会直接放行
+  回写——等于把并行终端里换号后的凭据写进原账号快照，之后切回去就串号。
+- 修复：`(Some(disk), None)` 分支改为拒绝，并提示重新捕获该账号。
+- 测试：`checked_refuses_when_stored_uuid_unknown_but_network_resolves`、
+  `checked_refuses_when_stored_uuid_unknown_and_disk_uuid_unknown`。
+  原有测试 `checked_applies_when_stored_uuid_unknown_but_network_resolves`
+  固化了错误行为，已改名并反转断言。
+
+### Critical 2：WSL 回写不核对账号身份（wsl.rs / lib.rs）
+
+- 问题：`remote_newer_blob` 只按过期时间判定。WSL 里登着别的账号时，它的凭据会被
+  写进当前账号快照（`lib.rs` 的 WSL 回写路径同样只看过期时间）。
+- 修复：新增 `remote_blob_matches_profile`，用账号库登记的 uuid 与 WSL blob 的
+  uuid 比对；`sync_to_wsl_blocking` 增加 `profile_uuid` 参数，
+  `write_wsl_credentials` 传入 `profile.meta.account_uuid`。
+  只有 `Some(true)` 才回写；`Some(false)` 拒绝并提示切换账号，`None` 提示重新捕获。
+- 测试：`allows_writeback_only_when_remote_matches_profile`、
+  `writeback_is_undecidable_when_either_uuid_missing`。
+
+### Important 3：权限编辑器数据丢失（permissions.rs）
+
+- 空列表删整个 `hooks` 块 → 改为保留隐藏分组，只有彻底空掉才删整块。
+  测试：`apply_editor_keeps_hidden_hooks_when_user_deletes_all_visible_ones`、
+  `apply_editor_removes_hooks_block_only_when_nothing_left`。
+- stale 分组删不掉 → 编辑器展示过的 `(event, matcher)` 分组以编辑器为准。
+  测试：`apply_editor_removes_hook_the_user_deleted_from_a_shown_event`、
+  `apply_editor_removes_event_when_all_its_shown_hooks_deleted`。
+- 非 command 类型钩子被接管 → `extract_hooks` 与合并都只认 `type == "command"`
+  （或缺 type）的钩子。测试：`extract_hooks_skips_non_command_hook_types`。
+- 混合分组按索引写回会覆盖/截断隐藏项 → 改为按 `is_editable_hook` 身份逐槽更新，
+  隐藏项原位保留。测试：
+  `apply_editor_keeps_hidden_hook_inside_a_mixed_group`、
+  `apply_editor_deleting_visible_hook_in_mixed_group_keeps_hidden`。
+- 界面增加说明：此列表是权威的，删掉即真删；读不出命令行的钩子原样保留。
+
+### Important 4：工作区启停未约束 id（workspace.rs）
+
+- 问题：`set_workspace_enabled` 的 id 来自前端，直接 `Path::join`。绝对 id 会丢弃
+  基路径，`../` 会逃出配置目录，可能误移用户文件。
+- 修复：新增 `validate_asset_id`（拒绝空、绝对/盘符/UNC、`.`/`..` 分量、反斜杠、
+  控制字符），并在拼路径后加 `starts_with(claude_dir)` 双保险。
+- 测试：`validate_asset_id_accepts_normal_and_nested_ids`、
+  `validate_asset_id_rejects_traversal_and_absolute`、
+  `paths_for_absolute_id_drops_the_base_dir`、
+  `paths_for_traversal_id_builds_an_escaping_path`。
+
+### Minor 5：后台回写无去重（parallel.rs）
+
+- 问题：身份未知时不推进 `updated_at`，每次托盘刷新都会为同一账号再 spawn 线程。
+- 修复：per-profile in-flight 集合（`try_claim_writeback` / `release_writeback`），
+  Drop guard 覆盖含 panic 的所有退出路径。
+- 测试：`writeback_claim_is_exclusive_and_releasable`、
+  `writeback_claims_are_per_profile`。
+
+### 审查车道可用性（如实记录）
+
+- Codex 车道本机不可用：默认路由 `gpt-6-astra` 与审查路由 `deepseek-v4-pro`
+  均不被该账号支持；随后账号额度耗尽（提示 2026-11-17 恢复）。
+- 按 §D fallback，改用一次独立合格审查者（独立上下文、只读、不嵌套派发）
+  完成两轮审查，失败证据与结论一并记录在此。
+
