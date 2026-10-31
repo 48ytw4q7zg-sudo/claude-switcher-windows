@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{Mutex, OnceLock};
 use std::thread::sleep;
 use std::time::Duration;
 
@@ -169,6 +170,31 @@ fn verify_and_apply_credential_checked(
     verify_and_apply_credential_inner(profile, raw, disk_uuid, true)
 }
 
+/// 正在做身份核对/回写的 profile id 集合（in-flight 去重）。
+///
+/// 身份未知时回写不会推进 `updated_at`，于是每次托盘刷新/切换都会再次扫描到同一
+/// 份凭据；没有去重就会为同一个账号不断 spawn 后台线程，断网或账号多时累积争锁。
+static INFLIGHT_WRITEBACK: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+
+fn inflight_writeback() -> &'static Mutex<std::collections::HashSet<String>> {
+    INFLIGHT_WRITEBACK.get_or_init(|| Mutex::new(std::collections::HashSet::new()))
+}
+
+/// 尝试登记一个 profile 的 in-flight 回写；已在处理中返回 false（跳过本次）。
+fn try_claim_writeback(profile_id: &str) -> bool {
+    inflight_writeback()
+        .lock()
+        .map(|mut set| set.insert(profile_id.to_string()))
+        .unwrap_or(false)
+}
+
+/// 释放 in-flight 标记，线程结束（无论成功失败）都必须调用。
+fn release_writeback(profile_id: &str) {
+    if let Ok(mut set) = inflight_writeback().lock() {
+        set.remove(profile_id);
+    }
+}
+
 /// 把并行终端里已刷新过的 `.credentials.json` 原文回写到账号库（best-effort，K-1 后台化）。
 ///
 /// 并行终端里 claude 刷新令牌后，磁盘上的 `.credentials.json` 是新的，但账号库里
@@ -178,10 +204,23 @@ fn verify_and_apply_credential_checked(
 /// 2. 进 `with_store` 做身份校验：身份不一致拒绝回写；查不到身份保守不覆盖，
 ///    留待下次托盘刷新；一致才更新。
 ///
+/// 同一 profile 已有回写在途时直接跳过（[`try_claim_writeback`]），避免重复 spawn。
 /// 立即返回、不阻塞开终端。任何内部错误都只记日志；找不到对应 profile 视为 no-op。
 fn sync_parallel_credentials_back(profile_id: &str, raw_cred: &str) {
+    if !try_claim_writeback(profile_id) {
+        return;
+    }
     let (id, raw) = (profile_id.to_string(), raw_cred.to_string());
     std::thread::spawn(move || {
+        // 在途标记必须在任何退出路径（含 panic）都释放，否则该 profile 会被永久
+        // 判定为「处理中」，之后的回写全部被跳过。
+        struct ClaimGuard(String);
+        impl Drop for ClaimGuard {
+            fn drop(&mut self) {
+                release_writeback(&self.0);
+            }
+        }
+        let _guard = ClaimGuard(id.clone());
         // 网络核对（约 4 秒超时，命中缓存则更快）；失败 → None。
         let disk_uuid = crate::usage::oauth_account_uuid_for_blob(&raw);
         let result = store::with_store(|s| {
@@ -847,8 +886,39 @@ mod tests {
         messages
     }
 
-    // ── 共享 skills：junction 优先，复制降级 ──
+    // ── 后台回写 in-flight 去重 ──
 
+    #[test]
+    fn writeback_claim_is_exclusive_and_releasable() {
+        // 用独立 id，避免与其他用例互相干扰。
+        let id = "claim-test-unique";
+        release_writeback(id);
+        assert!(try_claim_writeback(id), "首次应能登记");
+        assert!(
+            !try_claim_writeback(id),
+            "同一 profile 已在进行中时不能重复登记，否则每次扫描都 spawn 新线程"
+        );
+        release_writeback(id);
+        assert!(
+            try_claim_writeback(id),
+            "释放后必须能重新登记——否则该账号的回写被永久跳过"
+        );
+        release_writeback(id);
+    }
+
+    #[test]
+    fn writeback_claims_are_per_profile() {
+        let a = "claim-a";
+        let b = "claim-b";
+        release_writeback(a);
+        release_writeback(b);
+        assert!(try_claim_writeback(a));
+        assert!(try_claim_writeback(b), "不同账号互不影响");
+        release_writeback(a);
+        release_writeback(b);
+    }
+
+    // ── 共享 skills：junction 优先，复制降级 ──
     #[test]
     fn shared_skills_are_junctioned_not_copied() {
         let dir = tempfile::tempdir().unwrap();

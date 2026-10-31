@@ -117,6 +117,19 @@ pub fn extract_hooks(root: &Value) -> Vec<HookEntry> {
     out
 }
 
+/// 一个钩子对象是否是编辑器可编辑的本地命令行。
+///
+/// 条件：`type` 缺省或等于 `"command"`，且能读出字符串 `command`。
+/// 不满足的（type 为 prompt/http、或没有 command 字段）编辑器看不到，保存时
+/// 必须原位保留，不能覆盖也不能删除。
+fn is_editable_hook(hook: &Value) -> bool {
+    let is_command_type = hook
+        .get("type")
+        .and_then(Value::as_str)
+        .is_none_or(|kind| kind == "command");
+    is_command_type && hook.get("command").and_then(Value::as_str).is_some()
+}
+
 /// 读取编辑器数据并做校验。
 pub fn read_permission_editor() -> Result<PermissionEditorData, String> {
     let settings_path = paths::claude_settings_path()?;
@@ -305,18 +318,33 @@ fn merge_hooks_into(obj: &mut serde_json::Map<String, Value>, entries: &[HookEnt
         });
         if let Some(group) = target {
             if let Some(hook_list) = group.get_mut("hooks").and_then(Value::as_array_mut) {
-                // 就地更新每条 command；数量不足时补建最小对象。
-                for (index, command) in commands.iter().enumerate() {
-                    if let Some(slot) = hook_list.get_mut(index) {
-                        if let Some(hook_obj) = slot.as_object_mut() {
-                            hook_obj.insert("command".to_string(), Value::String(command.clone()));
-                            continue;
-                        }
+                // 逐个可见钩子按「可编辑身份」写回，不按索引：
+                // 同一分组里可能混着编辑器看不到的项（type 非 command、或读不出
+                // command）。按索引对齐会把可见命令写到隐藏项头上，截断也会
+                // 连带删掉它们。这里只动可见槽位，隐藏项原位不动。
+                let mut visible_index = 0usize;
+                for slot in hook_list.iter_mut() {
+                    if !is_editable_hook(slot) {
+                        continue;
                     }
+                    match commands.get(visible_index) {
+                        Some(command) => {
+                            if let Some(hook_obj) = slot.as_object_mut() {
+                                hook_obj
+                                    .insert("command".to_string(), Value::String(command.clone()));
+                            }
+                            visible_index += 1;
+                        }
+                        // 用户删掉了这条：先标记，稍后统一移除。
+                        None => slot["__deleted__"] = json!(true),
+                    }
+                }
+                // 数量不够：补建最小对象（追加在末尾）。
+                for command in commands.iter().skip(visible_index) {
                     hook_list.push(json!({"type": "command", "command": command}));
                 }
-                // 用户删掉了多余的钩子：截断到期望长度。
-                hook_list.truncate(commands.len());
+                // 移除被标记的可见钩子，隐藏项不受影响。
+                hook_list.retain(|hook| !hook["__deleted__"].as_bool().unwrap_or(false));
             }
         } else {
             let hook_list: Vec<Value> = commands
@@ -620,6 +648,65 @@ mod tests {
             root.get("hooks").is_none(),
             "既无可见也无隐藏钩子时应删除整个 hooks 块"
         );
+    }
+
+    #[test]
+    fn apply_editor_keeps_hidden_hook_inside_a_mixed_group() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [{"hooks": [
+                    {"type": "command", "command": "first-visible"},
+                    {"type": "prompt", "command": "hidden-not-editable"},
+                    {"type": "command", "command": "second-visible"}
+                ]}]
+            }
+        });
+        // 用户把两条可见钩子的命令都改掉；中间那条 type=prompt 编辑器看不到。
+        let hooks = vec![
+            HookEntry {
+                event: "Stop".to_string(),
+                matcher: String::new(),
+                command: "A".to_string(),
+            },
+            HookEntry {
+                event: "Stop".to_string(),
+                matcher: String::new(),
+                command: "B".to_string(),
+            },
+        ];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        let list = root["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(list.len(), 3, "隐藏钩子不能被截断删掉");
+        assert_eq!(list[0]["command"], json!("A"), "可见钩子按顺序更新");
+        assert_eq!(
+            list[1],
+            json!({"type": "prompt", "command": "hidden-not-editable"}),
+            "混在同一分组里的隐藏钩子必须原位保留，不能被可见命令覆盖"
+        );
+        assert_eq!(list[2]["command"], json!("B"));
+    }
+
+    #[test]
+    fn apply_editor_deleting_visible_hook_in_mixed_group_keeps_hidden() {
+        let mut root = json!({
+            "hooks": {
+                "Stop": [{"hooks": [
+                    {"type": "command", "command": "keep"},
+                    {"no_command": true},
+                    {"type": "command", "command": "user-deleted"}
+                ]}]
+            }
+        });
+        let hooks = vec![HookEntry {
+            event: "Stop".to_string(),
+            matcher: String::new(),
+            command: "keep".to_string(),
+        }];
+        apply_editor_to_settings(&mut root, &PermissionRules::default(), &hooks).expect("apply");
+        let list = root["hooks"]["Stop"][0]["hooks"].as_array().unwrap();
+        assert_eq!(list.len(), 2, "只应删掉用户删的那条可见钩子");
+        assert_eq!(list[0]["command"], json!("keep"));
+        assert_eq!(list[1], json!({"no_command": true}));
     }
 
     #[test]
