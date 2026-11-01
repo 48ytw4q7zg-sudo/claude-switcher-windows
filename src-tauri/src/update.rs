@@ -3,7 +3,7 @@
 //! 只提示、不自动安装（未签名场景下 tauri-plugin-updater 的签名密钥方案不现实）。
 //! 匿名 API 有限流（403）：失败一律静默返回「检查失败」，绝不弹错、绝不阻塞主线程。
 
-use std::time::Duration;
+use std::{path::Path, time::Duration};
 
 use serde::{Deserialize, Serialize};
 
@@ -33,7 +33,7 @@ pub struct UpdateCheckResult {
 /// 带磁盘缓存：匿名 GitHub API 限流是每小时 60 次**按 IP**，用户经 Clash 共享
 /// 出口 IP 时很容易 403。缓存让面板反复打开不再重复请求。
 ///
-/// **只缓存成功结果**：失败（限流/断网）也用长 TTL 的话，断网时打开一次，
+/// **成功与失败使用不同 TTL**：失败（限流/断网）也用长 TTL 的话，断网时打开一次，
 /// 之后 6 小时内即使网络恢复，面板也只会返回缓存的失败——用户以为升级通道
 /// 坏了。失败改用短 TTL，很快会重新尝试。
 ///
@@ -41,14 +41,27 @@ pub struct UpdateCheckResult {
 /// 「发现新版本 v0.3.0（当前 v0.2.0）」——版本号已经对不上了。
 pub fn check_for_update_blocking() -> UpdateCheckResult {
     let current = env!("CARGO_PKG_VERSION").to_string();
+    check_for_update_with(
+        &current,
+        cache_path().as_deref(),
+        chrono::Utc::now().timestamp(),
+        || fetch_latest(&current),
+    )
+}
 
-    if let Some(cached) = read_cache(&current) {
+fn check_for_update_with(
+    current: &str,
+    path: Option<&Path>,
+    now: i64,
+    fetch: impl FnOnce() -> UpdateCheckResult,
+) -> UpdateCheckResult {
+    if let Some(cached) = path.and_then(|path| read_cache(path, current, now)) {
         return cached.result;
     }
 
-    let fresh = fetch_latest(&current);
-    if fresh.latest_version.is_some() {
-        write_cache(&fresh);
+    let fresh = fetch();
+    if let Some(path) = path {
+        write_cache(path, now, &fresh);
     }
     fresh
 }
@@ -72,11 +85,10 @@ fn cache_path() -> Option<std::path::PathBuf> {
         .map(|d| d.join("update-check.json"))
 }
 
-fn read_cache(current: &str) -> Option<CachedCheck> {
-    let path = cache_path()?;
+fn read_cache(path: &Path, current: &str, now: i64) -> Option<CachedCheck> {
     let raw = std::fs::read_to_string(path).ok()?;
     let mut cached: CachedCheck = serde_json::from_str(&raw).ok()?;
-    let age = chrono::Utc::now().timestamp() - cached.checked_at;
+    let age = now.checked_sub(cached.checked_at)?;
     // 成功用长 TTL，失败用短 TTL（见 `check_for_update_blocking` 的说明）。
     let ttl = if cached.result.latest_version.is_some() {
         CACHE_TTL_SECS
@@ -90,23 +102,28 @@ fn read_cache(current: &str) -> Option<CachedCheck> {
     if cached.result.current_version != current {
         return None;
     }
+    // 旧版本缓存里的比较结果可能不符合 SemVer；复用发布信息，重新计算结论。
+    // 非法版本不能沿用六小时成功缓存，也不能冒充「已是最新」。
+    if let Some(latest) = &cached.result.latest_version {
+        cached.result = result_for_version(current, latest, &cached.result.release_url).ok()?;
+    }
     // 标注这是缓存值：用户看到「有更新」时能判断信息可能不够新。
-    cached.result.message = format!(
-        "{}（{} 小时前检查，缓存）",
-        cached.result.message,
-        age / 3600
-    );
+    let checked_ago = if age < 3600 {
+        format!("{} 分钟前", age / 60)
+    } else {
+        format!("{} 小时前", age / 3600)
+    };
+    cached.result.message = format!("{}（{checked_ago}检查，缓存）", cached.result.message);
     Some(cached)
 }
 
-fn write_cache(result: &UpdateCheckResult) {
-    let Some(path) = cache_path() else { return };
+fn write_cache(path: &Path, now: i64, result: &UpdateCheckResult) {
     let cached = CachedCheck {
-        checked_at: chrono::Utc::now().timestamp(),
+        checked_at: now,
         result: result.clone(),
     };
     if let Ok(text) = serde_json::to_string(&cached) {
-        let _ = fsx::write_atomically(&path, &text);
+        let _ = fsx::write_atomically(path, &text);
     }
 }
 
@@ -137,33 +154,57 @@ fn fetch_latest(current: &str) -> UpdateCheckResult {
         Err(e) => return failure(current, format!("响应解析失败: {e}")),
     };
 
-    let latest = value
+    result_from_release(current, &value)
+}
+
+fn result_from_release(current: &str, value: &serde_json::Value) -> UpdateCheckResult {
+    let tag = value
         .get("tag_name")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .trim_start_matches('v')
-        .to_string();
+        .unwrap_or_default();
+    let latest = tag.strip_prefix('v').unwrap_or(tag);
     let url = value
         .get("html_url")
         .and_then(|v| v.as_str())
-        .unwrap_or_default()
-        .to_string();
+        .unwrap_or_default();
     if latest.is_empty() {
         return failure(current, "响应缺少 tag_name".to_string());
     }
 
-    let has_update = version_newer(&latest, current);
-    UpdateCheckResult {
+    result_for_version(current, latest, url).unwrap_or_else(|e| failure(current, e))
+}
+
+/// SemVer 优先级比较：预发布标识符参与排序，构建信息不影响新旧。
+/// 非法版本不能当作 0，也不能报告为「已是最新」。
+fn result_for_version(current: &str, latest: &str, url: &str) -> Result<UpdateCheckResult, String> {
+    let release_url = url::Url::parse(url).map_err(|_| "发布页地址缺失或无效".to_string())?;
+    let expected_path = "/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/";
+    if release_url.scheme() != "https"
+        || release_url.host_str() != Some("github.com")
+        || !release_url.username().is_empty()
+        || release_url.password().is_some()
+        || release_url.port().is_some()
+        || !release_url.path().starts_with(expected_path)
+        || release_url.path().len() == expected_path.len()
+    {
+        return Err("发布页地址不属于本项目的 GitHub Release".to_string());
+    }
+    let candidate =
+        semver::Version::parse(latest).map_err(|e| format!("发布版本号格式无效: {e}"))?;
+    let installed =
+        semver::Version::parse(current).map_err(|e| format!("当前版本号格式无效: {e}"))?;
+    let has_update = candidate.cmp_precedence(&installed).is_gt();
+    Ok(UpdateCheckResult {
         message: if has_update {
             format!("发现新版本 v{latest}（当前 v{current}）")
         } else {
             format!("已是最新版本（v{current}）")
         },
         current_version: current.to_string(),
-        latest_version: Some(latest),
+        latest_version: Some(latest.to_string()),
         has_update,
-        release_url: url,
-    }
+        release_url: url.to_string(),
+    })
 }
 
 fn failure(current: &str, message: String) -> UpdateCheckResult {
@@ -176,39 +217,211 @@ fn failure(current: &str, message: String) -> UpdateCheckResult {
     }
 }
 
-/// 比较版本号：`candidate` 是否比 `current` 新。
-///
-/// 规则：
-/// - 逐段比较 `major.minor.patch`，非数字段按 0；
-/// - **预发布后缀参与比较**：`0.3.0-beta1` 视为比 `0.3.0` 旧（semver 语义），
-///   避免把预发布当正式版推给用户。早期实现把后缀整体忽略，`0.3.0-beta1` 会被
-///   判成和 `0.3.0` 相等——发预发布时用户永远收不到提示。
-fn version_newer(candidate: &str, current: &str) -> bool {
-    let parse = |s: &str| -> ([u64; 3], bool) {
-        let mut out = [0u64; 3];
-        // 取 '-' 前的数字部分；'-' 之后是预发布后缀。
-        let (numeric, has_pre) = match s.split_once('-') {
-            Some((n, p)) => (n, !p.is_empty()),
-            None => (s, false),
-        };
-        for (i, part) in numeric.trim().split('.').take(3).enumerate() {
-            out[i] = part.parse().unwrap_or(0);
-        }
-        (out, has_pre)
-    };
-    let (c, c_pre) = parse(candidate);
-    let (cur, cur_pre) = parse(current);
-    match c.cmp(&cur) {
-        std::cmp::Ordering::Greater => true,
-        std::cmp::Ordering::Less => false,
-        // 数字部分相同：带预发布后缀的一方更旧。
-        std::cmp::Ordering::Equal => cur_pre && !c_pre,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const RELEASE_URL: &str =
+        "https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.7.0";
+
+    fn version_newer(candidate: &str, current: &str) -> bool {
+        result_for_version(current, candidate, RELEASE_URL)
+            .map(|result| result.has_update)
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn failed_check_is_reused_before_retry_window_expires() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("update-check.json");
+        let first = check_for_update_with("0.6.0", Some(&cache), 1000, || {
+            failure("0.6.0", "GitHub unavailable".into())
+        });
+        assert!(first.latest_version.is_none());
+        let repeated = check_for_update_with("0.6.0", Some(&cache), 1001, || {
+            panic!("a repeated failed check must not request GitHub again")
+        });
+        assert!(repeated.latest_version.is_none());
+        assert!(repeated.message.contains("缓存"));
+    }
+
+    #[test]
+    fn malformed_release_is_a_failed_check_not_up_to_date() {
+        for tag in ["v0.7.x", "vv0.7.0", "0.7.0.1", "01.7.0", "0.7.0-rc.01", ""] {
+            let result = result_from_release(
+                "0.6.0",
+                &serde_json::json!({"tag_name": tag, "html_url": RELEASE_URL}),
+            );
+            assert!(
+                result.latest_version.is_none(),
+                "accepted invalid tag {tag}"
+            );
+            assert!(!result.has_update);
+            assert!(result.message.contains("检查失败"));
+        }
+        assert!(
+            result_from_release("0.6.0", &serde_json::json!({"html_url": RELEASE_URL}))
+                .latest_version
+                .is_none()
+        );
+        assert!(result_from_release(
+            "0.6.0",
+            &serde_json::json!({"tag_name": 7, "html_url": RELEASE_URL})
+        )
+        .latest_version
+        .is_none());
+    }
+
+    #[test]
+    fn missing_or_untrusted_release_url_is_not_a_successful_check() {
+        for url in [
+            serde_json::Value::Null,
+            serde_json::json!(17),
+            serde_json::json!(""),
+            serde_json::json!("https://example.com/download"),
+            serde_json::json!("https://github.com/other/repo/releases/tag/v0.7.0"),
+        ] {
+            let result = result_from_release(
+                "0.6.0",
+                &serde_json::json!({"tag_name": "v0.7.0", "html_url": url}),
+            );
+            assert!(result.latest_version.is_none());
+            assert!(!result.has_update);
+            assert!(result.release_url.is_empty());
+        }
+    }
+
+    #[test]
+    fn failed_check_retries_after_ten_minutes_and_caches_recovery() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("update-check.json");
+        check_for_update_with("0.6.0", Some(&cache), 1000, || {
+            failure("0.6.0", "offline".into())
+        });
+        check_for_update_with("0.6.0", Some(&cache), 1600, || panic!("retry is too early"));
+        let recovered = check_for_update_with("0.6.0", Some(&cache), 1601, || {
+            result_for_version("0.6.0", "0.7.0", RELEASE_URL).unwrap()
+        });
+        assert!(recovered.has_update);
+        let cached = check_for_update_with("0.6.0", Some(&cache), 2202, || {
+            panic!("success uses the longer TTL")
+        });
+        assert_eq!(cached.latest_version.as_deref(), Some("0.7.0"));
+    }
+
+    #[test]
+    fn successful_check_is_reused_for_six_hours_then_refetched() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("update-check.json");
+        check_for_update_with("0.6.0", Some(&cache), 1000, || {
+            result_for_version("0.6.0", "0.7.0", RELEASE_URL).unwrap()
+        });
+        let cached =
+            check_for_update_with("0.6.0", Some(&cache), 22600, || panic!("cache still valid"));
+        assert_eq!(cached.latest_version.as_deref(), Some("0.7.0"));
+        let fresh = check_for_update_with("0.6.0", Some(&cache), 22601, || {
+            result_for_version("0.6.0", "0.8.0", RELEASE_URL).unwrap()
+        });
+        assert_eq!(fresh.latest_version.as_deref(), Some("0.8.0"));
+    }
+
+    #[test]
+    fn application_upgrade_invalidates_success_and_failure_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("update-check.json");
+        for old in [
+            result_for_version("0.6.0", "0.7.0", RELEASE_URL).unwrap(),
+            failure("0.6.0", "offline".into()),
+        ] {
+            check_for_update_with("0.6.0", Some(&cache), 1000, || old);
+            let result = check_for_update_with("0.7.0", Some(&cache), 1001, || {
+                result_for_version("0.7.0", "0.7.0", RELEASE_URL).unwrap()
+            });
+            assert_eq!(result.current_version, "0.7.0");
+            assert!(!result.has_update);
+        }
+    }
+
+    #[test]
+    fn corrupt_cache_is_replaced_by_a_fresh_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("update-check.json");
+        std::fs::write(&cache, "{incomplete").unwrap();
+        let result = check_for_update_with("0.6.0", Some(&cache), 1000, || {
+            result_for_version("0.6.0", "0.7.0", RELEASE_URL).unwrap()
+        });
+        assert!(result.has_update);
+        check_for_update_with("0.6.0", Some(&cache), 1001, || {
+            panic!("new cache must be usable")
+        });
+    }
+
+    #[test]
+    fn cache_unavailable_or_unwritable_does_not_hide_the_check_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent_file = dir.path().join("file-not-directory");
+        std::fs::write(&parent_file, "preserve me").unwrap();
+        let cache = parent_file.join("update-check.json");
+        for path in [None, Some(cache.as_path())] {
+            let result = check_for_update_with("0.6.0", path, 1000, || {
+                result_for_version("0.6.0", "0.7.0", RELEASE_URL).unwrap()
+            });
+            assert!(result.has_update);
+            let failed =
+                check_for_update_with("0.6.0", path, 1001, || failure("0.6.0", "offline".into()));
+            assert!(failed.latest_version.is_none());
+        }
+        assert_eq!(std::fs::read_to_string(parent_file).unwrap(), "preserve me");
+    }
+
+    #[test]
+    fn release_tag_and_build_metadata_follow_semver_precedence() {
+        let result = result_from_release(
+            "0.6.0+local",
+            &serde_json::json!({"tag_name":"v0.6.0+release", "html_url": RELEASE_URL}),
+        );
+        assert_eq!(result.latest_version.as_deref(), Some("0.6.0+release"));
+        assert!(!result.has_update);
+        assert!(version_newer("0.6.1+release", "0.6.0+local"));
+        assert!(!version_newer("0.6.0+release", "0.6.1+local"));
+        assert!(version_newer("0.7.0-rc.1+build", "0.7.0-beta.11+build"));
+        assert!(result_for_version("invalid", "0.7.0", RELEASE_URL).is_err());
+    }
+
+    #[test]
+    fn invalid_cache_timestamps_trigger_a_fresh_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("update-check.json");
+        for checked_at in [1001, i64::MIN] {
+            write_cache(&cache, checked_at, &failure("0.6.0", "old failure".into()));
+            let result = check_for_update_with("0.6.0", Some(&cache), 1000, || {
+                result_for_version("0.6.0", "0.7.0", RELEASE_URL).unwrap()
+            });
+            assert!(result.has_update, "invalid timestamp {checked_at} reused");
+        }
+    }
+
+    #[test]
+    fn legacy_cache_recomputes_version_precedence_and_rejects_invalid_versions() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("update-check.json");
+        let mut old = result_for_version("0.7.0-rc.2", "0.7.0-rc.10", RELEASE_URL).unwrap();
+        old.has_update = false;
+        old.message = "old comparison was wrong".into();
+        write_cache(&cache, 1000, &old);
+        let corrected = check_for_update_with("0.7.0-rc.2", Some(&cache), 1001, || {
+            panic!("valid legacy cache should be reused with corrected comparison")
+        });
+        assert!(corrected.has_update);
+        assert!(corrected.message.contains("发现新版本"));
+
+        old.latest_version = Some("not-a-version".into());
+        write_cache(&cache, 1000, &old);
+        let fresh = check_for_update_with("0.7.0-rc.2", Some(&cache), 1001, || {
+            result_for_version("0.7.0-rc.2", "0.7.0", RELEASE_URL).unwrap()
+        });
+        assert_eq!(fresh.latest_version.as_deref(), Some("0.7.0"));
+    }
 
     #[test]
     fn version_newer_compares_semver_fields() {
@@ -219,11 +432,17 @@ mod tests {
         assert!(!version_newer("0.0.9", "0.1.0"));
     }
 
-    /// 格式异常（非数字）按 0 处理，绝不 panic。
+    #[test]
+    fn version_newer_orders_prerelease_identifiers() {
+        assert!(version_newer("0.7.0-rc.10", "0.7.0-rc.2"));
+        assert!(!version_newer("0.7.0-rc.2", "0.7.0-rc.10"));
+    }
+
+    /// 格式异常不构成可用更新，绝不 panic。
     #[test]
     fn version_newer_tolerates_garbage() {
         assert!(!version_newer("abc", "0.1.0"));
-        assert!(version_newer("0.2.x", "0.1.0"));
+        assert!(!version_newer("0.2.x", "0.1.0"));
     }
 
     /// 预发布后缀必须参与比较：`0.3.0-beta1` 比 `0.3.0` 旧（semver 语义）。
