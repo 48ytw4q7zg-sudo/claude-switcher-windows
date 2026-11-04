@@ -297,6 +297,30 @@ async fn import_store_encrypted(
     .await
 }
 
+/// **P1-02**：完整迁移包加密导出（账号库 + 全部 Claude Desktop 快照）。
+#[tauri::command]
+async fn export_full_migration(
+    dest: String,
+    password: String,
+) -> Result<export::FullExportResult, String> {
+    blocking(move || {
+        export::export_full_migration_blocking(PathBuf::from(dest).as_path(), &password)
+    })
+    .await
+}
+
+/// **P1-02**：完整迁移包导入（账号库 + Claude Desktop 快照，事务性落位）。
+#[tauri::command]
+async fn import_full_migration(
+    src: String,
+    password: String,
+) -> Result<export::FullImportResult, String> {
+    blocking(move || {
+        export::import_full_migration_blocking(PathBuf::from(src).as_path(), &password)
+    })
+    .await
+}
+
 // ───────────────────────── 状态 ─────────────────────────
 
 /// Tauri 2 中非 async 命令跑在主线程上。`get_status` 里有 OAuth profile 请求
@@ -2900,13 +2924,20 @@ fn egate_rearm() -> Result<serde_json::Value, String> {
 }
 
 /// 出口门禁：监控状态（是否暂停/剩余时间/是否已熔断）。
+///
+/// **低成本项 4**：`tripped` / `partial` / `unknown` 三态必须分开返回。
+/// `unknown=true` 表示防火墙查询失败或本进程还没查过——界面应显示
+/// 「无法确认」，不能把 `tripped=false` 当成「确认未隔离」。
 #[tauri::command]
 fn egate_monitor_status() -> serde_json::Value {
+    let unknown = egate_monitor::is_trip_state_unknown();
     serde_json::json!({
         "paused": egate_monitor::is_paused(),
         "remaining_secs": egate_monitor::paused_remaining_secs(),
         "tripped": egate_monitor::is_tripped(),
         "partial": egate_monitor::is_partial(),
+        "unknown": unknown,
+        "manual_hold": egate_monitor::is_manual_hold(),
         "disarmed": egate_monitor::is_disarmed(),
         "intent": egate_monitor::protection_intent(),
     })
@@ -3265,6 +3296,8 @@ pub fn run() {
             check_for_update,
             export_store_encrypted,
             import_store_encrypted,
+            export_full_migration,
+            import_full_migration,
             set_telemetry_mode,
             list_profiles,
             capture_current_profile,

@@ -283,9 +283,10 @@ pub fn guard_tick() -> GuardTick {
             == crate::egate_monitor::ProtectionIntent::Armed
         && !crate::egate_monitor::is_paused()
     {
-        // 同时杀桌面版（进程名 Claude）与 CLI（claude）；Get-Process -Name 本就
-        // 大小写不敏感，两个名都传是显式对齐任务约定。
-        match imp::kill_processes_by_names(&["Claude", "claude"]) {
+        // **CLI 边界**：只结束后台 GUI（Claude Desktop），Claude Code CLI 只提醒。
+        // `Get-Process -Name claude` 大小写不敏感，会把终端里的 CLI 一起打死；
+        // 改用按**映像路径**判定的版本（node/npm/nvm 等宿主一律跳过）。
+        match imp::kill_desktop_app_processes(&["Claude", "claude"]) {
             Ok(list) if !list.is_empty() => {
                 append_log(
                     "bodyguard.log",

@@ -73,9 +73,28 @@ pub fn is_guarded_agent(id: &str) -> bool {
     agent_spec(id).is_some()
 }
 
-/// 规则名：`ClaudeSwitcher Egate <agent> <Out|In>`。
+/// 规则名：`ClaudeSwitcher AppIsolation <agent> <Out|In>`。
+///
+/// **兼容用法**：旧版按「每应用一条」建规则，规则名不带路径后缀。
+/// 新代码按「每应用 × 每路径」建规则（见 [`rule_name_for_exe`]），
+/// 但仍需识别旧规则以便清理，因此保留本函数。
 pub fn rule_name(agent: &str, direction: &str) -> String {
     format!("{RULE_PREFIX} {agent} {direction}")
+}
+
+/// **P0-08**：按「应用 + 方向 + 具体可执行路径」生成规则名。
+///
+/// 同一应用可能有多个安装路径（用户级 / 系统级 / MSIX）。若仍用
+/// `rule_name()` 的单一名，后建的规则会覆盖前一条，导致只有一份安装被隔离。
+///
+/// 后缀取路径 SHA256 的前 12 位十六进制：稳定（同一路径永远同一后缀）、
+/// 短到能读、且不会因路径里的空格/斜杠污染规则名。
+pub fn rule_name_for_exe(agent: &str, direction: &str, exe: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let normalized = crate::platform::imp::normalize_path(std::path::Path::new(exe));
+    let digest = Sha256::digest(normalized.to_string_lossy().as_bytes());
+    let suffix: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("{} {suffix}", rule_name(agent, direction))
 }
 
 /// 结束一个应用的全部进程（按进程名）。返回被结束的进程描述。
@@ -126,10 +145,137 @@ pub fn agent_pids(agents: &[String]) -> std::collections::BTreeMap<u32, String> 
     out
 }
 
-/// 查询某个 exe 路径对应的防火墙规则是否已存在且生效。
+/// **P0-08**：一个受管应用的可执行文件候选路径及其来源。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ExeCandidate {
+    /// 规范化后的完整路径。
+    pub path: String,
+    /// 来源：`running`（运行中的进程）/ `installed`（安装记录）/ `registered`（注册表）。
+    pub source: String,
+}
+
+/// **P0-08**：解析某个应用的全部候选 exe 路径。
 ///
-/// 返回 `(查询成功, 生效规则数)`。查询失败时调用方**不得**宣称隔离成功。
-/// 防火墙规则核验结果。
+/// 原实现 `Get-Process ... | Select-Object -First 1` 只取第一个正在运行的进程：
+/// 应用没运行、或同一应用装了多份（用户级 + 系统级 + MSIX）时，要么拿不到路径
+/// （无法预先建立隔离），要么只覆盖其中一份（另一份仍可联网）。
+///
+/// 现在按三个来源合并去重：
+/// 1. **运行中的进程**：`Get-Process`（含 Path），保留全部不同路径；
+/// 2. **注册表安装记录**：`App Paths` / `Uninstall` 里的 DisplayIcon /
+///    InstallLocation，覆盖「没运行但已安装」的常见情形；
+/// 3. **MSIX 包**：`Get-AppxPackage` 的 InstallLocation，Store 版 Claude 走这条。
+///
+/// 返回 **规整化后的去重列表**。调用方对每个路径都要建立规则，
+/// `rules_expected` 也随之按路径数放大。
+pub fn resolve_agent_exe_candidates(agent: &str) -> Vec<ExeCandidate> {
+    let Some((_, exe_names)) = agent_spec(agent) else {
+        return Vec::new();
+    };
+    let names = exe_names
+        .iter()
+        .map(|n| ps_quote(n))
+        .collect::<Vec<_>>()
+        .join(",");
+    // exe 名用于在注册表 InstallLocation 里拼候选文件名。
+    let exe_files = exe_names
+        .iter()
+        .map(|n| ps_quote(&format!("{n}.exe")))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'\n\
+         $found = New-Object System.Collections.ArrayList\n\
+         # 1) 运行中的进程\n\
+         foreach ($p in @(Get-Process -Name {names})) {{\n\
+           if ($p.Path) {{ [void]$found.Add(@{{ path = $p.Path; source = 'running' }}) }}\n\
+         }}\n\
+         # 2) 注册表 App Paths / Uninstall 的安装位置\n\
+         $exeNames = @({exe_files})\n\
+         $roots = @(\n\
+           'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths',\n\
+           'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths',\n\
+           'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths'\n\
+         )\n\
+         foreach ($root in $roots) {{\n\
+           foreach ($n in $exeNames) {{\n\
+             $k = Join-Path $root $n\n\
+             if (Test-Path $k) {{\n\
+               $v = (Get-ItemProperty -Path $k).'(default)'\n\
+               if ($v) {{ [void]$found.Add(@{{ path = $v; source = 'registered' }}) }}\n\
+             }}\n\
+           }}\n\
+         }}\n\
+         foreach ($root in @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall')) {{\n\
+           foreach ($sub in @(Get-ChildItem $root -ErrorAction SilentlyContinue)) {{\n\
+             $props = Get-ItemProperty $sub.PSPath -ErrorAction SilentlyContinue\n\
+             if (-not $props) {{ continue }}\n\
+             $loc = $props.InstallLocation\n\
+             if (-not $loc) {{ continue }}\n\
+             foreach ($n in $exeNames) {{\n\
+               $candidate = Join-Path $loc $n\n\
+               if (Test-Path $candidate) {{ [void]$found.Add(@{{ path = $candidate; source = 'installed' }}) }}\n\
+             }}\n\
+           }}\n\
+         }}\n\
+         # 3) MSIX 包安装位置\n\
+         foreach ($pkg in @(Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue)) {{\n\
+           if ($pkg.InstallLocation) {{ [void]$found.Add(@{{ path = $pkg.InstallLocation; source = 'msix' }}) }}\n\
+         }}\n\
+         ConvertTo-Json -InputObject @($found) -Compress",
+        names = names,
+        exe_files = exe_files
+    );
+    let Ok(json) = crate::platform::imp::run_powershell(&script) else {
+        return Vec::new();
+    };
+    parse_exe_candidates(&json)
+}
+
+/// 解析候选路径 JSON（数组 / 单对象 / 空），并做规整化去重。
+///
+/// 单独抽成纯函数便于单测：PowerShell 侧无法在 CI 里跑。
+fn parse_exe_candidates(json: &str) -> Vec<ExeCandidate> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() || trimmed == "null" {
+        return Vec::new();
+    }
+    let value: serde_json::Value = match serde_json::from_str(trimmed) {
+        Ok(value) => value,
+        Err(_) => return Vec::new(),
+    };
+    let items: Vec<serde_json::Value> = match value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(_) => vec![value],
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<ExeCandidate> = Vec::new();
+    let mut seen: Vec<std::path::PathBuf> = Vec::new();
+    for item in items {
+        let (Some(path), source) = (
+            item.get("path").and_then(|v| v.as_str()).map(str::trim),
+            item.get("source")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown"),
+        ) else {
+            continue;
+        };
+        if path.is_empty() {
+            continue;
+        }
+        // MSIX 的 InstallLocation 是目录：拼上 exe 名再判断（由调用方保证存在）。
+        let normalized = crate::platform::imp::normalize_path(std::path::Path::new(path));
+        if seen.contains(&normalized) {
+            continue;
+        }
+        seen.push(normalized);
+        out.push(ExeCandidate {
+            path: path.to_string(),
+            source: source.to_string(),
+        });
+    }
+    out
+}
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RuleVerification {
     query_ok: bool,
@@ -138,69 +284,137 @@ struct RuleVerification {
     failed: Vec<String>,
 }
 
-/// 查询某个 exe 路径对应的防火墙规则是否已存在且生效。
+/// 查询某个应用在**全部已解析路径**上的规则是否完整生效。
 ///
-/// 核验语义：期望集合是「该 exe × 出站/入站」，每条规则都必须满足：
-/// 存在、启用、动作=Block、方向正确、程序路径匹配。只有全部期望满足才算完整。
-fn count_rules_for(agent: &str, exe: &str) -> RuleVerification {
-    let out_name = rule_name(agent, "Out");
-    let in_name = rule_name(agent, "In");
+/// **P0-08**：期望集合从 `exe × 2 方向` 扩展为
+/// `每一条候选 exe × 出站/入站`。多路径（用户级 + 系统级 + MSIX 共存）时
+/// 只覆盖其中一份等于没隔离——另一份照样能联网。
+///
+/// 核验的每条规则必须同时满足：
+/// 1. 存在且启用（`Enabled=True`）；
+/// 2. `Action=Block`、方向正确；
+/// 3. `Program` 与候选路径一致（规范化后比较）；
+/// 4. **在当前生效策略下确实存在**——`Get-NetFirewallRule -PolicyStore ActiveStore`
+///    能看到它。只查配置对象（`PersistentStore`）不等于证明阻断已生效：
+///    组策略可能覆盖或禁用本地规则。
+fn count_rules_for(agent: &str, exes: &[String]) -> RuleVerification {
+    if exes.is_empty() {
+        return RuleVerification {
+            query_ok: true,
+            expected: 0,
+            verified: 0,
+            failed: vec!["没有可核验的可执行文件路径".to_string()],
+        };
+    }
+    let exe_list = exes
+        .iter()
+        .map(|e| ps_quote(e))
+        .collect::<Vec<_>>()
+        .join(",");
     let script = format!(
         "$ErrorActionPreference='Stop'
-         $outName = {}
-         $inName = {}
-         $exe = {}
-         $outOk = $false; $inOk = $false
-         try {{
-           $r = Get-NetFirewallRule -DisplayName $outName -ErrorAction Stop
-           $f = $r | Get-NetFirewallApplicationFilter
-           if ($r.Enabled -eq 'True' -and $r.Action -eq 'Block' -and $r.Direction -eq 'Outbound' -and $f.Program -and $f.Program -ieq $exe) {{ $outOk = $true }}
-         }} catch {{}}
-         try {{
-           $r = Get-NetFirewallRule -DisplayName $inName -ErrorAction Stop
-           $f = $r | Get-NetFirewallApplicationFilter
-           if ($r.Enabled -eq 'True' -and $r.Action -eq 'Block' -and $r.Direction -eq 'Inbound' -and $f.Program -and $f.Program -ieq $exe) {{ $inOk = $true }}
-         }} catch {{}}
-         ConvertTo-Json @{{ out = $outOk; in = $inOk }} -Compress",
-        ps_quote(&out_name),
-        ps_quote(&in_name),
-        ps_quote(exe)
+         $agent = {agent}
+         $exes = @({exe_list})
+         $dirs = @(
+           @{{ dir = 'Out'; suffix = 'Out'; expect = 'Outbound' }},
+           @{{ dir = 'In';  suffix = 'In';  expect = 'Inbound' }}
+         )
+         $results = New-Object System.Collections.ArrayList
+         foreach ($exe in $exes) {{
+           foreach ($d in $dirs) {{
+             $name = \"{prefix} $agent $($d.suffix)\"
+             $ok = $false
+             $reason = ''
+             try {{
+               $r = Get-NetFirewallRule -DisplayName $name -PolicyStore PersistentStore -ErrorAction Stop | Select-Object -First 1
+               if (-not $r) {{ $reason = '规则不存在' }}
+               else {{
+                 $f = $r | Get-NetFirewallApplicationFilter
+                 if ($r.Enabled -ne 'True') {{ $reason = '规则未启用' }}
+                 elseif ($r.Action -ne 'Block') {{ $reason = '动作不是阻断' }}
+                 elseif ($r.Direction -ne $d.expect) {{ $reason = '方向不符' }}
+                 elseif (-not $f.Program) {{ $reason = '规则未绑定程序' }}
+                 elseif ($f.Program -ine $exe) {{ $reason = '程序路径不匹配' }}
+                 else {{
+                   # 再确认该规则在**当前生效策略**（ActiveStore）里也存在。
+                   $active = @(Get-NetFirewallRule -DisplayName $name -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+                   if ($active.Count -eq 0) {{ $reason = '未进入当前生效策略（可能被组策略覆盖）' }}
+                   else {{
+                     $ar = $active | Select-Object -First 1
+                     if ($ar.Enabled -ne 'True' -or $ar.Action -ne 'Block') {{
+                       $reason = '生效策略中的规则属性不符'
+                     }} else {{ $ok = $true }}
+                   }}
+                 }}
+               }}
+             }} catch {{ $reason = '规则不存在' }}
+             [void]$results.Add(@{{ exe = $exe; dir = $d.dir; ok = $ok; reason = $reason }})
+           }}
+         }}
+         ConvertTo-Json -InputObject @($results) -Compress",
+        agent = ps_quote(agent),
+        exe_list = exe_list,
+        prefix = RULE_PREFIX
     );
     match crate::platform::imp::run_powershell(&script) {
-        Ok(json) => {
-            let value: serde_json::Value = match serde_json::from_str(json.trim()) {
-                Ok(value) => value,
-                Err(_) => {
-                    return RuleVerification {
-                        query_ok: false,
-                        expected: 2,
-                        verified: 0,
-                        failed: vec!["规则查询结果无法解析".to_string()],
-                    }
-                }
-            };
-            let out_ok = value.get("out").and_then(|v| v.as_bool()).unwrap_or(false);
-            let in_ok = value.get("in").and_then(|v| v.as_bool()).unwrap_or(false);
-            let mut failed = Vec::new();
-            if !out_ok {
-                failed.push("出站规则未生效".to_string());
-            }
-            if !in_ok {
-                failed.push("入站规则未生效".to_string());
-            }
-            RuleVerification {
-                query_ok: true,
-                expected: 2,
-                verified: out_ok as u32 + in_ok as u32,
-                failed,
-            }
-        }
+        Ok(json) => parse_rule_verification(&json, exes.len() as u32 * 2),
         Err(_) => RuleVerification {
             query_ok: false,
-            expected: 2,
+            expected: exes.len() as u32 * 2,
             verified: 0,
-            failed: vec!["规则查询失败".to_string()],
+            failed: vec!["规则查询失败（无法确认隔离是否生效）".to_string()],
         },
+    }
+}
+
+/// 解析规则核验 JSON（严格：无法解析即 `query_ok=false`，绝不当作通过）。
+fn parse_rule_verification(json: &str, expected: u32) -> RuleVerification {
+    let value: serde_json::Value = match serde_json::from_str(json.trim()) {
+        Ok(value) => value,
+        Err(_) => {
+            return RuleVerification {
+                query_ok: false,
+                expected,
+                verified: 0,
+                failed: vec!["规则查询结果无法解析".to_string()],
+            }
+        }
+    };
+    let items: Vec<serde_json::Value> = match value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(_) => vec![value],
+        _ => {
+            return RuleVerification {
+                query_ok: false,
+                expected,
+                verified: 0,
+                failed: vec!["规则查询结果格式异常".to_string()],
+            }
+        }
+    };
+    let mut verified = 0u32;
+    let mut failed = Vec::new();
+    for item in items {
+        let exe = item.get("exe").and_then(|v| v.as_str()).unwrap_or("?");
+        let dir = item.get("dir").and_then(|v| v.as_str()).unwrap_or("?");
+        // `ok` 必须是明确的布尔值：缺字段一律按失败处理（不能 filter_map 丢掉）。
+        let ok = item.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
+        if ok {
+            verified += 1;
+        } else {
+            let reason = item
+                .get("reason")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .unwrap_or("原因未知");
+            failed.push(format!("{dir} {exe}：{reason}"));
+        }
+    }
+    RuleVerification {
+        query_ok: true,
+        expected,
+        verified,
+        failed,
     }
 }
 
@@ -209,32 +423,16 @@ fn ps_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-/// 查询一个应用的实际可执行路径（用于按 exe 建规则）。
-fn resolve_agent_exe(agent: &str) -> Option<String> {
-    let (_, exe_names) = agent_spec(agent)?;
-    let names = exe_names
-        .iter()
-        .map(|n| ps_quote(n))
-        .collect::<Vec<_>>()
-        .join(",");
-    let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'\n\
-         $p = Get-Process -Name {names} | Where-Object {{ $_.Path }} | Select-Object -First 1\n\
-         if ($p) {{ $p.Path }}"
-    );
-    let path = crate::platform::imp::run_powershell(&script).ok()?;
-    let path = path.trim().to_string();
-    if path.is_empty() {
-        None
-    } else {
-        Some(path)
-    }
-}
-
-/// 为单个应用加隔离：结束进程 → 按 exe 加出/入站阻断 → 回查核验。
+/// 为单个应用加隔离：结束进程 → 按**全部已解析路径**加出/入站阻断 → 回查核验。
 ///
-/// `exe_path` 为 `None` 时尝试从运行中的进程解析；解析不到则只结束进程并如实
-/// 说明「未加防火墙规则」，不谎称已隔离。
+/// **P0-08 变化**：
+/// - 路径来自 [`resolve_agent_exe_candidates`]（进程 + 注册表安装记录 + MSIX），
+///   而不是「取第一个运行中的进程」——应用没运行也能预先建立隔离；
+/// - 每个路径都建规则（多安装形态共存时只覆盖一份等于没隔离）；
+/// - 核验走 [`count_rules_for`]，要求同时满足属性正确 + 出现在 `ActiveStore`。
+///
+/// 解析不到任何路径时只结束进程，并**如实**说明「未加防火墙规则」，
+/// 绝不谎称已隔离。
 pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport {
     let mut report = QuarantineReport {
         agent: agent.to_string(),
@@ -253,16 +451,25 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
         return report;
     }
 
-    // 1. **先查 exe**：在进程还活着时获取安装路径（进程结束后无法从 Get-Process 取）。
-    let exe = exe_path
-        .map(str::to_string)
-        .or_else(|| resolve_agent_exe(agent));
-    let Some(exe) = exe else {
-        report
-            .note
-            .push_str("未找到可执行文件，无法添加防火墙规则（应用可能未安装或已退出）");
-        return report;
+    // 1. **先解析路径**：必须在进程还活着时取（结束后 Get-Process 拿不到）。
+    let exes: Vec<String> = match exe_path {
+        Some(explicit) => vec![explicit.to_string()],
+        None => resolve_agent_exe_candidates(agent)
+            .into_iter()
+            .map(|candidate| candidate.path)
+            .collect(),
     };
+    if exes.is_empty() {
+        // 没有路径：仍然结束进程（至少阻止当前实例），但必须说明隔离未完成。
+        match kill_agent_processes(agent) {
+            Ok(killed) => report.killed = killed,
+            Err(error) => report.note.push_str(&format!("结束进程失败（{error}）；")),
+        }
+        report.note.push_str(
+            "未找到可执行文件路径（应用可能未安装或从未运行），无法建立防火墙隔离；保护未完成",
+        );
+        return report;
+    }
 
     // 2. 再结束进程（失败不阻断后续隔离：进程可能已退出）。
     match kill_agent_processes(agent) {
@@ -270,35 +477,42 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
         Err(error) => report.note.push_str(&format!("结束进程失败（{error}）；")),
     }
 
-    // 3. 加出/入站阻断规则（已存在则不重复加）。
-    for (direction, label) in [("out", "Out"), ("in", "In")] {
-        let name = rule_name(agent, label);
-        let script = format!(
-            "$ErrorActionPreference='Stop'\n\
-             $existing = Get-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue\n\
-             if (-not $existing) {{\n\
-               New-NetFirewallRule -DisplayName {} -Direction {} -Action Block -Program {} -Enabled True | Out-Null\n\
-             }}",
-            ps_quote(&name),
-            ps_quote(&name),
-            if direction == "out" { "Outbound" } else { "Inbound" },
-            ps_quote(&exe)
-        );
-        match crate::platform::imp::run_powershell(&script) {
-            Ok(_) => report.rules_added += 1,
-            Err(error) => report
-                .note
-                .push_str(&format!("添加{label}站规则失败（{error}）；")),
+    // 3. 为**每个路径**建立出/入站阻断规则。
+    //
+    // 规则名带上路径的稳定哈希后缀：同一应用多路径共存时，每条规则对应一个
+    // 具体程序，既不会互相覆盖，也能在升级后按旧路径精确清理。
+    for exe in &exes {
+        for (direction, label) in [("out", "Out"), ("in", "In")] {
+            let name = rule_name_for_exe(agent, label, exe);
+            let script = format!(
+                "$ErrorActionPreference='Stop'\n\
+                 $existing = Get-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue\n\
+                 if (-not $existing) {{\n\
+                   New-NetFirewallRule -DisplayName {} -Direction {} -Action Block -Program {} -Enabled True | Out-Null\n\
+                 }}",
+                ps_quote(&name),
+                ps_quote(&name),
+                if direction == "out" { "Outbound" } else { "Inbound" },
+                ps_quote(exe)
+            );
+            match crate::platform::imp::run_powershell(&script) {
+                Ok(_) => report.rules_added += 1,
+                Err(error) => report
+                    .note
+                    .push_str(&format!("添加 {exe} 的{label}站规则失败（{error}）；")),
+            }
         }
     }
 
-    // 4. 回查：netsh/New-NetFirewallRule 返回成功不等于规则生效。
-    let verification = count_rules_for(agent, &exe);
+    // 4. 回查：规则写入返回成功不等于当前策略下真的生效。
+    let verification = count_rules_for(agent, &exes);
     report.query_ok = verification.query_ok;
     report.rules_expected = verification.expected;
     report.rules_verified = verification.verified;
-    report.coverage_complete =
-        verification.query_ok && verification.verified >= verification.expected;
+    // 核验必须有过非零期望——「0 条期望、0 条通过」不能算成功。
+    report.coverage_complete = verification.query_ok
+        && verification.expected > 0
+        && verification.verified >= verification.expected;
     report.verified = report.coverage_complete;
     report.failed_rules = verification.failed;
 
@@ -314,9 +528,22 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
         }
     }
     if report.coverage_complete {
-        report
-            .note
-            .push_str(&format!("已隔离 {exe}（出/入站阻断规则完整生效）"));
+        report.note.push_str(&format!(
+            "已隔离 {} 个可执行文件路径（出/入站阻断规则在当前生效策略下完整生效）：{}",
+            exes.len(),
+            exes.join("、")
+        ));
+        // **P0-08**：新路径规则已经完整生效，才清理指向旧路径的失效规则
+        // （升级后 exe 路径变化会留下永远匹配不到的残留）。
+        match prune_stale_rule_targets() {
+            Ok(0) => {}
+            Ok(removed) => report
+                .note
+                .push_str(&format!("；已清理 {removed} 条指向旧安装路径的失效规则")),
+            Err(error) => report.note.push_str(&format!(
+                "；清理旧路径规则失败（{error}），已保留待下次重试"
+            )),
+        }
     }
     report
 }
@@ -441,6 +668,44 @@ pub struct ReleaseReport {
     pub failures: Vec<String>,
 }
 
+/// **P0-08**：清理指向**已不存在路径**的本产品隔离规则。
+///
+/// 应用升级/换盘后 exe 路径会变：旧规则的 `Program` 指向一个不存在的文件，
+/// 永远不会再匹配任何进程，却会让 `rule_count()` 认为「仍处于隔离」，
+/// 也让用户以为还有保护。调用点在**新路径规则建立成功之后**——先有覆盖，
+/// 再清旧账，顺序反过来会出现「旧规则删了、新规则还没建」的空窗。
+///
+/// **只删除确认属于本产品、且 Program 确实不存在的规则**；
+/// 查询失败或无法解析一律不删（宁可留残留，也不误删正在生效的规则）。
+pub fn prune_stale_rule_targets() -> Result<u32, String> {
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'
+         $rules = @(Get-NetFirewallRule -DisplayName {}* )
+         $removed = 0
+         foreach ($r in $rules) {{
+           $f = $r | Get-NetFirewallApplicationFilter
+           $p = $f.Program
+           # 只有明确设置了程序路径、且该路径确实不存在的规则才算失效。
+           # `Any` / 空 / 通配（全局阻断规则）绝不在这里处理。
+           if (-not $p) {{ continue }}
+           if ($p -eq 'Any') {{ continue }}
+           if ($p -like '*\\*') {{
+             if (-not (Test-Path -LiteralPath $p)) {{
+               $r | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+               $removed++
+             }}
+           }}
+         }}
+         ConvertTo-Json @{{ removed = $removed }} -Compress",
+        ps_quote(RULE_PREFIX)
+    );
+    let json = crate::platform::imp::run_powershell(&script)
+        .map_err(|e| format!("清理失效规则失败：{e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("清理结果解析失败：{e}"))?;
+    Ok(value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32)
+}
+
 /// **P0-04**：删除应用隔离规则并回查确认真的消失。
 pub fn release_all_verified() -> Result<ReleaseReport, String> {
     let guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::ReleaseIsolation)?;
@@ -529,6 +794,85 @@ mod tests {
         );
         assert_ne!(rule_name("claude", "Out"), rule_name("chatgpt", "Out"));
         assert_ne!(rule_name("claude", "Out"), rule_name("claude", "In"));
+    }
+
+    /// **P0-08**：同一应用的不同安装路径必须得到**不同**规则名，
+    /// 否则后建的规则会覆盖先建的，只有一份安装被隔离。
+    #[test]
+    fn rule_names_are_scoped_per_executable_path() {
+        let user = r"C:\Users\a\AppData\Local\Programs\Claude\Claude.exe";
+        let system = r"C:\Program Files\Claude\Claude.exe";
+        let a = rule_name_for_exe("claude", "Out", user);
+        let b = rule_name_for_exe("claude", "Out", system);
+        assert_ne!(a, b, "不同路径必须得到不同规则名");
+        // 同路径重复调用必须稳定（幂等：重复隔离不产生新规则）。
+        assert_eq!(a, rule_name_for_exe("claude", "Out", user));
+        // 大小写与分隔符差异属于同一路径（Windows 语义）。
+        assert_eq!(
+            a,
+            rule_name_for_exe("claude", "Out", &user.to_lowercase().replace('\\', "/")),
+            "规范化后同一路径必须映射到同一规则名"
+        );
+        // 方向不同仍是不同规则。
+        assert_ne!(a, rule_name_for_exe("claude", "In", user));
+        // 规则名仍落在可被 `rule_count()` 通配统计的前缀下。
+        assert!(a.starts_with(RULE_PREFIX), "{a}");
+    }
+
+    /// **P0-08**：核验解析必须严格——缺 `ok` 字段、非数组/对象都算查询失败，
+    /// 不能因为 `filter_map` 而静默当成「全部通过」。
+    #[test]
+    fn rule_verification_parser_is_strict() {
+        // 正常：2 条通过。
+        let ok = parse_rule_verification(
+            r#"[{"exe":"C:\\a.exe","dir":"Out","ok":true,"reason":""},{"exe":"C:\\a.exe","dir":"In","ok":true,"reason":""}]"#,
+            2,
+        );
+        assert!(ok.query_ok);
+        assert_eq!(ok.verified, 2);
+        assert!(ok.failed.is_empty());
+
+        // 一条失败：原因必须被保留。
+        let partial = parse_rule_verification(
+            r#"[{"exe":"C:\\a.exe","dir":"Out","ok":true},{"exe":"C:\\a.exe","dir":"In","ok":false,"reason":"未进入当前生效策略（可能被组策略覆盖）"}]"#,
+            2,
+        );
+        assert!(partial.query_ok);
+        assert_eq!(partial.verified, 1);
+        assert_eq!(partial.failed.len(), 1);
+        assert!(
+            partial.failed[0].contains("生效策略"),
+            "{:?}",
+            partial.failed
+        );
+
+        // 缺少 ok 字段：不能当成通过。
+        let missing = parse_rule_verification(r#"[{"exe":"C:\\a.exe","dir":"Out"}]"#, 1);
+        assert_eq!(missing.verified, 0);
+        assert_eq!(missing.failed.len(), 1);
+
+        // 非预期形状：查询失败（不是「零失败」）。
+        assert!(!parse_rule_verification("not json", 2).query_ok);
+        assert!(!parse_rule_verification("123", 2).query_ok);
+    }
+
+    /// 候选路径解析：去重、忽略空路径、保留来源。
+    #[test]
+    fn exe_candidates_are_deduplicated_and_tagged() {
+        let json = r#"[
+            {"path":"C:\\Users\\a\\Claude.exe","source":"running"},
+            {"path":"c:/users/A/claude.EXE","source":"installed"},
+            {"path":"","source":"running"},
+            {"path":"C:\\Program Files\\Claude\\Claude.exe","source":"msix"}
+        ]"#;
+        let found = parse_exe_candidates(json);
+        assert_eq!(found.len(), 2, "规范化后重复路径必须去重：{found:?}");
+        assert_eq!(found[0].source, "running");
+        assert_eq!(found[1].source, "msix");
+        // 空 / null / 非 JSON 一律返回空列表，不 panic。
+        assert!(parse_exe_candidates("").is_empty());
+        assert!(parse_exe_candidates("null").is_empty());
+        assert!(parse_exe_candidates("garbage").is_empty());
     }
 
     #[test]

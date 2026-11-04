@@ -132,17 +132,30 @@ pub fn run_round(
     // 未接入 / 无法确认：按 enforce 开关决定是否跳过探测。
     let skip = enforce_access_path && !access.is_known();
     let route = plan_route(&access);
-    let (probed, skipped_reason) = if skip {
-        (
-            false,
-            Some(if access.is_uncovered() {
-                "未接入代理链路，已跳过探测（守护器不直连，避免暴露真实出口）".to_string()
-            } else if access.is_unknown() {
-                format!("接入路径无法确认（{}），已跳过探测", access.note())
-            } else {
+    // **P0 降级修复**：`probed` 必须反映**最终实际执行**的探测，而不是只看
+    // `skip` 变量。原实现只按 `enforce && !is_known()` 计算，因此：
+    // - `enforce=false` + TUN → `skip=false`，但 `plan_route(Tun)=Skip`，
+    //   实际一个请求都没发，却报告「本轮已探测」；
+    // - 纯 TUN 接入时目标全是 Unverified，界面会误以为做过检查。
+    //
+    // 现在把「路由是 Skip」也算进去，并把原因说清楚（TUN 是「路由未证实」，
+    // 不是「未接入」）。
+    let route_skips = matches!(route, ProbeRoute::Skip);
+    let (probed, skipped_reason) = if skip || route_skips {
+        let reason = if access.is_uncovered() {
+            "未接入代理链路，已跳过探测（守护器不直连，避免暴露真实出口）".to_string()
+        } else if access.is_unknown() {
+            format!("接入路径无法确认（{}），已跳过探测", access.note())
+        } else if matches!(access, AccessPath::Tun { .. }) {
+            // TUN：网卡存在 ≠ 路由经过它。没有路由证明就不发直连请求。
+            format!(
+                "{}：路由未验证，主动探测已跳过（已避免未经确认的直连，但不代表出口已验证）",
                 access.note()
-            }),
-        )
+            )
+        } else {
+            access.note()
+        };
+        (false, Some(reason))
     } else {
         (true, None)
     };
@@ -152,8 +165,14 @@ pub fn run_round(
     for target in targets {
         let probe: ProbeResult = if !target.enabled {
             ProbeResult::default()
-        } else if skip {
-            ProbeResult::skipped("未接入代理链路，已跳过探测")
+        } else if skip || route_skips {
+            // 与 `probed` 保持同一判据：凡报告「未探测」，目标就判 Unverified
+            // 而不是发起请求（否则 TUN 下会出现「说没探测、其实发了请求」）。
+            ProbeResult::skipped(
+                skipped_reason
+                    .as_deref()
+                    .unwrap_or("已跳过探测（未确认接入路径）"),
+            )
         } else {
             probe_with_route(target, &route)
         };
@@ -360,7 +379,7 @@ mod tests {
 
     #[test]
     fn skipped_round_marks_targets_unverified_not_fail() {
-        // 未接入时 enforce=true：目标应判 Unverified（不判 Fail），且本轮未探测。
+        // 未接入 / TUN（路由未证实）时：目标应判 Unverified（不判 Fail），且本轮未探测。
         let mut streaks = std::collections::BTreeMap::new();
         let report = run_round(&[target("a", true)], &mut streaks, true, 2);
         // 真实注册表读取结果不可控，只断言不变量：
@@ -370,6 +389,14 @@ mod tests {
                 "未探测的目标不得判 Fail"
             );
             assert!(report.skipped_reason.is_some());
+            // TUN 场景必须说明「路由未验证」，不能含糊地说「未接入」。
+            if report.access.path == "tun" {
+                let reason = report.skipped_reason.as_deref().unwrap_or_default();
+                assert!(
+                    reason.contains("路由未验证"),
+                    "TUN 跳过时必须说明路由未验证，实际：{reason}"
+                );
+            }
             // P0-05：目标失败计数仍必须为空（跳过 ≠ 目标失败）。
             assert!(
                 !streaks.keys().any(|k| k == "a"),
@@ -395,8 +422,10 @@ mod tests {
         // 模拟连续多轮 Uncovered（通过真实接入判定驱动）。
         for _ in 0..3 {
             let report = run_round(&targets, &mut streaks, true, 2);
-            if report.probed {
-                // 本机实际接入了代理：本测试不适用，跳过。
+            // 本机确实接入了代理（系统代理或 TUN）时本测试不适用，跳过。
+            // 注意不能再用 `report.probed` 做判据：TUN 下现在 `probed=false`
+            // （路由未验证就跳过探测），但接入路径本身是「已接入」。
+            if report.access.path != "uncovered" {
                 return;
             }
             last = Some(report);

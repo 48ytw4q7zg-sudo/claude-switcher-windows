@@ -166,6 +166,23 @@ interface ImportResult {
   backup_of_previous: string;
 }
 
+/** P1-02：完整迁移包（账号库 + Desktop 快照）导出结果。 */
+interface FullExportResult {
+  path: string;
+  bytes: number;
+  desktop_files: number;
+  skipped_links: number;
+}
+
+/** P1-02：完整迁移包导入结果。 */
+interface FullImportResult {
+  imported_bytes: number;
+  profiles_imported: number;
+  desktop_files: number;
+  backup_of_previous: string;
+  desktop_restored_to?: string | null;
+}
+
 interface SessionIsolationStatus {
   enabled: boolean;
   live_path: string;
@@ -325,6 +342,8 @@ type BusyAction =
   | 'autostart'
   | 'export'
   | 'import'
+  | 'export-full'
+  | 'import-full'
   | 'update'
   | null;
 
@@ -875,6 +894,43 @@ function App() {
       setUpdateInfo(result);
       return formatMessage(result.message);
     });
+
+  /** P1-02：导出完整迁移包（账号库 + 全部 Claude Desktop 快照）。 */
+  const exportFullMigration = () =>
+    run('export-full', async () => {
+      const result = await invoke<FullExportResult>('export_full_migration', {
+        dest: exportPath.trim(),
+        password: exportPassword,
+      });
+      setExportPassword('');
+      const links =
+        result.skipped_links > 0
+          ? `；跳过 ${result.skipped_links} 个链接/超大文件（不会跨机还原）`
+          : '';
+      return `已加密导出完整迁移包（${(result.bytes / 1024).toFixed(1)} 千字节，含 ${result.desktop_files} 个 Desktop 快照文件${links}）→ ${result.path}`;
+    });
+
+  /** P1-02：导入完整迁移包（账号库 + Claude Desktop 快照，事务性落位）。 */
+  const importFullMigration = () => {
+    askConfirm({
+      title: '导入完整迁移包',
+      detail:
+        '会覆盖当前账号库与全部 Claude Desktop 快照（两者都会先备份）。' +
+        '注意：Windows DPAPI 系统凭据与 %APPDATA%\\Claude 活目录不在包内，换机后 Desktop 可能需要重新登录。',
+      confirmLabel: '确认导入',
+      danger: true,
+      onConfirm: () =>
+        run('import-full', async () => {
+          const result = await invoke<FullImportResult>('import_full_migration', {
+            src: importPath.trim(),
+            password: importPassword,
+          });
+          setImportPassword('');
+          await load().catch(() => undefined);
+          return `完整迁移包导入完成：${result.profiles_imported} 个 CLI 账号、${result.desktop_files} 个 Desktop 快照文件；原账号库已备份到 ${result.backup_of_previous}`;
+        }),
+    });
+  };
 
   const remove = (id: string, label: string) => {
     // 弹三选项确认框。破坏性选项必须由用户显式点击触发——
@@ -1861,7 +1917,7 @@ function App() {
             <strong>加密导出（换机迁移 / 冷备）</strong>
             <span>口令 ≥8 位，Argon2id + AES-256-GCM 加密整个快照库。</span>
             <input
-              placeholder="导出文件路径（如 D:\\backup\\claude-store.csbk）"
+              placeholder="导出文件路径（如 D:\\backup\\claude-migration.csbk1）"
               value={exportPath}
               onChange={(e) => setExportPath(e.target.value)}
             />
@@ -1879,12 +1935,21 @@ function App() {
               {busy === 'export' ? <Loader2 className="spin" /> : <FileKey />}
               加密导出
             </button>
+            <button
+              className="ghost"
+              onClick={exportFullMigration}
+              disabled={!!busy || exportPath.trim().length === 0 || exportPassword.length < 8}
+              title="包含账号库与全部 Claude Desktop 快照；换机后 Desktop 账号也能一起恢复"
+            >
+              {busy === 'export-full' ? <Loader2 className="spin" /> : <FileKey />}
+              导出完整迁移包（含 Desktop 快照）
+            </button>
           </div>
           <div className="export-import-card">
             <strong>加密导入（恢复快照库）</strong>
             <span>覆盖当前快照库；导入前现有账号库自动备份。</span>
             <input
-              placeholder="导入文件路径（.csbk）"
+              placeholder="导入文件路径（.csbk1）"
               value={importPath}
               onChange={(e) => setImportPath(e.target.value)}
             />
@@ -1901,6 +1966,15 @@ function App() {
             >
               {busy === 'import' ? <Loader2 className="spin" /> : <RotateCcw />}
               解密导入
+            </button>
+            <button
+              className="ghost"
+              onClick={importFullMigration}
+              disabled={!!busy || importPath.trim().length === 0 || importPassword.length === 0}
+              title="从完整迁移包恢复账号库与 Claude Desktop 快照"
+            >
+              {busy === 'import-full' ? <Loader2 className="spin" /> : <RotateCcw />}
+              导入完整迁移包
             </button>
           </div>
         </div>

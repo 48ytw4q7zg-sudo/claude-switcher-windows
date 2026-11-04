@@ -1302,6 +1302,65 @@ pub fn kill_processes_by_names(names: &[&str]) -> Result<Vec<String>, String> {
     parse_killed(&json)
 }
 
+/// **CLI 边界**：按进程名结束**桌面 GUI 应用**，跳过 CLI 宿主。
+///
+/// 背景：Claude Code CLI 与 Claude Desktop 的可执行名都可能是 `claude`
+/// （`Get-Process -Name` 大小写不敏感），只按名字杀会把终端里的 CLI 一起打死
+/// ——正是 `egate_trip` 明确避免的「误伤终端宿主」。项目策略是
+/// **CLI 只提醒、不查杀**。
+///
+/// 判定依据是**映像路径**而不是名字：
+/// - 桌面版安装在 `...\AnthropicClaude\claude.exe` / `...\Claude\Claude.exe`
+///   / MSIX 的 `...\WindowsApps\...claude.exe`；
+/// - CLI 由 `node.exe`（`claude.cmd`/npm shim）或 `...\npm\claude` 承载，
+///   也常出现在 `...\node_modules\...\claude` 下。
+///
+/// 规则（保守优先，宁可不杀）：
+/// 1. 路径含 `\node_modules\`、`\npm\`、`\nvm\`、`\fnm\`、`\volta\` → 跳过（CLI）；
+/// 2. 进程名是 `node` / `bun` / `deno` → 跳过（CLI 宿主）；
+/// 3. 其余命中的同名进程才结束。
+///
+/// 返回值与 [`kill_processes_by_names`] 一致（被结束进程的描述），
+/// 额外把跳过的 CLI 进程也追加为 `"<desc>（CLI，已跳过）"` 便于用户核对。
+pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let name_list = names
+        .iter()
+        .map(|n| ps_single_quote(n))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'
+         $killed = New-Object System.Collections.ArrayList
+         $cliMarkers = @('\\node_modules\\', '\\npm\\', '\\nvm\\', '\\fnm\\', '\\volta\\', '\\.bun\\', '\\.deno\\')
+         foreach ($p in @(Get-Process -Name {names} -ErrorAction SilentlyContinue)) {{
+           $path = $p.Path
+           $pname = $p.ProcessName
+           $isCli = $false
+           if ($pname -in @('node','bun','deno','npm','npx')) {{ $isCli = $true }}
+           if ($path) {{
+             $lower = $path.ToLowerInvariant()
+             foreach ($m in $cliMarkers) {{
+               if ($lower.Contains($m)) {{ $isCli = $true }}
+             }}
+           }}
+           $desc = \"$pname (PID $($p.Id))\"
+           if ($isCli) {{
+             [void]$killed.Add(\"$desc（CLI，已跳过：只提醒不查杀）\")
+             continue
+           }}
+           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
+           [void]$killed.Add($desc)
+         }}
+         ConvertTo-Json -InputObject @($killed)",
+        names = name_list
+    );
+    let json = run_ps(&script)?;
+    parse_killed(&json)
+}
+
 fn parse_killed(json: &str) -> Result<Vec<String>, String> {
     let trimmed = json.trim();
     if trimmed.is_empty() {

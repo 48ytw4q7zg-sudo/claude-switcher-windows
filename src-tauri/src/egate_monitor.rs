@@ -10,7 +10,7 @@
 //! 结论调用 [`crate::egate_trip`]。这样「暂停期间绝不熔断」这条最要紧的语义
 //! 可以被单测锁死，而不需要真的去断网。
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -56,6 +56,9 @@ pub struct Gate {
     pub paused: bool,
     /// 是否已经处于**完整**熔断状态（避免重复执行）。
     pub already_tripped: bool,
+    /// **低成本项 4**：熔断状态无法确认（查询失败）。此时不得开始新的熔断，
+    /// 也不得自动恢复——先要让用户知道「不知道」，而不是按猜测动作。
+    pub trip_state_unknown: bool,
     /// **P0-06**：上次熔断是否只部分成功（需要补齐）。
     pub partial_protection: bool,
     /// **P0-03**：自动恢复资格（目标/接入/泄漏/手动保持）。
@@ -118,6 +121,12 @@ pub fn decide(gate: Gate) -> RoundAction {
         return RoundAction::Idle;
     }
     if gate.paused {
+        return RoundAction::Idle;
+    }
+    // **低成本项 4**：熔断状态无法确认时**什么都不做**——既不在未知前提下
+    // 叠加新的隔离（可能重复/覆盖），也不在未知前提下解除（可能放开仍然
+    // 需要保护的机器）。先把「未知」显示给用户，由人工核对。
+    if gate.trip_state_unknown {
         return RoundAction::Idle;
     }
     // **P0-03**：部分熔断时先看风险是否已消失——若恢复资格满足则进入恢复，
@@ -342,8 +351,18 @@ fn write_pause_state(state: &PauseState) -> Result<(), String> {
         serde_json::to_string_pretty(state).map_err(|e| format!("序列化暂停状态失败：{e}"))?;
     crate::fsx::write_atomically(&path, &text).map_err(|e| format!("写入暂停状态失败：{e}"))
 }
-/// 熔断状态：0=未熔断，1=部分熔断，2=完整熔断。
+/// 熔断状态：0=未熔断，1=部分熔断，2=完整熔断，3=**无法确认**。
+///
+/// 3 只在「本进程从未得出过结论、且从系统重建时查询失败」时写入。
+/// 它与 0 的区别是语义上的：0 是「确认没有隔离」，3 是「防火墙状态读不出来，
+/// 不知道有没有隔离」。界面与 CLI 必须分别显示，不能把读不出来当成安全。
 static TRIP_STATE: AtomicU64 = AtomicU64::new(0);
+
+/// 本进程是否已经对熔断状态得出过**可信**结论（执行过熔断/恢复，或重建成功）。
+///
+/// 用于区分「真的没有隔离」和「本进程还没查过」——后者在
+/// [`rebuild_trip_state_from_system`] 查询失败时不能冒充「未熔断」。
+static TRIP_STATE_CONFIRMED: AtomicBool = AtomicBool::new(false);
 /// 监控线程是否已启动（单例）。
 static MONITOR_STARTED: OnceLock<()> = OnceLock::new();
 
@@ -389,11 +408,23 @@ pub fn paused_remaining_secs() -> u64 {
 /// 标记熔断完成（0=未熔断，1=部分成功，2=完整成功）。
 pub fn mark_tripped_state(complete: bool) {
     TRIP_STATE.store(if complete { 2 } else { 1 }, Ordering::SeqCst);
+    // 这是本进程亲自执行的结果，属于可信结论。
+    TRIP_STATE_CONFIRMED.store(true, Ordering::SeqCst);
 }
 
 /// 清除熔断标记（解除隔离后调用）。
 pub fn clear_tripped() {
     TRIP_STATE.store(0, Ordering::SeqCst);
+    TRIP_STATE_CONFIRMED.store(true, Ordering::SeqCst);
+}
+
+/// **低成本项 4**：标记「无法确认是否隔离」。
+///
+/// 只在系统查询失败时使用；一旦后续查询成功，由 [`mark_tripped_state`] /
+/// [`clear_tripped`] 覆盖成确定值。
+pub fn mark_trip_state_unknown() {
+    TRIP_STATE.store(3, Ordering::SeqCst);
+    TRIP_STATE_CONFIRMED.store(false, Ordering::SeqCst);
 }
 
 /// 是否已完整熔断。
@@ -406,6 +437,14 @@ pub fn is_partial() -> bool {
     TRIP_STATE.load(Ordering::SeqCst) == 1
 }
 
+/// **低成本项 4**：熔断状态是否无法确认（防火墙查询失败 / 从未查过）。
+///
+/// 与「未熔断」严格区分：调用方要显式展示「无法确认」，不能当成安全。
+pub fn is_trip_state_unknown() -> bool {
+    TRIP_STATE.load(Ordering::SeqCst) == 3
+        || (!TRIP_STATE_CONFIRMED.load(Ordering::SeqCst) && !is_tripped() && !is_partial())
+}
+
 /// **P0-06**：启动时从**实际系统状态**重建熔断状态。
 ///
 /// 内存里的 TRIP_STATE 在进程重启后会归零，但 Windows 防火墙里的规则
@@ -415,12 +454,15 @@ pub fn is_partial() -> bool {
 /// - 无本产品规则 → 未熔断
 /// - 有规则且所有守护对象覆盖完整 → 完整熔断（2）
 /// - 有规则但覆盖不完整 → 部分熔断（1）
-/// - 查询失败 → 不猜测（保持未熔断，但记日志告知无法确认）
+/// - 查询失败 → **未知（3）**，不是「未熔断」
 pub fn rebuild_trip_state_from_system() {
     let count = match crate::egate_trip::rule_count() {
         Some(count) => count,
         None => {
-            crate::log_error("无法查询防火墙规则，熔断状态无法重建（按未熔断处理，请人工确认）");
+            // **低成本项 4**：查询失败不能落回默认的「未熔断」——那会让界面
+            // 与 CLI 在防火墙读不出来时误报安全。标记未知并保留原因。
+            mark_trip_state_unknown();
+            crate::log_error("无法查询防火墙规则，熔断状态无法确认（显示为「未知」，请人工核对）");
             return;
         }
     };
@@ -449,6 +491,8 @@ pub fn current_gate(
         paused: is_paused(),
         already_tripped: is_tripped(),
         partial_protection: is_partial(),
+        // 未知优先于「未熔断」：未查过/查失败时不能按未熔断动作。
+        trip_state_unknown: is_trip_state_unknown(),
         recovery,
         enabled,
     }
@@ -759,6 +803,7 @@ mod tests {
             at_warning_point: false,
             paused: false,
             already_tripped: false,
+            trip_state_unknown: false,
             partial_protection: false,
             recovery: RecoveryEligibility {
                 targets_pass: false,

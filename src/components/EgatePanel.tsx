@@ -64,7 +64,14 @@ export function EgatePanel() {
   const [cutState, setCutState] = useState<CutState | null>(null);
   const [cutMode, setCutMode] = useState<'off' | 'firewall' | 'nics'>('off');
   const [networkNote, setNetworkNote] = useState<string | null>(null);
-  const [monitor, setMonitor] = useState<{ paused: boolean; remaining_secs: number; tripped: boolean } | null>(null);
+  const [monitor, setMonitor] = useState<{
+    paused: boolean;
+    remaining_secs: number;
+    tripped: boolean;
+    partial?: boolean;
+    unknown?: boolean;
+    manual_hold?: boolean;
+  } | null>(null);
   const [launchNote, setLaunchNote] = useState<string | null>(null);
   const [envCheck, setEnvCheck] = useState<EnvCheck | null>(null);
   const [envNote, setEnvNote] = useState<string | null>(null);
@@ -122,7 +129,7 @@ export function EgatePanel() {
     invoke<CutState | null>('egate_cut_state')
       .then(setCutState)
       .catch(() => setCutState(null));
-    invoke<{ paused: boolean; remaining_secs: number; tripped: boolean }>('egate_monitor_status')
+    invoke<{ paused: boolean; remaining_secs: number; tripped: boolean; partial?: boolean; unknown?: boolean; manual_hold?: boolean }>('egate_monitor_status')
       .then(setMonitor)
       .catch(() => setMonitor(null));
   }, [refreshQuarantine]);
@@ -459,6 +466,19 @@ export function EgatePanel() {
           </span>
         )}
         {monitor?.tripped && <span className="pill bad">熔断中</span>}
+        {!monitor?.tripped && monitor?.partial && (
+          <span className="pill bad">部分隔离（覆盖不完整）</span>
+        )}
+        {!monitor?.tripped && !monitor?.partial && monitor?.unknown && (
+          <span className="pill bad" title="防火墙规则查询失败，无法确认当前是否已隔离">
+            隔离状态无法确认
+          </span>
+        )}
+        {monitor?.manual_hold && (
+          <span className="pill muted" title="由你手动触发的隔离，自动恢复不会解除">
+            手动保持隔离
+          </span>
+        )}
         {quarantineCount !== null && (
           <span className="pill muted">当前隔离规则：{quarantineCount} 条</span>
         )}

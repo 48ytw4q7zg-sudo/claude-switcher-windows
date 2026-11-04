@@ -174,19 +174,59 @@ mod tests {
         assert!(after.is_some(), "A 释放后 B 应能获取");
     }
 
+    /// `OperationGuard` 必须是 `!Send`（锁所有权不跨线程迁移）。
+    ///
+    /// **旧写法为什么无效**：先定义一个 `NotSend` trait、再为 Guard 实现它——
+    /// 这个 impl 永远成立，把 `PhantomData<*const ()>` 删掉测试照样通过。
+    ///
+    /// **有效写法**（`static_assertions::assert_not_impl_any!` 的歧义推断法）：
+    ///
+    /// ```text
+    /// impl<T: ?Sized>         AmbiguousIfImpl<()>      for T {}   // 总是适用
+    /// impl<T: ?Sized + Send>  AmbiguousIfImpl<Invalid> for T {}   // 仅 Send 时适用
+    /// ```
+    ///
+    /// - `OperationGuard: !Send` → 只有一条 impl 匹配，`_` 推断为 `()`，编译通过；
+    /// - 若 Guard 变成 `Send` → 两条都匹配 → **E0283 类型歧义 → 编译失败**。
+    ///
+    /// 因此「本测试能编译」本身就是 `!Send` 的证明。**关键**：推断必须发生在
+    /// **具体类型**的表达式上；写成泛型函数 `fn f<T>() { <T as _>::_ }` 时
+    /// 编译器不会做歧义检测（实测：泛型版本对 Send 类型也照样通过）。
+    /// 已用 rustc 双向验证：`u32` 报 E0283，`PhantomData<*const ()>` 通过。
+    ///
+    /// 同模块的 [`Self::send_types_hit_the_ambiguity_probe`] 提供正向对照，
+    /// 确保第二条 impl 没有写坏成「永不匹配」。
     #[test]
     fn guard_is_not_send() {
-        // 编译期约束：OperationGuard 必须是 !Send（锁所有权不跨线程迁移）。
-        fn assert_not_send<T>()
-        where
-            T: Send,
-        {
-        }
-        // 下面这行若取消注释应编译失败——用 trait 检测间接表达：
-        trait NotSend {}
-        impl NotSend for OperationGuard {}
-        // 该断言本身不运行，仅记录设计意图。
-        let _ = std::marker::PhantomData::<fn() -> dyn NotSend>;
-        let _ = assert_not_send::<u32>;
+        let _ = <OperationGuard as super::not_send_probe::AmbiguousIfImpl<_>>::probe;
     }
+
+    /// 正向对照：`u32` 是 `Send`，第二条 impl 必须对它生效。
+    ///
+    /// 这里**显式**选 `Invalid` 分支——若那条 `T: Send` 的 impl 被删/写错，
+    /// 本测试将因找不到 impl 而编译失败。
+    #[test]
+    fn send_types_hit_the_ambiguity_probe() {
+        let _ =
+            <u32 as super::not_send_probe::AmbiguousIfImpl<super::not_send_probe::Invalid>>::probe;
+    }
+}
+
+/// `!Send` 编译期断言的支持模块（歧义推断法）。
+///
+/// trait 与两条 impl 必须位于**模块作用域**：写在测试函数体内时，trait 解析
+/// 的歧义检测不会生效。
+#[cfg(test)]
+mod not_send_probe {
+    /// 占位类型，仅用于制造第二个候选 impl 的类型参数。
+    pub struct Invalid;
+
+    pub trait AmbiguousIfImpl<A> {
+        fn probe() {}
+    }
+
+    // 候选一：所有类型（包括 !Send）。
+    impl<T: ?Sized> AmbiguousIfImpl<()> for T {}
+    // 候选二：仅 Send 类型。!Send 类型不会匹配这一条。
+    impl<T: ?Sized + Send> AmbiguousIfImpl<Invalid> for T {}
 }

@@ -20,6 +20,11 @@ pub struct LaunchGate {
     pub failing: Vec<String>,
     /// 是否处于熔断态。
     pub tripped: bool,
+    /// **低成本项 4**：熔断状态无法确认（防火墙查询失败）。
+    ///
+    /// 与 `tripped` 分开：`tripped=false + unknown=true` 不等于「确认未隔离」。
+    /// 启动门禁遇到 unknown 必须阻止并说明「无法确认」，不能放行。
+    pub trip_state_unknown: bool,
     /// 是否暂停守护。
     ///
     /// **P0-10**：暂停只停止自动副作用，**不参与**「是否允许启动」的判定；
@@ -68,6 +73,13 @@ pub fn decide(gate: &LaunchGate) -> LaunchDecision {
     if gate.tripped {
         return LaunchDecision::block("当前处于熔断状态，请先解除隔离并确认出口正常");
     }
+    // **低成本项 4**：无法确认隔离状态时不能放行。这不是「已熔断」，
+    // 而是「不知道有没有熔断」——两者都必须阻止，理由要能区分。
+    if gate.trip_state_unknown {
+        return LaunchDecision::block(
+            "无法确认当前是否处于隔离状态（防火墙查询失败），请打开保护面板核对后再启动",
+        );
+    }
     if !gate.all_pass {
         let names = if gate.failing.is_empty() {
             "有目标未通过".to_string()
@@ -101,6 +113,9 @@ pub fn gate_from_round(
         all_pass: report.overall.verdict == Verdict::Pass,
         failing,
         tripped,
+        // 从全局状态读取：调用方传入的 `tripped` 只反映「是否已熔断」，
+        // 而「能否确认」是另一个维度。
+        trip_state_unknown: crate::egate_monitor::is_trip_state_unknown(),
         paused,
         enabled,
     }
@@ -164,6 +179,7 @@ mod tests {
             all_pass: true,
             failing: Vec::new(),
             tripped: false,
+            trip_state_unknown: false,
             paused: false,
             enabled: true,
         }
@@ -205,6 +221,22 @@ mod tests {
         let decision = decide(&g);
         assert!(!decision.allowed);
         assert!(decision.reason.unwrap().contains("熔断"));
+    }
+
+    /// **低成本项 4**：熔断状态无法确认时必须阻止启动，且理由要与
+    /// 「已熔断」区分开——用户需要知道该去核对什么。
+    #[test]
+    fn unknown_trip_state_blocks_launch() {
+        let mut g = gate();
+        g.trip_state_unknown = true;
+        let decision = decide(&g);
+        assert!(!decision.allowed, "无法确认隔离状态时不得放行");
+        let reason = decision.reason.unwrap();
+        assert!(reason.contains("无法确认"), "{reason}");
+        assert!(
+            !reason.contains("处于熔断状态"),
+            "理由应区分「未知」与「已熔断」：{reason}"
+        );
     }
 
     #[test]

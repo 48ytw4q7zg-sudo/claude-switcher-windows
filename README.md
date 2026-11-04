@@ -39,9 +39,9 @@
 | 项 | 状态 |
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
-| 安装包 | **Release v0.6.0**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计，SHA256 见 Release 说明 |
-| 开发分支验证 | 11 月 4 日更新：完整 Rust 回归 **515 passed / 0 failed / 0 ignored**，全目标 clippy 零警告，`npx tsc --noEmit` 与前端构建通过。详见[本轮进度](docs/full-audit-progress-2026-11-02.md)。已发布 v0.6.0 的历史结果为 394 项 |
-| 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；**尚未集齐全部功能**，逐项差距见[最终核对](docs/parity-gap-final-2026-11-04.md)（48 项中已完成 21 项） |
+| 安装包 | **Release v0.6.7**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计，SHA256 见 Release 说明 |
+| 开发分支验证 | 11 月 5 日（v0.6.7）：完整 Rust 回归 **599 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。本轮修项与验收证据见 [v0.6.7 发布说明](docs/release-v0.6.7.md) |
+| 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；逐项状态与剩余差异见[功能对等记录](docs/upstream-baseline.md)与[对等核对](docs/parity-gap-final-2026-11-04.md) |
 | 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
 
@@ -73,7 +73,7 @@ claude-switcher-windows/
 │   │   ├── usage.rs               # 用量统计 + 独立 usage-cache.json
 │   │   ├── tray.rs                # 托盘/弹窗定位（轻量读取）
 │   │   ├── cli.rs                 # 命令行入口 --list/--status/--switch
-│   │   ├── export.rs              # 加密快照导出/导入（CSBK1：Argon2id + AES-GCM）
+│   │   ├── export.rs              # 加密快照导出/导入（CSBK1 v2 账号库 / v3 完整迁移包含 Desktop 快照）
 │   │   ├── update.rs              # GitHub Release 版本检查
 │   │   ├── appconfig.rs           # 全局配置 appconfig.json（country/tz/locale/proxy_mode/proxy_group/webrtc）
 │   │   ├── egress.rs              # 出口 IP 探测（Cloudflare trace + ipinfo）+ 住宅/机房 ASN
@@ -164,7 +164,7 @@ Claude Code CLI 的登录凭据、全局配置和会话历史都散落在用户�
 - **Claude Desktop 管理**：`%APPDATA%\Claude` 整体快照/切换，**切换前自动把当前使用变更回存**，失败自动回滚。
 - **环境安全**：14 项检查 + 一键修复 + 保镖 kill-switch（代理掉线秒级杀进程）+ 时区看门狗。
 - **隐私工具**：STUN 泄漏探测、一次性隔离浏览器、代理诊断、系统指纹体检、CLI 安装体检。
-- **数据迁移**：加密快照导出/导入（CSBK1），换机冷备。
+- **数据迁移**：加密快照导出/导入（CSBK1，Argon2id + AES-256-GCM）。**v0.6.7 起支持完整迁移包**：除账号库外还打包全部 Claude Desktop 快照，换机后 Desktop 账号一并恢复；导入走「暂存 → 逐文件校验路径与哈希 → 事务性落位」，任一步失败都回滚。
 
 ### 多账号增强（v0.3.0）
 
@@ -314,8 +314,10 @@ ClaudeSwitcher-portable.zip                                       # 便携版
 | **open-safe 真实浏览器拉起**、WebRTC 标志生效、profile 销毁 | 未实机验证 |
 | **一键修复全流程**（拉起内核 → 恢复 TUN → 写规则 → 内核验证 → 注册保镖 → 复测） | 未实机验证 |
 | **Claude Desktop 切换**（进程结束、活目录回存、快照载入、回滚） | 未实机验证 |
-| **自动更新全流程** | 版本检查已修复；下载、校验与失败回滚仍待实现和验证 |
-| **加密快照跨机导入** | 未实机验证（导入侧已加外机密文拒绝，但换机场景未实测） |
+| **应用隔离多路径 / ActiveStore 核验**（未运行的已安装应用、多安装形态、升级后旧路径清理） | 纯逻辑与解析有单测；真实防火墙行为未实机验证 |
+| **网卡禁用/恢复**（改名、驱动变化、名称不稳定） | 账本已保存 `guid` 与原始管理状态；真实断网恢复需在可回滚虚拟机验证 |
+| **自动更新全流程** | 下载 + SHA256 校验已实现；`installed: false` 如实表示「安装向导已启动」而非已安装。安装后的版本替换与回滚需实机验收 |
+| **加密快照跨机导入** | 单元测试已覆盖「源机导出 → 另一 USERPROFILE 导入 → 账号库与 Desktop 快照同时恢复」；真实两台机器间的迁移仍需实机执行（DPAPI 系统凭据不在包内，Desktop 可能需重新登录） |
 | **托盘一键切换**（动态菜单、点击切换、系统通知、菜单重建） | 未完成完整实机验收 |
 | **按终端并行多账号**（wt/cmd 拉起、独立配置目录、共享 skills） | 未实机验证 |
 | **额度阈值通知 / 提醒**（Toast、notify-state、一键切换） | 未实机验证（Toast 需 AUMID；开发模式显示成 PowerShell 身份属正常） |
@@ -389,7 +391,7 @@ ClaudeSwitcher-portable.zip                                       # 便携版
 | `checks.rs` | **14 项安全检查** + 静默总检（N/14）+ 一键修复（拉起内核 → 恢复 TUN 开关 → 锁时区 → 关 IPv6 → 写规则 → 注册保镖 → 复测） |
 | `keep.rs` | 跨身份保留 `keep-in-workspace.txt`：stage（切换前收进暂存）/ merge（还原后合并）；**拒绝绝对路径、`..`、盘符前缀、符号链接**；残留暂存拒绝覆盖 |
 | `diagnostics.rs` | open-safe（一次性隔离浏览器，禁用非代理 UDP，关闭即销毁 profile）/ diagnose-proxy（无认证传输可达性，401/403 分类，不回显凭据）/ fingerprint（系统侧指纹 + 虚拟机启发式）/ cli-info（PATH 顺序、版本、安装方式、多份告警；**带 8s 超时**） |
-| `export.rs` | 加密快照导出/导入（CSBK1：magic + salt16 + nonce12 + AES-256-GCM，Argon2id m=64MiB/t=3/p=1，口令 ≥8）；**导入前检测外机密文并拒绝**（避免换机后整个账号库不可用） |
+| `export.rs` | 加密快照导出/导入（CSBK1：magic + salt16 + nonce12 + AES-256-GCM，Argon2id m=64MiB/t=3/p=1，口令 ≥8）；**导入前检测外机密文并拒绝**（避免换机后整个账号库不可用）。v3 完整迁移包额外包含 `desktop-accounts/` 全部文件（逐文件 SHA256、路径逃逸校验、暂存后事务性落位） |
 | `update.rs` | GitHub Releases latest 版本比对（只提示不自动安装；API 限流静默） |
 | `net.rs`（扩展） | Clash 控制器运行时配置探测：手动覆盖 > yaml > 端口探测（9097 → 9090）；**只接受回环控制器**（拒绝远程主机，防止 secret 外发） |
 | `platform/windows.rs`（扩展） | 新增：网卡列表、IPv6 绑定、时区读写、区域/GeoID、计划任务注册/删除/**启动**、WireGuard 隧道服务查询、无窗口进程拉起、按名/按 PID 结束进程 |
@@ -420,7 +422,7 @@ ClaudeSwitcher-portable.zip                                       # 便携版
 | **Clash 规则** | `get_clash_mode`、`ensure_clash_rules` |
 | **Claude Desktop** | `list_desktop_profiles_cmd`、`capture_desktop_profile_cmd`、`switch_desktop_profile_cmd`、`delete_desktop_profile_cmd`、`rename_desktop_profile_cmd` |
 | **隐私 / 诊断** | `open_safe_cmd`、`close_safe_cmd`、`diagnose_proxy_cmd`、`system_fingerprint_cmd`、`cli_info_cmd` |
-| **加密快照** | `export_store_encrypted`、`import_store_encrypted`、`check_for_update` |
+| **加密快照** | `export_store_encrypted`、`import_store_encrypted`、`export_full_migration`、`import_full_migration`、`check_for_update` |
 
 ### 关键数据流
 
@@ -557,6 +559,11 @@ Windows 凭据管理器：claude-switcher-store-key（32B AES-256-GCM 主密钥�
 - **切换前预检**（v0.2.0）：目标快照凭据可解密 / 配置目录可写，任一失败在动数据前中止（无损放弃点）
 - **切换事务日志**（v0.2.0）：`switch-journal.json` 记录切换目标/步骤/备份 id；正常完成即清除，中断残留会在状态里提示按备份回滚
 - **快照加密导出/导入**（v0.2.0）：单文件 CSBK1 格式（Argon2id + AES-256-GCM，口令 ≥8 位），换机迁移/冷备；导入前自动备份现有 store，**并检测外机密文拒绝导入**（避免换机后整个账号库不可用）；口令错/文件损坏绝不覆盖现有数据
+- **完整迁移包**（v0.6.7）：CSBK1 **v3** 在账号库之外打包 `desktop-accounts/` 下全部 Claude Desktop 快照。导出在**同一次 `load_store()` 视图**下取账号库与磁盘快照，保证两者一致；每个文件记录 SHA256。导入先解到同分区的隔离暂存目录，逐条校验路径（拒绝绝对路径 / `..` / 盘符 / 设备名）与哈希，全部通过后才把账号库与快照目录**事务性落位**；账号库或快照任一步失败都回滚，不留「账号库换了、快照没换」的半截状态。旧 v2 包继续可导入，但会被明确告知**不含 Desktop 快照**
+- **应用隔离加固**（v0.6.7）：受管应用的 exe 路径改为三源合并（运行中进程 + 注册表 `App Paths`/`Uninstall` + MSIX），**未运行的已安装应用也能预先隔离**；多安装路径各自独立规则名，逐条核验「属性正确 **且** 出现在 `ActiveStore` 生效策略」，新路径生效后才清理指向旧路径的失效规则
+- **隔离状态三态**（v0.6.7）：`已隔离 / 未隔离 / 无法确认`。防火墙查询失败时界面显示「隔离状态无法确认」，启动门禁会**阻止启动并说明原因**，而不是把读不出来当成安全
+- **手动隔离独立生命周期**（v0.6.7）：手动触发的隔离记为持久化 `ManualHold`，自动巡检达标也不会替你解除；只有手动解除才清除
+- **保镖 CLI 边界**（v0.6.7）：代理掉线时按**映像路径**区分桌面 GUI 与 CLI 宿主（`node`/`npm`/`nvm`/`fnm`/`volta`/`node_modules`），只结束 Desktop，Claude Code CLI 只记录不查杀
 - **应用内版本检查**（v0.2.0）：GitHub Releases 比对，有新版提示并给下载页链接（不自动安装；API 限流静默）
 - **Desktop 活目录回存**：切换前把当前账号的使用变更写回它的快照（对齐上游 `Save-Account`），不会静默回退到上次 capture
 - **keep 沙箱加固**：拒绝绝对路径、`..`、**盘符相对路径**（`C:foo`/`C:`，`PathBuf::join` 会整体替换 base）、符号链接
@@ -593,7 +600,7 @@ npx tsc --noEmit                            # 前端类型
 npm run tauri build                         # 出 MSI + NSIS
 ```
 
-当前源码测试状态：**414 通过、0 失败、0 ignored**（2026-11-01；以 `cargo test --lib` 实际输出为准）。主密钥相关测试使用内存后端，不依赖真实凭据存储。除链接、路径、原子写入、BOM/UTF-16、进程匹配、控制器地址、加密快照和 keep 路径边界外，还覆盖更新缓存与 SemVer 比较、Claude Desktop 传统/MSIX 语言配置读取。详细验证与限制见 [更新检查记录](docs/optimization-2026-11-01.md) 和 [客户端语言记录](docs/optimization-client-language-2026-11-01.md)。
+当前源码测试状态：**599 通过、0 失败、0 ignored**（2026-11-05，v0.6.7；以 `cargo test --lib` 实际输出为准）。主密钥相关测试使用内存后端，不依赖真实凭据存储。除链接、路径、原子写入、BOM/UTF-16、进程匹配、控制器地址、加密快照和 keep 路径边界外，还覆盖更新缓存与 SemVer 比较、Claude Desktop 传统/MSIX 语言配置读取。详细验证与限制见 [更新检查记录](docs/optimization-2026-11-01.md) 和 [客户端语言记录](docs/optimization-client-language-2026-11-01.md)。
 
 ---
 
