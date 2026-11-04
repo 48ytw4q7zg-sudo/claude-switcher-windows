@@ -758,8 +758,10 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
         .push(format!("WebRTC 策略：{}", policy.as_str()));
 
     let existed = script_path.exists();
+    // P0-13：文件存在但读取失败不能当空字符串——那会把用户内容整个覆盖掉。
     let old = if existed {
-        jsonio::read_text_lossy_bom(&script_path).unwrap_or_default()
+        jsonio::read_text_lossy_bom(&script_path)
+            .map_err(|e| format!("读取 Script.js 失败（未做任何修改）：{e}"))?
     } else {
         String::new()
     };
@@ -796,20 +798,31 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
         report
             .messages
             .push("置顶规则验证失败，正在回滚 Script.js...".to_string());
-        match (&report.script_backup, existed) {
-            (Some(backup), _) => {
-                let _ = std::fs::copy(backup, &script_path);
+        // P0-13：回滚必须检查结果，失败时不能报「已回滚」。
+        let rollback = match (&report.script_backup, existed) {
+            (Some(backup), _) => std::fs::copy(backup, &script_path).map(|_| ()),
+            (None, false) => fsx::remove_file_with_retry(&script_path),
+            (None, true) => Ok(()),
+        };
+        match rollback {
+            Ok(()) => {
+                restart_clash_verge(&mut report);
+                report.messages.push(
+                    "置顶规则 FAIL: 验证失败，已回滚 Script.js，请确认 Clash Verge 已启用全局扩展脚本"
+                        .to_string(),
+                );
             }
-            (None, false) => {
-                let _ = fsx::remove_file_with_retry(&script_path);
+            Err(error) => {
+                // 回滚失败：保留备份路径供用户手动恢复，明确报告未回滚。
+                let backup_hint = report
+                    .script_backup
+                    .clone()
+                    .unwrap_or_else(|| "（无备份）".to_string());
+                report.messages.push(format!(
+                    "置顶规则 FAIL: 验证失败且回滚失败（{error}）；原文件备份保留在 {backup_hint}，请手动恢复"
+                ));
             }
-            (None, true) => {}
         }
-        restart_clash_verge(&mut report);
-        report.messages.push(
-            "置顶规则 FAIL: 验证失败，已回滚 Script.js，请确认 Clash Verge 已启用全局扩展脚本"
-                .to_string(),
-        );
     } else {
         // 块本就在文件里（未改动），但内核没加载——只告警，不回滚。
         report
