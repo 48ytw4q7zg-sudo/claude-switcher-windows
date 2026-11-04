@@ -766,14 +766,17 @@ function App() {
     });
 
   const cancelNewAccount = () => {
-    if (!window.confirm('取消这次新号登录流程，并切回当前保存的账号快照？')) return;
-    run('switch', async () => {
-      setActionWarnings([]);
-      const result = await invoke<SwitchResult | null>('cancel_pending_new_account_login');
-      setActionWarnings(result?.warnings ?? []);
-      return result
-        ? `已取消新号流程，并切回 ${result.switched_to}`
-        : '已取消新号流程';
+    askConfirm({
+      title: '取消新号登录流程',
+      detail: '会切回当前保存的账号快照，已准备的节点与环境修改会保留。',
+      confirmLabel: '取消流程并切回',
+      onConfirm: () =>
+        run('switch', async () => {
+          setActionWarnings([]);
+          const result = await invoke<SwitchResult | null>('cancel_pending_new_account_login');
+          setActionWarnings(result?.warnings ?? []);
+          return '已取消新号流程并切回原账号';
+        }),
     });
   };
 
@@ -815,17 +818,18 @@ function App() {
     });
 
   const restore = (id: string, label: string) => {
-    if (
-      !window.confirm(
-        `完整还原到备份「${label}」？\n\n会用该备份覆盖当前 ~/.claude.json、settings.json 和${credentialFullText}；备份中缺失的项会被删除 / 清空。\n还原前会自动创建一次恢复前备份以便回滚。`,
-      )
-    )
-      return;
-    run('restore', async () => {
-      setActionWarnings([]);
-      const result = await invoke<RestoreResult>('restore_backup', { id });
-      setActionWarnings(result.warnings ?? []);
-      return `已从 ${result.restored_from} 恢复`;
+    askConfirm({
+      title: `还原到备份「${label}」`,
+      detail: `会用该备份覆盖当前 ~/.claude.json、settings.json 和${credentialFullText}；备份中缺失的项会被删除 / 清空。还原前会自动创建一次恢复前备份以便回滚。`,
+      confirmLabel: '确认还原',
+      danger: true,
+      onConfirm: () =>
+        run('restore', async () => {
+          setActionWarnings([]);
+          const result = await invoke<RestoreResult>('restore_backup', { id });
+          setActionWarnings(result.warnings ?? []);
+          return `已从 ${result.restored_from} 恢复`;
+        }),
     });
   };
 
@@ -847,20 +851,21 @@ function App() {
     });
 
   const importStore = () => {
-    if (
-      !window.confirm(
-        '导入会覆盖当前全部账号快照（现有账号库会先备份为 store.private.json.pre-import-*）。确定继续？',
-      )
-    )
-      return;
-    run('import', async () => {
-      const result = await invoke<ImportResult>('import_store_encrypted', {
-        src: importPath.trim(),
-        password: importPassword,
-      });
-      setImportPassword('');
-      await load().catch(() => undefined);
-      return `导入完成；原账号库已备份到 ${result.backup_of_previous}`;
+    askConfirm({
+      title: '导入账号快照',
+      detail: '导入会覆盖当前全部账号快照（现有账号库会先备份为 store.private.json.pre-import-*）。',
+      confirmLabel: '确认导入',
+      danger: true,
+      onConfirm: () =>
+        run('import', async () => {
+          const result = await invoke<ImportResult>('import_store_encrypted', {
+            src: importPath.trim(),
+            password: importPassword,
+          });
+          setImportPassword('');
+          await load().catch(() => undefined);
+          return `导入完成；原账号库已备份到 ${result.backup_of_previous}`;
+        }),
     });
   };
 
@@ -933,6 +938,28 @@ function App() {
   // C-2：Esc=取消、初始焦点在「取消」、焦点陷阱、背景滚动锁定。
   useModalDialog(deleteTarget !== null, () => setDeleteTarget(null), deleteDialogRef, deleteCancelRef);
 
+  // 通用中文确认框：替代 window.confirm——后者的按钮文字由操作系统语言决定，
+  // 英文系统上会显示「OK/Cancel」，与「界面全简体中文」的要求不符。
+  const [confirmAsk, setConfirmAsk] = useState<{
+    title: string;
+    detail: string;
+    confirmLabel: string;
+    danger?: boolean;
+    onConfirm: () => void;
+  } | null>(null);
+  const confirmDialogRef = useRef<HTMLElement | null>(null);
+  const confirmCancelRef = useRef<HTMLButtonElement | null>(null);
+  useModalDialog(confirmAsk !== null, () => setConfirmAsk(null), confirmDialogRef, confirmCancelRef);
+
+  /// 用中文确认框替代 window.confirm（按钮文字固定中文，不受系统语言影响）。
+  const askConfirm = (options: {
+    title: string;
+    detail: string;
+    confirmLabel: string;
+    danger?: boolean;
+    onConfirm: () => void;
+  }) => setConfirmAsk(options);
+
   /// 收集诊断信息并复制到剪贴板。默认只做本地检查（不发网络请求），
   /// 勾选后再查 Clash 与 OAuth——断网时也不会卡住界面。
   const copyDiagnostics = () =>
@@ -999,11 +1026,14 @@ function App() {
           </button>
           <button
             className="ghost danger"
-            onClick={() => {
-              if (window.confirm('退出 Claude Switcher？账号快照与备份都会保留。')) {
-                invoke('quit_app_cmd');
-              }
-            }}
+            onClick={() =>
+              askConfirm({
+                title: '退出 Claude 账号切换器',
+                detail: '账号快照与备份都会保留，下次打开可继续使用。',
+                confirmLabel: '退出',
+                onConfirm: () => invoke('quit_app_cmd'),
+              })
+            }
             disabled={!!busy}
             title="彻底退出（托盘图标也会消失）"
           >
@@ -1033,6 +1063,45 @@ function App() {
             ))}
           </div>
           <button onClick={() => setActionWarnings([])}>关闭</button>
+        </div>
+      )}
+
+      {confirmAsk && (
+        <div className="modal-scrim" role="presentation">
+          <section
+            className="prepare-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="confirm-title"
+            aria-describedby="confirm-desc"
+            ref={confirmDialogRef}
+          >
+            <div className="modal-title" id="confirm-title">
+              <ShieldAlert />
+              <div>
+                <strong>{confirmAsk.title}</strong>
+                <span>请确认后再继续。</span>
+              </div>
+            </div>
+            <p className="telemetry-intro" id="confirm-desc" style={{ whiteSpace: 'pre-line' }}>
+              {confirmAsk.detail}
+            </p>
+            <div className="modal-actions">
+              <button className="ghost" onClick={() => setConfirmAsk(null)} ref={confirmCancelRef}>
+                取消
+              </button>
+              <button
+                className={confirmAsk.danger ? 'danger wide' : 'primary wide'}
+                onClick={() => {
+                  const action = confirmAsk.onConfirm;
+                  setConfirmAsk(null);
+                  action();
+                }}
+              >
+                {confirmAsk.confirmLabel}
+              </button>
+            </div>
+          </section>
         </div>
       )}
 

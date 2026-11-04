@@ -27,7 +27,7 @@ region 锁定继续保留（它们是「主动锁环境」，ClaudeGuard 是「�
 | 5 | 防火墙兜底封锁（未接入→每守护对象出站 Block；fw_ensure_on 只开不关；手动封锁/解除；intent 差分） | `guard.rs` `netcut.rs` §3.6 | 无 | **新增** `firewall.rs` |
 | 6 | 直连泄露观察（GetExtendedTcpTable 筛守护对象连接，Proxy/Local/Public 分类；默认只告警） | `netwatch.rs` | 无 | **新增** `netwatch.rs` |
 | 7 | 环境一致性检查/对齐（tz/locale vs 出口；离线地点表；账本式自动对齐与一键还原） | `envcheck.rs` `envfix.rs` `geo.rs` | 部分（region.rs 锁定时区/区域，checks 查一致性；无账本还原） | **扩展** region：补账本式对齐/还原 |
-| 8 | 监控循环 + 防抖（fail_streak、trip_threshold、预警一次、暂停守护 30 分钟、间隔可调） | `monitor.rs` | 部分（guard.rs 10s kill-switch 巡检，无 streak/暂停） | **扩展** guard 循环 + 新状态 |
+| 8 | 监控循环 + 防抖（fail_streak、trip_threshold、预警一次、暂停守护 30 分钟、间隔可调） | `monitor.rs` | **已完成防抖层**（`egate_check` fail_streak / should_trip / should_warn，单轮检查可见）；常驻循环与暂停守护待接 | 部分完成 |
 | 9 | 熔断动作（杀 GUI 进程 + CLI 仅提醒 + 防火墙隔离 + 断网两档 off/firewall/nics；TripInfo） | `guard.rs` `netcut.rs` | 部分（kill-switch 杀 Desktop+CLI；无隔离/断网档位） | **扩展** guard + 新 `netcut.rs` |
 | 10 | 断网现场持久化与自愈（netcut.json 账本、启动恢复、规则去重、--restore 急救） | `netcut.rs` `recover.rs` | 无 | **新增** |
 | 11 | Claude 进程清理引擎（桌面/CLI 二分、一键全清/熔断清/退出清残留、残留监视线程） | `guard.rs` §5 | 部分（processes.rs 精确检测/结束） | **扩展** processes：补 sweep 三态 |
@@ -38,8 +38,8 @@ region 锁定继续保留（它们是「主动锁环境」，ClaudeGuard 是「�
 | 16 | 启动门禁（全部启用目标 Pass 才允许启动 Claude；失败阻止 + 通知 + 记录） | `monitor.rs` launch | 部分（guard kill-switch 有启动拦截语义） | **扩展** guard |
 | 17 | CLI（--check JSON/退出码、--restore、--settings、--tray、--install/--uninstall、--notify-test、状态查询） | `main.rs` | 部分（cs.exe --list/--status/--switch/run） | **扩展** cli.rs/cs |
 | 18 | 托盘菜单（显示/立即检测/暂停守护/解除隔离恢复网络/打开数据目录/退出） | `main.rs` | 部分（tray.rs 一键切换等） | **扩展** tray |
-| 19 | 首启向导（代理端口 → 白名单 → 守护对象/自启 三步） | UI + `config.rs` | 无（一键新号向导用途不同） | **新增**向导页 |
-| 20 | 设置 8 组折叠（目标 CRUD、熔断与清理、通知、客户端更新、自启等）+ 主界面仪表盘（状态环/目标瓦片/保护卡/CTA） | `ui/` | 无（本项目是分区式面板） | **新增**「出口门禁」分区 |
+| 19 | 首启向导（代理端口 → 白名单 → 守护对象/自启 三步） | UI + `config.rs` | 未实现；当前由「出口门禁」分区手动配目标 | 待实现 |
+| 20 | 设置 8 组折叠（目标 CRUD、熔断与清理、通知、客户端更新、自启等）+ 主界面仪表盘（状态环/目标瓦片/保护卡/CTA） | `ui/` | **目标 CRUD 与检查界面已完成**（`EgatePanel`）；仪表盘与设置分组待接 | 部分完成 |
 | 21 | 单实例 / 日志 1MB 裁剪 / 数据目录 %APPDATA% 独立 | `main.rs` `guard.rs` | 已有等价（single-instance、日志滚动、便携数据目录） | 复用 |
 | 22 | 配置版本化迁移（v2→v3→v4、损坏备份 config.json.bak-{ts}、升级前备份） | `config.rs` | 部分（appconfig.json 严格读取 + 锁；无版本迁移） | **扩展** appconfig |
 

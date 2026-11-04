@@ -248,6 +248,54 @@ mod tests {
     }
 
     #[test]
+    fn egate_settings_round_trip_without_losing_targets() {
+        let mut cfg = AppConfig {
+            egate_enabled: true,
+            egate_trip_threshold: 3,
+            egate_interval_secs: 30,
+            egate_enforce_access: false,
+            egate_guarded_agents: vec!["claude".to_string()],
+            egate_targets: crate::egate_defaults::builtin_targets(),
+            ..Default::default()
+        };
+        cfg.egate_targets[1].expect_ips = vec!["1.2.3.4".to_string()];
+        cfg.egate_targets[1].expect_regions = vec!["US".to_string()];
+        let text = serde_json::to_string(&cfg).expect("serialize");
+        let back: AppConfig = serde_json::from_str(&text).expect("deserialize");
+        assert_eq!(cfg, back);
+        // 目标表必须逐字段完整保留，不能只剩 id/name。
+        assert_eq!(
+            back.egate_targets[1].anchor_url,
+            cfg.egate_targets[1].anchor_url
+        );
+        assert_eq!(
+            back.egate_targets[1].anchor_kind,
+            cfg.egate_targets[1].anchor_kind
+        );
+        assert_eq!(
+            back.egate_targets[1].expect_ips,
+            vec!["1.2.3.4".to_string()]
+        );
+        assert_eq!(back.egate_targets[1].expect_regions, vec!["US".to_string()]);
+        assert!(back.egate_targets[2].enabled, "启用状态必须保留");
+        assert!(!back.egate_targets[0].enabled, "local 默认关闭必须保留");
+    }
+
+    #[test]
+    fn egate_fields_default_safely_when_absent() {
+        // 旧版 appconfig.json 没有 egate 字段：必须安全降级为「门禁关闭、无目标」，
+        // 而不是解析失败把整份配置丢掉。
+        let old = r#"{"country_target":"US","wsl_integration_enabled":false}"#;
+        let cfg: AppConfig = serde_json::from_str(old).unwrap();
+        assert!(!cfg.egate_enabled, "缺字段时必须默认关闭门禁");
+        assert!(cfg.egate_targets.is_empty());
+        assert_eq!(cfg.egate_trip_threshold, 2, "阈值默认 2");
+        assert_eq!(cfg.egate_interval_secs, 15, "间隔默认 15 秒");
+        assert!(cfg.egate_enforce_access, "接入检查默认开启");
+        assert_eq!(cfg.country_target.as_deref(), Some("US"), "旧字段不能丢");
+    }
+
+    #[test]
     fn strict_loader_rejects_invalid_file() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("invalid.json");

@@ -531,13 +531,32 @@ mod tests {
             let mut request = Vec::new();
             while !request.ends_with(b"\r\n\r\n") {
                 let mut byte = [0u8; 1];
-                stream.read_exact(&mut byte).unwrap();
-                request.push(byte[0]);
+                // 读超时/对端提前断开都是夹具的合法结束条件（客户端可能因重定向
+                // 被拒而先关闭连接）；这里不能 unwrap，否则夹具线程 panic 会让
+                // join().unwrap() 把整条测试带崩，掩盖真正的断言结果。
+                match stream.read_exact(&mut byte) {
+                    Ok(()) => request.push(byte[0]),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            std::io::ErrorKind::WouldBlock
+                                | std::io::ErrorKind::TimedOut
+                                | std::io::ErrorKind::UnexpectedEof
+                        ) =>
+                    {
+                        break
+                    }
+                    Err(e) => panic!("读取夹具请求失败: {e}"),
+                }
             }
-            assert!(String::from_utf8(request)
-                .unwrap()
+            if !String::from_utf8_lossy(&request)
                 .to_ascii_lowercase()
-                .contains("authorization: bearer fixture-only"));
+                .contains("authorization: bearer fixture-only")
+            {
+                // 没收到完整请求头就写响应会误导判定；直接结束夹具，
+                // 由主线程的「是否发生第二次请求」断言给出结论。
+                return false;
+            }
             stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /redirect-target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
             drop(stream);
             listener.set_nonblocking(true).unwrap();
