@@ -228,11 +228,14 @@ pub fn guard_tick() -> GuardTick {
     let client_up = client_up_for(&mode, &running);
 
     // **P1-01**：用户可运行在「系统代理」模式——此时不强制要求 TUN，
-    // 改为核验系统代理可用（与应用真实出口一致）。
+    // 但只接受**明确有效**的代理地址：Unsupported（socks/PAC/坏端口）与
+    // 缺地址都不能算「可用」，否则开着代理却仍判正常会放行不安全流量。
     let system_proxy_mode = crate::egate_check::read_proxy_evidence();
     let use_system_proxy = system_proxy_mode.enable
-        && crate::egate_access::parse_proxy_server(system_proxy_mode.server.as_deref())
-            != crate::egate_access::ProxyParse::Empty;
+        && matches!(
+            crate::egate_access::parse_proxy_server(system_proxy_mode.server.as_deref()),
+            crate::egate_access::ProxyParse::Http(_)
+        );
 
     let alive_now = if use_system_proxy {
         // 系统代理已开启：客户端在线即视为接入正常（TUN 不强制）。
@@ -273,7 +276,13 @@ pub fn guard_tick() -> GuardTick {
     }
 
     let mut killed = Vec::new();
-    if should_kill {
+    if should_kill
+        // **P0-06**：真正执行查杀前重新核验意图——巡检过程可能耗时数秒，
+        // 期间用户已暂停或紧急恢复，此时不应再按旧决策杀进程。
+        && crate::egate_monitor::protection_intent()
+            == crate::egate_monitor::ProtectionIntent::Armed
+        && !crate::egate_monitor::is_paused()
+    {
         // 同时杀桌面版（进程名 Claude）与 CLI（claude）；Get-Process -Name 本就
         // 大小写不敏感，两个名都传是显式对齐任务约定。
         match imp::kill_processes_by_names(&["Claude", "claude"]) {

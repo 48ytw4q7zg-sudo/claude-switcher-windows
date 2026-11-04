@@ -237,8 +237,9 @@ pub fn cut(mode: CutMode) -> (bool, String) {
     // P0-A：**先枚举目标并写账本，再逐块禁用**。每禁一块都更新账本，
     // 这样中途崩溃时，恢复器知道哪些网卡已经被本事务禁用。
     let final_state = if mode == CutMode::Nics {
-        let targets = match list_up_physical_nics() {
-            Ok(targets) => targets,
+        // **P0-02**：保留完整快照（guid + 原始管理状态），不要只留名字。
+        let snapshots = match list_up_physical_nics() {
+            Ok(snapshots) => snapshots,
             Err(error) => {
                 let _ = save_state(&after_firewall);
                 return (
@@ -247,12 +248,13 @@ pub fn cut(mode: CutMode) -> (bool, String) {
                 );
             }
         };
-        let targets: Vec<String> = targets.iter().map(|s| s.name.clone()).collect();
-        // 先把「计划禁用的全部网卡」写入账本。
+        let targets: Vec<String> = snapshots.iter().map(|s| s.name.clone()).collect();
+        // 先把「计划禁用的全部网卡」连同完整快照写入账本。
         let planned = CutState {
             mode: "nics".to_string(),
             planned_adapters: targets.clone(),
             completed_adapters: Vec::new(),
+            adapter_snapshots: snapshots.clone(),
             phase: CutPhase::FirewallApplied,
             ..after_firewall.clone()
         };
@@ -273,6 +275,7 @@ pub fn cut(mode: CutMode) -> (bool, String) {
                         mode: "nics".to_string(),
                         planned_adapters: targets.clone(),
                         completed_adapters: disabled.clone(),
+                        adapter_snapshots: snapshots.clone(),
                         phase: CutPhase::NicsApplied,
                         ..after_firewall.clone()
                     };
@@ -293,6 +296,7 @@ pub fn cut(mode: CutMode) -> (bool, String) {
                         mode: "nics".to_string(),
                         planned_adapters: targets.clone(),
                         completed_adapters: disabled.clone(),
+                        adapter_snapshots: snapshots.clone(),
                         phase: CutPhase::NicsApplied,
                         ..after_firewall.clone()
                     };
@@ -311,6 +315,7 @@ pub fn cut(mode: CutMode) -> (bool, String) {
             mode: "nics".to_string(),
             planned_adapters: targets.clone(),
             completed_adapters: disabled,
+            adapter_snapshots: snapshots.clone(),
             phase: CutPhase::Applied,
             ..after_firewall.clone()
         }
@@ -458,7 +463,13 @@ fn rule_exists(name: &str) -> Result<bool, String> {
     );
     let out =
         crate::platform::imp::run_powershell(&script).map_err(|e| format!("查询规则失败：{e}"))?;
-    Ok(out.trim().eq_ignore_ascii_case("true"))
+    // 严格解析：只认明确的 true/false，其他输出一律报错——查询失败绝不能
+    // 被当成「规则不存在」。
+    match out.trim().to_ascii_lowercase().as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        other => Err(format!("规则查询输出无法解析：{other:?}")),
+    }
 }
 
 /// 启动自愈：若存在断网现场就恢复（进程崩溃/被杀后由下次启动调用）。
@@ -480,18 +491,55 @@ pub fn heal() -> Vec<String> {
     }
 }
 
-/// 加全局出站阻断规则（幂等）。
+/// 加全局出站阻断规则（**属性核验 + 回查**）。
+///
+/// 只按名字查「存在」是不够的：同名规则可能被禁用、方向或动作不符。
+/// 发现错误属性时删除重建，创建后回读确认。
 fn ensure_firewall_cut_rule() -> Result<(), String> {
+    match query_cut_rule()? {
+        RuleState::Present => return Ok(()),
+        RuleState::WrongAttributes => {
+            // 同名但属性错误：只处理本产品规则名，删除后重建。
+            remove_cut_rule()?;
+        }
+        RuleState::Absent => {}
+    }
     let script = format!(
         "$ErrorActionPreference='Stop'\n\
-         $existing = Get-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue\n\
-         if (-not $existing) {{\n\
-           New-NetFirewallRule -DisplayName {} -Direction Outbound -Action Block -Enabled True | Out-Null\n\
-         }}",
-        ps_quote(CUT_RULE),
+         New-NetFirewallRule -DisplayName {} -Direction Outbound -Action Block -Enabled True | Out-Null",
         ps_quote(CUT_RULE)
     );
-    crate::platform::imp::run_powershell(&script).map(|_| ())
+    crate::platform::imp::run_powershell(&script).map(|_| ())?;
+    match query_cut_rule()? {
+        RuleState::Present => Ok(()),
+        other => Err(format!("阻断规则创建后核验失败：{other:?}")),
+    }
+}
+
+/// 规则核验三态：存在且正确 / 不存在 / 存在但属性不符。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleState {
+    Present,
+    Absent,
+    WrongAttributes,
+}
+
+/// 查询规则并**核验属性**（严格解析，任何非预期输出都报错）。
+fn query_cut_rule() -> Result<RuleState, String> {
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'\n\
+         $r = @(Get-NetFirewallRule -DisplayName {}) | Select-Object -First 1\n\
+         if (-not $r) {{ 'absent' }} elseif ($r.Enabled -eq 'True' -and $r.Direction -eq 'Outbound' -and $r.Action -eq 'Block') {{ 'present' }} else {{ 'wrong' }}",
+        ps_quote(CUT_RULE)
+    );
+    let out = crate::platform::imp::run_powershell(&script)
+        .map_err(|e| format!("查询阻断规则失败：{e}"))?;
+    match out.trim().to_ascii_lowercase().as_str() {
+        "present" => Ok(RuleState::Present),
+        "absent" => Ok(RuleState::Absent),
+        "wrong" => Ok(RuleState::WrongAttributes),
+        other => Err(format!("阻断规则查询输出无法解析：{other:?}")),
+    }
 }
 
 /// 删除全局出站阻断规则。

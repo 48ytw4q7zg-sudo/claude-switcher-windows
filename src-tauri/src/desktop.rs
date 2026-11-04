@@ -667,6 +667,28 @@ fn write_switch_ledger(ledger: &DesktopSwitchLedger) -> Result<(), String> {
     fsx::write_atomically(&path, &text).map_err(|e| format!("写入切换账本失败：{e}"))
 }
 
+/// **P0-01**：备份一落地就更新持久化账本，再允许删除活目录。
+///
+/// 原实现在 `with_store()` 返回后才把备份路径写入账本：在备份与记账之间崩溃，
+/// 磁盘账本仍是 `backup_path=None`，恢复器会误当作「原本没有活目录」而删掉
+/// 唯一可用副本。改为备份成功即记账，写失败则中止切换（原账号尚未被动）。
+fn persist_backup_path(backup: &Path, live_dir: &Path) -> Result<(), String> {
+    let path = desktop_switch_ledger_path()?;
+    let Ok(bytes) = std::fs::read(&path) else {
+        // 没有事务账本：不做任何写入（避免误建不完整的恢复记录）。
+        return Ok(());
+    };
+    let text = crate::jsonio::decode_text(&bytes);
+    let mut ledger: DesktopSwitchLedger =
+        serde_json::from_str(&text).map_err(|e| format!("已有切换账本损坏，拒绝覆盖：{e}"))?;
+    if !crate::platform::imp::paths_equivalent(Path::new(&ledger.live_dir), live_dir) {
+        return Err("已有切换账本的活目录与当前操作不一致，已拒绝覆盖".to_string());
+    }
+    ledger.backup_path = Some(backup.to_string_lossy().to_string());
+    ledger.phase = "backup_verified".to_string();
+    write_switch_ledger(&ledger).map_err(|e| format!("备份已创建但账本更新失败，已中止切换：{e}"))
+}
+
 fn clear_switch_ledger() {
     if let Ok(path) = desktop_switch_ledger_path() {
         let _ = std::fs::remove_file(path);
@@ -735,16 +757,35 @@ pub fn heal_desktop_switch() -> Vec<String> {
                         }
                     }
                 }
-                None => {
-                    // 原本无活目录：清理半成品。
-                    if live.exists() {
-                        let _ = fsx::retry_io(|| fs::remove_dir_all(&live));
-                    }
+                None if ledger.original_existed => {
+                    // **P0-01**：原本有数据但缺备份路径——**绝不**按「无活目录」
+                    // 清理。保留现场，让用户人工核对，而不是删掉唯一可用副本。
                     messages.push(format!(
-                        "检测到中断的 Desktop 切换（→ {}，原本无活目录），已清理",
-                        ledger.to_id
+                        "检测到中断的 Desktop 切换（→ {}），但账本没有备份路径（原本存在活目录）。\
+                         已保留全部现场，请人工核对 {} 的账号归属后再恢复",
+                        ledger.to_id, ledger.live_dir
                     ));
-                    clear_switch_ledger();
+                }
+                None => {
+                    // 原本无活目录：清理半成品，但只有清理成功才删账本。
+                    if live.exists() {
+                        match fsx::retry_io(|| fs::remove_dir_all(&live)) {
+                            Ok(()) => {
+                                messages.push(format!(
+                                    "检测到中断的 Desktop 切换（→ {}，原本无活目录），已清理",
+                                    ledger.to_id
+                                ));
+                                clear_switch_ledger();
+                            }
+                            Err(error) => {
+                                messages.push(format!(
+                                    "检测到中断的 Desktop 切换，但清理失败（{error}），账本已保留待重试"
+                                ));
+                            }
+                        }
+                    } else {
+                        clear_switch_ledger();
+                    }
                 }
             }
         }
@@ -919,6 +960,10 @@ fn switch_desktop_profile_in(
         let outcome = copy(live_dir, &path)?;
         // **P0-NEW-03**：把本次备份的精确路径交给事务上下文。
         *transaction.backup_path.borrow_mut() = Some(path.clone());
+        // **P0-01**：备份一落地就写入账本——删除活目录之前，账本里必须已经
+        // 存在精确的备份路径，否则崩溃时恢复器不知道去哪里恢复。
+        // 写失败则中止（活目录尚未改动，原账号仍完整）。
+        persist_backup_path(&path, live_dir)?;
         warnings.push(format!(
             "切换前已备份当前 Claude Desktop 数据到 {}（{} 字节，跳过链接 {} 个）",
             path.display(),

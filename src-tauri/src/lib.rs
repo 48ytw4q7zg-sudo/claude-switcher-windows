@@ -2998,7 +2998,12 @@ async fn egate_trip_now() -> Result<egate_trip::TripReport, String> {
         } else {
             config.egate_guarded_agents.clone()
         };
-        Ok(egate_trip::trip(&agents))
+        let result = egate_trip::trip(&agents);
+        // **P0-07**：手动触发的隔离属于用户意图，自动恢复不得解除它。
+        if result.any_isolated {
+            egate_monitor::mark_manual_hold();
+        }
+        Ok(result)
     })
     .await
 }
@@ -3016,6 +3021,8 @@ async fn egate_release_now() -> Result<u32, String> {
                 report.failures.join("；")
             ));
         }
+        // **P0-07**：手动解除隔离时清除 ManualHold 意图。
+        egate_monitor::clear_manual_hold();
         egate_monitor::clear_tripped();
         Ok(report.requested)
     })

@@ -324,6 +324,16 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
 ///
 /// 与上游一致：**只处理 GUI 应用**；CLI 宿主不在守护列表里，避免误伤终端。
 pub fn trip(guarded_agents: &[String]) -> TripReport {
+    // 没有守护对象时不申请系统操作锁：无事可做的调用不该因为锁不可用而报错。
+    if guarded_agents.is_empty() {
+        return TripReport {
+            agents: Vec::new(),
+            any_isolated: false,
+            all_isolated: false,
+            failures: Vec::new(),
+            note: "没有配置的守护对象，未执行任何操作".to_string(),
+        };
+    }
     // **P0-02**：熔断必须独占系统操作权。
     let guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::Isolate) {
         Ok(guard) => guard,
@@ -338,6 +348,20 @@ pub fn trip(guarded_agents: &[String]) -> TripReport {
         }
     };
     let _keep = &guard;
+    // **P0-06**：拿到锁后重新核验保护意图——等待锁期间用户可能刚执行了
+    // 紧急恢复（Disarmed），或状态文件损坏（Unknown）。此时旧的「该熔断」决策
+    // 已过期，绝不能继续施加隔离。
+    if crate::egate_monitor::protection_intent() != crate::egate_monitor::ProtectionIntent::Armed
+        || crate::egate_monitor::is_paused()
+    {
+        return TripReport {
+            agents: Vec::new(),
+            any_isolated: false,
+            all_isolated: false,
+            failures: Vec::new(),
+            note: "保护已暂停或已停止（用户意图在操作期间改变），未执行熔断".to_string(),
+        };
+    }
     let mut agents = Vec::new();
     let mut failures = Vec::new();
     for id in guarded_agents {

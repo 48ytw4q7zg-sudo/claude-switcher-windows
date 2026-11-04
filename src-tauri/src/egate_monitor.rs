@@ -242,6 +242,57 @@ fn pause_file() -> Result<std::path::PathBuf, String> {
 }
 
 /// 暂停状态（落盘）。
+/// **P0-07**：手动隔离意图（与自动熔断分开）。
+///
+/// 自动巡检**不得**解除用户手动要求保持的隔离。意图持久化在磁盘，
+/// 进程重启后仍生效；只有用户手动解除才清除。
+fn isolation_intent_file() -> Result<std::path::PathBuf, String> {
+    Ok(crate::paths::app_data_dir()?.join("eguard-manual-hold.json"))
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct ManualHoldState {
+    /// 用户是否明确要求保持隔离。
+    manual_hold: bool,
+    /// 记录时间（unix 秒）。
+    #[serde(default)]
+    since: u64,
+}
+
+/// 用户手动执行隔离：写入 ManualHold 意图，自动恢复不得解除它。
+pub fn mark_manual_hold() {
+    let state = ManualHoldState {
+        manual_hold: true,
+        since: now_secs(),
+    };
+    if let Ok(path) = isolation_intent_file() {
+        if let Ok(text) = serde_json::to_string_pretty(&state) {
+            let _ = crate::fsx::write_atomically(&path, &text);
+        }
+    }
+}
+
+/// 用户手动解除隔离：清除 ManualHold 意图。
+pub fn clear_manual_hold() {
+    if let Ok(path) = isolation_intent_file() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// 当前是否有用户手动保持的隔离（读取失败按 false——见 P0-NEW-04 的意图检查）。
+pub fn is_manual_hold() -> bool {
+    let Ok(path) = isolation_intent_file() else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    let text = crate::jsonio::decode_text(&bytes);
+    serde_json::from_str::<ManualHoldState>(&text)
+        .map(|state| state.manual_hold)
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 struct PauseState {
     /// 暂停截止时间（unix 秒；0 表示未暂停）。
@@ -549,8 +600,8 @@ fn run_monitor_round(
         access_ok,
         // 启用 leak_trip 时，仍有达阈值的直连泄漏则不允许恢复。
         leak_clear: !(config.egate_leak_trip && leak.trip),
-        // 用户手动锁定/保持隔离的意图（当前无独立手动接口，保守为 false）。
-        manual_hold: false,
+        // **P0-07**：用户手动要求保持的隔离不被自动恢复解除。
+        manual_hold: is_manual_hold(),
     };
     if !recovery.allowed() && is_tripped() {
         crate::log_error(&format!(

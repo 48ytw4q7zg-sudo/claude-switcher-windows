@@ -805,6 +805,7 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
         || group.contains('\n')
         || FORBIDDEN_GROUPS.contains(&group_trimmed.to_uppercase().as_str())
     {
+        let _ = restore_merge(&merge_path, merge_original.as_deref(), merge_changed);
         return Err(
             "代理组名为空、含逗号/换行或为内置策略名，请先在设置中选择 Clash 代理组".to_string(),
         );
@@ -818,21 +819,31 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
     let existed = script_existed;
     let old = script_old;
     let block = build_managed_block(group_trimmed, policy);
-    let new_text = upsert_managed_block(&old, &block)?;
+    let new_text = match upsert_managed_block(&old, &block) {
+        Ok(text) => text,
+        Err(error) => {
+            let _ = restore_merge(&merge_path, merge_original.as_deref(), merge_changed);
+            return Err(error);
+        }
+    };
 
     if new_text == old {
         report.messages.push("规则已是当前版本".to_string());
     } else {
         let backup = if existed {
             let backup = backup_path_for(&script_path);
-            std::fs::copy(&script_path, &backup)
-                .map_err(|e| format!("备份 Script.js 失败: {e}"))?;
+            if let Err(error) = std::fs::copy(&script_path, &backup) {
+                let _ = restore_merge(&merge_path, merge_original.as_deref(), merge_changed);
+                return Err(format!("备份 Script.js 失败: {error}"));
+            }
             Some(backup)
         } else {
             None
         };
-        fsx::write_atomically(&script_path, &new_text)
-            .map_err(|e| format!("写入 Script.js 失败: {e}"))?;
+        if let Err(error) = fsx::write_atomically(&script_path, &new_text) {
+            let _ = restore_merge(&merge_path, merge_original.as_deref(), merge_changed);
+            return Err(format!("写入 Script.js 失败: {error}"));
+        }
         report.script_changed = true;
         report.script_backup = backup.as_ref().map(|b| b.to_string_lossy().to_string());
         report.messages.push(match &report.script_backup {
@@ -887,6 +898,18 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
                 ));
             }
         }
+    } else if merge_changed {
+        // P0-04：Script 没改但 Merge 改了且内核验证失败 → 同样恢复 Merge。
+        if let Err(error) = restore_merge(&merge_path, merge_original.as_deref(), true) {
+            report
+                .messages
+                .push(format!("Merge.yaml 回滚失败：{error}（请手动恢复备份）"));
+        } else {
+            report
+                .messages
+                .push("内核未加载规则；已恢复本次对 Merge.yaml 的修改".to_string());
+        }
+        restart_clash_verge(&mut report);
     } else {
         // 块本就在文件里（未改动），但内核没加载——只告警，不回滚。
         report
