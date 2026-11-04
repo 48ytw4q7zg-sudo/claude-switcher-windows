@@ -508,9 +508,18 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
     let live = desktop_live_dir()?;
     let accounts = desktop_accounts_dir()?;
     let backup_root = live_backup_root()?;
-    // H-2：读—改—写走 with_store。
-    store::with_store(|store| {
-        switch_desktop_profile_in(
+
+    // **P0-07**：文件切换与账号库提交必须形成事务。
+    //
+    // with_store 是「先执行闭包、再 save_store」。如果闭包里的文件切换成功
+    // 但 save_store 失败，就会出现「活目录是 B、账号库记录是 A」。
+    //
+    // 做法：闭包内记录本次切换前的活目录备份路径；若 save_store 失败
+    // （with_store 返回 Err 且错误来自保存），用该备份把活目录回滚。
+    let mut rollback_source: Option<std::path::PathBuf> = None;
+    let mut switched_id: Option<String> = None;
+    let result = store::with_store(|store| {
+        let outcome = switch_desktop_profile_in(
             id,
             &live,
             &accounts,
@@ -519,8 +528,55 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
             &|| claude_desktop_running(),
             &backup_root,
             &copy_dir_recursive,
-        )
-    })
+        );
+        if outcome.is_ok() {
+            switched_id = Some(id.to_string());
+            // 取最新的备份（switch_desktop_profile_in 已写入 backup_root）。
+            rollback_source = latest_backup_in(&backup_root);
+        }
+        outcome
+    });
+
+    match result {
+        Ok(warnings) => Ok(warnings),
+        Err(error) => {
+            // 若是保存账号库失败且文件已切换 → 回滚活目录，恢复一致状态。
+            if switched_id.is_some() {
+                if let Some(backup) = &rollback_source {
+                    let rollback = (|| -> Result<(), String> {
+                        if live.exists() || links::path_is_link(&live) {
+                            fsx::retry_io(|| fs::remove_dir_all(&live))
+                                .map_err(|e| format!("清理目标目录失败：{e}"))?;
+                        }
+                        copy_dir_recursive(backup, &live)
+                            .map(|_| ())
+                            .map_err(|e| format!("还原活目录失败：{e}"))
+                    })();
+                    return Err(match rollback {
+                        Ok(()) => format!(
+                            "{error}；账号库保存失败，已将 Desktop 活目录回滚到切换前状态"
+                        ),
+                        Err(rollback_error) => format!(
+                            "{error}；账号库保存失败且活目录回滚失败（{rollback_error}），                             请用备份手动恢复：{}",
+                            backup.display()
+                        ),
+                    });
+                }
+            }
+            Err(error)
+        }
+    }
+}
+
+/// 取备份目录下最新的一个备份（按名称排序，名称含时间戳）。
+fn latest_backup_in(root: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut entries: Vec<_> = fs::read_dir(root)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().is_dir())
+        .collect();
+    entries.sort_by_key(|entry| entry.file_name());
+    entries.last().map(|entry| entry.path())
 }
 
 /// [`switch_desktop_profile`] 的可注入版本：`kill`/`running`/`copy` 均可替换，

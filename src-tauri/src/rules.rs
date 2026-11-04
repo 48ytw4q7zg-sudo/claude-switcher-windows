@@ -679,6 +679,26 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
     let script_path = profiles.join("Script.js");
     let merge_path = profiles.join("Merge.yaml");
 
+    // **P0-08**：所有可能失败的读取与校验必须在**任何写入之前**完成。
+    //
+    // 原实现先清理 Merge.yaml 再读 Script.js：若 Script.js 读失败，
+    // Merge.yaml 已被改写而无法一并回滚。
+    //
+    // 预检：unknown 模式直接返回；rule 模式先读 Script.js（失败即中止）。
+    let script_existed = script_path.exists();
+    let script_old = if script_existed {
+        jsonio::read_text_lossy_bom(&script_path)
+            .map_err(|e| format!("读取 Script.js 失败（未做任何修改）：{e}"))?
+    } else {
+        String::new()
+    };
+    if mode == "unknown" {
+        report
+            .messages
+            .push("无法确认 Clash 模式，已跳过规则修改".to_string());
+        return Ok(report);
+    }
+
     // —— 1. 所有模式都先清理历史 Merge.yaml 遗留（global/direct 也需要）——
     if merge_path.exists() {
         let raw = jsonio::read_text_lossy_bom(&merge_path)?;
@@ -708,12 +728,6 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
 
     // —— 2. 按模式分派 ——
     match mode.as_str() {
-        "unknown" => {
-            report
-                .messages
-                .push("无法确认 Clash 模式，已跳过规则修改".to_string());
-            return Ok(report);
-        }
         "global" | "direct" => {
             report.messages.push(format!(
                 "Clash 模式={mode}，规则不适用，未写入任何规则{}",
@@ -757,14 +771,9 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
         .messages
         .push(format!("WebRTC 策略：{}", policy.as_str()));
 
-    let existed = script_path.exists();
-    // P0-13：文件存在但读取失败不能当空字符串——那会把用户内容整个覆盖掉。
-    let old = if existed {
-        jsonio::read_text_lossy_bom(&script_path)
-            .map_err(|e| format!("读取 Script.js 失败（未做任何修改）：{e}"))?
-    } else {
-        String::new()
-    };
+    // P0-08：使用预检阶段读到的内容（已在任何写入之前读取成功）。
+    let existed = script_existed;
+    let old = script_old;
     let block = build_managed_block(group_trimmed, policy);
     let new_text = upsert_managed_block(&old, &block)?;
 
