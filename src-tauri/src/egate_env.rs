@@ -185,19 +185,27 @@ pub fn align_timezone(egress_country: &str, city: &str) -> Result<AppliedEnv, St
         restore()?;
     }
     let current = crate::platform::imp::current_timezone_id()?;
+
+    // **P1-05：先写账本（记录原时区与计划目标），再改系统。**
+    // 如果先改后写，改成功但账本写失败时就无法按原值恢复了。
+    let record = AppliedEnv {
+        at: now_secs(),
+        city: city.to_string(),
+        tz_from: current.clone(),
+        tz_to: target.to_string(),
+    };
+    // 先落盘（Prepared 状态即最终记录），写入成功才允许改系统。
+    save(&record)?;
+
     crate::platform::imp::set_timezone_id(target)?;
     // 回读核验：设置接口返回成功不等于真的生效。
     let after = crate::platform::imp::current_timezone_id().unwrap_or_default();
     if !after.eq_ignore_ascii_case(target) {
-        return Err(format!("时区设置后回读为 {after}，与目标 {target} 不符"));
+        // 核验失败：账本已记录原值，restore() 可以还原。
+        return Err(format!(
+            "时区设置后回读为 {after}，与目标 {target} 不符（原时区已记录，可还原）"
+        ));
     }
-    let record = AppliedEnv {
-        at: now_secs(),
-        city: city.to_string(),
-        tz_from: current,
-        tz_to: target.to_string(),
-    };
-    save(&record)?;
     Ok(record)
 }
 
