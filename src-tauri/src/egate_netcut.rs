@@ -187,34 +187,81 @@ pub fn cut(mode: CutMode) -> (bool, String) {
     }
 
     // 步骤 3：禁用网卡（仅 Nics 档）。
+    //
+    // P0-A：**先枚举目标并写账本，再逐块禁用**。每禁一块都更新账本，
+    // 这样中途崩溃时，恢复器知道哪些网卡已经被本事务禁用。
     let final_state = if mode == CutMode::Nics {
-        match disable_up_nics() {
-            Ok((disabled, errors)) => {
-                if !errors.is_empty() {
-                    let partial = CutState {
-                        mode: "nics".to_string(),
-                        nics: disabled,
-                        phase: CutPhase::FirewallApplied,
-                        ..after_firewall
-                    };
-                    let _ = save_state(&partial);
-                    return (false, format!("部分网卡禁用失败：{}", errors.join("；")));
-                }
-                CutState {
-                    mode: "nics".to_string(),
-                    nics: disabled,
-                    phase: CutPhase::Applied,
-                    ..after_firewall
-                }
-            }
+        let targets = match list_up_physical_nics() {
+            Ok(targets) => targets,
             Err(error) => {
-                // 网卡禁用失败：降级为防火墙阻断，账本保留 FirewallApplied。
                 let _ = save_state(&after_firewall);
                 return (
                     false,
-                    format!("禁用网卡失败（已降级为防火墙阻断）：{error}"),
+                    format!("枚举网卡失败（已降级为防火墙阻断）：{error}"),
                 );
             }
+        };
+        // 先把「计划禁用的全部网卡」写入账本。
+        let planned = CutState {
+            mode: "nics".to_string(),
+            nics: targets.clone(),
+            phase: CutPhase::FirewallApplied,
+            ..after_firewall
+        };
+        if let Err(error) = save_state(&planned) {
+            return (
+                false,
+                format!("写入网卡计划失败，已停止（未禁用任何网卡）：{error}"),
+            );
+        }
+
+        // 逐块禁用，每块后更新账本。
+        let mut disabled: Vec<String> = Vec::new();
+        for name in &targets {
+            match disable_one_nic(name) {
+                Ok(()) => {
+                    disabled.push(name.clone());
+                    let progress = CutState {
+                        mode: "nics".to_string(),
+                        nics: disabled.clone(),
+                        phase: CutPhase::NicsApplied,
+                        ..after_firewall
+                    };
+                    if let Err(error) = save_state(&progress) {
+                        // 账本更新失败：停止继续禁用，保留已写内容。
+                        return (
+                            false,
+                            format!(
+                                "已禁用 {} 块网卡但账本更新失败，已停止：{error}",
+                                disabled.len()
+                            ),
+                        );
+                    }
+                }
+                Err(error) => {
+                    // 单块失败：停止继续，如实报告已禁用范围。
+                    let partial = CutState {
+                        mode: "nics".to_string(),
+                        nics: disabled.clone(),
+                        phase: CutPhase::NicsApplied,
+                        ..after_firewall
+                    };
+                    let _ = save_state(&partial);
+                    return (
+                        false,
+                        format!(
+                            "网卡「{name}」禁用失败（已禁用 {} 块，账本已记录，可恢复）：{error}",
+                            disabled.len()
+                        ),
+                    );
+                }
+            }
+        }
+        CutState {
+            mode: "nics".to_string(),
+            nics: disabled,
+            phase: CutPhase::Applied,
+            ..after_firewall
         }
     } else {
         CutState {
@@ -375,32 +422,34 @@ fn remove_cut_rule() -> Result<(), String> {
 }
 
 /// 枚举启用中的物理网卡并禁用它们；返回实际禁用的网卡名。
-fn disable_up_nics() -> Result<(Vec<String>, Vec<String>), String> {
-    let script = "\
-$ErrorActionPreference='Stop'\n\
-$names = @(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Select-Object -ExpandProperty Name)\n\
-$done = @(); $failed = @()\n\
-foreach ($n in $names) {\n\
-  try { Disable-NetAdapter -Name $n -Confirm:$false -ErrorAction Stop; $done += $n }\n\
-  catch { $failed += \"$n($($_.Exception.Message))\" }\n\
-}\n\
-ConvertTo-Json @{ done = @($done); failed = @($failed) } -Compress";
+/// **P0-A**：只枚举将被禁用的物理网卡（只读，不改系统）。
+///
+/// 必须在执行任何禁用之前调用，并把结果连同原始状态一起写入账本——
+/// 否则中途崩溃时账本里没有「哪些网卡已被禁用」的信息。
+pub fn list_up_physical_nics() -> Result<Vec<String>, String> {
+    let script = "$ErrorActionPreference='Stop'
+@(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Select-Object -ExpandProperty Name) | ConvertTo-Json -Compress";
     let json = crate::platform::imp::run_powershell(script)?;
     let value: serde_json::Value =
         serde_json::from_str(json.trim()).map_err(|e| format!("网卡列表解析失败：{e}"))?;
-    let list = |key: &str| -> Vec<String> {
-        value
-            .get(key)
-            .and_then(|v| v.as_array())
-            .map(|items| {
-                items
-                    .iter()
-                    .filter_map(|v| v.as_str().map(str::to_string))
-                    .collect()
-            })
-            .unwrap_or_default()
-    };
-    Ok((list("done"), list("failed")))
+    Ok(match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        serde_json::Value::String(one) if !one.is_empty() => vec![one],
+        _ => Vec::new(),
+    })
+}
+
+/// 禁用**一块**网卡（供逐块处理，每块之间更新账本）。
+pub fn disable_one_nic(name: &str) -> Result<(), String> {
+    let script = format!(
+        "$ErrorActionPreference='Stop'
+         Disable-NetAdapter -Name {} -Confirm:$false -ErrorAction Stop | Out-Null",
+        ps_quote(name)
+    );
+    crate::platform::imp::run_powershell(&script).map(|_| ())
 }
 
 /// 重新启用记录在案的网卡。
