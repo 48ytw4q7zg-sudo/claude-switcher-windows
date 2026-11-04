@@ -179,6 +179,35 @@ fn load_from(path: &std::path::Path) -> Result<AppConfig, String> {
         .map_err(|error| format!("应用配置格式无效，请先修复配置文件：{error}"))
 }
 
+/// 配置加载的严格结果（区分三种状态）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConfigLoad {
+    /// 正常读取。
+    Ok(Box<AppConfig>),
+    /// 首次安装（文件不存在）。
+    Fresh,
+    /// 配置损坏或无法读取（**不得**当成用户主动关闭）。
+    Corrupt(String),
+}
+
+/// **P0-12**：严格加载配置，区分「首次安装」「正常读取」「配置损坏」。
+///
+/// 门禁监控、恢复器和受保护启动入口必须用这个版本——用 `load()` 的默认值
+/// 兜底会让「已启用保护的用户遇到配置损坏」被静默降级为「用户主动关闭」。
+pub fn load_checked() -> ConfigLoad {
+    let path = match config_path() {
+        Ok(path) => path,
+        Err(error) => return ConfigLoad::Corrupt(format!("无法定位配置文件：{error}")),
+    };
+    if !path.exists() {
+        return ConfigLoad::Fresh;
+    }
+    match load_from(&path) {
+        Ok(config) => ConfigLoad::Ok(Box::new(config)),
+        Err(error) => ConfigLoad::Corrupt(error),
+    }
+}
+
 /// 在跨进程排他锁内完成读取、修改和原子保存。
 /// 闭包只修改传入配置，不得再次调用 update。
 pub fn update(mut f: impl FnMut(&mut AppConfig)) -> Result<AppConfig, String> {

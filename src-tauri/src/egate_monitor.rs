@@ -187,7 +187,24 @@ pub fn start_monitor() {
         let mut last_run = 0u64;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
-            let config = crate::appconfig::load();
+            // P0-12：配置损坏不能静默当成「用户关闭了门禁」。
+            let config = match crate::appconfig::load_checked() {
+                crate::appconfig::ConfigLoad::Ok(config) => *config,
+                crate::appconfig::ConfigLoad::Fresh => continue,
+                crate::appconfig::ConfigLoad::Corrupt(error) => {
+                    // 配置损坏：不执行新熔断，但也不清除现有隔离。
+                    // 每轮只记一次日志，避免刷屏。
+                    static LAST_REPORT: AtomicU64 = AtomicU64::new(0);
+                    let now = now_secs();
+                    if now.saturating_sub(LAST_REPORT.load(Ordering::Relaxed)) > 300 {
+                        LAST_REPORT.store(now, Ordering::Relaxed);
+                        crate::log_error(&format!(
+                            "出口门禁配置损坏（{error}），已暂停新熔断；现有隔离保持不变。请修复 appconfig.json"
+                        ));
+                    }
+                    continue;
+                }
+            };
             if !config.egate_enabled {
                 continue;
             }
