@@ -2508,29 +2508,10 @@ fn egate_save_targets(targets: Vec<egate::EgateTarget>) -> Result<(), String> {
     if !errors.is_empty() {
         return Err(format!("目标配置有问题：{}", errors.join("；")));
     }
-    // 内置目标不允许删除（只能停用）：删掉后用户若改主意就得手动照文档重建，
-    // 而内置锚点是「这个应用此刻走哪条路」的权威定义。
-    let saved: Vec<&str> = targets.iter().map(|t| t.id.trim()).collect();
-    for builtin in egate_defaults::builtin_targets() {
-        if !saved.contains(&builtin.id.as_str()) {
-            return Err(format!(
-                "内置目标「{}」不能删除，可以取消勾选停用",
-                builtin.name
-            ));
-        }
-    }
-    // 内置目标的 id 不能改：id 是熔断执行与配置迁移的稳定标识。
-    for target in &targets {
-        if egate_defaults::is_builtin(target.id.trim()) {
-            let expected = egate_defaults::builtin_targets()
-                .into_iter()
-                .find(|builtin| builtin.id == target.id.trim());
-            if let Some(expected) = expected {
-                if expected.anchor_url != target.anchor_url.trim() {
-                    return Err(format!("内置目标「{}」的探测地址不能修改", expected.name));
-                }
-            }
-        }
+    // 内置目标保护：不可删除、探测地址不可改（含复用内置 id 的绕过场景）。
+    let protection = egate_defaults::check_builtin_protection(&targets);
+    if !protection.is_empty() {
+        return Err(protection.join("；"));
     }
     let normalized: Vec<egate::EgateTarget> = targets
         .into_iter()
@@ -2592,6 +2573,19 @@ fn egate_update_settings(
     Ok(())
 }
 
+/// 出口门禁的连续失败计数（跨轮持久）。
+///
+/// 防抖语义要求「连续 N 次失败」跨轮累计；每轮新建 map 会让计数永远是 1，
+/// 阈值 2 永远不成立——「连续两次才熔断」被静默降级成「永不熔断」。
+/// 用进程内静态状态保存，键为目标 id。
+static EGATE_STREAKS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::BTreeMap<String, u32>>,
+> = std::sync::OnceLock::new();
+
+fn egate_streaks() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, u32>> {
+    EGATE_STREAKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
+}
+
 /// 出口门禁：立即跑一轮检查（只读探测，不结束进程、不断网）。
 ///
 /// 熔断执行按批次接入（当前只报告结果）；未接入代理链路时按开关跳过探测。
@@ -2604,7 +2598,10 @@ async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
         } else {
             config.egate_targets.clone()
         };
-        let mut streaks = std::collections::BTreeMap::new();
+        // 防抖计数必须跨轮保留；锁中毒按空计数恢复（宁可多熔断一次也不卡死）。
+        let mut streaks = egate_streaks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         Ok(egate_check::run_round(
             &targets,
             &mut streaks,

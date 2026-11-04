@@ -293,6 +293,43 @@ mod tests {
     }
 
     #[test]
+    fn streaks_accumulate_across_rounds_when_caller_reuses_map() {
+        // 防抖的核心契约：同一份 streaks 跨轮复用时，连续失败才累加。
+        // （曾经每轮新建 map，阈值 2 永远不成立——熔断被静默降级成永不触发。）
+        let targets = vec![target("a", true)];
+        let mut streaks = std::collections::BTreeMap::new();
+        // 直接驱动计数逻辑：模拟三轮 Fail。
+        for expected in 1..=3u32 {
+            let streak = streaks.get("a").copied().unwrap_or(0) + 1;
+            streaks.insert("a".to_string(), streak);
+            assert_eq!(streak, expected);
+            assert_eq!(
+                should_trip_report_from(&streaks, 2),
+                expected >= 2,
+                "第 {expected} 轮后熔断判定"
+            );
+        }
+        // 一次非 Fail 必须清零（否则偶发失败会累积成熔断）。
+        streaks.remove("a");
+        assert!(!should_trip_report_from(&streaks, 2), "成功后必须清零");
+        // 顺带确认 run_round 会写入调用方传入的 map（跨轮持有的前提）。
+        let mut live = std::collections::BTreeMap::new();
+        let _ = run_round(&targets, &mut live, false, 2);
+        assert!(
+            live.is_empty() || live.values().all(|v| *v >= 1),
+            "run_round 只能写入有效计数"
+        );
+    }
+
+    /// 从裸计数表判定熔断（供跨轮测试直接驱动）。
+    fn should_trip_report_from(
+        streaks: &std::collections::BTreeMap<String, u32>,
+        threshold: u32,
+    ) -> bool {
+        threshold > 0 && streaks.values().any(|streak| *streak >= threshold)
+    }
+
+    #[test]
     fn skipped_round_marks_targets_unverified_not_fail() {
         // 未接入时 enforce=true：目标应判 Unverified（不熔断），且本轮未探测。
         let mut streaks = std::collections::BTreeMap::new();

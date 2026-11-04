@@ -103,6 +103,39 @@ pub fn validate_targets(targets: &[EgateTarget]) -> Vec<String> {
     errors
 }
 
+/// 保存前的内置目标保护：内置目标不能被删除，其探测地址不能改。
+///
+/// 方向很重要：校验的是**配置里所有带内置 id 的条目**。若反过来只遍历内置默认表，
+/// 用户新建一个 `id: "claude"` 的自定义目标就能绕过——它会顶替内置目标参与
+/// 熔断决策，却指向任意地址。
+pub fn check_builtin_protection(targets: &[EgateTarget]) -> Vec<String> {
+    let mut errors = Vec::new();
+    let saved: Vec<&str> = targets.iter().map(|t| t.id.trim()).collect();
+    for builtin in builtin_targets() {
+        if !saved.contains(&builtin.id.as_str()) {
+            errors.push(format!(
+                "内置目标「{}」不能删除，可以取消勾选停用",
+                builtin.name
+            ));
+        }
+    }
+    for target in targets {
+        let id = target.id.trim();
+        if !is_builtin(id) {
+            continue;
+        }
+        if let Some(expected) = builtin_targets()
+            .into_iter()
+            .find(|builtin| builtin.id == id)
+        {
+            if expected.anchor_url != target.anchor_url.trim() {
+                errors.push(format!("内置目标「{}」的探测地址不能修改", expected.name));
+            }
+        }
+    }
+    errors
+}
+
 /// 归一化地区码：能归一的转 alpha-2，其余原样保留（判定时按原文比较）。
 pub fn normalize_expect_regions(regions: &[String]) -> Vec<String> {
     regions
@@ -205,6 +238,46 @@ mod tests {
             "2001:db8::1".to_string(),
         ]);
         assert_eq!(ips, vec!["1.2.3.4".to_string(), "2001:db8::1".to_string()]);
+    }
+
+    #[test]
+    fn builtin_protection_blocks_deletion_url_override_and_id_hijack() {
+        // 正常保存：内置目标齐全且地址未改 → 无错误。
+        assert!(check_builtin_protection(&builtin_targets()).is_empty());
+
+        // 1. 删除内置目标。
+        let mut missing = builtin_targets();
+        missing.retain(|t| t.id != "claude");
+        let errors = check_builtin_protection(&missing);
+        assert!(errors.iter().any(|e| e.contains("不能删除")), "{errors:?}");
+
+        // 2. 修改内置目标的探测地址。
+        let mut url_changed = builtin_targets();
+        url_changed[1].anchor_url = "https://evil.invalid/trace".to_string();
+        let errors = check_builtin_protection(&url_changed);
+        assert!(
+            errors.iter().any(|e| e.contains("探测地址不能修改")),
+            "{errors:?}"
+        );
+
+        // 3. 新建自定义目标复用内置 id 指向任意地址（绕过场景）必须被拦。
+        let mut hijack = builtin_targets();
+        hijack.retain(|t| t.id != "claude");
+        hijack.push(EgateTarget {
+            id: "claude".to_string(),
+            name: "伪装目标".to_string(),
+            anchor_url: "https://evil.invalid/trace".to_string(),
+            anchor_kind: AnchorKind::Auto,
+            expect_ips: Vec::new(),
+            expect_regions: Vec::new(),
+            enabled: true,
+            timeout_secs: 5,
+        });
+        let errors = check_builtin_protection(&hijack);
+        assert!(
+            errors.iter().any(|e| e.contains("探测地址不能修改")),
+            "复用内置 id 改地址必须被拒绝：{errors:?}"
+        );
     }
 
     #[test]
