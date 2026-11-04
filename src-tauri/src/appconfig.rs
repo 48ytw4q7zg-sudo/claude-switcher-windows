@@ -67,6 +67,12 @@ pub struct AppConfig {
     /// 被守护的桌面应用 id（claude / chatgpt / antigravity）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egate_guarded_agents: Vec<String>,
+    /// 发现绕过代理的直连时是否**熔断**（默认只告警）。
+    ///
+    /// 默认关闭：直连判定依赖 TCP 连接表，某些正常场景（应用更新、遥测）也会
+    /// 出现公网连接，直接熔断可能误杀。开启前用户应确认自己的网络结构。
+    #[serde(default)]
+    pub egate_leak_trip: bool,
 }
 
 /// 熔断默认连续 2 次失败（单次网络抖动不熔断）。
@@ -115,6 +121,7 @@ impl Default for AppConfig {
             egate_interval_secs: default_egate_interval(),
             egate_enforce_access: default_egate_enforce_access(),
             egate_guarded_agents: Vec::new(),
+            egate_leak_trip: false,
         }
     }
 }

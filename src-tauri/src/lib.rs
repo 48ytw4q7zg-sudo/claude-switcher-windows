@@ -2580,12 +2580,14 @@ fn egate_update_settings(
     trip_threshold: u32,
     interval_secs: u64,
     enforce_access: bool,
+    leak_trip: bool,
 ) -> Result<(), String> {
     appconfig::update(|config| {
         config.egate_enabled = enabled;
         config.egate_trip_threshold = trip_threshold;
         config.egate_interval_secs = egate_check::clamp_timeout(interval_secs);
         config.egate_enforce_access = enforce_access;
+        config.egate_leak_trip = leak_trip;
         // 首次开启门禁时若还没选守护对象，回落到内置默认（claude/chatgpt/antigravity），
         // 否则熔断执行阶段不知道该结束哪些进程。
         if config.egate_guarded_agents.is_empty() {

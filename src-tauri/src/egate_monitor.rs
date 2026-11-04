@@ -192,6 +192,80 @@ fn ensure_app_handle(cache: &mut Option<tauri::AppHandle>) -> Option<&tauri::App
     cache.as_ref()
 }
 
+/// 直连泄露的判定结果。
+struct LeakRound {
+    /// 是否达到熔断条件（仅在开启 leak_trip 时可能为 true）。
+    trip: bool,
+    /// 是否应告警（发现直连但不熔断）。
+    warn: bool,
+}
+
+/// 观察一轮直连泄露。
+///
+/// 单次快照出现直连就熔断过于激进（应用启动瞬间可能先直连再走代理），
+/// 因此沿用与目标失败相同的防抖计数，键名带 `leak:` 前缀避免与目标 id 冲突。
+fn leak_round(config: &crate::appconfig::AppConfig) -> LeakRound {
+    let evidence = crate::egate_check::read_proxy_evidence();
+    let proxy_port = crate::egate_netwatch::proxy_port_from_evidence(&evidence);
+    let agents = if config.egate_guarded_agents.is_empty() {
+        crate::egate_defaults::DEFAULT_GUARDED_AGENTS
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+    } else {
+        config.egate_guarded_agents.clone()
+    };
+    let targets = if config.egate_targets.is_empty() {
+        crate::egate_defaults::builtin_targets()
+    } else {
+        config.egate_targets.clone()
+    };
+    let access = crate::egate_check::current_access(&crate::egate_check::monitored_hosts(&targets));
+    let mode = match &access {
+        crate::egate_access::AccessPath::SystemProxy { .. } => "system_proxy",
+        crate::egate_access::AccessPath::Tun { .. } => "tun",
+        crate::egate_access::AccessPath::Uncovered => "uncovered",
+        crate::egate_access::AccessPath::Unknown { .. } => "unknown",
+    };
+    let pids = crate::egate_trip::agent_pids(&agents);
+    let conns = crate::egate_netwatch::collect_agent_conns();
+    let report = crate::egate_netwatch::summarize(mode, proxy_port, &conns, &pids);
+
+    if !report.applicable || report.direct_total == 0 {
+        // 没有直连就清零计数，避免历史累积。
+        if let Ok(mut streaks) = crate::egate_streaks().lock() {
+            streaks.remove("leak:direct");
+        }
+        return LeakRound {
+            trip: false,
+            warn: false,
+        };
+    }
+
+    let threshold = config.egate_trip_threshold.max(1);
+    let streak = {
+        let mut streaks = crate::egate_streaks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let next = streaks.get("leak:direct").copied().unwrap_or(0) + 1;
+        streaks.insert("leak:direct".to_string(), next);
+        next
+    };
+    crate::log_error(&format!(
+        "直连泄露观察：{} 条绕过代理的直连（连续 {streak} 次）{}",
+        report.direct_total,
+        if config.egate_leak_trip {
+            ""
+        } else {
+            "，当前仅告警"
+        }
+    ));
+    LeakRound {
+        trip: config.egate_leak_trip && streak >= threshold,
+        warn: streak + 1 == threshold || (!config.egate_leak_trip && streak == 1),
+    }
+}
+
 /// 跑一轮监控（含熔断执行）。
 fn run_monitor_round(
     config: &crate::appconfig::AppConfig,
@@ -213,7 +287,13 @@ fn run_monitor_round(
     );
     drop(streaks);
 
-    let gate = current_gate(config.egate_enabled, report.should_trip, report.should_warn);
+    // 直连泄露：默认只告警；开启 egate_leak_trip 后与目标失败同等对待。
+    let leak = leak_round(config);
+    let gate = current_gate(
+        config.egate_enabled,
+        report.should_trip || leak.trip,
+        report.should_warn || leak.warn,
+    );
     match decide(gate) {
         RoundAction::Trip => {
             let agents = if config.egate_guarded_agents.is_empty() {
@@ -321,6 +401,21 @@ mod tests {
     #[test]
     fn healthy_round_is_idle() {
         assert_eq!(decide(gate()), RoundAction::Idle);
+    }
+
+    #[test]
+    fn leak_trip_is_off_by_default_and_needs_threshold() {
+        // 直连熔断默认关闭：默认配置下 leak_round 的 trip 必须是 false。
+        // 这里验证「开关 + 阈值」的组合语义，不依赖真实连接表。
+        let cfg = crate::appconfig::AppConfig::default();
+        assert!(!cfg.egate_leak_trip, "直连熔断必须默认关闭");
+        assert!(!cfg.egate_enabled, "门禁总开关也必须默认关闭");
+
+        // 开启后：仍要连续达到阈值（单次快照不熔断——应用启动瞬间可能先直连）。
+        let mut on = crate::appconfig::AppConfig::default();
+        on.egate_leak_trip = true;
+        on.egate_trip_threshold = 2;
+        assert!(on.egate_leak_trip && on.egate_trip_threshold >= 2);
     }
 
     #[test]

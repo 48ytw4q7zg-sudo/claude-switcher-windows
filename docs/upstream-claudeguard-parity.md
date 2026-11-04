@@ -25,7 +25,7 @@ region 锁定继续保留（它们是「主动锁环境」，ClaudeGuard 是「�
 | 3 | 判定矩阵（Pass/Fail/Unverified/Disabled；期望为空宁可错杀；信息缺失不熔断；整体判定） | `policy.rs` | **已完成** `egate::evaluate` + `egate::overall`（表测） | 已完成 |
 | 4 | 接入路径检查（系统代理/TUN/Uncovered；ProxyOverride 绕过清单按 AI 域名判定；未接入不直连探测） | `access.rs` | **已完成判定层** `egate_access.rs`（18 测试）+ `egate_check.rs`（注册表读取/TUN 枚举/路由/防抖） | 已完成 |
 | 5 | 防火墙兜底封锁（未接入→每守护对象出站 Block；fw_ensure_on 只开不关；手动封锁/解除；intent 差分） | `guard.rs` `netcut.rs` §3.6 | **部分完成**：`egate_trip` 已做按 exe 出/入站隔离 + 回查核验 + 解除；「未接入选出站 Block 的意图差分」未做 | 部分完成 |
-| 6 | 直连泄露观察（GetExtendedTcpTable 筛守护对象连接，Proxy/Local/Public 分类；默认只告警） | `netwatch.rs` | **已完成** `egate_netwatch`（9 项单测）+ 命令 + 界面按钮 | 已完成 |
+| 6 | 直连泄露观察（GetExtendedTcpTable 筛守护对象连接，Proxy/Local/Public 分类；默认只告警） | `netwatch.rs` | **已完成** `egate_netwatch`（9 项单测）+ 命令 + 界面按钮 + 可选熔断（`egate_leak_trip`，默认关，带防抖） | 已完成 |
 | 7 | 环境一致性检查/对齐（tz/locale vs 出口；离线地点表；账本式自动对齐与一键还原） | `envcheck.rs` `envfix.rs` `geo.rs` | 部分（region.rs 锁定时区/区域，checks 查一致性；无账本还原） | **扩展** region：补账本式对齐/还原 |
 | 8 | 监控循环 + 防抖（fail_streak、trip_threshold、预警一次、暂停守护 30 分钟、间隔可调） | `monitor.rs` | **已完成** `egate_monitor`（常驻线程 / 暂停 30 分钟 / 熔断门控纯函数 / 间隔 5–3600 收敛）；9 项单测含「暂停绝不超过熔断」 | 已完成 |
 | 9 | 熔断动作（杀 GUI 进程 + CLI 仅提醒 + 防火墙隔离 + 断网两档 off/firewall/nics；TripInfo） | `guard.rs` `netcut.rs` | **部分完成**：`egate_trip` 已实现杀 GUI + 防火墙隔离 + 回查；CLI 只提醒语义一致；**断网两档未做** | 部分完成 |

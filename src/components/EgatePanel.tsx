@@ -319,6 +319,7 @@ export function EgatePanel() {
         tripThreshold: config?.egate_trip_threshold ?? 2,
         intervalSecs: config?.egate_interval_secs ?? 15,
         enforceAccess: config?.egate_enforce_access ?? true,
+        leakTrip: config?.egate_leak_trip ?? false,
       });
       setNote('目标配置已保存。');
       await load();

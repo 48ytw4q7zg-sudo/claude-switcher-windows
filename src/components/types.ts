@@ -89,6 +89,8 @@ export interface AppConfig {
   egate_enforce_access?: boolean;
   /** 被守护的桌面应用 id。 */
   egate_guarded_agents?: string[];
+  /** 发现绕过代理的直连时是否熔断（默认只告警）。 */
+  egate_leak_trip?: boolean;
 }
 
 /** 出口门禁：一个被监控的出口链路。 */
