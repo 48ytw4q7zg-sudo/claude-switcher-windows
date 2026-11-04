@@ -166,6 +166,14 @@ export interface LeakReport {
   note: string;
 }
 
+/** 出口门禁：断网现场。 */
+export interface CutState {
+  mode: string;
+  firewall: boolean;
+  nics: string[];
+  since: number;
+}
+
 /** P1-3：并行终端启动结果。 */
 export interface ParallelTerminalResult {
   profile_id: string;

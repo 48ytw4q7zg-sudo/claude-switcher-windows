@@ -11,7 +11,7 @@ import {
   ShieldAlert,
   XCircle,
 } from 'lucide-react';
-import type { AppConfig, EgateReport, EgateTarget, LeakReport, TripReport } from './types';
+import type { AppConfig, CutState, EgateReport, EgateTarget, LeakReport, TripReport } from './types';
 
 /** 锚点类型的中文名（技术值只在展示时翻译）。 */
 const ANCHOR_LABELS: Record<string, string> = {
@@ -61,6 +61,9 @@ export function EgatePanel() {
   const [report, setReport] = useState<EgateReport | null>(null);
   const [tripReport, setTripReport] = useState<TripReport | null>(null);
   const [leakReport, setLeakReport] = useState<LeakReport | null>(null);
+  const [cutState, setCutState] = useState<CutState | null>(null);
+  const [cutMode, setCutMode] = useState<'off' | 'firewall' | 'nics'>('off');
+  const [networkNote, setNetworkNote] = useState<string | null>(null);
   const [quarantineCount, setQuarantineCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
@@ -112,7 +115,51 @@ export function EgatePanel() {
 
   useEffect(() => {
     refreshQuarantine();
+    invoke<CutState | null>('egate_cut_state')
+      .then(setCutState)
+      .catch(() => setCutState(null));
   }, [refreshQuarantine]);
+
+  /** 执行断网（最高强度动作，需二次确认）。 */
+  const cutNetwork = async () => {
+    if (cutMode === 'off') {
+      setNetworkNote('请先选择断网档位。');
+      return;
+    }
+    const label = cutMode === 'nics' ? '禁用物理网卡' : '防火墙全局阻断';
+    // 断网会让整机断网，必须显式确认。
+    if (!window.confirm(`确认执行「${label}」？这会让整台电脑暂时断网，直到你点「恢复网络」。`)) {
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    setNetworkNote(null);
+    try {
+      const result = await invoke<{ ok: boolean; note: string }>('egate_cut_network', { mode: cutMode });
+      setNetworkNote(formatMessage(result.note));
+      setCutState(await invoke<CutState | null>('egate_cut_state').catch(() => null));
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /** 恢复网络。 */
+  const restoreNetwork = async () => {
+    setSaving(true);
+    setError(null);
+    setNetworkNote(null);
+    try {
+      const result = await invoke<{ ok: boolean; note: string }>('egate_restore_network');
+      setNetworkNote(formatMessage(result.note));
+      setCutState(await invoke<CutState | null>('egate_cut_state').catch(() => null));
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   /** 执行熔断：结束守护对象进程 + 防火墙隔离（真实系统修改）。 */
   const trip = async () => {
@@ -282,6 +329,46 @@ export function EgatePanel() {
         {quarantineCount !== null && (
           <span className="pill muted">当前隔离规则：{quarantineCount} 条</span>
         )}
+      </div>
+
+      <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px dashed rgba(72,66,52,0.25)' }}>
+        <strong style={{ fontSize: 13 }}>断网档位（最高强度熔断动作）</strong>
+        <div className="telemetry-options" style={{ marginTop: 8 }}>
+          {([
+            ['off', '不断网'],
+            ['firewall', '防火墙全局阻断'],
+            ['nics', '禁用物理网卡'],
+          ] as const).map(([value, label]) => (
+            <button
+              key={value}
+              className={cutMode === value ? 'primary' : 'ghost'}
+              onClick={() => setCutMode(value)}
+              disabled={busy}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <div className="profile-actions" style={{ marginTop: 8 }}>
+          <button className="danger" onClick={cutNetwork} disabled={busy || cutMode === 'off'}>
+            执行断网
+          </button>
+          <button className="ghost" onClick={restoreNetwork} disabled={busy}>
+            恢复网络
+          </button>
+          {cutState && (
+            <span className="pill bad">当前处于断网状态（{cutState.mode}）</span>
+          )}
+        </div>
+        {networkNote && (
+          <div className="inline-warning" style={{ marginTop: 8 }}>
+            {networkNote}
+          </div>
+        )}
+        <p className="usage-note" style={{ marginTop: 8 }}>
+          断网会让整台电脑暂时无法上网。断网现场会写入本机账本，程序崩溃或被结束后
+          下次启动会自动恢复网络。
+        </p>
       </div>
 
       {leakReport && (

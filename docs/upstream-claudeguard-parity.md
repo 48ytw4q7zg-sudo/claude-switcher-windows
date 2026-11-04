@@ -29,7 +29,7 @@ region 锁定继续保留（它们是「主动锁环境」，ClaudeGuard 是「�
 | 7 | 环境一致性检查/对齐（tz/locale vs 出口；离线地点表；账本式自动对齐与一键还原） | `envcheck.rs` `envfix.rs` `geo.rs` | 部分（region.rs 锁定时区/区域，checks 查一致性；无账本还原） | **扩展** region：补账本式对齐/还原 |
 | 8 | 监控循环 + 防抖（fail_streak、trip_threshold、预警一次、暂停守护 30 分钟、间隔可调） | `monitor.rs` | **已完成防抖层**（`egate_check` fail_streak / should_trip / should_warn，单轮检查可见）；常驻循环与暂停守护待接 | 部分完成 |
 | 9 | 熔断动作（杀 GUI 进程 + CLI 仅提醒 + 防火墙隔离 + 断网两档 off/firewall/nics；TripInfo） | `guard.rs` `netcut.rs` | **部分完成**：`egate_trip` 已实现杀 GUI + 防火墙隔离 + 回查；CLI 只提醒语义一致；**断网两档未做** | 部分完成 |
-| 10 | 断网现场持久化与自愈（netcut.json 账本、启动恢复、规则去重、--restore 急救） | `netcut.rs` `recover.rs` | 无 | **新增** |
+| 10 | 断网现场持久化与自愈（netcut.json 账本、启动恢复、规则去重、--restore 急救） | `netcut.rs` `recover.rs` | **已完成** `egate_netcut`（账本 netcut.json / 启动 heal / 两档 / 先恢复网卡后删规则）；`--restore` CLI 急救未接 | 基本完成 |
 | 11 | Claude 进程清理引擎（桌面/CLI 二分、一键全清/熔断清/退出清残留、残留监视线程） | `guard.rs` §5 | 部分（processes.rs 精确检测/结束） | **扩展** processes：补 sweep 三态 |
 | 12 | 桌面通知六类 + AUMID 幂等登记（trip/recover/launch_blocked/warning/client_update/self_update） | `notify.rs` | 部分（notify_state + Toast/AUMID 有；无六类语义） | **扩展** notify_state |
 | 13 | 飞书群通知（签名校验、DPAPI 加密凭据、持久队列、失败补发） | `feishu.rs` | 无 | **新增** `feishu.rs` |

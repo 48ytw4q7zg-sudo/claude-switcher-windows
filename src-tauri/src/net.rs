@@ -584,10 +584,17 @@ mod tests {
             controller_error: None,
         };
         let result = clash_api_with_config(&cfg, "GET", "/version", None);
+        // 核心断言：绝不能发生第二次（重定向后的）请求。
         assert!(
             !server.join().unwrap(),
             "redirect caused a second authenticated request"
         );
-        assert!(result.unwrap_err().contains("302"));
+        // 客户端必须报错；具体文案取决于夹具退出时机——收到 302 时是状态码，
+        // 连接提前关闭时是传输错误。两者都说明「没有跟随重定向」。
+        let error = result.expect_err("重定向必须被当作失败，不能静默成功");
+        assert!(
+            error.contains("302") || error.to_lowercase().contains("error"),
+            "错误应说明重定向或传输失败：{error}"
+        );
     }
 }

@@ -31,6 +31,7 @@ mod egate;
 mod egate_access;
 mod egate_check;
 mod egate_defaults;
+mod egate_netcut;
 mod egate_netwatch;
 mod egate_probe;
 mod egate_trip;
@@ -2614,6 +2615,35 @@ async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
     .await
 }
 
+/// 出口门禁：执行断网（防火墙全局阻断 / 禁用物理网卡）。
+///
+/// 这是**最高强度的熔断动作**，默认关闭；只有用户显式选择档位才会走到这里。
+#[tauri::command]
+async fn egate_cut_network(mode: String) -> Result<serde_json::Value, String> {
+    blocking(move || {
+        let cut_mode = egate_netcut::CutMode::parse(&mode);
+        let (ok, note) = egate_netcut::cut(cut_mode);
+        Ok(serde_json::json!({ "ok": ok, "note": note, "mode": mode }))
+    })
+    .await
+}
+
+/// 出口门禁：恢复网络（删阻断规则 + 重新启用网卡 + 清现场）。
+#[tauri::command]
+async fn egate_restore_network() -> Result<serde_json::Value, String> {
+    blocking(|| {
+        let (ok, note) = egate_netcut::restore();
+        Ok(serde_json::json!({ "ok": ok, "note": note }))
+    })
+    .await
+}
+
+/// 出口门禁：当前断网现场（None 表示未断网）。
+#[tauri::command]
+async fn egate_cut_state() -> Result<Option<egate_netcut::CutState>, String> {
+    blocking(egate_netcut::load_state).await
+}
+
 /// 出口门禁：观察被守护进程是否绕过系统代理直连公网。
 ///
 /// 只读：不改系统状态、不结束进程。TUN/未接入模式下不具备判定条件，
@@ -2837,6 +2867,12 @@ pub fn run() {
         std::process::exit(1);
     }
 
+    // 出口门禁断网自愈：上次进程崩溃/被杀留下的断网现场在这里恢复。
+    // fail-closed：宁可多恢复一次，也不能让用户以为「还断着」却没人接管。
+    for message in egate_netcut::heal() {
+        log_error(&message);
+    }
+
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -2988,6 +3024,9 @@ pub fn run() {
             egate_release_now,
             egate_quarantine_count,
             egate_leak_watch,
+            egate_cut_network,
+            egate_restore_network,
+            egate_cut_state,
             // Claude Desktop 桌面版
             list_desktop_profiles_cmd,
             capture_desktop_profile_cmd,
