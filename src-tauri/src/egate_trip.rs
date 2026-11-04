@@ -14,7 +14,7 @@
 use serde::Serialize;
 
 /// 隔离规则的名称前缀（本产品独占，便于整体清理）。
-const RULE_PREFIX: &str = "ClaudeSwitcher Egate";
+const RULE_PREFIX: &str = "ClaudeSwitcher AppIsolation";
 
 /// 单个被守护应用的隔离结果。
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
@@ -350,9 +350,10 @@ pub fn trip(guarded_agents: &[String]) -> TripReport {
     }
 }
 
-/// 解除全部隔离规则（按本产品前缀整体清理）。
+/// 解除应用隔离规则（只删除本应用的隔离规则，不影响全局断网）。
 ///
-/// 按名字删而不是按记录的状态删：崩遗后重启也能清干净。
+/// 使用 `AppIsolation` 前缀，与 `Cut All` 断网规则严格区分。
+/// 按名字删而不是按记录的状态删：崩溃后重启也能清干净。
 pub fn release_all() -> Result<u32, String> {
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'\n\
@@ -387,7 +388,7 @@ mod tests {
     fn rule_names_are_scoped_per_agent_and_direction() {
         assert_eq!(
             rule_name("claude", "Out"),
-            "ClaudeSwitcher Egate claude Out"
+            "ClaudeSwitcher AppIsolation claude Out"
         );
         assert_ne!(rule_name("claude", "Out"), rule_name("chatgpt", "Out"));
         assert_ne!(rule_name("claude", "Out"), rule_name("claude", "In"));
