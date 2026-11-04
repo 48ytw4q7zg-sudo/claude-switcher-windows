@@ -12,6 +12,10 @@ use crate::paths;
 /// 全局环境与代理偏好。所有字段可选，缺省走默认/自动探测。
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct AppConfig {
+    /// **P1-03**：配置 schema 版本（用于迁移）。
+    /// 0/缺失 = 旧版（首次引入版本号的配置）。
+    #[serde(default)]
+    pub schema_version: u32,
     /// 目标国家码（如 "US"、"JP"），由出口 IP 锁定。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub country_target: Option<String>,
@@ -123,6 +127,7 @@ fn default_quota_reminder_threshold() -> u8 {
 impl Default for AppConfig {
     fn default() -> Self {
         AppConfig {
+            schema_version: CURRENT_SCHEMA_VERSION,
             country_target: None,
             tz_target: None,
             locale_target: None,
@@ -147,6 +152,49 @@ impl Default for AppConfig {
             log_level: default_log_level(),
         }
     }
+}
+
+/// **P1-03**：当前配置 schema 版本。
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+/// **P1-03**：按版本迁移配置（纯函数，保留未知字段由 serde 默认值兜底）。
+///
+/// 返回 `(迁移后配置, 是否发生迁移)`。迁移失败返回 Err，调用方**不得**
+/// 用默认配置覆盖原文件。
+pub fn migrate(mut config: AppConfig) -> Result<(AppConfig, bool), String> {
+    let from = config.schema_version;
+    if from > CURRENT_SCHEMA_VERSION {
+        return Err(format!(
+            "配置版本 {from} 高于本程序支持的 {CURRENT_SCHEMA_VERSION}（可能来自更新版本），已拒绝加载以免降级覆盖"
+        ));
+    }
+    if from == CURRENT_SCHEMA_VERSION {
+        return Ok((config, false));
+    }
+    // v0 → v1：仅补版本号（其余字段由 serde default 处理，已有值保持不变）。
+    // 未来版本在此逐级迁移。
+    config.schema_version = CURRENT_SCHEMA_VERSION;
+    Ok((config, true))
+}
+
+/// **P1-03**：严格加载 + 迁移（升级前先备份原文件）。
+fn load_from_migrated(path: &std::path::Path) -> Result<AppConfig, String> {
+    let config = load_from(path)?;
+    let (migrated, changed) = migrate(config)?;
+    if changed {
+        // 迁移前备份原始文件（时间戳后缀，不覆盖）。
+        let backup = path.with_extension(format!(
+            "json.bak-{}",
+            chrono::Utc::now().format("%Y%m%d%H%M%S")
+        ));
+        std::fs::copy(path, &backup).map_err(|e| format!("迁移前备份配置失败：{e}"))?;
+        // 只在迁移成功后写入新版本。
+        let text = serde_json::to_string_pretty(&migrated)
+            .map_err(|e| format!("序列化迁移后配置失败：{e}"))?;
+        crate::fsx::write_atomically(path, &text)
+            .map_err(|e| format!("写入迁移后配置失败：{e}"))?;
+    }
+    Ok(migrated)
 }
 
 fn config_path() -> Result<std::path::PathBuf, String> {
@@ -202,7 +250,7 @@ pub fn load_checked() -> ConfigLoad {
     if !path.exists() {
         return ConfigLoad::Fresh;
     }
-    match load_from(&path) {
+    match load_from_migrated(&path) {
         Ok(config) => ConfigLoad::Ok(Box::new(config)),
         Err(error) => ConfigLoad::Corrupt(error),
     }

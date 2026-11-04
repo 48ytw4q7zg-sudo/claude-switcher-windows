@@ -497,32 +497,65 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
         .clone()
         .unwrap_or_else(|| "clash-verge".to_string());
 
-    // —— 一次性收集真实数据 ——
+    // **QW-05**：先建立执行计划——被关闭的非核心检查不再产生网络请求/历史写入。
+    let enabled = |key: &str| !cfg.disabled_checks.iter().any(|disabled| disabled == key);
+    // egress 被多项检查共享（出口/时区/地区/ASN/WebRTC/生态），任一需要就采集。
+    let need_egress = [
+        "egress_country",
+        "ip_consistency",
+        "timezone",
+        "region",
+        "asn",
+        "webrtc",
+        "ecosystem",
+    ]
+    .iter()
+    .any(|key| enabled(key));
+
+    // —— 收集真实数据（按需）——
     let adapters = imp::list_adapters();
-    let egress = egress::detect_egress_blocking();
+    let egress = if need_egress {
+        egress::detect_egress_blocking()
+    } else {
+        Err("出口探测已被关闭".to_string())
+    };
     let tz = imp::current_timezone_id();
     let culture = imp::current_culture();
     let client_lang = desktop::client_locale();
     let bindings = imp::ipv6_bindings();
     let dns = resolve_claude_ai();
-    let stun_result = match &egress {
-        Ok(e) => {
-            // STUN 探针只解析 IPv4 MAPPED-ADDRESS：出口是 IPv6 时，任何 IPv4
-            // 响应都必然"不等于"IPv6 出口，会被误判成泄漏（假 fail）。
-            // 这种场景跳过探测，交给 WebRTC 检查明确说明未验证。
-            if e.ip.contains(':') {
-                None
-            } else {
-                Some(stun::probe_stun_leak(&e.ip, 2000))
+    let stun_result = if !enabled("webrtc") {
+        None
+    } else {
+        match &egress {
+            Ok(e) => {
+                // STUN 探针只解析 IPv4 MAPPED-ADDRESS：出口是 IPv6 时，
+                // 任何 IPv4 响应都必然"不等于"IPv6 出口，会被误判成泄漏。
+                if e.ip.contains(':') {
+                    None
+                } else {
+                    Some(stun::probe_stun_leak(&e.ip, 2000))
+                }
             }
+            Err(_) => None,
         }
-        Err(_) => None,
     };
     let guard_installed = guard::guard_installed();
     let rules_outcome = evaluate_rules(&cfg);
-    let (ecosystem_claude, ecosystem_api) = probe_ecosystem();
-    // 48 小时漂移：读失败按「无历史」处理，不能因此让整轮安检失败。
-    let drift = crate::ip_history::current_drift().ok();
+    let (ecosystem_claude, ecosystem_api) = if enabled("ecosystem") {
+        probe_ecosystem()
+    } else {
+        (
+            Reach::Failed("生态检查已关闭".to_string()),
+            Reach::Failed("生态检查已关闭".to_string()),
+        )
+    };
+    // 48 小时漂移：仅在 IP 一致性检查启用时读取与写入。
+    let drift = if enabled("ip_consistency") {
+        crate::ip_history::current_drift().ok()
+    } else {
+        None
+    };
 
     // —— 逐项拼装（判定纯函数不做 IO）——
     let items = vec![
@@ -639,8 +672,10 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
     // 与上游一致：每次检查后把最新出口 IP 写入 lastip（供下次「IP一致」比对），
     // 同时追加到 48 小时历史——单值比较看不到「切走又切回」的漂移。
     if let Ok(e) = &egress {
-        let _ = appconfig::update(|c| c.last_egress_ip = Some(e.ip.clone()));
-        let _ = crate::ip_history::record(&e.ip);
+        if enabled("ip_consistency") {
+            let _ = appconfig::update(|c| c.last_egress_ip = Some(e.ip.clone()));
+            let _ = crate::ip_history::record(&e.ip);
+        }
     }
 
     items

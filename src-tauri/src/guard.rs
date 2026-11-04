@@ -227,8 +227,28 @@ pub fn guard_tick() -> GuardTick {
     let (tun_up, tun_detail) = tun_status_from_adapters(&adapters);
     let client_up = client_up_for(&mode, &running);
 
-    let prev_offline = OFFLINE.swap(!(tun_up && client_up), Ordering::SeqCst);
-    let (alive, log_offline, should_kill) = tick_decision(tun_up, client_up, prev_offline);
+    // **P1-01**：用户可运行在「系统代理」模式——此时不强制要求 TUN，
+    // 改为核验系统代理可用（与应用真实出口一致）。
+    let system_proxy_mode = crate::egate_check::read_proxy_evidence();
+    let use_system_proxy = system_proxy_mode.enable
+        && crate::egate_access::parse_proxy_server(system_proxy_mode.server.as_deref())
+            != crate::egate_access::ProxyParse::Empty;
+
+    let alive_now = if use_system_proxy {
+        // 系统代理已开启：客户端在线即视为接入正常（TUN 不强制）。
+        client_up
+    } else {
+        // TUN 模式：客户端 + TUN 都必须在线。
+        tun_up && client_up
+    };
+
+    let prev_offline = OFFLINE.swap(!alive_now, Ordering::SeqCst);
+    let (alive, log_offline, should_kill) = if use_system_proxy {
+        // 系统代理模式下 TUN 缺失不算离线。
+        tick_decision(true, client_up, prev_offline)
+    } else {
+        tick_decision(tun_up, client_up, prev_offline)
+    };
 
     if log_offline {
         let client_state = if mode == "auto" || mode == "other" {
@@ -241,7 +261,12 @@ pub fn guard_tick() -> GuardTick {
         append_log(
             "bodyguard.log",
             &format!(
-                "{} 代理离线(模式={mode}, TUN={tun_detail}, 客户端={client_state})",
+                "{} 代理离线(模式={mode}, 接入={}, TUN={tun_detail}, 客户端={client_state})",
+                if use_system_proxy {
+                    "系统代理"
+                } else {
+                    "TUN"
+                },
                 now_timestamp()
             ),
         );

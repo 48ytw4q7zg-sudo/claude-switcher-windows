@@ -52,8 +52,8 @@ const emptyTarget = (): EgateTarget => ({
 /**
  * 出口门禁面板（融合 ClaudeGuard 的按目标出口校验）。
  *
- * 当前批次交付：目标表查看/编辑/保存/恢复默认、开关与阈值、单轮检查与接入路径。
- * 熔断执行（结束进程 / 防火墙隔离 / 断网）按批次接入，界面会明确说明当前只报告不熔断。
+ * 已交付：目标表 CRUD、开关与阈值、单轮检查、接入路径、熔断执行
+ * （进程 + 防火墙隔离 + 断网）、自愈账本、常驻巡检、暂停/停止保护、泄漏观察。
  */
 export function EgatePanel() {
   const [config, setConfig] = useState<AppConfig | null>(null);
@@ -190,6 +190,26 @@ export function EgatePanel() {
     try {
       setEnvNote(formatMessage(await invoke<string>('egate_env_restore')));
       setEnvCheck(await invoke<EnvCheck>('egate_env_check').catch(() => null));
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /** **P1-04**：重新布防（清除停止保护意图，与「恢复暂停」分离）。 */
+  const rearm = async () => {
+    setSaving(true);
+    setError(null);
+    setNote(null);
+    try {
+      await invoke('egate_rearm');
+      setNote('已重新布防：自动保护已恢复');
+      setMonitor(
+        await invoke<{ paused: boolean; remaining_secs: number; tripped: boolean }>(
+          'egate_monitor_status',
+        ).catch(() => null),
+      );
     } catch (e) {
       setError(formatError(e));
     } finally {
@@ -428,7 +448,10 @@ export function EgatePanel() {
           直连泄露观察
         </button>
         <button className="ghost" onClick={togglePause} disabled={busy} title="暂停期间照常检测，但不会执行熔断">
-          {monitor?.paused ? '恢复守护' : '暂停守护 30 分钟'}
+          {monitor?.paused ? '恢复暂停' : '暂停守护 30 分钟'}
+        </button>
+        <button className="primary" onClick={rearm} disabled={busy} title="清除「停止保护」意图，重新启用自动保护">
+          重新布防
         </button>
         {monitor?.paused && (
           <span className="pill muted">
@@ -677,8 +700,9 @@ export function EgatePanel() {
 
       <p className="usage-note" style={{ marginTop: 12 }}>
         熔断会结束守护对象的进程并按可执行文件施加出/入站防火墙阻断（需管理员权限），
-        隔离后回查规则确已生效才报告成功。未接入代理链路时本工具不会发起探测，
-        避免把真实家宽出口暴露给被测站点。断网档位、自愈账本与常驻循环尚未接入。
+        隔离后回查规则确已生效才报告成功。未接入代理链路或 TUN 路由未证实时，
+        本工具不会发起探测，避免把真实家宽出口暴露给被测站点。
+        断网档位、自愈账本、常驻巡检与自动恢复均已接入。
       </p>
     </div>
   );

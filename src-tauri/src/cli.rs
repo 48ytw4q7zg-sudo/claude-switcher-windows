@@ -22,6 +22,8 @@ pub enum CliCommand {
     EgateCheck,
     /// 出口门禁：急救——恢复网络并解除全部隔离。
     EgateRestore,
+    /// 出口门禁：真实保护状态。
+    EgateStatus,
     /// 出口门禁：发送一条测试通知，后接类别。
     EgateNotifyTest(String),
 }
@@ -46,6 +48,7 @@ pub fn parse(args: &[String]) -> Option<CliCommand> {
             // 出口门禁：脚本化入口（批处理 / 前置流水线）。
             "--egate-check" => return Some(CliCommand::EgateCheck),
             "--egate-restore" => return Some(CliCommand::EgateRestore),
+            "--egate-status" => return Some(CliCommand::EgateStatus),
             "--egate-notify-test" => {
                 let kind = iter.next().cloned().unwrap_or_default();
                 return Some(CliCommand::EgateNotifyTest(kind));
@@ -64,6 +67,7 @@ pub fn run_readonly(cmd: &CliCommand) -> i32 {
         CliCommand::Status => print_status(),
         CliCommand::EgateCheck => run_egate_check(),
         CliCommand::EgateRestore => run_egate_restore(),
+        CliCommand::EgateStatus => run_egate_status(),
         // 写路径/需要 GUI 上下文的命令不应走这里；保守返回参数错误码。
         CliCommand::Switch(_) | CliCommand::SwitchId(_) | CliCommand::EgateNotifyTest(_) => 2,
     };
@@ -114,6 +118,35 @@ fn run_egate_check() -> i32 {
 /// 出口门禁急救：恢复网络 + 解除全部隔离（`--restore` 的等价入口）。
 ///
 /// 与上游一致：**先恢复网络**（断网状态下没人能来点界面），再解隔离。
+/// **P1-04**：输出真实保护状态（意图 / 隔离规则数 / 断网账本）。
+fn run_egate_status() -> i32 {
+    let intent = crate::egate_monitor::protection_intent();
+    let rules = crate::egate_trip::rule_count();
+    let cut = crate::egate_netcut::load_state().ok().flatten();
+    let status = serde_json::json!({
+        "intent": intent,
+        "paused": crate::egate_monitor::is_paused(),
+        "tripped": crate::egate_monitor::is_tripped(),
+        "partial": crate::egate_monitor::is_partial(),
+        "isolation_rules": rules,
+        "network_cut": cut.as_ref().map(|s| serde_json::json!({
+            "mode": s.mode,
+            "phase": s.phase,
+            "since": s.since,
+        })),
+    });
+    match serde_json::to_string_pretty(&status) {
+        Ok(json) => {
+            println!("{json}");
+            0
+        }
+        Err(error) => {
+            eprintln!("序列化保护状态失败: {error}");
+            1
+        }
+    }
+}
+
 fn run_egate_restore() -> i32 {
     // P0-15：CLI 急救也走统一恢复入口，与托盘/卸载行为一致。
     let report = crate::egate_netcut::restore_all();
@@ -310,6 +343,7 @@ pub fn run_console(args: &[String]) -> i32 {
         Some(CliCommand::SwitchId(id)) => run_switch_id_first_instance(&id),
         Some(CliCommand::EgateCheck) => run_readonly(&CliCommand::EgateCheck),
         Some(CliCommand::EgateRestore) => run_readonly(&CliCommand::EgateRestore),
+        Some(CliCommand::EgateStatus) => run_readonly(&CliCommand::EgateStatus),
         // 通知测试需要 GUI 的 AppHandle，走主程序而非 CLI 进程。
         Some(CliCommand::EgateNotifyTest(_)) => {
             print_usage();

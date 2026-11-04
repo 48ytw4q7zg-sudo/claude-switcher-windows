@@ -126,7 +126,7 @@ impl AccessPath {
     pub fn label(&self) -> &'static str {
         match self {
             AccessPath::SystemProxy { .. } => "系统代理",
-            AccessPath::Tun { .. } => "TUN 直连",
+            AccessPath::Tun { .. } => "TUN 直连（路由未证实）",
             AccessPath::Uncovered => "未接入代理",
             AccessPath::Unknown { .. } => "无法确认",
         }
@@ -195,16 +195,25 @@ pub enum ProbeRoute {
     /// 经该地址探测。
     Proxy(String),
     /// 直连探测（TUN 接管，与应用同路）。
+    ///
+    /// **P0-07**：当前不使用——仅检测到 TUN 网卡不足以证明路由经过它。
+    /// 保留该变体供未来实现真实路由核验后启用。
+    #[allow(dead_code)]
     Direct,
     /// 不探测——守护器自身流量绝不带着家宽 IP 出机器。
     Skip,
 }
 
 /// 由接入方式决定探测路由（纯函数）。
+///
+/// **P0-07**：TUN 路线采用**保守策略**——只检测到 TUN 网卡存在不足以证明
+/// 目标流量真的经过它（Clash 可能已退出但网卡残留，或 IPv6 未接管）。
+/// 因此 TUN 也走 Skip：不做未经确认的直连探测，判定与保护由确定性检查承担。
+/// 这与上游「不能把网卡存在当作出口证明」一致。
 pub fn plan_route(path: &AccessPath) -> ProbeRoute {
     match path {
         AccessPath::SystemProxy { addr } => ProbeRoute::Proxy(format!("http://{addr}")),
-        AccessPath::Tun { .. } => ProbeRoute::Direct,
+        AccessPath::Tun { .. } => ProbeRoute::Skip,
         AccessPath::Uncovered | AccessPath::Unknown { .. } => ProbeRoute::Skip,
     }
 }
@@ -587,11 +596,13 @@ mod tests {
             }),
             ProbeRoute::Proxy("http://127.0.0.1:7890".to_string())
         );
+        // P0-07：TUN 保守策略——路由未证实，不做直连探测。
         assert_eq!(
             plan_route(&AccessPath::Tun {
                 adapter: "Mihomo".to_string()
             }),
-            ProbeRoute::Direct
+            ProbeRoute::Skip,
+            "TUN 存在不等于路由经过它，不应直连探测"
         );
         assert_eq!(
             plan_route(&AccessPath::Unknown {
