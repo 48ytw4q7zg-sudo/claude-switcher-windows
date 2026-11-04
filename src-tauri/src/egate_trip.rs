@@ -350,11 +350,53 @@ pub fn trip(guarded_agents: &[String]) -> TripReport {
     }
 }
 
+/// **P0-C**：清理旧版应用隔离规则（升级兼容）。
+///
+/// 旧版本用 `ClaudeSwitcher Egate {agent} Out/In`，新版改为 `AppIsolation`。
+/// 升级后旧规则可能残留，导致「已解除隔离」但应用仍无法联网。
+///
+/// **安全边界**：旧命名空间也可能包含全局断网规则（`... Cut All`），
+/// 因此只删除**匹配旧应用隔离格式**的规则（名字里含具体 agent 名），
+/// 绝不按 `ClaudeSwitcher Egate*` 通配删除。
+pub fn cleanup_legacy_rules() -> Result<u32, String> {
+    // 明确列出旧版应用隔离的规则名（只含内置 agent），不碰 Cut All。
+    let legacy_names: Vec<String> = ["claude", "chatgpt", "antigravity"]
+        .iter()
+        .flat_map(|agent| {
+            [
+                format!("ClaudeSwitcher Egate {agent} Out"),
+                format!("ClaudeSwitcher Egate {agent} In"),
+            ]
+        })
+        .collect();
+    let list = legacy_names
+        .iter()
+        .map(|name| ps_quote(name))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'
+         $removed = 0
+         foreach ($n in @({list})) {{
+           $r = Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue
+           if ($r) {{ $r | Remove-NetFirewallRule -ErrorAction SilentlyContinue; $removed++ }}
+         }}
+         ConvertTo-Json @{{ removed = $removed }} -Compress"
+    );
+    let json = crate::platform::imp::run_powershell(&script)
+        .map_err(|e| format!("清理旧规则失败：{e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("清理结果解析失败：{e}"))?;
+    Ok(value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32)
+}
+
 /// 解除应用隔离规则（只删除本应用的隔离规则，不影响全局断网）。
 ///
 /// 使用 `AppIsolation` 前缀，与 `Cut All` 断网规则严格区分。
 /// 按名字删而不是按记录的状态删：崩溃后重启也能清干净。
 pub fn release_all() -> Result<u32, String> {
+    // P0-C：先尝试清理旧版残留（升级兼容），失败不阻断主流程。
+    let legacy = cleanup_legacy_rules().unwrap_or(0);
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'\n\
          $rules = @(Get-NetFirewallRule -DisplayName {}* )\n\
@@ -366,7 +408,8 @@ pub fn release_all() -> Result<u32, String> {
     let json = crate::platform::imp::run_powershell(&script)?;
     let value: serde_json::Value =
         serde_json::from_str(json.trim()).map_err(|e| format!("清理结果解析失败：{e}"))?;
-    Ok(value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32)
+    let removed = value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    Ok(removed + legacy)
 }
 
 /// 当前存在的本产品隔离规则数（恢复后核验用）。
