@@ -67,6 +67,10 @@ pub struct AppConfig {
     /// 被守护的桌面应用 id（claude / chatgpt / antigravity）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egate_guarded_agents: Vec<String>,
+    /// 已关闭的检查项 key 列表（如 ["webrtc","asn"]）。
+    /// 核心保护项（proxy_core / tun / egress_country / guard）不允许关闭。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_checks: Vec<String>,
     /// 发现绕过代理的直连时是否**熔断**（默认只告警）。
     ///
     /// 默认关闭：直连判定依赖 TCP 连接表，某些正常场景（应用更新、遥测）也会
@@ -122,6 +126,7 @@ impl Default for AppConfig {
             egate_enforce_access: default_egate_enforce_access(),
             egate_guarded_agents: Vec::new(),
             egate_leak_trip: false,
+            disabled_checks: Vec::new(),
         }
     }
 }

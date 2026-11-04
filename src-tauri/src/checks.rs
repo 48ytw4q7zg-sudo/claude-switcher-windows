@@ -381,6 +381,35 @@ fn build_item(
     }
 }
 
+/// 不允许关闭的核心保护项——这些是「不看它就会出事」的底线。
+///
+/// 与上游一致：只允许关闭**非关键**检查（如 WebRTC、ASN、规则），不允许关闭
+/// 代理内核、TUN、出口、保镖这些守护底线。
+pub fn is_core_check(key: &str) -> bool {
+    matches!(key, "proxy_core" | "tun" | "egress_country" | "guard")
+}
+
+/// 把已关闭的检查项替换为「跳过」状态。
+///
+/// 核心保护项不允许关闭，即使配置里写进来也忽略——防止用户误操作。
+fn apply_disabled_checks(items: &mut [CheckItem], disabled: &[String]) {
+    for item in items.iter_mut() {
+        if disabled.contains(&item.key) && !is_core_check(&item.key) {
+            item.status = "skipped".to_string();
+            item.detail = "此检查已关闭".to_string();
+        }
+    }
+}
+
+/// 校验哪些关闭请求被拒绝（返回被拒绝的 key 列表）。
+pub fn rejected_disables(disabled: &[String]) -> Vec<String> {
+    disabled
+        .iter()
+        .filter(|key| is_core_check(key))
+        .cloned()
+        .collect()
+}
+
 /// 解析 claude.ai 的全部 IPv4（走系统解析器；TUN 接管后假IP段 198.18.x 即命中）。
 fn resolve_claude_ai() -> Result<Vec<String>, String> {
     use std::net::ToSocketAddrs;
@@ -595,6 +624,9 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
             judge_ecosystem(&ecosystem_claude, &ecosystem_api),
         ),
     ];
+
+    let mut items = items;
+    apply_disabled_checks(&mut items, &cfg.disabled_checks);
 
     // 与上游一致：每次检查后把最新出口 IP 写入 lastip（供下次「IP一致」比对），
     // 同时追加到 48 小时历史——单值比较看不到「切走又切回」的漂移。
@@ -857,6 +889,53 @@ mod tests {
             org: None,
             source: "test".to_string(),
         }
+    }
+
+    #[test]
+    fn core_checks_cannot_be_disabled() {
+        // 核心保护项不允许关闭——防误操作。
+        for key in ["proxy_core", "tun", "egress_country", "guard"] {
+            assert!(is_core_check(key), "{key} 应为核心保护项");
+        }
+        for key in [
+            "webrtc",
+            "asn",
+            "rules",
+            "dns",
+            "ipv6",
+            "client_language",
+            "ecosystem",
+        ] {
+            assert!(!is_core_check(key), "{key} 应允许关闭");
+        }
+    }
+
+    #[test]
+    fn rejected_disables_catches_core_items() {
+        let rejected = rejected_disables(&[
+            "webrtc".to_string(),
+            "proxy_core".to_string(),
+            "guard".to_string(),
+        ]);
+        assert_eq!(rejected.len(), 2, "两项核心保护项应被拒绝：{rejected:?}");
+        assert!(rejected.contains(&"proxy_core".to_string()));
+        assert!(rejected.contains(&"guard".to_string()));
+    }
+
+    #[test]
+    fn apply_disabled_checks_skips_only_non_core() {
+        let mut items = vec![
+            build_item(1, "proxy_core", "代理内核", ("ok", "正常".to_string())),
+            build_item(2, "webrtc", "WebRTC", ("ok", "正常".to_string())),
+        ];
+        apply_disabled_checks(
+            &mut items,
+            &["proxy_core".to_string(), "webrtc".to_string()],
+        );
+        // 核心保护项即使配了也不能关闭。
+        assert_eq!(items[0].status, "ok", "核心保护项不能关闭");
+        assert_eq!(items[1].status, "skipped", "非关键项可关闭");
+        assert!(items[1].detail.contains("已关闭"));
     }
 
     #[test]

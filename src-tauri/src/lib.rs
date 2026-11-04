@@ -2574,6 +2574,28 @@ fn egate_get_targets() -> Vec<egate::EgateTarget> {
     }
 }
 
+/// 出口门禁：更新已关闭的检查项（核心保护项拒绝关闭）。
+#[tauri::command]
+fn egate_set_disabled_checks(disabled: Vec<String>) -> Result<Vec<String>, String> {
+    let rejected = checks::rejected_disables(&disabled);
+    let allowed: Vec<String> = disabled
+        .into_iter()
+        .filter(|key| !checks::is_core_check(key))
+        .collect();
+    appconfig::update(|config| config.disabled_checks = allowed.clone())?;
+    if rejected.is_empty() {
+        Ok(Vec::new())
+    } else {
+        Err(format!("这些核心保护项不能关闭：{}", rejected.join("、")))
+    }
+}
+
+/// 出口门禁：列出可关闭的检查项（不含核心保护项）。
+#[tauri::command]
+fn egate_disabled_checks() -> Vec<String> {
+    appconfig::load().disabled_checks
+}
+
 /// 出口门禁：开关与参数（整体更新，缺省保持原值由前端回读保证）。
 #[tauri::command]
 fn egate_update_settings(
@@ -3219,6 +3241,8 @@ pub fn run() {
             egate_notify_test,
             egate_env_check,
             egate_supported_regions,
+            egate_set_disabled_checks,
+            egate_disabled_checks,
             egate_env_align,
             egate_env_restore,
             egate_env_ledger,
