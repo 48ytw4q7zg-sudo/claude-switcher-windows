@@ -36,7 +36,7 @@ region 锁定继续保留（它们是「主动锁环境」，ClaudeGuard 是「�
 | 14 | Claude/Codex 客户端更新（只走官方 MSIX 源、签名校验、原位升级、注册版本核验） | `claude_update.rs` `claude_package.ps1` | 无 | **新增** `msix_update.rs` |
 | 15 | 自身更新（GitHub Releases 静默周期检查 + 下载自替换 + 同版本只提醒一次） | `update.rs` | 部分（update.rs 只有检查；下载/安装/回滚缺——与 YOURSJEYO 缺口重合） | **扩展** update.rs |
 | 16 | 启动门禁（全部启用目标 Pass 才允许启动 Claude；失败阻止 + 通知 + 记录） | `monitor.rs` launch | **已完成** `egate_launch`（同步判定 + AUMID/exe 双路径启动 + 暂停放行）；通知未接 | 基本完成 |
-| 17 | CLI（--check JSON/退出码、--restore、--settings、--tray、--install/--uninstall、--notify-test、状态查询） | `main.rs` | 部分（cs.exe --list/--status/--switch/run） | **扩展** cli.rs/cs |
+| 17 | CLI（--check JSON/退出码、--restore、--settings、--tray、--install/--uninstall、--notify-test、状态查询） | `main.rs` | **部分完成**：`--egate-check`（JSON+0/2）/`--egate-restore` 已加；--settings/--install 等未接 | 部分完成 |
 | 18 | 托盘菜单（显示/立即检测/暂停守护/解除隔离恢复网络/打开数据目录/退出） | `main.rs` | 部分（tray.rs 一键切换等） | **扩展** tray |
 | 19 | 首启向导（代理端口 → 白名单 → 守护对象/自启 三步） | UI + `config.rs` | 未实现；当前由「出口门禁」分区手动配目标 | 待实现 |
 | 20 | 设置 8 组折叠（目标 CRUD、熔断与清理、通知、客户端更新、自启等）+ 主界面仪表盘（状态环/目标瓦片/保护卡/CTA） | `ui/` | **目标 CRUD 与检查界面已完成**（`EgatePanel`）；仪表盘与设置分组待接 | 部分完成 |

@@ -18,6 +18,12 @@ pub enum CliCommand {
     Switch(String),
     /// K-5：后接账号 id（UUID），改名/引号不影响，开始菜单快捷方式专用。
     SwitchId(String),
+    /// 出口门禁：单次检查，JSON 输出；退出码 0 通过 / 2 未通过。
+    EgateCheck,
+    /// 出口门禁：急救——恢复网络并解除全部隔离。
+    EgateRestore,
+    /// 出口门禁：发送一条测试通知，后接类别。
+    EgateNotifyTest(String),
 }
 
 /// 从 argv 解析子命令（不假设 argv[0] 之外的位置）。无匹配返回 None。
@@ -37,6 +43,13 @@ pub fn parse(args: &[String]) -> Option<CliCommand> {
                 let id = iter.next().cloned().unwrap_or_default();
                 return Some(CliCommand::SwitchId(id));
             }
+            // 出口门禁：脚本化入口（批处理 / 前置流水线）。
+            "--egate-check" => return Some(CliCommand::EgateCheck),
+            "--egate-restore" => return Some(CliCommand::EgateRestore),
+            "--egate-notify-test" => {
+                let kind = iter.next().cloned().unwrap_or_default();
+                return Some(CliCommand::EgateNotifyTest(kind));
+            }
             _ => {}
         }
     }
@@ -49,13 +62,74 @@ pub fn run_readonly(cmd: &CliCommand) -> i32 {
     let code = match cmd {
         CliCommand::List => print_list(),
         CliCommand::Status => print_status(),
-        // 写路径不应走这里；保守返回参数错误码。
-        CliCommand::Switch(_) | CliCommand::SwitchId(_) => 2,
+        CliCommand::EgateCheck => run_egate_check(),
+        CliCommand::EgateRestore => run_egate_restore(),
+        // 写路径/需要 GUI 上下文的命令不应走这里；保守返回参数错误码。
+        CliCommand::Switch(_) | CliCommand::SwitchId(_) | CliCommand::EgateNotifyTest(_) => 2,
     };
     let _ = std::io::stdout().flush();
     if !attached {
         // 没有可附加的父控制台（如从运行框直接启动），无法输出；
         // 不视为致命，仍返回计算出的退出码。
+    }
+    code
+}
+
+/// 出口门禁单次检查：JSON 输出，退出码 0 通过 / 2 未通过。
+///
+/// 与上游 `--check` 对齐：调用方只看退出码就能做前置判断（例如「出口不对就
+/// 不启动应用」），不需要解析 JSON。
+fn run_egate_check() -> i32 {
+    let config = crate::appconfig::load();
+    let targets = if config.egate_targets.is_empty() {
+        crate::egate_defaults::builtin_targets()
+    } else {
+        config.egate_targets
+    };
+    let mut streaks = crate::egate_streaks()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let report = crate::egate_check::run_round(
+        &targets,
+        &mut streaks,
+        config.egate_enforce_access,
+        config.egate_trip_threshold,
+    );
+    drop(streaks);
+    match serde_json::to_string_pretty(&report) {
+        Ok(json) => {
+            println!("{json}");
+            match report.overall.verdict {
+                crate::egate::Verdict::Pass => 0,
+                _ => 2,
+            }
+        }
+        Err(error) => {
+            eprintln!("序列化检查结果失败: {error}");
+            1
+        }
+    }
+}
+
+/// 出口门禁急救：恢复网络 + 解除全部隔离（`--restore` 的等价入口）。
+///
+/// 与上游一致：**先恢复网络**（断网状态下没人能来点界面），再解隔离。
+fn run_egate_restore() -> i32 {
+    let mut code = 0;
+    let (network_ok, network_note) = crate::egate_netcut::restore();
+    if !network_ok {
+        eprintln!("恢复网络失败: {network_note}");
+        code = 1;
+    }
+    match crate::egate_trip::release_all() {
+        Ok(removed) => {
+            crate::egate_monitor::clear_tripped();
+            println!("已恢复网络并解除隔离（清理 {removed} 条规则）");
+        }
+        Err(error) => {
+            eprintln!("解除隔离失败: {error}");
+            code = 1;
+        }
     }
     code
 }
@@ -236,6 +310,13 @@ pub fn run_console(args: &[String]) -> i32 {
         Some(CliCommand::Status) => run_readonly(&CliCommand::Status),
         Some(CliCommand::Switch(name)) => run_switch_first_instance(&name),
         Some(CliCommand::SwitchId(id)) => run_switch_id_first_instance(&id),
+        Some(CliCommand::EgateCheck) => run_readonly(&CliCommand::EgateCheck),
+        Some(CliCommand::EgateRestore) => run_readonly(&CliCommand::EgateRestore),
+        // 通知测试需要 GUI 的 AppHandle，走主程序而非 CLI 进程。
+        Some(CliCommand::EgateNotifyTest(_)) => {
+            print_usage();
+            2
+        }
         None => {
             print_usage();
             2
@@ -271,6 +352,27 @@ mod tests {
         assert_eq!(
             parse(&argv(&["exe", "--switch", "work"])),
             Some(CliCommand::Switch("work".to_string()))
+        );
+    }
+
+    #[test]
+    fn parse_detects_egate_subcommands() {
+        assert_eq!(
+            parse(&argv(&["exe", "--egate-check"])),
+            Some(CliCommand::EgateCheck)
+        );
+        assert_eq!(
+            parse(&argv(&["exe", "--egate-restore"])),
+            Some(CliCommand::EgateRestore)
+        );
+        assert_eq!(
+            parse(&argv(&["exe", "--egate-notify-test", "trip"])),
+            Some(CliCommand::EgateNotifyTest("trip".to_string()))
+        );
+        // 缺类别时给空串，由调用方报参数错误，不静默当成默认类别。
+        assert_eq!(
+            parse(&argv(&["exe", "--egate-notify-test"])),
+            Some(CliCommand::EgateNotifyTest(String::new()))
         );
     }
 
