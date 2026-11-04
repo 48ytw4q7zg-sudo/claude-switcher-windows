@@ -1873,6 +1873,21 @@ pub fn log_info(message: &str) {
 }
 
 fn log_line(level: &str, message: &str) {
+    // 日志级别过滤：关闭日志或级别不达标时跳过落盘（控制台仍打印）。
+    // 读 appconfig 是轻量 IO；调用频率低（日志仅在有意义事件时调用）。
+    let config = appconfig::load();
+    if !config.log_enabled {
+        eprintln!("[claude-switcher] [{level}] {message}");
+        return;
+    }
+    let should_log = match config.log_level.as_str() {
+        "error" => level == "ERROR",
+        "debug" => true,
+        _ => level == "ERROR" || level == "INFO",
+    };
+    if !should_log {
+        return;
+    }
     let message = format!("[{level}] {message}");
     let line = format!("[{}] {message}\n", Utc::now().format("%Y-%m-%d %H:%M:%S"));
     if let Ok(dir) = p::app_data_dir() {
@@ -2574,6 +2589,30 @@ fn egate_get_targets() -> Vec<egate::EgateTarget> {
     }
 }
 
+/// 日志开关与级别设置。
+#[tauri::command]
+fn set_log_config(enabled: bool, level: String) -> Result<(), String> {
+    let level = level.trim().to_ascii_lowercase();
+    if !["error", "info", "debug"].contains(&level.as_str()) {
+        return Err(format!("未知日志级别：{level}（可用 error/info/debug）"));
+    }
+    appconfig::update(|config| {
+        config.log_enabled = enabled;
+        config.log_level = level.clone();
+    })?;
+    Ok(())
+}
+
+/// 读取当前日志配置。
+#[tauri::command]
+fn get_log_config() -> serde_json::Value {
+    let config = appconfig::load();
+    serde_json::json!({
+        "enabled": config.log_enabled,
+        "level": config.log_level,
+    })
+}
+
 /// 出口门禁：更新已关闭的检查项（核心保护项拒绝关闭）。
 #[tauri::command]
 fn egate_set_disabled_checks(disabled: Vec<String>) -> Result<Vec<String>, String> {
@@ -3242,6 +3281,8 @@ pub fn run() {
             egate_env_check,
             egate_supported_regions,
             egate_set_disabled_checks,
+            set_log_config,
+            get_log_config,
             egate_disabled_checks,
             egate_env_align,
             egate_env_restore,

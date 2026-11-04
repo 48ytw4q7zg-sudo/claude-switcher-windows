@@ -67,6 +67,14 @@ pub struct AppConfig {
     /// 被守护的桌面应用 id（claude / chatgpt / antigravity）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egate_guarded_agents: Vec<String>,
+    /// 是否启用本地日志（默认开启）。
+    /// 关闭后不写 `~/.claude-switcher/logs/`，但排障线索也丢失。
+    #[serde(default = "default_true")]
+    pub log_enabled: bool,
+    /// 日志级别：error / info / debug（默认 info）。
+    /// error 只记录错误，info 记录错误 + 非错误事件，debug 全记录。
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
     /// 已关闭的检查项 key 列表（如 ["webrtc","asn"]）。
     /// 核心保护项（proxy_core / tun / egress_country / guard）不允许关闭。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -92,6 +100,14 @@ fn default_egate_interval() -> u64 {
 /// 默认启用接入路径检查。
 fn default_egate_enforce_access() -> bool {
     true
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_log_level() -> String {
+    "info".to_string()
 }
 
 /// H-6：自动收养默认开启。
@@ -127,6 +143,8 @@ impl Default for AppConfig {
             egate_guarded_agents: Vec::new(),
             egate_leak_trip: false,
             disabled_checks: Vec::new(),
+            log_enabled: true,
+            log_level: default_log_level(),
         }
     }
 }
