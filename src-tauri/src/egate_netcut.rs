@@ -76,7 +76,14 @@ pub struct CutState {
     pub mode: String,
     /// 防火墙全局阻断规则是否已加上。
     pub firewall: bool,
-    /// 断网前处于启用状态的物理网卡名（恢复时逐个启用）。
+    /// **P0-03**：计划禁用的**全部**网卡（写入后永不缩减）。
+    /// 恢复器必须以此为准——「执行成功但进度没写」时它仍知道要恢复什么。
+    #[serde(default)]
+    pub planned_adapters: Vec<String>,
+    /// 已确认禁用的网卡（进度记录，仅用于诊断与增量核验）。
+    #[serde(default)]
+    pub completed_adapters: Vec<String>,
+    /// 旧版兼容字段（= planned_adapters 的别名，读取时回退）。
     #[serde(default)]
     pub nics: Vec<String>,
     /// 断网开始时间（unix 秒）。
@@ -84,6 +91,17 @@ pub struct CutState {
     /// 事务阶段（用于崩溃恢复时判断做到哪一步）。
     #[serde(default)]
     pub phase: CutPhase,
+}
+
+impl CutState {
+    /// 需要恢复的全部网卡（优先新字段，回退旧字段）。
+    pub fn adapters_to_restore(&self) -> &[String] {
+        if !self.planned_adapters.is_empty() {
+            &self.planned_adapters
+        } else {
+            &self.nics
+        }
+    }
 }
 
 fn state_path() -> Result<PathBuf, String> {
@@ -163,6 +181,8 @@ pub fn cut(mode: CutMode) -> (bool, String) {
         }
         .to_string(),
         firewall: false,
+        planned_adapters: Vec::new(),
+        completed_adapters: Vec::new(),
         nics: Vec::new(),
         since: now_secs(),
         phase: CutPhase::Prepared,
@@ -178,6 +198,9 @@ pub fn cut(mode: CutMode) -> (bool, String) {
     }
     let after_firewall = CutState {
         firewall: true,
+        planned_adapters: Vec::new(),
+        completed_adapters: Vec::new(),
+        nics: Vec::new(),
         phase: CutPhase::FirewallApplied,
         ..prepared
     };
@@ -204,9 +227,10 @@ pub fn cut(mode: CutMode) -> (bool, String) {
         // 先把「计划禁用的全部网卡」写入账本。
         let planned = CutState {
             mode: "nics".to_string(),
-            nics: targets.clone(),
+            planned_adapters: targets.clone(),
+            completed_adapters: Vec::new(),
             phase: CutPhase::FirewallApplied,
-            ..after_firewall
+            ..after_firewall.clone()
         };
         if let Err(error) = save_state(&planned) {
             return (
@@ -223,9 +247,10 @@ pub fn cut(mode: CutMode) -> (bool, String) {
                     disabled.push(name.clone());
                     let progress = CutState {
                         mode: "nics".to_string(),
-                        nics: disabled.clone(),
+                        planned_adapters: targets.clone(),
+                        completed_adapters: disabled.clone(),
                         phase: CutPhase::NicsApplied,
-                        ..after_firewall
+                        ..after_firewall.clone()
                     };
                     if let Err(error) = save_state(&progress) {
                         // 账本更新失败：停止继续禁用，保留已写内容。
@@ -242,9 +267,10 @@ pub fn cut(mode: CutMode) -> (bool, String) {
                     // 单块失败：停止继续，如实报告已禁用范围。
                     let partial = CutState {
                         mode: "nics".to_string(),
-                        nics: disabled.clone(),
+                        planned_adapters: targets.clone(),
+                        completed_adapters: disabled.clone(),
                         phase: CutPhase::NicsApplied,
-                        ..after_firewall
+                        ..after_firewall.clone()
                     };
                     let _ = save_state(&partial);
                     return (
@@ -259,14 +285,15 @@ pub fn cut(mode: CutMode) -> (bool, String) {
         }
         CutState {
             mode: "nics".to_string(),
-            nics: disabled,
+            planned_adapters: targets.clone(),
+            completed_adapters: disabled,
             phase: CutPhase::Applied,
-            ..after_firewall
+            ..after_firewall.clone()
         }
     } else {
         CutState {
             phase: CutPhase::Applied,
-            ..after_firewall
+            ..after_firewall.clone()
         }
     };
 
@@ -294,13 +321,15 @@ pub fn restore() -> (bool, String) {
 
     // 顺序：先恢复网卡、最后删规则——恢复过程中网络始终被规则挡着。
     if let Some(state) = &state {
-        if !state.nics.is_empty() {
+        // P0-03：以**完整计划**为准恢复（覆盖「执行成功但进度没写」的情形）。
+        let adapters = state.adapters_to_restore().to_vec();
+        if !adapters.is_empty() {
             // 启用网卡并核验。
-            if let Err(error) = enable_nics(&state.nics) {
+            if let Err(error) = enable_nics(&adapters) {
                 failures.push(format!("启用网卡失败：{error}"));
             } else {
                 // 回查：确认网卡确实已 Up（驱动加载可能延迟）。
-                match verify_nics_up(&state.nics) {
+                match verify_nics_up(&adapters) {
                     Ok(gone) if !gone.is_empty() => {
                         failures.push(format!("网卡未能恢复（可能驱动延迟）：{}", gone.join("、")));
                     }
@@ -507,7 +536,9 @@ mod tests {
         let state = CutState {
             mode: "nics".to_string(),
             firewall: true,
-            nics: vec!["以太网".to_string(), "WLAN".to_string()],
+            planned_adapters: vec!["以太网".to_string(), "WLAN".to_string()],
+            completed_adapters: vec!["以太网".to_string()],
+            nics: Vec::new(),
             since: 1_760_000_000,
             phase: CutPhase::Applied,
         };
@@ -518,6 +549,7 @@ mod tests {
         let legacy: CutState =
             serde_json::from_str(r#"{"mode":"firewall","firewall":true,"since":1}"#).unwrap();
         assert!(legacy.nics.is_empty());
+        assert!(legacy.adapters_to_restore().is_empty());
     }
 
     #[test]
