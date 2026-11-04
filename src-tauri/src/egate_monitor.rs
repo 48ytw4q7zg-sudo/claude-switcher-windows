@@ -412,9 +412,11 @@ mod tests {
         assert!(!cfg.egate_enabled, "门禁总开关也必须默认关闭");
 
         // 开启后：仍要连续达到阈值（单次快照不熔断——应用启动瞬间可能先直连）。
-        let mut on = crate::appconfig::AppConfig::default();
-        on.egate_leak_trip = true;
-        on.egate_trip_threshold = 2;
+        let on = crate::appconfig::AppConfig {
+            egate_leak_trip: true,
+            egate_trip_threshold: 2,
+            ..Default::default()
+        };
         assert!(on.egate_leak_trip && on.egate_trip_threshold >= 2);
     }
 

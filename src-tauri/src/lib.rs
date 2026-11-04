@@ -43,6 +43,7 @@ mod egress;
 mod export;
 mod fsx;
 mod guard;
+mod ip_history;
 mod isolation;
 mod jsonio;
 mod keep;

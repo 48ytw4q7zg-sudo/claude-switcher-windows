@@ -147,6 +147,23 @@ fn judge_ip_consistency(current: Option<&str>, last: Option<&str>) -> (&'static 
     }
 }
 
+/// 4（扩展）. 48 小时出口漂移：单值比较看不到「切走又切回」的历史，
+/// 这里叠加窗口内的变化次数——达到阈值时即使本次与上次相同也要提示。
+fn judge_ip_drift(
+    base: (&'static str, String),
+    drift: Option<&crate::ip_history::DriftReport>,
+) -> (&'static str, String) {
+    let Some(drift) = drift else {
+        return base;
+    };
+    if !drift.drifting {
+        return base;
+    }
+    // 只在基础判定没有更严重结论（fail）时升级为 warn。
+    let status: &'static str = if base.0 == "fail" { "fail" } else { "warn" };
+    (status, format!("{}；{}", base.1, drift.note))
+}
+
 /// 5. 时区：Windows 时区 ID 与 appconfig.tz_target（忽略大小写）。
 fn judge_timezone(current: Result<&str, &str>, target: Option<&str>) -> (&'static str, String) {
     match current {
@@ -467,6 +484,8 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
     let guard_installed = guard::guard_installed();
     let rules_outcome = evaluate_rules(&cfg);
     let (ecosystem_claude, ecosystem_api) = probe_ecosystem();
+    // 48 小时漂移：读失败按「无历史」处理，不能因此让整轮安检失败。
+    let drift = crate::ip_history::current_drift().ok();
 
     // —— 逐项拼装（判定纯函数不做 IO）——
     let items = vec![
@@ -492,9 +511,12 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
             4,
             "ip_consistency",
             "IP一致",
-            judge_ip_consistency(
-                egress.as_ref().ok().map(|e| e.ip.as_str()),
-                cfg.last_egress_ip.as_deref(),
+            judge_ip_drift(
+                judge_ip_consistency(
+                    egress.as_ref().ok().map(|e| e.ip.as_str()),
+                    cfg.last_egress_ip.as_deref(),
+                ),
+                drift.as_ref(),
             ),
         ),
         build_item(
@@ -574,9 +596,11 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
         ),
     ];
 
-    // 与上游一致：每次检查后把最新出口 IP 写入 lastip（供下次「IP一致」比对）。
+    // 与上游一致：每次检查后把最新出口 IP 写入 lastip（供下次「IP一致」比对），
+    // 同时追加到 48 小时历史——单值比较看不到「切走又切回」的漂移。
     if let Ok(e) = &egress {
         let _ = appconfig::update(|c| c.last_egress_ip = Some(e.ip.clone()));
+        let _ = crate::ip_history::record(&e.ip);
     }
 
     items
