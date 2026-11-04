@@ -246,6 +246,8 @@ mod tests {
             should_trip: false,
             should_warn: true,
             trip_threshold: 2,
+            access_trip: false,
+            access_streak: 0,
         };
         assert!(trip_detail(&report).contains("Claude 出口"));
         assert!(

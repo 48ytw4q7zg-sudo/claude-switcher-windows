@@ -50,6 +50,10 @@ pub struct EgateReport {
     pub should_warn: bool,
     /// 本轮使用的熔断阈值。
     pub trip_threshold: u32,
+    /// **P0-05**：接入路径是否达到熔断阈值（独立于目标失败计数）。
+    pub access_trip: bool,
+    /// 接入路径连续未覆盖次数。
+    pub access_streak: u32,
 }
 
 /// 从注册表读系统代理配置（`HKCU\...\Internet Settings`）。
@@ -179,8 +183,29 @@ pub fn run_round(
     }
 
     let threshold = trip_threshold;
-    let trip = should_trip_report(&reports, threshold);
-    let warn = should_warn_report(&reports, threshold);
+    // **P0-05**：接入路径独立防抖——未接入（Uncovered）时即使没有发出
+    // HTTP 请求（因此目标都是 Unverified），也必须能触发保护。
+    let access_uncovered = access.is_uncovered();
+    let access_streak = if access_uncovered && !skip {
+        // 未强制跳过（enforce=false）：仍然统计，但实际探测已执行。
+        streaks.get("access:uncovered").copied().unwrap_or(0) + 1
+    } else if access_uncovered {
+        let next = streaks.get("access:uncovered").copied().unwrap_or(0) + 1;
+        streaks.insert("access:uncovered".to_string(), next);
+        next
+    } else {
+        // 接入恢复正常：清零。
+        streaks.remove("access:uncovered");
+        0
+    };
+    if access_uncovered && !skip {
+        streaks.insert("access:uncovered".to_string(), access_streak);
+    }
+    let access_trip = access_uncovered && threshold > 0 && access_streak >= threshold;
+
+    let trip = should_trip_report(&reports, threshold) || access_trip;
+    let warn = should_warn_report(&reports, threshold)
+        || (access_uncovered && threshold > 1 && access_streak + 1 == threshold);
     EgateReport {
         access: access_info,
         overall: crate::egate::overall(&evaluations),
@@ -190,6 +215,8 @@ pub fn run_round(
         should_trip: trip,
         should_warn: warn,
         trip_threshold: threshold,
+        access_trip,
+        access_streak,
     }
 }
 
