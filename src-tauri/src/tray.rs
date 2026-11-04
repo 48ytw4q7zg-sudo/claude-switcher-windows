@@ -42,7 +42,7 @@ pub fn refresh_tray_status(app: &tauri::AppHandle) -> Result<(), String> {
     }
     let session = usage::compact_token_count(tray_usage.session.totals.total_tokens);
     let weekly = usage::compact_token_count(tray_usage.weekly.totals.total_tokens);
-    let mut tooltip = format!("Claude Switcher\n近 5 小时: {session}\n近 7 天: {weekly}");
+    let mut tooltip = format!("账号切换器\n近 5 小时：{session}\n近 7 天：{weekly}");
     if let Some(model) = tray_usage.top_model.as_deref() {
         let model = if model.chars().count() > 40 {
             format!("{}…", model.chars().take(40).collect::<String>())
@@ -131,7 +131,7 @@ pub fn toggle_tray_popup(app: &AppHandle, tray_position: PhysicalPosition<f64>) 
         label,
         WebviewUrl::App("index.html?window=tray-popup".into()),
     )
-    .title("Claude Switcher Status")
+    .title("账号状态")
     .inner_size(POPUP_WIDTH, POPUP_HEIGHT)
     .resizable(false)
     .decorations(false)
@@ -279,14 +279,9 @@ fn build_tray_menu<R: tauri::Runtime>(
     let refresh_item =
         tauri::menu::MenuItem::with_id(app, "tray-refresh", "刷新用量", true, None::<&str>)
             .map_err(|e| format!("创建菜单项失败: {e}"))?;
-    let quit_item = tauri::menu::MenuItem::with_id(
-        app,
-        "tray-quit",
-        "退出 Claude Switcher",
-        true,
-        None::<&str>,
-    )
-    .map_err(|e| format!("创建菜单项失败: {e}"))?;
+    let quit_item =
+        tauri::menu::MenuItem::with_id(app, "tray-quit", "退出账号切换器", true, None::<&str>)
+            .map_err(|e| format!("创建菜单项失败: {e}"))?;
     menu_refs.push(&open_item);
     menu_refs.push(&refresh_item);
     menu_refs.push(&quit_item);
@@ -340,7 +335,7 @@ fn notify_switch_result(app: &tauri::AppHandle, result: &Result<crate::SwitchRes
 pub fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
     let app_handle = app.handle().clone();
     if let Some(tray) = app_handle.tray_by_id("main") {
-        let _ = tray.set_tooltip(Some("Claude Switcher".to_string()));
+        let _ = tray.set_tooltip(Some("账号切换器".to_string()));
         // tauri.conf.json 里的 tray.png 是单色模板图标，在深色任务栏上看不清。
         // 改用多尺寸彩色 ICO（16/24/32/48/64/256），高 DPI 与不同任务栏尺寸下都清晰。
         if let Ok(icon) = tauri::image::Image::from_bytes(include_bytes!("../icons/icon.ico")) {

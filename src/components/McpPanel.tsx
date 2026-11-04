@@ -1,3 +1,4 @@
+import { formatError } from '../uiText';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Box, Loader2, Plus, Trash2, Wrench } from 'lucide-react';
@@ -35,7 +36,7 @@ export function McpPanel() {
       setServers(result);
       setError(null);
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     }
   }, [scope, projectDir]);
 
@@ -60,7 +61,7 @@ export function McpPanel() {
     let server: McpServer;
     if (formType === 'stdio') {
       if (!command.trim()) {
-        setError('stdio 服务器必须填写 command');
+        setError('标准输入输出服务器必须填写启动命令');
         return;
       }
       const args = argsText
@@ -79,7 +80,7 @@ export function McpPanel() {
       server = { type: 'stdio', command: command.trim(), args, env };
     } else {
       if (!url.trim()) {
-        setError(`${formType} 服务器必须填写 url`);
+        setError(`${formType.toUpperCase()} 服务器必须填写服务地址`);
         return;
       }
       server = { type: formType, url: url.trim() };
@@ -96,7 +97,7 @@ export function McpPanel() {
       resetForm();
       await load();
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     } finally {
       setBusy(null);
     }
@@ -112,7 +113,7 @@ export function McpPanel() {
       });
       await load();
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     } finally {
       setBusy(null);
     }
@@ -127,7 +128,7 @@ export function McpPanel() {
       <div className="panel">
         <div className="panel-title">
           <Box />
-          <span>管理 mcpServers（全局 / 项目）</span>
+          <span>管理 MCP 服务器（全局 / 项目）</span>
         </div>
 
         <div className="mcp-scope">
@@ -166,7 +167,7 @@ export function McpPanel() {
                   <strong>{key}</strong>
                   <span className="mcp-target">{target}</span>
                   {envKeys.length > 0 && (
-                    <span className="mcp-env">env: {envKeys.join(', ')}</span>
+                    <span className="mcp-env">环境变量：{envKeys.join(', ')}</span>
                   )}
                 </div>
                 <button className="danger" onClick={() => removeServer(key)} disabled={busy === key}>
@@ -185,34 +186,34 @@ export function McpPanel() {
               value={formType}
               onChange={(e) => setFormType(e.target.value as 'stdio' | 'http' | 'sse')}
             >
-              <option value="stdio">stdio</option>
-              <option value="http">http</option>
-              <option value="sse">sse</option>
+              <option value="stdio">标准输入输出（stdio）</option>
+              <option value="http">网络接口（HTTP）</option>
+              <option value="sse">事件流（SSE）</option>
             </select>
           </div>
           <input placeholder="名称（唯一标识）" value={name} onChange={(e) => setName(e.target.value)} />
           {formType === 'stdio' ? (
             <>
               <input
-                placeholder="command（如 npx；npx 系会自动 cmd /c 包装）"
+                placeholder="启动命令（例如 npx，会自动用 cmd /c 包装）"
                 value={command}
                 onChange={(e) => setCommand(e.target.value)}
               />
               <textarea
-                placeholder="args：每行一个参数"
+                placeholder="启动参数：每行一个"
                 value={argsText}
                 onChange={(e) => setArgsText(e.target.value)}
                 rows={2}
               />
               <textarea
-                placeholder="env：每行 KEY=VALUE（密钥不进日志）"
+                placeholder="环境变量：每行 KEY=VALUE（密钥不进日志）"
                 value={envText}
                 onChange={(e) => setEnvText(e.target.value)}
                 rows={2}
               />
             </>
           ) : (
-            <input placeholder="url（http:// 或 https://）" value={url} onChange={(e) => setUrl(e.target.value)} />
+            <input placeholder="服务地址（http:// 或 https://）" value={url} onChange={(e) => setUrl(e.target.value)} />
           )}
           <button className="primary" onClick={addServer} disabled={busy === 'add'}>
             {busy === 'add' ? <Loader2 className="spin" /> : <Plus />}

@@ -2,6 +2,19 @@
 
 给后续 AI 助手 / 维护者的工程说明。**先读本文再动手。**
 
+## 本项目的模型分工与思考档位
+
+用户于 2026-11-02 指定 GPT-6 Astra（`gpt-6-astra`）负责方案、优先级、风险判断与验收，
+GPT-6.1 Sol（`gpt-6.1-sol`）负责按方案实现和测试。两者通过明确的任务与验证结果交接。
+本项目所有模型调用的思考档位统一为 `xhigh`（极高），上限也是 `xhigh`，禁止 `max` 及更高档位。
+启动子代理或命令行调用时须显式核对实际模型和档位。项目默认配置记录在 `.codex/config.toml`。
+模型身份以运行记录为准，审查与验证要求继续适用。
+
+用户随后明确调整本项目的审查方式：使用平台自带的自动审核，不另外启动模型或外部命令
+进行专门的付费代码审查，也不把此类额外审查作为提交门槛。此项替换本项目此前的额外
+独立旗舰模型审查要求。Astra 的方案判断与 Sol 的实现验证继续进行，`fmt`、`clippy`、
+测试、类型检查、构建及实际界面验收仍按改动范围执行。自动审核是否完成以实际结果为准。
+
 ## 这是什么
 
 Windows 版 Claude 账号切换器（Tauri 2 + Rust + React），**同时管理
@@ -234,6 +247,16 @@ async fn xxx() -> Result<T, String> {
 35. **windows-sys 语言/锁的 feature 归属**：`GetUserDefaultUILanguage` 在
     Win32_Globalization；`CreateFileW` 在 Win32_Security；`SendMessageTimeoutW`
     在 Win32_UI_WindowsAndMessaging。缺 feature 是编译期长报错，先核对归属。
+
+36. **`bash -c <长脚本>` 的 argv 在 ~10240 字符处被截断**：Git Bash（MSYS）
+    实测 raw 10231 字符恰好可跑，加任何前缀即在截断点断引号/断 `case`（报
+    `unexpected EOF while looking for matching`）。生产脚本必须经 stdin 暂存到
+    短路径再 `bash <path> <op>` 调用（见 `wsl::run_sync_script`）；凭据帧仍走
+    stdin，绝不进 argv。
+37. **Git Bash 的 PATH 里没有 `pwsh`**：后台命令经 bash 调 PowerShell 要用
+    `/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe` 全路径；且
+    `-File` 传参时 `--manifest-path` 这类参数会被 PS 5.1 当命名参数吞掉，
+    必须用 `-Command "& '脚本' -参数 @('a','b')"` 数组形式（同坑 33 家族）。
 
 ## 实机未验证项（改相关代码后优先测）
 

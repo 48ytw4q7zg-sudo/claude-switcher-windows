@@ -3,6 +3,32 @@
 > 目的：把「迁移目标」固定成可复现的具体 commit，而不是会变化的 `main`。
 > 任何人复核时按这里的 SHA 拉取，看到的代码与本次审查一致。
 
+## 当前迁移状态（2026-11-02）
+
+**全部功能融合仍在进行。** 下方早期矩阵记录实现位置和历史测试线索，不能作为全量对等、
+当前版本通过验证或实机验收完成的证明。存在测试函数只说明有相应覆盖入口，必须核对
+其断言、实际调用路径及本轮执行结果；纯判定函数通过也不能证明真实系统行为正确。
+当前执行证据与剩余工作以[全量进度](full-audit-progress-2026-11-02.md)为准。
+
+本轮按固定上游 `dfd2a5012a2633ebfe0d435cb3c15a089be58184` 的 README、Windows 说明
+及核心实现继续核对。已明确需要完成或补证的能力包括以下内容，均保留在迁移范围内。
+
+| 能力 | 当前证据与待办 |
+| --- | --- |
+| Desktop 完整账号生命周期 | 已有快照管理；重复选择当前账号的会话保护正在修复，首次登录、切换前完整检查、应用自动启动及故障恢复仍需补齐和验证 |
+| 账号快照迁移 | 需证明加密文件携带真实 Desktop 数据，并覆盖占用目标、错误密码、篡改、越界路径、链接与失败后保留原数据；仅导出账号库元数据不足以满足这一能力 |
+| 六项非关键检查配置 | 关闭后停止对应探测并显示跳过，可选失败降级仅限允许项目；核心保护不可关闭或降级，当前待实现 |
+| 48 小时出口历史 | 启用 IP 一致性检查时记录并统计窗口内变化，关闭后停止记录，当前待实现 |
+| 出口与 ASN 检查 | 需补正常 Cloudflare trace 回退、IP 与网络归属一致性及真实 ASN 类型查询；组织名关键词不能证明住宅网络 |
+| 日志与诊断导出 | 需补日志开关、轮转、受限字段及导出范围，不能将原始账号、地址或认证信息打包 |
+| 代理规则修复 | 已有 Clash Verge 实现，回滚与旧托管块迁移存在待修项；FlClash 活动 Profile 数据库事务修复、重启验证和失败恢复仍需逐项对齐 |
+| 独立代理诊断 | 需完整验证显式入口、端口及 HTTP/HTTPS/SOCKS5/SOCKS5H，不继承代理、不回退直连、不改账号状态，HTTP 响应与账号可用性分开报告 |
+| 一次性浏览器 | 需补地区语言跟随、Chrome/Chromium/Edge/Brave 发现、浏览器退出后清理，并验证代理/TUN 前置条件 |
+| 自动更新 | 已完成版本检查可靠性修复；下载、校验、安装/替换与失败回滚尚未完成，不能仅标作待实机 |
+| Windows 发布与界面 | 简体中文逐屏验收、完整便携运行时、发布质量门禁、安装升级/卸载及真实系统交互仍待闭环 |
+
+上述是已确认的待办清单，不是完整需求的缩减版。其余上游能力仍需按入口与失败路径完成核验。
+
 ## 1. 双代码基线（实现来源）
 
 本仓库是**两个上游能力的融合**，统一落在一个 Tauri 2 + Rust + React 应用里：
@@ -26,13 +52,22 @@
 | --- | --- | --- |
 | MSIX Claude 数据目录发现 | `Find-ClaudeDataPath` | 已对等：`desktop::resolve_desktop_live_dir` + `platform::claude_appx_families` |
 | FlClash 客户端识别 | `Test-ProxyAlive` | 已对等：`guard::required_process` 加 `flclash → flclashcore` |
-| 客户端语言按系统 UI 语言、不一致降 warn | `Invoke-CheckDetail` | 已对等：`platform::current_ui_language` + `judge_client_language` |
+| 客户端语言按系统 UI 语言、不一致降 warn | `Invoke-CheckDetail` | 历史实现，已被 1.1.1 的 Claude 配置语言方案替换 |
 | 48h 出口 IP 变化计数 | `Add-IpHistory` / `iphistory.log` | **未实现**：仅影响 warn 档文案，不改变 fail 判定；见 `docs/qa-v0.6.0.md` |
 | Claude 由 Appx/AUMID 兜底启动 | `Find-ClaudeAumid` | 未实现：本仓库 Desktop 切换不负责拉起 Claude |
 | 切换目录改用暂存+换位（不先删活目录） | `Switch-DataDir` | 已有等价保护：先 staging 备份再清空，失败自动回滚 |
 | 优雅关闭后再强杀 | `Stop-ClaudeApp` | 已对等：`kill_desktop_processes` 两段式 |
 
-### 1.1 关键决定反转（以用户最新指令为准）
+### 1.1.1 2026-11-01 增量复核
+
+上游最新为 `dfd2a5012a2633ebfe0d435cb3c15a089be58184`，相对上述 `f37cb26` 新增
+`6600bf9`（Windows 语言与 ASN 检查修正）和一项文档提交。
+客户端语言现已对齐：读取 Claude `config.json` 的 `locale`，传统配置缺失时查询 MSIX，
+不再用 Windows 显示语言代替；缺失/损坏/不一致为 warn。临时目录与编码回归通过，
+真实 MSIX 安装及运行时语言仍未验证，见 [本轮记录](optimization-client-language-2026-11-01.md)。
+ASN 网络类型查询、48h IP 历史和 Desktop 启动等剩余差异继续保留，不因本次修复改成已完成。
+
+### 1.1.2 关键决定反转（以用户最新指令为准）
 
 早期版本（含旧 AGENTS.md / 本文件）记录「YOURSJEYO 已明确不移植」。
 **项目 owner 已明确推翻该决定，要求把 YOURSJEYO 的全部功能一模一样地迁移到 Windows，
@@ -40,7 +75,7 @@
 
 - 基线 B 的全部能力（14 项检查、一键修复、保镖/看门狗、地区锁定、Clash 规则、
   STUN/open-safe/diagnose/fingerprint/cli-info、加密快照、自动更新、桌面版管理）
-  已用 Rust + React 重新实现并纳入本应用；
+  均须以 Rust + React 实现并纳入本应用，现有对应模块仍有上述功能与验证缺口；
 - 上游 PowerShell / bash / Swift 仅作为**逐行行为基准**，主交付是 Tauri 应用；
 - 本文件旧版「不实现 YOURSJEYO」整段作废。
 
@@ -54,7 +89,7 @@ MSI/NSIS 安装包。融合后的应用同时管理两类对象：
 - **Claude Desktop 桌面版**：活目录 `%APPDATA%\Claude`（`dirs::config_dir()\Claude`），
   切换前必须完全退出（含托盘）。
 
-## 2. 新增 Rust 模块与职责
+## 2. 早期新增 Rust 模块与职责（历史统计）
 
 所有平台差异收拢在 `src-tauri/src/platform/`，业务代码不写 `#[cfg(windows)]`；
 阻塞操作走 `blocking(...).await`；落盘一律 `fsx::write_atomically`。
@@ -74,10 +109,11 @@ MSI/NSIS 安装包。融合后的应用同时管理两类对象：
 | `platform/windows.rs` | 新增网卡/时区/区域/IPv6/计划任务/进程等平台 API | +8 |
 | `store.rs` | 新增 `DesktopProfile` 数据模型（向后兼容） | +1 |
 
-## 3. 功能对等矩阵（feature parity）
+## 3. 早期功能对等矩阵（历史定位）
 
-状态：**已验证** = 有 `#[test]` 覆盖（给出测试定位）；**待实机** = 实现完成，
-但依赖真实网络/管理员/显示器/登录态，沙箱无法验证。
+早期记录曾将有 `#[test]` 覆盖标为「已验证」，将实现存在但系统交互未测标为「待实机」。
+这些标签仅保留历史含义，不构成本轮验收结论。尤其测试存在、分类逻辑通过、功能完整实现、
+真实运行通过是不同层次；已发现的覆盖不足与功能缺口按本文开头和全量进度处理。
 
 ### 3.1 基线 A（CLI，VallierDev）
 
@@ -111,7 +147,7 @@ MSI/NSIS 安装包。融合后的应用同时管理两类对象：
 | 9 | WebRTC 检查（STUN 探针比对） | `checks::judge_webrtc` + `stun::probe_stun_leak` | `checks::*webrtc*`、`stun::*` | 部分验证 |
 | 10 | 保镖检查（已安装/运行） | `checks::judge_guard` + `guard::guard_installed` | `checks::*guard*`、`guard::*` | 已验证 |
 | 11 | 规则置顶检查（模式识别 + 内核 /rules 前 16 条） | `checks::judge_rules` + `rules::verify_pinned_rules` | `rules::*`（24 个） | 已验证 |
-| 12 | 客户端语言检查（跟随系统） | `checks::judge_client_language` | `checks::*language*` | 已验证 |
+| 12 | 客户端语言检查（Claude 配置与目标主语言比较） | `desktop::client_locale` + `checks::judge_client_language` | `desktop::*client_locale*`、`checks::*language*` | 文件读取/判定已验证，真实 MSIX 与运行时语言未验证 |
 | 13 | ASN 属性检查（住宅 vs 机房） | `checks::judge_asn` + `egress::is_datacenter_org` | `checks::*asn*`、`egress::*` | 已验证 |
 | 14 | 生态可达性检查（claude.ai + api.anthropic.com） | `checks::judge_reachability` | `checks::*reachability*` | 已验证（分类），实机待验 |
 | fix | 一键修复（拉起内核/TUN→锁时区→关 IPv6→写规则→注册保镖→复测） | `checks::run_fix_blocking` | `checks::*fix*` | 部分验证 |
@@ -129,10 +165,10 @@ MSI/NSIS 安装包。融合后的应用同时管理两类对象：
 | — | cli-info（PATH 顺序/版本/安装方式/多份告警） | `diagnostics::cli_info` | `diagnostics::*cli*` | 已验证 |
 | — | 加密快照导出/导入（CSBK1，Argon2id+AES-GCM，口令≥8） | `export::{export,import}_store_encrypted_*` | `export::*` | 已验证（逻辑） |
 | — | 跨身份保留 keep-in-workspace | `keep::{stage,merge}_keep` | `keep::*`（5 个） | 已验证（逻辑） |
-| — | 自动更新（GitHub Release，校验和，备份回滚） | `update::check_for_update_blocking` | 无直接测试 | 待实机 |
+| — | 自动更新（GitHub Release，校验和，备份回滚） | `update::check_for_update_blocking` | 更新检查专项测试已通过 | 检查已修复；下载、校验与回滚待实现 |
 | — | Desktop 账号管理（捕获/切换/删除/重命名） | `desktop::*` | `desktop::*`（10 个） | 已验证（逻辑），实机待验 |
 
-## 4. 测试与构建结果
+## 4. 早期测试与构建结果（非当前全量结果）
 
 - `cargo fmt --check`：通过。
 - `cargo clippy --all-targets -- -D warnings`：**零警告**。
@@ -140,7 +176,7 @@ MSI/NSIS 安装包。融合后的应用同时管理两类对象：
 - `npx tsc --noEmit`：前端融合后通过（见前端交付）。
 - `npm run tauri build`：产出 MSI + NSIS（见发布记录）。
 
-## 5. 未实机验证项（沙箱无管理员/显示器/真实登录态）
+## 5. 未实机验证项
 
 - 保镖真实 kill（Claude Desktop + CLI）、计划任务 highest 权限注册与 AtLogOn 触发；
 - TUN 网卡、verge.yaml TUN 开关恢复后 Clash Verge 实机重启加载；

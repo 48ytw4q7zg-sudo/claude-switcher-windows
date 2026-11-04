@@ -1,3 +1,4 @@
+import { formatError } from '../uiText';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Loader2, UserPlus, UserRoundX } from 'lucide-react';
@@ -19,7 +20,7 @@ export function ReconcileSettings() {
       setEnabled(cfg.auto_adopt_enabled ?? true);
       setError(null);
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     }
   }, []);
 
@@ -35,7 +36,7 @@ export function ReconcileSettings() {
       const cfg = await invoke<AppConfig>('set_auto_adopt', { enabled: next });
       setEnabled(cfg.auto_adopt_enabled ?? next);
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     } finally {
       setBusy(false);
     }
@@ -53,7 +54,7 @@ export function ReconcileSettings() {
           <span>检测到未登记账号时的处理方式</span>
         </div>
         <p className="telemetry-intro">
-          切换前会比对当前 live 账号与账号库：开启时未登记账号自动收养为快照，关闭时仅提示、
+          切换前会比对当前正在使用的账号与账号库：开启时未登记账号自动收养为快照，关闭时仅提示、
           由你手动处理，不会自动改动账号库。
         </p>
         <div className="quota-controls">

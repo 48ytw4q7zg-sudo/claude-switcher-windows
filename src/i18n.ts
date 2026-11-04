@@ -1,105 +1,7 @@
-// F-7 多语言：极简 i18n 框架。
-// - 默认跟随系统：初始化时调用后端 get_system_language（GetUserDefaultUILanguage）。
-// - 词典覆盖本轮新增面板；旧界面硬编码中文按增量迁移（见 docs/qa-v0.5.0.md）。
-// - t() 支持 {name} 形式的参数替换；缺失键回退英文再回退键名。
-
-import { invoke } from '@tauri-apps/api/core';
-import { useEffect, useState } from 'react';
-
+// 产品界面固定使用简体中文；系统语言与旧版语言选择不影响显示。
+// 保留原语言接口，避免旧调用方传入英文选项时恢复英文界面。
 export type Lang = 'zh' | 'en';
-
 type Dict = Record<string, string>;
-
-const en: Dict = {
-  // 通用
-  'common.busy': 'Working…',
-  'common.error': 'Error',
-  'common.language': 'Language',
-  // 集成面板
-  'integ.title': 'CLI Integration & Tools',
-  'integ.path.title': 'User PATH (command line)',
-  'integ.path.intro':
-    'Add the tool bin directory to your user PATH so the cs command works anywhere. Written as REG_EXPAND_SZ, variables like %USERPROFILE% are preserved.',
-  'integ.path.add': 'Add to user PATH',
-  'integ.path.remove': 'Remove from user PATH',
-  'integ.bind.title': 'Directory binding (cs run)',
-  'integ.bind.intro':
-    'Bind a directory to an account. Running cs run in that folder (or a subfolder) starts Claude with that account via CLAUDE_CONFIG_DIR.',
-  'integ.bind.dir': 'Directory path',
-  'integ.bind.account': 'Account name',
-  'integ.bind.bind': 'Bind directory',
-  'integ.bind.unbind': 'Unbind directory',
-  'integ.menu.title': 'Start menu shortcuts',
-  'integ.menu.intro':
-    'Create one Start menu shortcut per account (--switch-id <id>). Shortcuts are rebuilt to stay in sync after rename/delete.',
-  'integ.menu.rebuild': 'Rebuild shortcuts',
-  'integ.menu.clear': 'Clear all shortcuts',
-  'integ.diag.title': 'Diagnostic bundle',
-  'integ.diag.intro':
-    'Build a sanitized zip (tokens and emails are redacted). The full portable edition bundles a fixed WebView2 runtime and sets WEBVIEW2_BROWSER_EXECUTABLE_FOLDER.',
-  'integ.diag.build': 'Build diagnostic bundle',
-  // 令牌状态
-  'token.valid': 'Valid',
-  'token.expiring': 'Expiring soon',
-  'token.expired.refresh': 'Access token expired; it auto-refreshes when used',
-  'token.expired.noRefresh': 'No refresh token; you need to sign in again',
-  'token.unknown': 'Unknown',
-  // 供应商
-  'provider.title': 'Third-party providers',
-  'provider.intro':
-    'Anthropic-compatible endpoints. Only keys managed by this feature are changed; switch back to OAuth to clear them. ANTHROPIC_AUTH_TOKEN takes priority over the saved OAuth.',
-  'provider.name': 'Name',
-  'provider.baseUrl': 'Base URL',
-  'provider.authToken': 'Auth token (encrypted)',
-  'provider.modelEnv': 'Model env (KEY=VALUE, one per line)',
-  'provider.create': 'Create provider',
-  'provider.switch': 'Use this provider',
-  'provider.test': 'Test connection',
-  'provider.delete': 'Delete',
-  'provider.active': 'Active',
-  // WSL
-  'wsl.title': 'WSL integration (experimental)',
-  'wsl.intro':
-    'Experimental and off by default. Credentials are written only when you explicitly choose a distro. The target 0600 permission cannot be guaranteed from Windows.',
-  'wsl.enable': 'Enable WSL integration',
-  'wsl.distro': 'Target distro',
-  'wsl.refresh': 'Refresh distro list',
-  'wsl.write': 'Write credentials',
-  'wsl.clear': 'Clear credentials',
-  // 工作区资产管理
-  'ws.title': 'Workspace assets',
-  'ws.panel.title': 'Skills / Commands / Agents / CLAUDE.md (enable/disable)',
-  'ws.search': 'Search name or description',
-  'ws.skill': 'Skills',
-  'ws.command': 'Commands',
-  'ws.agent': 'Subagents',
-  'ws.memory': 'Project memory CLAUDE.md',
-  'ws.enable': 'Enable',
-  'ws.disable': 'Disable',
-  'ws.empty': 'No matching workspace assets.',
-  'ws.count': '{n} items · {enabled} enabled',
-  // 权限与钩子编辑器
-  'perm.title': 'Permissions & hooks',
-  'perm.panel.title': 'Permission rules and hooks editor',
-  'perm.allow': 'Allow',
-  'perm.deny': 'Deny',
-  'perm.ask': 'Ask',
-  'perm.allow.hint': 'Tools/rules always allowed',
-  'perm.deny.hint': 'Always denied',
-  'perm.ask.hint': 'Ask each time',
-  'perm.rule.placeholder': 'e.g. Bash(npm run build)',
-  'perm.hooks': 'Hooks ({n})',
-  'perm.hooks.note':
-    'This list is authoritative: hooks you remove here are removed on save. Hooks whose command line cannot be read are kept untouched, as are unrecognized fields such as timeout.',
-  'perm.noHooks': 'No hooks.',
-  'perm.event': 'Event e.g. Stop',
-  'perm.matcher': 'Matcher (optional)',
-  'perm.command': 'Command line',
-  'perm.addHook': 'Add hook',
-  'perm.save': 'Save',
-  'perm.saved': 'Saved to settings.json.',
-  'perm.perLine': 'one per line',
-};
 
 const zh: Dict = {
   'common.busy': '处理中…',
@@ -108,7 +10,7 @@ const zh: Dict = {
   'integ.title': '命令行集成与工具',
   'integ.path.title': '用户 PATH（命令行）',
   'integ.path.intro':
-    '把工具 bin 目录加入用户 PATH，即可在任意位置使用 cs 命令。以 REG_EXPAND_SZ 写回，保留 %USERPROFILE% 等变量不被展开。',
+    '把工具可执行文件目录加入用户 PATH，即可在任意位置使用 cs 命令。以 REG_EXPAND_SZ 写回，保留 %USERPROFILE% 等变量不被展开。',
   'integ.path.add': '加入用户 PATH',
   'integ.path.remove': '从用户 PATH 移除',
   'integ.bind.title': '目录绑定（cs run）',
@@ -125,7 +27,7 @@ const zh: Dict = {
   'integ.menu.clear': '全部清理',
   'integ.diag.title': '诊断包',
   'integ.diag.intro':
-    '生成脱敏 zip（令牌与邮箱均已脱敏）。完整便携版随包固定 WebView2 运行时并设置 WEBVIEW2_BROWSER_EXECUTABLE_FOLDER。',
+    '生成脱敏压缩包（令牌与邮箱均已脱敏）。完整便携版随包固定 WebView2 运行时并设置 WEBVIEW2_BROWSER_EXECUTABLE_FOLDER。',
   'integ.diag.build': '生成诊断包',
   'token.valid': '有效',
   'token.expiring': '即将过期',
@@ -134,11 +36,11 @@ const zh: Dict = {
   'token.unknown': '未知',
   'provider.title': '第三方供应商',
   'provider.intro':
-    'Anthropic 兼容端点。只改本功能管理的 env 键；切回 OAuth 时清键。ANTHROPIC_AUTH_TOKEN 优先级高于已保存的 OAuth。',
+    'Anthropic 兼容端点。只修改本功能管理的环境变量；切回 OAuth 账号时清除这些变量。ANTHROPIC_AUTH_TOKEN 优先级高于已保存的 OAuth。',
   'provider.name': '名称',
-  'provider.baseUrl': 'Base URL',
-  'provider.authToken': 'Auth token（加密保存）',
-  'provider.modelEnv': '模型 env（每行 KEY=VALUE）',
+  'provider.baseUrl': '服务地址',
+  'provider.authToken': '认证令牌（加密保存）',
+  'provider.modelEnv': '模型环境变量（每行 KEY=VALUE）',
   'provider.create': '创建供应商',
   'provider.switch': '使用该供应商',
   'provider.test': '连通测试',
@@ -156,9 +58,9 @@ const zh: Dict = {
   'ws.title': '工作区资产',
   'ws.panel.title': '技能 / 命令 / 子代理 / CLAUDE.md（启用/停用）',
   'ws.search': '搜索名称或说明',
-  'ws.skill': '技能 Skills',
-  'ws.command': '命令 Commands',
-  'ws.agent': '子代理 Agents',
+  'ws.skill': '技能',
+  'ws.command': '命令',
+  'ws.agent': '子代理',
   'ws.memory': '项目记忆 CLAUDE.md',
   'ws.enable': '启用',
   'ws.disable': '停用',
@@ -167,18 +69,18 @@ const zh: Dict = {
   // 权限与钩子编辑器
   'perm.title': '权限与钩子',
   'perm.panel.title': '权限规则与钩子编辑器',
-  'perm.allow': '允许 allow',
-  'perm.deny': '拒绝 deny',
-  'perm.ask': '询问 ask',
+  'perm.allow': '允许',
+  'perm.deny': '拒绝',
+  'perm.ask': '询问',
   'perm.allow.hint': '始终放行的工具/规则',
   'perm.deny.hint': '始终禁止',
   'perm.ask.hint': '每次先询问',
   'perm.rule.placeholder': '例如 Bash(npm run build)',
-  'perm.hooks': '钩子 hooks（{n}）',
+  'perm.hooks': '钩子（{n}）',
   'perm.hooks.note':
-    '此列表是权威的：在这里删掉的钩子保存时会被真正删除。读不出命令行的钩子、以及 timeout 等本编辑器不认识的字段会原样保留，不会被改动。',
+    '此列表是权威的：在这里删掉的钩子保存时会被真正删除。读不出命令行的钩子、以及超时设置等本编辑器不认识的字段会原样保留，不会被改动。',
   'perm.noHooks': '暂无钩子。',
-  'perm.event': '事件 如 Stop',
+  'perm.event': '事件（例如 Stop）',
   'perm.matcher': '匹配器（可空）',
   'perm.command': '命令行',
   'perm.addHook': '添加钩子',
@@ -187,37 +89,22 @@ const zh: Dict = {
   'perm.perLine': '每行一条',
 };
 
-let currentLang: Lang = 'zh';
-const listeners = new Set<() => void>();
-
-function emit() {
-  listeners.forEach((fn) => fn());
-}
-
-/** 初始化：语言跟随系统（失败回退中文）。 */
+/** 初始化文档语言，供辅助技术与日期格式识别。 */
 export async function initI18n() {
-  try {
-    const code = await invoke<string>('get_system_language');
-    currentLang = code.startsWith('zh') ? 'zh' : 'en';
-  } catch {
-    currentLang = 'zh';
-  }
-  emit();
+  document.documentElement.lang = 'zh-CN';
 }
 
 export function getLang(): Lang {
-  return currentLang;
+  return 'zh';
 }
 
-export function setLang(lang: Lang) {
-  currentLang = lang;
-  emit();
+export function setLang(_lang: Lang) {
+  document.documentElement.lang = 'zh-CN';
 }
 
-/** 翻译 + 参数替换。 */
+/** 翻译与参数替换；缺失文案也不会回退英文。 */
 export function t(key: string, params?: Record<string, string | number>): string {
-  const dict = currentLang === 'en' ? en : zh;
-  let text = dict[key] ?? en[key] ?? key;
+  let text = zh[key] ?? '暂无中文说明';
   if (params) {
     for (const [name, value] of Object.entries(params)) {
       text = text.replace(`{${name}}`, String(value));
@@ -226,15 +113,6 @@ export function t(key: string, params?: Record<string, string | number>): string
   return text;
 }
 
-/** React 订阅：语言切换时重渲染。 */
 export function useI18n() {
-  const [, force] = useState(0);
-  useEffect(() => {
-    const fn = () => force((x) => x + 1);
-    listeners.add(fn);
-    return () => {
-      listeners.delete(fn);
-    };
-  }, []);
-  return { t, lang: currentLang, setLang };
+  return { t, lang: getLang(), setLang };
 }

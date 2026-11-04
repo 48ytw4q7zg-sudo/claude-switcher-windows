@@ -1,3 +1,4 @@
+import { formatError, formatMessage } from '../uiText';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -49,7 +50,7 @@ export function IntegrationPanel() {
         setMessage(success);
         setPathWarning(result.warning);
       } catch (e) {
-        setError(String(e));
+        setError(formatError(e));
       } finally {
         setBusy(null);
       }
@@ -70,7 +71,7 @@ export function IntegrationPanel() {
         await action();
         setMessage(success);
       } catch (e) {
-        setError(String(e));
+        setError(formatError(e));
       } finally {
         setBusy(null);
       }
@@ -110,7 +111,7 @@ export function IntegrationPanel() {
             {t('integ.path.remove')}
           </button>
         </div>
-        {pathWarning && <p className="inline-warnings">{pathWarning}</p>}
+        {pathWarning && <p className="inline-warnings">{formatMessage(pathWarning)}</p>}
       </div>
 
       {/* 目录绑定 */}
@@ -235,7 +236,7 @@ export function IntegrationPanel() {
                   `${preview.info_json}\n\n===== 日志 =====\n${preview.log_text}`,
                 );
               } catch (e) {
-                setError(String(e));
+                setError(formatError(e));
               } finally {
                 setBusy(null);
               }

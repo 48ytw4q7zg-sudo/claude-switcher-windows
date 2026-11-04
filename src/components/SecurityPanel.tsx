@@ -1,3 +1,4 @@
+import { formatError, formatMessage } from '../uiText';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -50,7 +51,7 @@ export function SecurityPanel() {
       // 重新检测后清掉上一次修复报告，避免新旧结果混在一起。
       setFixReport(null);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setChecking(false);
     }
@@ -69,7 +70,7 @@ export function SecurityPanel() {
       // 修复后用后端返回的复测结果刷新列表。
       if (Array.isArray(report.checks)) setItems(report.checks);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setFixing(false);
     }
@@ -90,7 +91,7 @@ export function SecurityPanel() {
       <div className="section-title">
         <h2>环境安检</h2>
         <span>
-          {items ? `${summary.ok}/${summary.total} 通过` : '读取中'}
+          {items ? `${summary.ok}/${summary.total} 通过` : checking ? '读取中' : '读取失败'}
         </span>
       </div>
 
@@ -137,7 +138,7 @@ export function SecurityPanel() {
                 <StatusDot status={item.status} />
                 <div className="check-row-body">
                   <strong>{item.name}</strong>
-                  <span>{item.detail}</span>
+                  <span>{formatMessage(item.detail)}</span>
                 </div>
               </div>
             ))}
@@ -156,7 +157,7 @@ export function SecurityPanel() {
                   <StatusDot status={step.status} />
                   <div className="check-row-body">
                     <strong>{step.name}</strong>
-                    <span>{step.detail}</span>
+                    <span>{formatMessage(step.detail)}</span>
                   </div>
                 </div>
               ))}

@@ -13,7 +13,7 @@
 
 ## 一、原项目地址与平台分工（不同项目对应不同系统）
 
-本项目**融合了两个上游的全部功能**，它们是**面向不同系统的独立项目**，请勿混用：
+本项目以**融合两个上游的全部功能**为目标，它们是**面向不同系统的独立项目**，请勿混用。已实现范围、剩余差异与实机验证状态见[功能对等记录](docs/upstream-baseline.md)：
 
 | 项目 | 地址 | 面向系统 | 说明 |
 | --- | --- | --- | --- |
@@ -21,7 +21,7 @@
 | 上游 B（环境/桌面版） | [YOURSJEYO/claude-switcher](https://github.com/YOURSJEYO/claude-switcher) | **macOS 为主 + Windows（Beta）+ Linux（Beta）** | bash/PowerShell/Swift 实现的环境安全套件。本仓库的第二个融合基线为 commit [`870c4ca`](https://github.com/YOURSJEYO/claude-switcher/commit/870c4ca0754234965878ef58144d7a755d965037)。感谢原作者 **[@YOURSJEYO](https://github.com/YOURSJEYO)**。 |
 | **本仓库** | [48ytw4q7zg-sudo/claude-switcher-windows](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows) | **Windows 10 / 11（x64）** | 把两个上游的能力融合进**同一个 Tauri 应用**，并完成 Windows 适配、模块化重构与加固。 |
 
-> **关于平台分工**：上游 A 是 macOS 的 Claude Code CLI 账号切换器；上游 B 以 macOS 为主，同时提供 Windows（Beta，PowerShell + WPF）与 Linux（Beta，bash + systemd）版本。**三者是不同的项目、面向不同的操作系统**。本仓库是上游 B 的 Windows 能力的**原生重写版**——不再依赖 PowerShell/WPF 脚本，而是用 Rust + React 实现，与上游 A 的 Tauri 技术栈统一，因此同时具备两边的全部功能。
+> **关于平台分工**：上游 A 是 macOS 的 Claude Code CLI 账号切换器；上游 B 以 macOS 为主，同时提供 Windows（Beta，PowerShell + WPF）与 Linux（Beta，bash + systemd）版本。**三者是不同的项目、面向不同的操作系统**。本仓库以 Rust + React 实现上游 B 的 Windows 能力，与上游 A 的 Tauri 技术栈统一；不运行上游 PowerShell/WPF 主程序，部分系统查询仍通过 Windows PowerShell 完成。功能对齐程度以逐项验证记录为准。
 >
 > **功能融合说明**：本仓库把两个上游的能力统一到一个 Tauri 应用中——
 >
@@ -30,7 +30,7 @@
 > | 管理对象 | Claude Code CLI（`~/.claude`、`~/.claude.json`、OAuth 凭据） | Claude Desktop 桌面版（`%APPDATA%\Claude`） |
 > | 核心能力 | 账号快照 / 凭据切换 / 会话隔离 / Clash 节点绑定 / 用量 | 14 项检查、一键修复、保镖/看门狗、地区锁定、规则托管、STUN/指纹/CLI 体检、加密快照、自动更新 |
 >
-> 上游 B 的 PowerShell / bash / Swift 脚本仅作为**逐行行为基准**，所有能力均用 Rust + React 重新实现。Windows 上没有沿用 macOS 的 Keychain / `pgrep` / `security`，而是替换为等价的 Rust + 系统 API。
+> 上游 B 的 PowerShell / bash / Swift 脚本作为**逐行行为基准**，迁移能力在 Rust + React 应用内实现。Windows 上没有沿用 macOS 的 Keychain / `pgrep` / `security`，而是替换为对应的 Rust + 系统 API。
 >
 > 早期版本的本文件曾写「不包含 YOURSJEYO 的任何代码或功能」，**该表述已作废**：项目 owner 已明确要求融合全部功能。
 
@@ -40,8 +40,8 @@
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
 | 安装包 | **Release v0.6.0**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计，SHA256 见 Release 说明 |
-| 测试 | `cargo test --lib` **394 passed / 0 failed / 0 ignored**；`cargo clippy --all-targets -- -D warnings` 零警告；`npx tsc --noEmit` 通过 |
-| 实测环境 | 无显示器环境本地构建；Windows 10/11 端到端实机验证项见文末清单 |
+| 开发分支验证 | 11 月 3 日完成 WSL 超时修复后，完整 Rust 回归为 **443 passed / 0 failed / 0 ignored**，全目标 clippy 零警告；最终前端、安装包和后续修改的集成验证仍需完成。详见[本轮进度](docs/full-audit-progress-2026-11-02.md)。已发布 v0.6.0 的历史结果为 394 项 |
+| 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
 
 ---
@@ -297,7 +297,7 @@ ClaudeSwitcher-portable.zip                                       # 便携版
 
 ## 验收边界（实机未验证项）
 
-以下功能已实现并有单元测试或代码审查覆盖，但**未在真实 Windows 环境实机验证**（沙箱无管理员权限、无显示器、无 Claude Code 登录态）：
+以下系统交互尚未完成相应实机验收。部分能力还存在实现缺口，详见[当前功能对等记录](docs/upstream-baseline.md)；单元测试通过不代表这些完整流程已通过。
 
 | 项 | 状态 |
 | --- | --- |
@@ -313,22 +313,21 @@ ClaudeSwitcher-portable.zip                                       # 便携版
 | **open-safe 真实浏览器拉起**、WebRTC 标志生效、profile 销毁 | 未实机验证 |
 | **一键修复全流程**（拉起内核 → 恢复 TUN → 写规则 → 内核验证 → 注册保镖 → 复测） | 未实机验证 |
 | **Claude Desktop 切换**（进程结束、活目录回存、快照载入、回滚） | 未实机验证 |
-| **自动更新全流程** | 未实机验证 |
+| **自动更新全流程** | 版本检查已修复；下载、校验与失败回滚仍待实现和验证 |
 | **加密快照跨机导入** | 未实机验证（导入侧已加外机密文拒绝，但换机场景未实测） |
-| **托盘一键切换**（动态菜单、点击切换、系统通知、菜单重建） | 未实机验证（无显示器/无托盘环境） |
+| **托盘一键切换**（动态菜单、点击切换、系统通知、菜单重建） | 未完成完整实机验收 |
 | **按终端并行多账号**（wt/cmd 拉起、独立配置目录、共享 skills） | 未实机验证 |
 | **额度阈值通知 / 提醒**（Toast、notify-state、一键切换） | 未实机验证（Toast 需 AUMID；开发模式显示成 PowerShell 身份属正常） |
 | **MCP 服务器管理**（stdio 拉起、cmd /c 包装、.mcp.json 读写） | 未实机验证（纯逻辑有单测，真实拉起未测） |
-| **便携版 zip**（portable.flag、数据目录与 WebView2 重定向） | 未实机验证（需在 WebView2 创建前设置，真实解压运行未测） |
+| **便携版 zip**（portable.flag、数据目录与 WebView2 重定向） | 旧构建的隔离空账号实例曾启动；最终便携包及固定 WebView2 完整版未验收 |
 
 > **P2-2 凭据锁：本轮不实现（待实机调研）**。必须先用 Process Monitor 实机抓取
 > `claude.exe` / `node.exe` 刷新令牌时的锁文件（路径、句柄、持续时间），确认后再实现，
 > 禁止凭猜测写。当前在文档中标记为「待实机调研」。
 
-> 另有两项**已知功能缺口**（非缺陷，未在第二轮补齐）：
-> ① 自动更新目前只做版本检查并提供下载页链接，不自动下载安装（未签名场景下 updater 插件方案不现实）；
-> ② 上游的「48 小时出口 IP 漂移历史」警告未实现（当前只比对上一次出口）。
-> 详见 `docs/qa-report.md` 第四之二节。
+> **全部功能融合仍在进行。** 自动更新安装与回滚、48 小时出口历史、非关键检查设置、
+> 日志控制、Desktop 完整生命周期等缺口均保留在迁移范围内。
+> 完整待办和证据边界见[功能对等记录](docs/upstream-baseline.md)与[本轮进度](docs/full-audit-progress-2026-11-02.md)。
 
 ---
 
@@ -348,23 +347,23 @@ ClaudeSwitcher-portable.zip                                       # 便携版
 
 ### 设计原则（五条硬规则）
 
-1. **cfg 收拢**：所有平台差异必须收拢在 `platform/{windows,unix}.rs`，业务代码不写 `#[cfg(windows)]`。新增平台能力时：先在 platform 加同名函数，再在业务里调 `platform::imp::xxx`。
+1. **cfg 收拢**：所有平台差异必须收拢在 `platform/{windows,mod}.rs`，业务代码不写 `#[cfg(windows)]`。新增平台能力时：先在 platform 加同名函数，再在业务里调 `platform::imp::xxx`。
 2. **阻塞命令走 `blocking()`**：Tauri 2 中非 `async` 命令跑在主线程，任何可能阻塞的（网络、进程扫描、目录 rename、凭据读取、PowerShell 查询）都必须 `blocking(|| ...)` 包装。**不用** `#[tauri::command(async)]` 包同步函数（会跑在 tokio 工作线程，调 `reqwest::blocking` 有 panic 风险）。
 3. **写文件一律原子**：`fsx::write_atomically`（临时文件 + rename）。绝不用 `fs::write` 直接写 `store.private.json` / `.credentials.json` / `~/.claude.json`——截断式写入中途崩溃会丢数据。rename 失败时**不删**目标文件（旧数据必须保留）。
 4. **凭据与密钥边界**：`settings_json` 里的认证字段（`AUTH_ENV_KEYS` + `apiKeyHelper`）落盘前 `split_auth_settings` 拆出加密，读时 `restore_auth_settings` 合并回去；解密路径**绝不生成新密钥**（缺密钥报错让用户恢复，绝不覆盖）；`keyring::Error` 除 `NoEntry` 外一律致命（PlatformFailure 可能是 DPAPI 失败，当「不存在」会铸新钥覆盖旧数据）。
 5. **PowerShell 错误必须显式传播**：PowerShell 的非终止错误（`Write-Error`）**不改变进程退出码**，所以 `run_ps` 的脚本头强制 `$ErrorActionPreference = 'Stop'`，把非终止错误转成非零退出码；否则「设置失败」会被当成成功上报。
 
-### 模块划分（src-tauri/src/，27 个 `.rs` 文件：23 个业务模块 + `lib.rs`/`main.rs` + `platform/` 3 个）
+### 主要模块划分（src-tauri/src/）
 
-**来自上游 A（VallierDev，CLI 账号切换）——13 个模块：**
+**来自上游 A（VallierDev，CLI 账号切换）的主要模块：**
 
 | 模块 | 职责 |
 | --- | --- |
-| `lib.rs` | 36 个命令处理器、返回类型、应用启动（单实例、关窗到托盘、`--guard`/`--autostart` 分发）、日志与 panic hook |
+| `lib.rs` | 命令处理器、返回类型、应用启动（单实例、关窗到托盘、`--guard`/`--autostart` 分发）、日志与 panic hook |
 | `main.rs` | 桌面程序入口（`windows_subsystem = "windows"` 无黑窗），调 `claude_switcher_lib::run()` |
 | `accounts.rs` | 账号材料事务写入：Merge / FullReplace 两种语义、回滚「先凭据后 JSON」、settings env 注入（遥测 + runtime） |
 | `store.rs` | `store.private.json` 读写；AES-GCM 加解密；`split_auth_settings` / `restore_auth_settings`；`DesktopProfile` 与 `current_desktop_profile_id`；密钥「只读现有、解密绝不铸新钥」 |
-| `credentials.rs` | Windows 凭据文件 / macOS Keychain 的读写与清除（差异收拢进 platform） |
+| `credentials.rs` | Windows Claude 凭据文件的读写与清除 |
 | `isolation.rs` | 按 profile 接管/激活 `projects`、`telemetry`、`file-history`、`shell-snapshots`、`cache`、`debug`、`plugins/data`、`config.json` 共 8 个隔离面 |
 | `links.rs` | 符号链接 / junction / 硬链接的创建、识别（含悬空链接）、移除与链接模式上报 |
 | `fsx.rs` | 原子写入（`.原文件名.tmp-<rand>` + rename）、rename/删除锁重试（Windows 错误 5/32/33 短退避）、陈旧临时文件清理 |
@@ -375,7 +374,7 @@ ClaudeSwitcher-portable.zip                                       # 便携版
 | `usage.rs` | 本地日志聚合 + OAuth usage/profile 的 TTL 缓存与 in-flight 合并 + 本地快照 45 秒缓存 + token 指纹防串号 |
 | `tray.rs` | 托盘 tooltip、弹窗定位（工作区/多屏）、失焦防抖、右键菜单 |
 
-**来自上游 B（YOURSJEYO，环境安全 / 桌面版）——10 个模块：**
+**来自上游 B（YOURSJEYO，环境安全 / 桌面版）的主要模块：**
 
 | 模块 | 职责 |
 | --- | --- |
@@ -400,7 +399,7 @@ ClaudeSwitcher-portable.zip                                       # 便携版
 | --- | --- |
 | `platform/mod.rs` | **Windows 平台适配唯一入口**：非 Windows 目标直接 `compile_error!`（本项目只做 Windows） |
 
-### 命令清单（36 个 `#[tauri::command]`，按域分组）
+### 主要命令清单（按域分组）
 
 | 域 | 命令 |
 | --- | --- |
@@ -426,7 +425,7 @@ ClaudeSwitcher-portable.zip                                       # 便携版
 
 ```
 React 主窗口（7 个面板） / 托盘弹窗
-        │  invoke（36 个命令，阻塞操作全部经 blocking() 移出主线程）
+        │  invoke（阻塞操作经 blocking() 移出主线程）
         ▼
 lib.rs（命令层）
    ├─ accounts.rs ── credentials.rs ──► %USERPROFILE%\.claude\.credentials.json
@@ -593,7 +592,7 @@ npx tsc --noEmit                            # 前端类型
 npm run tauri build                         # 出 MSI + NSIS
 ```
 
-当前测试状态（v0.2.2）：**175 通过 + 1 ignored**（`encrypt_decrypt_roundtrip` 需实机凭据存储；以 `cargo test --lib` 实际输出为准）。测试覆盖亮点：链接识别与悬空链接、路径归一化（含 8.3 短名）、原子写入、merge/scrub 逻辑、BOM/UTF-16 解码、进程匹配表格（16 例）、Clash 控制器地址归一化（11 例，含 IPv6）、`is_under` 前缀陷阱、删除链路 `deactivate_in`（含硬链接 config.json、悬空 junction、移除失败中止保现场）、版本号比较（含预发布后缀）、CSBK1 快照加解密（AAD 防篡改、KDF 参数上限）、keep 路径沙箱（备用数据流/设备名/尾点尾空格/大小写重复）。
+当前源码测试状态：**414 通过、0 失败、0 ignored**（2026-11-01；以 `cargo test --lib` 实际输出为准）。主密钥相关测试使用内存后端，不依赖真实凭据存储。除链接、路径、原子写入、BOM/UTF-16、进程匹配、控制器地址、加密快照和 keep 路径边界外，还覆盖更新缓存与 SemVer 比较、Claude Desktop 传统/MSIX 语言配置读取。详细验证与限制见 [更新检查记录](docs/optimization-2026-11-01.md) 和 [客户端语言记录](docs/optimization-client-language-2026-11-01.md)。
 
 ---
 
@@ -606,7 +605,7 @@ npm run tauri build                         # 出 MSI + NSIS
 
 ## 构建与发布
 
-- `CI`（`.github/workflows/ci.yml`）：push / PR 时在 macOS 与 Windows runner 上跑前端构建、`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --lib`、Tauri build。（macOS runner 的 host 与 target 不同，会额外按 target 再跑一遍 clippy；Windows runner 两者相同，不重复。）
+- `CI`（`.github/workflows/ci.yml`）：向 `main` 推送或创建以 `main` 为目标的 PR 时，在 Windows x64 runner 上跑前端构建、`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test --lib`、Tauri build。本项目仅面向 Windows。
 - `Windows Build`（`.github/workflows/windows-build.yml`）：打 `v*` tag 自动构建 MSI / NSIS 并**自动创建 Release**（含 `SHA256SUMS.txt`，裸文件名可直接 `sha256sum -c`）；手动触发只出 Actions 产物。**构建来源证明（v0.2.0 起）**：安装包带 GitHub attestation，可验证确实来自本仓库 CI：`gh attestation verify .\ClaudeSwitcher_0.2.2_x64-setup.exe -R 48ytw4q7zg-sudo/claude-switcher-windows`。**从 v0.1.0 升级请先卸载旧版**（v0.2.0 更换了应用标识与发布者署名；用户数据在 `%USERPROFILE%\.claude-switcher\` 不受影响，装完新版自动继续使用）。
 - 未配置代码签名证书；首次运行安装包会有 SmartScreen 提示，属预期。有条件可接 Azure Trusted Signing 或自持证书消除该提示。**路线图**：可申请 SignPath Foundation 面向开源项目的免费代码签名（需项目审核通过）。
 
@@ -627,4 +626,4 @@ npm run tauri build                         # 出 MSI + NSIS
 
 - 工程说明（构建命令、架构约定、踩坑记录全文）：见 [AGENTS.md](AGENTS.md)。
 - 上游基线、功能映射与升级差异审查流程：见 [docs/upstream-baseline.md](docs/upstream-baseline.md)。
-- 提交 PR 前请跑完「质量门禁与测试」一节的本地门禁；CI 会在 macOS 与 Windows 上再跑一遍。
+- 提交 PR 前请跑完「质量门禁与测试」一节的本地门禁；CI 会在 Windows 上再跑一遍。

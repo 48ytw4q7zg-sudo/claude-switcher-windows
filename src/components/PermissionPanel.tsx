@@ -1,3 +1,4 @@
+import { formatError, formatMessage } from '../uiText';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { AlertTriangle, Loader2, Plus, ShieldCheck, Trash2 } from 'lucide-react';
@@ -58,7 +59,7 @@ export function PermissionPanel() {
       setHooks(result.hooks);
       setError(null);
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     }
   }, []);
 
@@ -88,7 +89,7 @@ export function PermissionPanel() {
       await load();
       setSaved(true);
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     } finally {
       setBusy(false);
     }
@@ -103,7 +104,7 @@ export function PermissionPanel() {
     <section className="profiles">
       <div className="section-title">
         <h2>{t('perm.title')}</h2>
-        <span>settings.json</span>
+        <span>设置文件 settings.json</span>
       </div>
       <div className="panel">
         <div className="panel-title">
@@ -118,9 +119,9 @@ export function PermissionPanel() {
         {data && data.warnings.length > 0 && (
           <div className="warnings compact">
             {data.warnings.map((w, i) => (
-              <div key={`${i}-${w}`}>
+              <div key={`${i}-${formatMessage(w)}`}>
                 <AlertTriangle size={14} />
-                {w}
+                {formatMessage(w)}
               </div>
             ))}
           </div>

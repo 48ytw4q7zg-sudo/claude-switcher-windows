@@ -1,3 +1,4 @@
+import { formatError, formatMessage, localizedDiagnostics, technicalLabel } from '../uiText';
 import { useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -34,7 +35,7 @@ export function PrivacyTools() {
       const id = await invoke<string>('open_safe_cmd', { url: safeUrl.trim() });
       setSafeSession(id);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setBusy(null);
     }
@@ -48,7 +49,7 @@ export function PrivacyTools() {
       await invoke('close_safe_cmd', { id: safeSession });
       setSafeSession(null);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setBusy(null);
     }
@@ -64,7 +65,7 @@ export function PrivacyTools() {
       });
       setProxyResult(result);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setBusy(null);
     }
@@ -77,7 +78,7 @@ export function PrivacyTools() {
       const fp = await invoke<SystemFingerprint>('system_fingerprint_cmd');
       setFingerprint(fp);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setBusy(null);
     }
@@ -90,7 +91,7 @@ export function PrivacyTools() {
       const info = await invoke<CliInfo>('cli_info_cmd');
       setCliInfo(info);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setBusy(null);
     }
@@ -122,7 +123,7 @@ export function PrivacyTools() {
           <input
             value={safeUrl}
             onChange={(e) => setSafeUrl(e.target.value)}
-            placeholder="https://example.com"
+            placeholder="网页地址，例如 https://example.com"
             style={{ marginTop: 8 }}
           />
           <div className="profile-actions" style={{ marginTop: 10 }}>
@@ -158,7 +159,7 @@ export function PrivacyTools() {
           <input
             value={proxyUrl}
             onChange={(e) => setProxyUrl(e.target.value)}
-            placeholder="http://127.0.0.1:7897"
+            placeholder="代理地址，例如 http://127.0.0.1:7897"
             style={{ marginTop: 8 }}
           />
           <button
@@ -171,7 +172,7 @@ export function PrivacyTools() {
             开始诊断
           </button>
           {proxyResult && (
-            <pre className="diag-pre">{JSON.stringify(proxyResult, null, 2)}</pre>
+            <pre className="diag-pre">{JSON.stringify(localizedDiagnostics(proxyResult), null, 2)}</pre>
           )}
         </div>
 
@@ -182,7 +183,7 @@ export function PrivacyTools() {
             <span>系统指纹体检</span>
           </div>
           <p className="telemetry-intro">
-            读取 OS / CPU / 内存 / GPU / 是否虚拟机，用于判断当前环境是否容易被关联。
+            读取操作系统、处理器、内存、显卡和虚拟机状态，用于判断当前环境是否容易被关联。
           </p>
           <button className="ghost wide" onClick={loadFingerprint} disabled={busy !== null}>
             {busy === 'fingerprint' ? <Loader2 className="spin" /> : <MonitorSmartphone />}
@@ -201,7 +202,7 @@ export function PrivacyTools() {
                 <strong>{fingerprint.host_name}</strong>
               </div>
               <div className="field">
-                <span>CPU</span>
+                <span>处理器</span>
                 <strong style={{ fontSize: 12 }}>{fingerprint.cpu_brand}</strong>
               </div>
               <div className="field">
@@ -209,8 +210,8 @@ export function PrivacyTools() {
                 <strong>{humanBytes(fingerprint.total_memory_bytes)}</strong>
               </div>
               <div className="field">
-                <span>GPU</span>
-                <strong style={{ fontSize: 12 }}>{fingerprint.gpu}</strong>
+                <span>显卡</span>
+                <strong style={{ fontSize: 12 }}>{technicalLabel(fingerprint.gpu)}</strong>
               </div>
               <div className="field">
                 <span>虚拟机判定</span>
@@ -225,7 +226,7 @@ export function PrivacyTools() {
               )}
               {fingerprint.web_notice && (
                 <p className="usage-note" style={{ marginTop: 8 }}>
-                  {fingerprint.web_notice}
+                  {formatMessage(fingerprint.web_notice)}
                 </p>
               )}
             </div>
@@ -236,14 +237,14 @@ export function PrivacyTools() {
         <div className="panel">
           <div className="panel-title">
             <TerminalSquare />
-            <span>Claude Code CLI 体检</span>
+            <span>Claude Code 命令行体检</span>
           </div>
           <p className="telemetry-intro">
             扫描本机安装的 claude 可执行文件路径、版本与安装方式。
           </p>
           <button className="ghost wide" onClick={loadCliInfo} disabled={busy !== null}>
             {busy === 'cli' ? <Loader2 className="spin" /> : <TerminalSquare />}
-            扫描 CLI
+            扫描命令行工具
           </button>
           {cliInfo && (
             <div style={{ marginTop: 12 }}>
@@ -259,7 +260,7 @@ export function PrivacyTools() {
               )}
               {cliInfo.instances.map((inst, i) => (
                 <div className="link-mode-row" key={i}>
-                  <span>#{inst.order} · {inst.install_method}</span>
+                  <span>#{inst.order} · {technicalLabel(inst.install_method)}</span>
                   <strong style={{ fontSize: 11 }}>
                     {inst.version ? `v${inst.version} · ` : ''}
                     {inst.path}
@@ -270,7 +271,7 @@ export function PrivacyTools() {
                 <div className="inline-warning" style={{ marginTop: 8 }}>
                   {cliInfo.warnings.map((w, i) => (
                     <div key={i} style={{ fontSize: 12, fontWeight: 600 }}>
-                      · {w}
+                      · {formatMessage(w)}
                     </div>
                   ))}
                 </div>

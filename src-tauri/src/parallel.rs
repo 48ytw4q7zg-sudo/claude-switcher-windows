@@ -108,66 +108,89 @@ fn stored_profile_uuid(profile: &StoredProfile) -> Option<&str> {
     })
 }
 
-/// J-3/K-1 核心：在已借用的 profile 上做身份校验并按需回写凭据。
+/// K-1/I-09：把已核对身份的远端凭据提交进账号库（纯函数，供并行与 WSL 共用）。
 ///
-/// `disk_uuid` 为已核对到的磁盘账号 uuid（本地解析或网络 profile 核对），
-/// `conservative_when_unknown` 决定磁盘 uuid 缺失时的策略：
-/// - 两边都能解析且**不一致** → 拒绝回写，返回提示「该并行目录已换成别的账号，
-///   可收养为新账号」，绝不覆盖；
-/// - **账号库未登记 uuid** 而磁盘能解析出 uuid → 无法证明是同一账号，拒绝回写
-///   （否则用户 `/login` 换了号，新凭据会被写进原账号快照，之后切回去就串号）；
-/// - `disk_uuid=None` 且 `conservative_when_unknown=true`（后台网络路径）→
-///   查不到身份，保守不覆盖，留待下次托盘刷新再试；
-/// - 其余（一致）→ best-effort 回写，值不同才更新。
+/// 三道闸门，缺一不可：
+/// 1. **身份一致**：调用方已核对 `disk_uuid == 登记 uuid`（身份未知绝不进这里）；
+/// 2. **严格更新**：远端过期时间必须晚于库内现值，否则回写等于把库里的新令牌
+///    打回旧值（并行目录保存 T1、全局已刷新为 T2 的经典顺序）；
+/// 3. **快照未变**：`observed_store_blob` 是核对期间读到的库内快照；提交时若它
+///    已与当前值不同，说明期间有别的写入（用户切号/另一次回写）先落地，
+///    本次结果已过期，必须放弃而不是覆盖。
 ///
-/// 返回 Some(提示) 时调用方负责展示/记录。
-fn verify_and_apply_credential_inner(
+/// 返回 `true` 表示已写入；`false` 表示按上述任一条件放弃（值相同也返回 false）。
+pub(crate) fn commit_verified_credential(
     profile: &mut StoredProfile,
-    raw: &str,
+    observed_store_blob: &str,
+    remote_blob: &str,
     disk_uuid: Option<&str>,
-    conservative_when_unknown: bool,
-) -> Option<String> {
-    let stored_uuid = stored_profile_uuid(profile);
-    match (disk_uuid, stored_uuid) {
-        // 两边都能解析：一致才放行，不一致拒绝。
-        (Some(disk), Some(stored)) if disk == stored => {}
-        (Some(disk), Some(stored)) => {
-            return Some(format!(
-                "并行目录「{}」已换成别的账号（磁盘账号 {disk} ≠ 登记账号 {stored}），已拒绝回写以免覆盖；可在界面把它收养为新账号。",
-                profile.name
-            ));
-        }
-        // 账号库未登记 uuid，磁盘却能解析出 uuid：无法证明是同一账号，拒绝。
-        // 老账号快照可能没有 uuid，此时宁可保守也不冒串号风险。
-        (Some(disk), None) => {
-            return Some(format!(
-                "账号「{}」未登记账号 uuid，无法确认并行目录里的凭据（{disk}）属于它，已拒绝回写；请重新捕获该账号后再试。",
-                profile.name
-            ));
-        }
-        // 磁盘 uuid 解析不到。
-        (None, _) => {
-            if conservative_when_unknown {
-                // 网络核对查不到身份：保守不覆盖，下次托盘刷新再试。
-                return None;
-            }
-        }
+) -> bool {
+    // 身份必须**可核对且一致**：任一边拿不到 uuid 都不算证明同一账号。
+    // （`None == None` 会让「两边都未知」被误判为一致，正是原始缺陷的成因。）
+    if disk_uuid.is_none() || disk_uuid != stored_profile_uuid(profile) {
+        return false;
     }
-    let same = matches!(&profile.keychain_password, Some(cur) if cur == raw);
-    if !same {
-        profile.keychain_password = Some(raw.to_string());
-        profile.updated_at = chrono::Utc::now();
+    if !remote_credential_is_newer(remote_blob, observed_store_blob) {
+        return false;
     }
-    None
+    if !matches!(&profile.keychain_password, Some(cur) if cur == observed_store_blob) {
+        return false;
+    }
+    if matches!(&profile.keychain_password, Some(cur) if cur == remote_blob) {
+        return false;
+    }
+    profile.keychain_password = Some(remote_blob.to_string());
+    profile.updated_at = chrono::Utc::now();
+    true
 }
 
-/// K-1：用已核对好的磁盘 uuid（网络 profile）做身份校验，查不到身份时保守不覆盖。
-fn verify_and_apply_credential_checked(
-    profile: &mut StoredProfile,
-    raw: &str,
-    disk_uuid: Option<&str>,
-) -> Option<String> {
-    verify_and_apply_credential_inner(profile, raw, disk_uuid, true)
+/// 远端凭据是否严格新于库内快照（过期时间更晚；任一边解析不到时按旧宽松语义
+/// 认为「可写」，但前提是另外两道闸门已通过）。
+fn remote_credential_is_newer(remote: &str, current: &str) -> bool {
+    match (
+        credential_blob_expiry(remote),
+        credential_blob_expiry(current),
+    ) {
+        (Some(remote_exp), Some(current_exp)) => remote_exp > current_exp,
+        _ => true,
+    }
+}
+
+/// 从凭据 blob 读访问令牌过期时间（毫秒）。
+fn credential_blob_expiry(blob: &str) -> Option<u64> {
+    crate::token_status::evaluate_token_status(blob, 0).expires_at_ms
+}
+
+/// I-09/WSL：延迟凭据回写的账号库提交入口（带「仍是当前账号」闸门）。
+///
+/// WSL 同步与并行后台核对都是「先读库 → 花数秒联网核对 → 再写库」的形状，
+/// 期间用户可能切到别的账号。若目标账号已不是当前账号，本次结果可能是上一个
+/// 账号的残留，必须拒绝而不是写进账号库。
+pub(crate) fn commit_wsl_credential_if_current(
+    store_data: &mut store::Store,
+    profile_id: &str,
+    observed_store_blob: &str,
+    remote_blob: &str,
+) -> Result<(), String> {
+    let Some(profile) = store_data.profiles.iter_mut().find(|p| p.id == profile_id) else {
+        return Err("找不到当前账号".to_string());
+    };
+    if store_data.current_profile_id.as_deref() != Some(profile_id) {
+        return Err("账号已切换，已放弃本次凭据回写".to_string());
+    }
+    if !matches!(&profile.keychain_password, Some(cur) if cur == observed_store_blob) {
+        return Err("账号库凭据在核对期间已被更新，已放弃本次回写".to_string());
+    }
+    let disk_uuid = stored_profile_uuid(profile).map(str::to_string);
+    if !commit_verified_credential(
+        profile,
+        observed_store_blob,
+        remote_blob,
+        disk_uuid.as_deref(),
+    ) {
+        return Err("账号库凭据不比远端旧或身份不一致，已放弃本次回写".to_string());
+    }
+    Ok(())
 }
 
 /// 正在做身份核对/回写的 profile id 集合（in-flight 去重）。
@@ -221,18 +244,67 @@ fn sync_parallel_credentials_back(profile_id: &str, raw_cred: &str) {
             }
         }
         let _guard = ClaimGuard(id.clone());
+        // 联网核对前先记录库内快照原文：核对要花数秒，期间用户可能切号或
+        // 另一次回写先落地，提交时必须比对这份快照有没有变。
+        let observed = store::with_store(|s| {
+            let Some(profile) = s.profiles.iter().find(|p| p.id == id) else {
+                return Ok(None);
+            };
+            Ok(Some((
+                profile.keychain_password.clone().unwrap_or_default(),
+                stored_profile_uuid(profile).map(str::to_string),
+            )))
+        })
+        .ok()
+        .flatten();
+        let Some((observed_blob, stored_uuid)) = observed else {
+            return;
+        };
         // 网络核对（约 4 秒超时，命中缓存则更快）；失败 → None。
         let disk_uuid = crate::usage::oauth_account_uuid_for_blob(&raw);
         let result = store::with_store(|s| {
             let Some(profile) = s.profiles.iter_mut().find(|p| p.id == id) else {
                 return Ok(());
             };
-            if let Some(warn) =
-                verify_and_apply_credential_checked(profile, &raw, disk_uuid.as_deref())
-            {
-                crate::log_error(&warn);
+            // 身份核对：库内未登记 uuid 或两边不一致 → 拒绝，绝不覆盖。
+            match (disk_uuid.as_deref(), stored_uuid.as_deref()) {
+                (Some(disk), Some(stored)) if disk == stored => {}
+                (Some(disk), None) => {
+                    crate::log_error(&format!(
+                        "账号「{}」未登记账号 uuid，无法确认并行目录凭据（{disk}）属于它，已拒绝回写；请重新捕获该账号后再试。",
+                        profile.name
+                    ));
+                    return Ok(());
+                }
+                (Some(disk), Some(stored)) => {
+                    crate::log_error(&format!(
+                        "并行目录「{}」已换成别的账号（磁盘账号 {disk} ≠ 登记账号 {stored}），已拒绝回写以免覆盖；可在界面把它收养为新账号。",
+                        profile.name
+                    ));
+                    return Ok(());
+                }
+                (None, _) => {
+                    // 网络也核对不到身份：保守不覆盖，留待下次托盘刷新再试。
+                    return Ok(());
+                }
             }
-            Ok::<(), String>(())
+            // 三道闸门（身份/严格更新/快照未变）在提交函数内统一校验。
+            if commit_verified_credential(
+                profile,
+                &observed_blob,
+                &raw,
+                Some(
+                    disk_uuid
+                        .as_deref()
+                        .unwrap_or(&stored_uuid.unwrap_or_default()),
+                ),
+            ) {
+                return Ok(());
+            }
+            crate::log_error(&format!(
+                "并行目录凭据回写已放弃（可能已有更新写入或账号已切换）: profile={id}"
+            ));
+            Ok(())
         });
         if let Err(e) = result {
             crate::log_error(&format!(
@@ -257,8 +329,7 @@ enum CredentialAction {
 
 /// J-3/K-1：在已借用的 profile 上判定一条磁盘凭据该如何处置（纯函数）。
 ///
-/// 与 [`verify_and_apply_credential`] 的区别：这里**不写入**，只给决定，由调用方
-/// 分派到「立即回写」或「后台网络核对」。
+/// 这里**不写入**，只给决定，由调用方分派到「立即回写」或「后台网络核对」。
 fn classify_scanned_credential(profile: &StoredProfile, raw: &str) -> CredentialAction {
     let stored_uuid = stored_profile_uuid(profile);
     match (credential_blob_account_uuid(raw), stored_uuid) {
@@ -685,20 +756,115 @@ mod tests {
         assert_eq!(credential_blob_account_uuid("not-json"), None);
     }
 
-    // 原「本地 best-effort 回写」测试已随 verify_and_apply_credential 删除：
-    // 本地解析不到 uuid 时不再直接覆盖，改为交后台核对（见
-    // unknown_disk_identity_is_deferred_not_written）。身份不一致/一致的
-    // 写入语义由下面两个 checked 测试覆盖。
+    // 回写提交语义由下面这些 checked 测试覆盖（身份/严格更新/快照未变）。
 
     // ── K-1 后台网络核对路径 ──
+
+    fn blob_with_expiry(expiry: u64) -> String {
+        serde_json::json!({
+            "claudeAiOauth": { "accessToken": "fixture", "expiresAt": expiry }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn checked_rejects_stale_remote_and_changed_snapshot() {
+        let old = blob_with_expiry(1_000);
+        let newer_disk = blob_with_expiry(2_000);
+        let newest_store = blob_with_expiry(3_000);
+        // (库内现值, 期望回写结果)：旧库 → 写新；已相同 → 不动；库更新 → 拒绝。
+        for (store_blob, expected) in [
+            (old.as_str(), Some(newer_disk.as_str())),
+            (newer_disk.as_str(), Some(newer_disk.as_str())),
+            (newest_store.as_str(), Some(newest_store.as_str())),
+        ] {
+            let mut profile = make_test_profile(Some("same-uuid"));
+            profile.keychain_password = Some(store_blob.to_string());
+            commit_verified_credential(&mut profile, store_blob, &newer_disk, Some("same-uuid"));
+            assert_eq!(
+                profile.keychain_password.as_deref(),
+                expected,
+                "远端必须严格新于库内版本；相同或库内更新时不得回写"
+            );
+        }
+        // 身份不一致：即使远端更新也不得写入。
+        let mut profile = make_test_profile(Some("same-uuid"));
+        profile.keychain_password = Some(old.clone());
+        commit_verified_credential(&mut profile, &old, &newer_disk, Some("other-uuid"));
+        assert_eq!(
+            profile.keychain_password.as_deref(),
+            Some(old.as_str()),
+            "身份不一致绝不回写"
+        );
+    }
+
+    #[test]
+    fn checked_refuses_changed_snapshot_and_wrong_selected_profile() {
+        let mut store = store::Store::default();
+        let mut profile = make_test_profile(Some("same-uuid"));
+        let observed = blob_with_expiry(1_000);
+        profile.keychain_password = Some(observed.clone());
+        store.profiles.push(profile);
+        let current_id = store.profiles[0].id.clone();
+        // 1. 目标账号不是当前账号 → 拒绝。
+        store.current_profile_id = Some("other".to_string());
+        assert!(
+            commit_wsl_credential_if_current(
+                &mut store,
+                &current_id,
+                &observed,
+                &blob_with_expiry(2_000),
+            )
+            .is_err(),
+            "账号已切换时必须拒绝回写"
+        );
+        // 2. 仍是当前账号，但库内快照在核对期间被改新 → 拒绝覆盖。
+        store.current_profile_id = Some(current_id.clone());
+        store.profiles[0].keychain_password = Some(blob_with_expiry(3_000));
+        assert!(
+            commit_wsl_credential_if_current(
+                &mut store,
+                &current_id,
+                &observed,
+                &blob_with_expiry(2_000),
+            )
+            .is_err(),
+            "观察到的旧快照已被改动时必须拒绝回写"
+        );
+        assert_eq!(
+            store.profiles[0].keychain_password.as_deref(),
+            Some(blob_with_expiry(3_000).as_str()),
+            "较新的库内值必须保留"
+        );
+        // 3. 仍是当前账号且快照未变 → 允许回写。
+        let observed_old = store.profiles[0].keychain_password.clone().unwrap();
+        store.profiles[0].keychain_password = Some(blob_with_expiry(1_000));
+        assert!(
+            commit_wsl_credential_if_current(
+                &mut store,
+                &current_id,
+                &blob_with_expiry(1_000),
+                &blob_with_expiry(2_000),
+            )
+            .is_ok(),
+            "快照未变且远端更新时应允许回写"
+        );
+        assert_eq!(
+            store.profiles[0].keychain_password.as_deref(),
+            Some(blob_with_expiry(2_000).as_str()),
+            "回写后库内应为远端新值"
+        );
+        let _ = observed_old;
+    }
 
     #[test]
     fn checked_conservative_skips_write_when_identity_unknown() {
         let mut profile = make_test_profile(Some("stored-uuid"));
         let raw = "new-raw-cred";
         // 网络查不到身份（None）→ 保守不覆盖，也无警告。
-        let warn = verify_and_apply_credential_checked(&mut profile, raw, None);
-        assert!(warn.is_none());
+        // 身份核对不到（None）→ 提交函数拒绝回写。
+        let written = commit_verified_credential(&mut profile, "old-raw", raw, None);
+        assert!(!written);
         assert_eq!(
             profile.keychain_password.as_deref(),
             Some("old-raw"),
@@ -711,9 +877,8 @@ mod tests {
         let mut profile = make_test_profile(Some("stored-uuid"));
         let raw = "new-raw-cred";
         // 网络核对到的 uuid 与登记 uuid 不一致 → 拒绝回写并提示收养。
-        let warn = verify_and_apply_credential_checked(&mut profile, raw, Some("other-uuid"));
-        assert!(warn.is_some());
-        assert!(warn.unwrap().contains("收养"));
+        let written = commit_verified_credential(&mut profile, "old-raw", raw, Some("other-uuid"));
+        assert!(!written, "身份不一致必须拒绝回写");
         assert_eq!(
             profile.keychain_password.as_deref(),
             Some("old-raw"),
@@ -726,9 +891,8 @@ mod tests {
         let mut profile = make_test_profile(Some("same-uuid"));
         let raw = "new-raw-cred";
         // 网络 uuid 与登记一致 → 回写新凭据。
-        assert!(
-            verify_and_apply_credential_checked(&mut profile, raw, Some("same-uuid")).is_none()
-        );
+        let written = commit_verified_credential(&mut profile, "old-raw", raw, Some("same-uuid"));
+        assert!(written, "身份一致且远端更新时应回写");
         assert_eq!(profile.keychain_password.as_deref(), Some(raw));
     }
 
@@ -739,9 +903,9 @@ mod tests {
         // 账号库未登记 uuid，网络却能核对到身份：无法证明是同一账号。
         // 早先这里放行回写——等于把并行终端里换号后的凭据写进原账号快照，
         // 之后切回该账号就会写入别人的登录态。必须拒绝。
-        let warn = verify_and_apply_credential_checked(&mut profile, raw, Some("network-uuid"));
-        assert!(warn.is_some(), "账号库无 uuid 时必须拒绝回写");
-        assert!(warn.unwrap().contains("未登记"));
+        let written =
+            commit_verified_credential(&mut profile, "old-raw", raw, Some("network-uuid"));
+        assert!(!written, "账号库无 uuid 时必须拒绝回写");
         assert_eq!(
             profile.keychain_password.as_deref(),
             Some("old-raw"),
@@ -753,8 +917,8 @@ mod tests {
     fn checked_refuses_when_stored_uuid_unknown_and_disk_uuid_unknown() {
         // 两边都解析不到 uuid：后台路径保守不覆盖，也不报错（留待下次重试）。
         let mut profile = make_test_profile(None);
-        let warn = verify_and_apply_credential_checked(&mut profile, "new-raw-cred", None);
-        assert!(warn.is_none());
+        let written = commit_verified_credential(&mut profile, "old-raw", "new-raw-cred", None);
+        assert!(!written, "两边都解析不到 uuid 时不得覆盖");
         assert_eq!(profile.keychain_password.as_deref(), Some("old-raw"));
     }
 

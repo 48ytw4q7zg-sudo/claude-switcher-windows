@@ -83,47 +83,53 @@ fn config_path() -> Result<std::path::PathBuf, String> {
     Ok(paths::app_data_dir()?.join("appconfig.json"))
 }
 
-/// 读取配置；文件不存在时返回默认。
-///
-/// **文件损坏时不静默回默认**：记一条日志说明原内容未被采用，且不会自动重写
-/// （要等某次 `update()` 才会整体覆盖）。静默回退会让用户以为地区/代理设置
-/// 还在，实际已被默认值取代，排障时毫无线索。
+/// 读取配置供界面展示；错误会记录，原文件保持可恢复状态。
 pub fn load() -> AppConfig {
-    match config_path() {
-        Ok(path) if path.exists() => match std::fs::read_to_string(&path) {
-            Ok(text) => match serde_json::from_str::<AppConfig>(&text) {
-                Ok(cfg) => cfg,
-                Err(e) => {
-                    crate::log_error(&format!(
-                        "appconfig.json 解析失败，本次按默认配置运行（{}）；\
-                         下次保存设置会整体覆盖该文件",
-                        e
-                    ));
-                    AppConfig::default()
-                }
-            },
-            Err(e) => {
-                crate::log_error(&format!("appconfig.json 读取失败，按默认配置运行: {e}"));
-                AppConfig::default()
-            }
-        },
-        _ => AppConfig::default(),
+    match config_path().and_then(|path| load_from(&path)) {
+        Ok(config) => config,
+        Err(error) => {
+            crate::log_error(&format!(
+                "应用配置读取失败，本次展示默认值，原文件已保留：{error}"
+            ));
+            AppConfig::default()
+        }
     }
 }
 
-/// 原子写入配置。
-pub fn save(config: &AppConfig) -> Result<(), String> {
-    let path = config_path()?;
-    let text =
-        serde_json::to_string_pretty(config).map_err(|e| format!("序列化 appconfig 失败: {e}"))?;
-    fsx::write_atomically(&path, &text).map_err(|e| format!("写入 appconfig 失败: {e}"))
+fn load_from(path: &std::path::Path) -> Result<AppConfig, String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(AppConfig::default())
+        }
+        Err(error) => return Err(format!("读取应用配置失败：{error}")),
+    };
+    let text = crate::jsonio::decode_text(&bytes);
+    serde_json::from_str(&text)
+        .map_err(|error| format!("应用配置格式无效，请先修复配置文件：{error}"))
 }
 
-/// 在当前配置上原地修改并原子保存，返回更新后的配置。
+/// 在跨进程排他锁内完成读取、修改和原子保存。
+/// 闭包只修改传入配置，不得再次调用 update。
 pub fn update(mut f: impl FnMut(&mut AppConfig)) -> Result<AppConfig, String> {
-    let mut config = load();
+    let path = config_path()?;
+    let parent = path
+        .parent()
+        .ok_or_else(|| "应用配置缺少父目录".to_string())?;
+    std::fs::create_dir_all(parent).map_err(|error| format!("创建配置目录失败：{error}"))?;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path.with_extension("lock"))
+        .map_err(|error| format!("打开配置锁失败：{error}"))?;
+    fs4::FileExt::lock(&lock).map_err(|error| format!("获取配置锁失败：{error}"))?;
+    let mut config = load_from(&path)?;
     f(&mut config);
-    save(&config)?;
+    let text = serde_json::to_string_pretty(&config)
+        .map_err(|error| format!("序列化应用配置失败：{error}"))?;
+    fsx::write_atomically(&path, &text).map_err(|error| format!("保存应用配置失败：{error}"))?;
     Ok(config)
 }
 
@@ -132,8 +138,59 @@ mod tests {
     use super::*;
 
     #[test]
+    fn update_preserves_invalid_configuration_and_does_not_run_the_change() {
+        let _lock = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let path = config_path().unwrap();
+        assert_eq!(path, dir.path().join(".claude-switcher/appconfig.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "invalid configuration, preserve").unwrap();
+        let mut called = false;
+        assert!(update(|cfg| {
+            called = true;
+            cfg.country_target = Some("JP".into());
+        })
+        .is_err());
+        assert!(!called);
+        assert_eq!(
+            std::fs::read_to_string(path).unwrap(),
+            "invalid configuration, preserve"
+        );
+    }
+
+    #[test]
+    fn concurrent_updates_retain_every_change() {
+        let _lock = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        update(|cfg| cfg.country_target = Some("JP".into())).unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let threads: Vec<_> = (0..8)
+            .map(|_| {
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    update(|cfg| {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        cfg.quota_reminder_threshold += 1;
+                    })
+                    .unwrap();
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let result = load();
+        assert_eq!(result.quota_reminder_threshold, 98);
+        assert_eq!(result.country_target.as_deref(), Some("JP"));
+    }
+
+    #[test]
     fn missing_file_yields_default() {
-        let parsed: AppConfig = serde_json::from_str("{}").unwrap_or_default();
+        let dir = tempfile::tempdir().unwrap();
+        let parsed = load_from(&dir.path().join("missing.json")).unwrap();
         assert_eq!(parsed, AppConfig::default());
     }
 
@@ -151,8 +208,10 @@ mod tests {
     }
 
     #[test]
-    fn tolerates_garbage_via_default() {
-        let parsed: AppConfig = serde_json::from_str("not json").unwrap_or_default();
-        assert_eq!(parsed, AppConfig::default());
+    fn strict_loader_rejects_invalid_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("invalid.json");
+        std::fs::write(&path, "not json").unwrap();
+        assert!(load_from(&path).is_err());
     }
 }

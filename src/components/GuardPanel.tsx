@@ -1,3 +1,4 @@
+import { formatError, formatMessage } from '../uiText';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -12,16 +13,21 @@ import type { GuardTick } from './types';
 
 export function GuardPanel() {
   const [installed, setInstalled] = useState<boolean | null>(null);
+  const [loadingStatus, setLoadingStatus] = useState(true);
   const [tick, setTick] = useState<GuardTick | null>(null);
   const [busy, setBusy] = useState<'install' | 'uninstall' | 'tick' | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   const refreshStatus = useCallback(async () => {
+    setLoadingStatus(true);
     try {
       const s = await invoke<{ installed: boolean }>('guard_status');
       setInstalled(s.installed);
     } catch (err) {
-      setError(String(err));
+      setInstalled(null);
+      setError(formatError(err));
+    } finally {
+      setLoadingStatus(false);
     }
   }, []);
 
@@ -36,7 +42,7 @@ export function GuardPanel() {
       const result = await invoke<GuardTick>('guard_run_tick');
       setTick(result);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setBusy(null);
     }
@@ -50,7 +56,7 @@ export function GuardPanel() {
       await refreshStatus();
     } catch (err) {
       // 安装可能触发 UAC，失败把后端错误文本直接展示。
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setBusy(null);
     }
@@ -64,7 +70,7 @@ export function GuardPanel() {
       setTick(null);
       await refreshStatus();
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setBusy(null);
     }
@@ -81,7 +87,7 @@ export function GuardPanel() {
         <div>
           <span>安装状态</span>
           <strong>
-            {installed === null ? '读取中' : installed ? '已安装' : '未安装'}
+            {loadingStatus ? '读取中' : installed === null ? '读取失败' : installed ? '已安装' : '未安装'}
           </strong>
         </div>
         <div>
@@ -100,7 +106,7 @@ export function GuardPanel() {
 
       {tick && tick.tun_detail && (
         <p className="usage-note" style={{ marginTop: 8 }}>
-          TUN：{tick.tun_detail}
+          TUN：{formatMessage(tick.tun_detail)}
         </p>
       )}
       {tick && tick.killed.length > 0 && (

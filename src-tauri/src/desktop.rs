@@ -67,11 +67,15 @@ fn resolve_desktop_live_dir(
     if appdata_claude.is_dir() {
         return appdata_claude.to_path_buf();
     }
+    resolve_msix_data_dir(msix_root, appx_families).unwrap_or_else(|| appdata_claude.to_path_buf())
+}
+
+fn resolve_msix_data_dir(msix_root: &Path, appx_families: &[String]) -> Option<PathBuf> {
     // 2. AppX 包族名精确命中。
     for family in appx_families {
         let candidate = msix_root.join(family);
         if candidate.is_dir() {
-            return candidate;
+            return Some(candidate);
         }
     }
     // 3. 只有一个 claude_* 子目录时也能唯一定位。
@@ -87,11 +91,10 @@ fn resolve_desktop_live_dir(
             })
             .collect();
         if matches.len() == 1 {
-            return matches.remove(0);
+            return Some(matches.remove(0));
         }
     }
-    // 4. 回落（调用方据此报「未安装」）。
-    appdata_claude.to_path_buf()
+    None
 }
 
 /// Claude Desktop 活数据目录：MSIX 感知。
@@ -111,6 +114,72 @@ pub fn desktop_live_dir() -> Result<PathBuf, String> {
     let msix_root = local.join(MSIX_DATA_DIR_NAME);
     let families = imp::claude_appx_families();
     Ok(resolve_desktop_live_dir(&legacy, &msix_root, &families))
+}
+
+fn client_locale_from_dirs(
+    legacy: &Path,
+    msix_root: &Path,
+    families: &[String],
+) -> Result<String, String> {
+    let legacy_config = legacy.join("config.json");
+    let config_path = if legacy_config.try_exists().map_err(|e| e.to_string())? {
+        legacy_config
+    } else {
+        let mut registered = families
+            .iter()
+            .map(|family| msix_root.join(family))
+            .filter(|candidate| candidate.is_dir());
+        if let Some(first) = registered.next() {
+            let first = imp::normalize_path(&first);
+            if registered.any(|candidate| imp::normalize_path(&candidate) != first) {
+                return Err("发现多个 Claude 安装版本，无法确定语言配置".to_string());
+            }
+        }
+        // MSIX 迁移后旧目录可能仅保留 MCP 配置；不能用旧目录存在代替语言配置存在。
+        resolve_msix_data_dir(msix_root, families)
+            .ok_or_else(|| "未能定位 Claude 的语言配置".to_string())?
+            .join("config.json")
+    };
+    read_client_locale_config(&config_path)
+}
+
+fn read_client_locale_config(path: &Path) -> Result<String, String> {
+    let config = crate::jsonio::read_json_optional(path.to_path_buf())?;
+    config
+        .and_then(|value| {
+            value
+                .get("locale")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned)
+        })
+        .filter(|locale| valid_client_locale(locale))
+        .ok_or_else(|| "未能读取 Claude 的语言设置".to_string())
+}
+
+fn valid_client_locale(locale: &str) -> bool {
+    let mut parts = locale.split('-');
+    let language = parts.next().unwrap_or_default();
+    (2..=3).contains(&language.len())
+        && language.bytes().all(|c| c.is_ascii_alphabetic())
+        && parts.all(|part| {
+            (2..=8).contains(&part.len()) && part.bytes().all(|c| c.is_ascii_alphanumeric())
+        })
+}
+
+/// 读取 Claude 的语言配置；不等同于验证运行中的 navigator.language。
+pub fn client_locale() -> Result<String, String> {
+    let legacy = dirs::config_dir()
+        .ok_or_else(|| "无法定位应用配置目录（%APPDATA%）".to_string())?
+        .join(DESKTOP_DIR_NAME);
+    let config = legacy.join("config.json");
+    if config.try_exists().map_err(|e| e.to_string())? {
+        return read_client_locale_config(&config);
+    }
+    // 仅在传统配置缺失时查询 AppX 包族，避免给普通安装额外增加 PowerShell 调用。
+    let msix_root = dirs::data_local_dir()
+        .ok_or_else(|| "无法定位本地数据目录（%LOCALAPPDATA%）".to_string())?
+        .join(MSIX_DATA_DIR_NAME);
+    client_locale_from_dirs(&legacy, &msix_root, &imp::claude_appx_families())
 }
 
 /// 快照根目录 `~/.claude-switcher/desktop-accounts`。
@@ -476,6 +545,14 @@ fn switch_desktop_profile_in(
         .find(|p| p.id == id)
         .cloned()
         .ok_or_else(|| format!("未找到桌面账号快照: {id}"))?;
+    // 同账号重选必须保留 capture 后产生的实时会话，不能再用旧快照覆盖。
+    // 活目录缺失时仍走下方恢复流程；已有活目录时也不要求快照仍然存在。
+    if store.current_desktop_profile_id.as_deref() == Some(id) && live_dir.is_dir() {
+        return Ok(vec![format!(
+            "当前已是桌面账号「{}」，已保留正在使用的数据",
+            profile.name
+        )]);
+    }
     let snapshot = accounts_dir.join(&profile.id);
     if !snapshot.is_dir() {
         return Err(format!(
@@ -746,7 +823,173 @@ mod tests {
     use super::*;
     use std::fs;
 
+    #[test]
+    fn client_locale_falls_back_to_msix_when_legacy_only_has_mcp_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("Claude");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(
+            legacy.join("claude_desktop_config.json"),
+            b"{\"mcpServers\":{}}",
+        )
+        .unwrap();
+        let msix = dir.path().join("Claude-Data");
+        let family = "Claude_family";
+        fs::create_dir_all(msix.join(family)).unwrap();
+        fs::write(
+            msix.join(family).join("config.json"),
+            b"{\"locale\":\"ja-JP\"}",
+        )
+        .unwrap();
+        assert_eq!(
+            client_locale_from_dirs(&legacy, &msix, &[family.into()]).unwrap(),
+            "ja-JP"
+        );
+    }
+
     // ── MSIX 数据目录发现（上游 Find-ClaudeDataPath 行为基准）──
+
+    fn locale_config(directory: &Path, bytes: &[u8]) -> PathBuf {
+        fs::create_dir_all(directory).unwrap();
+        let path = directory.join("config.json");
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn client_locale_prefers_existing_legacy_config_without_modifying_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("Claude");
+        let msix = dir.path().join("Claude-Data");
+        locale_config(&msix.join("claude_family"), br#"{"locale":"ja-JP"}"#);
+        for locale in ["en", "EN-us", "eng-US", "es-419", "zh-Hant-TW"] {
+            let original = format!(r#"{{"locale":"{locale}","other":"preserve"}}"#);
+            let path = locale_config(&legacy, original.as_bytes());
+            assert_eq!(
+                client_locale_from_dirs(&legacy, &msix, &[]).unwrap(),
+                locale
+            );
+            assert_eq!(fs::read(path).unwrap(), original.as_bytes());
+        }
+    }
+
+    #[test]
+    fn client_locale_uses_unique_msix_directory_without_package_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let msix = dir.path().join("Claude-Data");
+        locale_config(&msix.join("claude_unique"), br#"{"locale":"de-DE"}"#);
+        assert_eq!(
+            client_locale_from_dirs(&dir.path().join("Claude"), &msix, &[]).unwrap(),
+            "de-DE"
+        );
+    }
+
+    #[test]
+    fn client_locale_selects_registered_package_among_multiple_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let msix = dir.path().join("Claude-Data");
+        locale_config(&msix.join("claude_old"), br#"{"locale":"en-US"}"#);
+        locale_config(&msix.join("claude_current"), br#"{"locale":"fr-FR"}"#);
+        assert_eq!(
+            client_locale_from_dirs(
+                &dir.path().join("Claude"),
+                &msix,
+                &["claude_current".into()]
+            )
+            .unwrap(),
+            "fr-FR"
+        );
+    }
+
+    #[test]
+    fn client_locale_accepts_case_aliases_of_one_registered_package() {
+        let dir = tempfile::tempdir().unwrap();
+        let msix = dir.path().join("Claude-Data");
+        locale_config(&msix.join("claude_current"), br#"{"locale":"fr-FR"}"#);
+        assert_eq!(
+            client_locale_from_dirs(
+                &dir.path().join("Claude"),
+                &msix,
+                &["claude_current".into(), "CLAUDE_CURRENT".into()],
+            )
+            .unwrap(),
+            "fr-FR"
+        );
+    }
+
+    #[test]
+    fn client_locale_rejects_multiple_registered_packages_in_either_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("Claude");
+        let msix = dir.path().join("Claude-Data");
+        locale_config(&msix.join("claude_a"), br#"{"locale":"en-US"}"#);
+        locale_config(&msix.join("claude_b"), br#"{"locale":"ja-JP"}"#);
+        for families in [["claude_a", "claude_b"], ["claude_b", "claude_a"]] {
+            let families: Vec<String> = families.into_iter().map(str::to_string).collect();
+            assert!(client_locale_from_dirs(&legacy, &msix, &families).is_err());
+        }
+    }
+
+    #[test]
+    fn client_locale_does_not_guess_when_configs_are_missing_or_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("Claude");
+        let msix = dir.path().join("Claude-Data");
+        assert!(client_locale_from_dirs(&legacy, &msix, &[]).is_err());
+        fs::create_dir_all(msix.join("claude_a")).unwrap();
+        assert!(client_locale_from_dirs(&legacy, &msix, &[]).is_err());
+        locale_config(&msix.join("claude_a"), br#"{"locale":"en-US"}"#);
+        locale_config(&msix.join("claude_b"), br#"{"locale":"fr-FR"}"#);
+        assert!(client_locale_from_dirs(&legacy, &msix, &[]).is_err());
+    }
+
+    #[test]
+    fn client_locale_does_not_mask_invalid_legacy_config_with_msix_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("Claude");
+        let msix = dir.path().join("Claude-Data");
+        locale_config(&msix.join("claude_family"), br#"{"locale":"en-US"}"#);
+        for raw in [
+            "{truncated",
+            "{}",
+            r#"{"locale":null}"#,
+            r#"{"locale":123}"#,
+            r#"{"locale":""}"#,
+            r#"{"locale":"en_US"}"#,
+            r#"{"locale":" en-US"}"#,
+            r#"{"locale":"en-US\n"}"#,
+            r#"{"locale":"en-u"}"#,
+            r#"{"locale":"en-123456789"}"#,
+            r#"{"locale":"中文"}"#,
+        ] {
+            let path = locale_config(&legacy, raw.as_bytes());
+            assert!(
+                client_locale_from_dirs(&legacy, &msix, &[]).is_err(),
+                "accepted {raw}"
+            );
+            assert_eq!(fs::read(path).unwrap(), raw.as_bytes());
+        }
+    }
+
+    #[test]
+    fn client_locale_reads_windows_bom_encodings() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("Claude");
+        let msix = dir.path().join("Claude-Data");
+        let raw = r#"{"locale":"zh-Hans-CN"}"#;
+        let mut utf8 = vec![0xef, 0xbb, 0xbf];
+        utf8.extend(raw.as_bytes());
+        let mut utf16 = vec![0xff, 0xfe];
+        utf16.extend(raw.encode_utf16().flat_map(u16::to_le_bytes));
+        for bytes in [utf8, utf16] {
+            let path = locale_config(&legacy, &bytes);
+            assert_eq!(
+                client_locale_from_dirs(&legacy, &msix, &[]).unwrap(),
+                "zh-Hans-CN"
+            );
+            assert_eq!(fs::read(path).unwrap(), bytes);
+        }
+    }
 
     #[test]
     fn live_dir_prefers_legacy_when_present() {
@@ -927,7 +1170,9 @@ mod tests {
 
     #[test]
     fn switch_in_loads_snapshot_backup_old_live_and_updates_timestamp() {
+        let _env = crate::test_support::env_lock();
         let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
         let accounts = dir.path().join("desktop-accounts");
         let snapshot = accounts.join("b-id");
         fs::create_dir_all(&snapshot).unwrap();
@@ -997,7 +1242,9 @@ mod tests {
     fn switch_in_saves_current_live_changes_into_current_account_snapshot() {
         // 上游 Save-Account $cur 语义：切换前必须把活目录回存给「当前账号」，
         // 否则每次切换都把活账号静默回退到上次 capture 的状态。
+        let _env = crate::test_support::env_lock();
         let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
         let accounts = dir.path().join("desktop-accounts");
         let snap_a = accounts.join("a-id");
         let snap_b = accounts.join("b-id");
@@ -1059,7 +1306,9 @@ mod tests {
     #[test]
     fn switch_in_skips_save_back_when_no_current_desktop_account() {
         // 从未 capture/切换过（无当前标记）时不得报错，也不得凭空创建快照。
+        let _env = crate::test_support::env_lock();
         let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
         let accounts = dir.path().join("desktop-accounts");
         let snapshot = accounts.join("b-id");
         fs::create_dir_all(&snapshot).unwrap();
@@ -1102,7 +1351,9 @@ mod tests {
 
     #[test]
     fn switch_in_rolls_back_when_snapshot_copy_fails() {
+        let _env = crate::test_support::env_lock();
         let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
         let accounts = dir.path().join("desktop-accounts");
         let snapshot = accounts.join("b-id");
         fs::create_dir_all(&snapshot).unwrap();
@@ -1162,7 +1413,9 @@ mod tests {
 
     #[test]
     fn switch_in_errors_for_unknown_missing_snapshot_and_still_running() {
+        let _env = crate::test_support::env_lock();
         let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
         let accounts = dir.path().join("desktop-accounts");
         fs::create_dir_all(&accounts).unwrap();
         let live = dir.path().join("APPDATA").join("Claude");
@@ -1226,6 +1479,227 @@ mod tests {
         .unwrap_err();
         assert!(err.contains("未能完全退出"), "{err}");
         assert_eq!(fs::read_to_string(live.join("who.txt")).unwrap(), "A");
+    }
+
+    fn current_desktop_store() -> Store {
+        let past = "2000-01-01T00:00:00Z"
+            .parse::<chrono::DateTime<Utc>>()
+            .unwrap();
+        let mut store = Store {
+            current_desktop_profile_id: Some("current".to_string()),
+            ..Default::default()
+        };
+        store.desktop_profiles.push(DesktopProfile {
+            id: "current".to_string(),
+            name: "当前测试账号".to_string(),
+            snapshot_rel: "desktop-accounts/current".to_string(),
+            created_at: past,
+            updated_at: past,
+            last_switched_at: Some(past),
+            size_bytes: 42,
+            ..Default::default()
+        });
+        store
+    }
+
+    fn file_tree(root: &Path) -> std::collections::BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(
+            root: &Path,
+            current: &Path,
+            result: &mut std::collections::BTreeMap<PathBuf, Vec<u8>>,
+        ) {
+            for entry in fs::read_dir(current).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    collect(root, &path, result);
+                } else {
+                    result.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+        let mut result = std::collections::BTreeMap::new();
+        collect(root, root, &mut result);
+        result
+    }
+
+    #[test]
+    fn switch_in_current_account_preserves_newer_live_bytes_and_store() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let accounts = dir.path().join("desktop-accounts");
+        let snapshot = accounts.join("current");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("session.bin"), b"old-capture").unwrap();
+        let live = dir.path().join("APPDATA/Claude");
+        fs::create_dir_all(live.join("nested")).unwrap();
+        fs::write(live.join("session.bin"), b"new-live-session\0\xff").unwrap();
+        fs::write(live.join("nested/new-session.dat"), [0, 1, 2, 254, 255]).unwrap();
+        let live_before = file_tree(&live);
+        let snapshot_before = file_tree(&snapshot);
+        let mut store = current_desktop_store();
+        let store_before = serde_json::to_value(&store).unwrap();
+        let calls = Rc::new(Cell::new(0));
+        let kill_calls = Rc::clone(&calls);
+        let running_calls = Rc::clone(&calls);
+        let copy_calls = Rc::clone(&calls);
+        let backup_root = dir.path().join("backups");
+        let warnings = switch_desktop_profile_in(
+            "current",
+            &live,
+            &accounts,
+            &mut store,
+            &move |_| {
+                kill_calls.set(kill_calls.get() + 1);
+                Ok(Vec::new())
+            },
+            &move || {
+                running_calls.set(running_calls.get() + 1);
+                Ok(false)
+            },
+            &backup_root,
+            &move |src, dst| {
+                copy_calls.set(copy_calls.get() + 1);
+                copy_dir_recursive(src, dst)
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            file_tree(&live),
+            live_before,
+            "同账号重选不得把当前会话换成旧快照"
+        );
+        assert_eq!(file_tree(&snapshot), snapshot_before);
+        assert_eq!(
+            serde_json::to_value(&store).unwrap(),
+            store_before,
+            "当前标记和所有时间戳应保持原值"
+        );
+        assert_eq!(calls.get(), 0, "幂等操作不得调用退出、进程检测或复制");
+        assert!(!backup_root.exists());
+        assert!(warnings.iter().any(|message| message.contains("当前已是")));
+    }
+
+    #[test]
+    fn switch_in_current_account_with_live_needs_no_snapshot_or_keep_staging() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let accounts = dir.path().join("desktop-accounts");
+        let live = dir.path().join("APPDATA/Claude");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("session.bin"), b"live-only").unwrap();
+        let keep = dir.path().join(".claude-switcher");
+        fs::create_dir_all(keep.join("keep-stage")).unwrap();
+        fs::write(keep.join("keep-in-workspace.txt"), "session.bin").unwrap();
+        fs::write(keep.join("keep-stage/retained.bin"), b"only-retained-copy").unwrap();
+        let keep_before = file_tree(&keep);
+        let mut store = current_desktop_store();
+        let store_before = serde_json::to_value(&store).unwrap();
+        for snapshot_exists in [false, true] {
+            if snapshot_exists {
+                fs::create_dir_all(accounts.join("current")).unwrap();
+            }
+            let result = switch_desktop_profile_in(
+                "current",
+                &live,
+                &accounts,
+                &mut store,
+                &|_| panic!("同账号已有活目录时不得退出进程"),
+                &|| panic!("同账号已有活目录时不得检测进程"),
+                &dir.path().join("backups"),
+                &|_, _| panic!("同账号已有活目录时不得复制文件"),
+            )
+            .unwrap();
+            assert!(result.iter().any(|message| message.contains("当前已是")));
+            assert_eq!(fs::read(live.join("session.bin")).unwrap(), b"live-only");
+            assert_eq!(
+                file_tree(&keep),
+                keep_before,
+                "不得暂存、合并或清理已有 keep 材料"
+            );
+            assert_eq!(serde_json::to_value(&store).unwrap(), store_before);
+            assert!(!dir.path().join("backups").exists());
+        }
+    }
+
+    #[test]
+    fn switch_in_current_account_recovers_missing_live_from_snapshot() {
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let accounts = dir.path().join("desktop-accounts");
+        let snapshot = accounts.join("current");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("session.bin"), b"recoverable-session").unwrap();
+        let snapshot_before = file_tree(&snapshot);
+        let live = dir.path().join("APPDATA/Claude");
+        let mut store = current_desktop_store();
+        let old_updated_at = store.desktop_profiles[0].updated_at;
+        let kill_calls = Rc::new(Cell::new(0));
+        let copy_calls = Rc::new(Cell::new(0));
+        let kill_count = Rc::clone(&kill_calls);
+        let copy_count = Rc::clone(&copy_calls);
+        let warnings = switch_desktop_profile_in(
+            "current",
+            &live,
+            &accounts,
+            &mut store,
+            &move |_| {
+                kill_count.set(kill_count.get() + 1);
+                Ok(Vec::new())
+            },
+            &|| Ok(false),
+            &dir.path().join("backups"),
+            &move |src, dst| {
+                copy_count.set(copy_count.get() + 1);
+                copy_dir_recursive(src, dst)
+            },
+        )
+        .unwrap();
+        assert_eq!(file_tree(&live), snapshot_before);
+        assert_eq!(file_tree(&snapshot), snapshot_before);
+        assert_eq!(kill_calls.get(), 1);
+        assert_eq!(copy_calls.get(), 1);
+        assert_eq!(store.current_desktop_profile_id.as_deref(), Some("current"));
+        assert!(store.desktop_profiles[0].updated_at > old_updated_at);
+        assert!(warnings.iter().any(|message| message.contains("已载入")));
+        assert!(!dir.path().join("backups").exists());
+    }
+
+    #[test]
+    fn switch_in_current_missing_both_and_unknown_id_fail_without_side_effects() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let accounts = dir.path().join("desktop-accounts");
+        let live = dir.path().join("APPDATA/Claude");
+        let mut store = current_desktop_store();
+        let store_before = serde_json::to_value(&store).unwrap();
+        for (target, expected) in [("current", "快照目录缺失"), ("unknown", "未找到")] {
+            let error = switch_desktop_profile_in(
+                target,
+                &live,
+                &accounts,
+                &mut store,
+                &|_| panic!("材料缺失时不得退出进程"),
+                &|| panic!("材料缺失时不得检测进程"),
+                &dir.path().join("backups"),
+                &|_, _| panic!("材料缺失时不得复制文件"),
+            )
+            .unwrap_err();
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(serde_json::to_value(&store).unwrap(), store_before);
+            assert!(!live.exists());
+            assert!(!dir.path().join("backups").exists());
+        }
     }
 
     #[test]

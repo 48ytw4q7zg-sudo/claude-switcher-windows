@@ -70,13 +70,18 @@ pub fn write_password(password: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 清空凭据（best-effort；不存在也成功）。
+/// 清空凭据；不存在视为已清空，其他错误交给事务调用方处理。
 pub fn clear_password() -> Result<(), String> {
     let path = credentials_path()?;
-    if crate::links::path_exists_or_link(&path) {
-        let _ = crate::fsx::remove_file_with_retry(&path);
+    match crate::fsx::remove_file_with_retry(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "清除凭据文件失败（{}）：{}",
+            path.display(),
+            crate::fsx::humanize_io_error(&error)
+        )),
     }
-    Ok(())
 }
 
 /// 清理早期版本的遗留凭据条目。Windows 上 `.credentials.json` 是主存储，
@@ -135,4 +140,41 @@ pub fn claude_dir() -> Result<PathBuf, String> {
 /// Windows 凭据文件路径。
 pub fn credentials_path() -> Result<PathBuf, String> {
     Ok(claude_dir()?.join(".credentials.json"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clearing_credentials_reports_failure_and_preserves_unremovable_target() {
+        let _lock = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let _config = crate::test_support::set_env("CLAUDE_CONFIG_DIR", &config);
+        let target = config.join(".credentials.json");
+        fs::create_dir_all(&target).unwrap();
+        fs::write(target.join("preserve.txt"), "fixture").unwrap();
+        assert!(clear_password().is_err());
+        assert_eq!(
+            fs::read_to_string(target.join("preserve.txt")).unwrap(),
+            "fixture"
+        );
+    }
+
+    #[test]
+    fn clearing_credentials_removes_a_file_and_is_idempotent() {
+        let _lock = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let _config = crate::test_support::set_env("CLAUDE_CONFIG_DIR", &config);
+        fs::create_dir_all(&config).unwrap();
+        let target = config.join(".credentials.json");
+        fs::write(&target, "{}").unwrap();
+        clear_password().unwrap();
+        assert!(!target.exists());
+        clear_password().unwrap();
+    }
 }

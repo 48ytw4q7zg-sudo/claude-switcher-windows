@@ -45,6 +45,294 @@ pub fn silent_command(program: &str) -> Command {
     command
 }
 
+/// LocalAlloc 系列 API 的返回内存必须用 LocalFree 释放。
+struct LocalAllocation(*mut std::ffi::c_void);
+
+impl Drop for LocalAllocation {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Foundation::LocalFree(self.0) };
+    }
+}
+
+struct CommandPipeSecurity(LocalAllocation);
+
+impl CommandPipeSecurity {
+    fn new() -> io::Result<Self> {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertSidToStringSidW, ConvertStringSecurityDescriptorToSecurityDescriptorW,
+            SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TokenUser, TOKEN_QUERY, TOKEN_USER,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let token = unsafe { OwnedHandle::from_raw_handle(token) };
+        let mut length = 0;
+        unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                std::ptr::null_mut(),
+                0,
+                &mut length,
+            );
+        }
+        if length == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // TOKEN_USER 含指针，使用 usize 缓冲保证对齐，SID 在本次调用期间仍由缓冲持有。
+        let mut user = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
+        if unsafe {
+            GetTokenInformation(
+                token.as_raw_handle(),
+                TokenUser,
+                user.as_mut_ptr().cast(),
+                length,
+                &mut length,
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        let sid = unsafe { &*user.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
+        let mut sid_text = std::ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(sid, &mut sid_text) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let sid_text = LocalAllocation(sid_text.cast());
+        let sid_pointer = sid_text.0.cast::<u16>();
+        let mut sid_length = 0;
+        while unsafe { *sid_pointer.add(sid_length) } != 0 {
+            sid_length += 1;
+        }
+        let sid = String::from_utf16_lossy(unsafe {
+            std::slice::from_raw_parts(sid_pointer, sid_length)
+        });
+        // 默认命名管道 DACL 允许更广的读取；令牌管道只允许当前用户与 SYSTEM。
+        let sddl: Vec<u16> = format!("D:P(A;;GA;;;SY)(A;;GA;;;{sid})")
+            .encode_utf16()
+            .chain(Some(0))
+            .collect();
+        let mut descriptor = std::ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut descriptor,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(LocalAllocation(descriptor)))
+    }
+}
+
+async fn command_pipe(
+    security: &CommandPipeSecurity,
+    parent_reads: bool,
+) -> io::Result<(tokio::net::windows::named_pipe::NamedPipeServer, fs::File)> {
+    use tokio::net::windows::named_pipe::ServerOptions;
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    let name = format!(r"\\.\pipe\claude-switcher-io-{}", uuid::Uuid::new_v4());
+    let mut attributes = SECURITY_ATTRIBUTES {
+        nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: security.0 .0,
+        bInheritHandle: 0,
+    };
+    let server = unsafe {
+        ServerOptions::new()
+            .access_inbound(parent_reads)
+            .access_outbound(!parent_reads)
+            .first_pipe_instance(true)
+            .max_instances(1)
+            .reject_remote_clients(true)
+            .create_with_security_attributes_raw(
+                &name,
+                (&mut attributes as *mut SECURITY_ATTRIBUTES).cast(),
+            )?
+    };
+    // 子端保持同步 File；只有父端使用 overlapped I/O。Stdio 在 spawn 时复制需要继承的句柄。
+    let client = fs::OpenOptions::new()
+        .read(!parent_reads)
+        .write(parent_reads)
+        .open(name)?;
+    server.connect().await?;
+    Ok((server, client))
+}
+
+struct CommandChild(std::process::Child);
+
+impl Drop for CommandChild {
+    fn drop(&mut self) {
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+        }
+    }
+}
+
+enum CommandIo {
+    Input,
+    Stdout(Vec<u8>),
+    Stderr(Vec<u8>),
+}
+
+async fn read_command_pipe(
+    mut pipe: tokio::net::windows::named_pipe::NamedPipeServer,
+) -> io::Result<Vec<u8>> {
+    use tokio::io::AsyncReadExt;
+    let mut bytes = Vec::new();
+    match pipe.read_to_end(&mut bytes).await {
+        Ok(_) => Ok(bytes),
+        Err(error) if error.kind() == io::ErrorKind::BrokenPipe => Ok(bytes),
+        Err(error) => Err(error),
+    }
+}
+
+async fn stop_command(
+    child: &mut CommandChild,
+    tasks: &mut tokio::task::JoinSet<Result<CommandIo, String>>,
+) -> Result<(), String> {
+    let cleanup_deadline = tokio::time::Instant::now() + StdDuration::from_secs(1);
+    tasks.abort_all();
+    if !matches!(child.0.try_wait(), Ok(Some(_))) {
+        let _ = child.0.kill();
+    }
+    tokio::time::timeout_at(cleanup_deadline, async {
+        while tasks.join_next().await.is_some() {}
+        loop {
+            match child.0.try_wait() {
+                Ok(Some(_)) => return Ok(()),
+                Ok(None) => tokio::time::sleep(StdDuration::from_millis(5)).await,
+                Err(error) => return Err(format!("确认直接子进程退出失败: {error}")),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "取消管道或确认直接子进程退出超时".to_string())?
+}
+
+/// 真正可取消的 Windows 子进程管道；不使用 Tokio ChildStdio 的阻塞线程包装。
+pub fn run_command_with_timeout(
+    mut command: Command,
+    input: Option<&[u8]>,
+    timeout: StdDuration,
+) -> Result<std::process::Output, String> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let deadline = std::time::Instant::now() + timeout;
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_io()
+        .enable_time()
+        .build()
+        .map_err(|error| format!("创建子进程执行环境失败: {error}"))?;
+    runtime.block_on(async {
+        let security =
+            CommandPipeSecurity::new().map_err(|error| format!("创建私有管道权限失败: {error}"))?;
+        let setup = async {
+            let (stdout, stdout_child) = command_pipe(&security, true).await?;
+            let (stderr, stderr_child) = command_pipe(&security, true).await?;
+            let stdin = if input.is_some() {
+                let (pipe, file) = command_pipe(&security, false).await?;
+                command.stdin(Stdio::from(file));
+                Some(pipe)
+            } else {
+                command.stdin(Stdio::null());
+                None
+            };
+            command
+                .stdout(Stdio::from(stdout_child))
+                .stderr(Stdio::from(stderr_child));
+            Ok::<_, io::Error>((stdin, stdout, stderr))
+        };
+        let deadline = tokio::time::Instant::from_std(deadline);
+        let (stdin, stdout, stderr) = tokio::time::timeout_at(deadline, setup)
+            .await
+            .map_err(|_| "创建子进程管道超时".to_string())?
+            .map_err(|error| format!("创建子进程管道失败: {error}"))?;
+        let mut child = CommandChild(
+            command
+                .spawn()
+                .map_err(|error| format!("启动子进程失败: {error}"))?,
+        );
+        // builder 仍持有子端 File，必须立刻释放，否则 stdout/stderr 永远收不到 EOF。
+        drop(command);
+        let mut tasks = tokio::task::JoinSet::new();
+        tasks.spawn(async move {
+            read_command_pipe(stdout)
+                .await
+                .map(CommandIo::Stdout)
+                .map_err(|error| format!("读取 stdout 失败: {error}"))
+        });
+        tasks.spawn(async move {
+            read_command_pipe(stderr)
+                .await
+                .map(CommandIo::Stderr)
+                .map_err(|error| format!("读取 stderr 失败: {error}"))
+        });
+        if let (Some(mut pipe), Some(input)) = (stdin, input) {
+            let bytes = input.to_vec();
+            tasks.spawn(async move {
+                pipe.write_all(&bytes)
+                    .await
+                    .map_err(|error| format!("写入 stdin 失败: {error}"))?;
+                // drop 最后一个父端，子进程才能读到真正 EOF；仅 shutdown 不足以关管道。
+                drop(pipe);
+                Ok(CommandIo::Input)
+            });
+        }
+        let operation = async {
+            let mut status = None;
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            loop {
+                while let Some(completed) = tasks.try_join_next() {
+                    match completed.map_err(|error| format!("执行管道任务失败: {error}"))??
+                    {
+                        CommandIo::Input => {}
+                        CommandIo::Stdout(bytes) => stdout = bytes,
+                        CommandIo::Stderr(bytes) => stderr = bytes,
+                    }
+                }
+                if status.is_none() {
+                    status = child
+                        .0
+                        .try_wait()
+                        .map_err(|error| format!("等待子进程失败: {error}"))?;
+                }
+                if tasks.is_empty() {
+                    if let Some(status) = status {
+                        return Ok(std::process::Output {
+                            status,
+                            stdout,
+                            stderr,
+                        });
+                    }
+                }
+                tokio::time::sleep(StdDuration::from_millis(5)).await;
+            }
+        };
+        let result = tokio::time::timeout_at(deadline, operation)
+            .await
+            .map_err(|_| format!("命令超过 {:.3} 秒未完成", timeout.as_secs_f64()))
+            .and_then(|result| result);
+        match result {
+            Ok(output) => Ok(output),
+            Err(error) => match stop_command(&mut child, &mut tasks).await {
+                Ok(()) => Err(error),
+                Err(cleanup_error) => Err(format!("{error}；{cleanup_error}")),
+            },
+        }
+    })
+}
+
 /// Windows PowerShell 5.1 的完整路径。
 ///
 /// 不要依赖 PATH 直接按名启动 `powershell.exe`：部分精简/安装环境（以及被
@@ -78,30 +366,61 @@ pub fn user_default_ui_language() -> String {
     .to_string()
 }
 
-/// 当前系统界面语言（CurrentUICulture，如 "zh-CN" / "en-US"）。
-///
-/// 第 12 项「客户端语言」检查用它：Windows 上读不到 Claude 内部的界面语言设置，
-/// 只能按上游做法比对系统 UI 语言（上游用 `[CultureInfo]::CurrentUICulture.Name`）。
-pub fn current_ui_language() -> Result<String, String> {
-    let json =
-        run_ps("[System.Globalization.CultureInfo]::CurrentUICulture.Name | ConvertTo-Json")?;
-    parse_ui_language(&json)
-}
-
-fn parse_ui_language(json: &str) -> Result<String, String> {
-    let trimmed = json.trim();
-    let name: String = serde_json::from_str(trimmed)
-        .map_err(|e| format!("UI 语言解析失败: {e}; 原文: {trimmed}"))?;
-    let name = name.trim();
-    if name.is_empty() {
-        return Err("UI 语言为空".to_string());
-    }
-    Ok(name.to_string())
-}
-
 /// 当前进程 PID（用于进程检测时排除自身，替代 spawn tasklist）。
 pub fn current_pid() -> u32 {
     unsafe { GetCurrentProcessId() }
+}
+
+/// 本工具自用的命名互斥量句柄：Drop 时释放并关闭。
+///
+/// 仅用于串行化本工具自己的 WSL 材料同步（同一用户/发行版），不声称是
+/// Claude 官方凭据锁。守卫不跨线程移动，释放与获取在同一线程。
+pub struct NamedMutexGuard(windows_sys::Win32::Foundation::HANDLE);
+
+impl Drop for NamedMutexGuard {
+    fn drop(&mut self) {
+        unsafe {
+            windows_sys::Win32::System::Threading::ReleaseMutex(self.0);
+            windows_sys::Win32::Foundation::CloseHandle(self.0);
+        }
+    }
+}
+
+/// 获取本工具命名互斥量；`timeout` 内拿不到返回 `Ok(None)`。
+///
+/// 名字不含 `Local\` 之外的反斜杠；调用方负责传入合法名字。
+/// 上一持有线程异常退出（WAIT_ABANDONED）仍视为获取成功：本工具自己的
+/// 事务脚本会在运行开头恢复残留状态。
+pub fn acquire_named_mutex(
+    name: &str,
+    timeout: StdDuration,
+) -> io::Result<Option<NamedMutexGuard>> {
+    use windows_sys::Win32::Foundation::{
+        CloseHandle, WAIT_ABANDONED_0, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    };
+    use windows_sys::Win32::System::Threading::{CreateMutexW, WaitForSingleObject};
+    let wide: Vec<u16> = name.encode_utf16().chain(std::iter::once(0)).collect();
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, wide.as_ptr()) };
+    if handle.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let waited = unsafe { WaitForSingleObject(handle, timeout.as_millis() as u32) };
+    match waited {
+        WAIT_OBJECT_0 | WAIT_ABANDONED_0 => Ok(Some(NamedMutexGuard(handle))),
+        WAIT_TIMEOUT => {
+            unsafe {
+                CloseHandle(handle);
+            }
+            Ok(None)
+        }
+        _ => {
+            let error = io::Error::last_os_error();
+            unsafe {
+                CloseHandle(handle);
+            }
+            Err(error)
+        }
+    }
 }
 
 /// MSIX/Store 安装的 Claude Desktop 包族名（PackageFamilyName）列表。
@@ -1013,6 +1332,125 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_pipe_security_is_private_and_parent_handles_are_not_inherited() {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+        use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_KERNEL_OBJECT};
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, EqualSid, GetAce, GetSecurityDescriptorControl,
+            GetTokenInformation, TokenUser, WinLocalSystemSid, ACCESS_ALLOWED_ACE,
+            DACL_SECURITY_INFORMATION, SECURITY_MAX_SID_SIZE, SE_DACL_PROTECTED, TOKEN_QUERY,
+            TOKEN_USER,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_io()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let security = CommandPipeSecurity::new().unwrap();
+            let (server, child_end) = command_pipe(&security, true).await.unwrap();
+            for handle in [server.as_raw_handle(), child_end.as_raw_handle()] {
+                let mut flags = 0;
+                assert_ne!(unsafe { GetHandleInformation(handle, &mut flags) }, 0);
+                assert_eq!(flags & HANDLE_FLAG_INHERIT, 0);
+            }
+            let mut descriptor = std::ptr::null_mut();
+            let mut dacl = std::ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    GetSecurityInfo(
+                        server.as_raw_handle(),
+                        SE_KERNEL_OBJECT,
+                        DACL_SECURITY_INFORMATION,
+                        std::ptr::null_mut(),
+                        std::ptr::null_mut(),
+                        &mut dacl,
+                        std::ptr::null_mut(),
+                        &mut descriptor,
+                    )
+                },
+                0
+            );
+            let descriptor = LocalAllocation(descriptor);
+            let mut control = 0;
+            let mut revision = 0;
+            assert_ne!(
+                unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) },
+                0
+            );
+            assert_ne!(control & SE_DACL_PROTECTED, 0);
+            assert!(!dacl.is_null());
+            assert_eq!(unsafe { (*dacl).AceCount }, 2);
+            // 独立读取进程 TokenUser，与内核返回的实际 ACE SID 比较。
+            let mut token = std::ptr::null_mut();
+            assert_ne!(
+                unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+                0
+            );
+            let token = unsafe { OwnedHandle::from_raw_handle(token) };
+            let mut length = 0;
+            unsafe {
+                GetTokenInformation(
+                    token.as_raw_handle(),
+                    TokenUser,
+                    std::ptr::null_mut(),
+                    0,
+                    &mut length,
+                )
+            };
+            assert!(length > 0);
+            let mut user = vec![0usize; (length as usize).div_ceil(std::mem::size_of::<usize>())];
+            assert_ne!(
+                unsafe {
+                    GetTokenInformation(
+                        token.as_raw_handle(),
+                        TokenUser,
+                        user.as_mut_ptr().cast(),
+                        length,
+                        &mut length,
+                    )
+                },
+                0
+            );
+            let current_sid = unsafe { &*user.as_ptr().cast::<TOKEN_USER>() }.User.Sid;
+            let mut system_sid = vec![
+                0usize;
+                (SECURITY_MAX_SID_SIZE as usize)
+                    .div_ceil(std::mem::size_of::<usize>())
+            ];
+            let mut system_length = SECURITY_MAX_SID_SIZE;
+            assert_ne!(
+                unsafe {
+                    CreateWellKnownSid(
+                        WinLocalSystemSid,
+                        std::ptr::null_mut(),
+                        system_sid.as_mut_ptr().cast(),
+                        &mut system_length,
+                    )
+                },
+                0
+            );
+            let mut saw_current = false;
+            let mut saw_system = false;
+            for index in 0..2 {
+                let mut ace = std::ptr::null_mut();
+                assert_ne!(unsafe { GetAce(dacl, index, &mut ace) }, 0);
+                let ace = unsafe { &*ace.cast::<ACCESS_ALLOWED_ACE>() };
+                assert_eq!(ace.Header.AceType, 0, "必须是 ACCESS_ALLOWED_ACE");
+                let sid = (&ace.SidStart as *const u32).cast_mut().cast();
+                let is_current = unsafe { EqualSid(sid, current_sid) } != 0;
+                let is_system = unsafe { EqualSid(sid, system_sid.as_mut_ptr().cast()) } != 0;
+                assert!(is_current || is_system, "不得给其他主体授权");
+                saw_current |= is_current;
+                saw_system |= is_system;
+            }
+            assert!(saw_current && saw_system);
+        });
+    }
+
+    #[test]
     fn run_ps_propagates_non_terminating_errors() {
         let result = run_ps("Write-Error 'synthetic probe without system changes'; 'false'");
         assert!(
@@ -1277,14 +1715,6 @@ mod tests {
         assert!(!parse_task_exists("false").unwrap());
         assert!(parse_task_exists("  true  ").unwrap());
         assert!(parse_task_exists("null").is_err());
-    }
-
-    #[test]
-    fn parse_ui_language_reads_json_string() {
-        assert_eq!(parse_ui_language("\"zh-CN\"").unwrap(), "zh-CN");
-        assert_eq!(parse_ui_language("  \"en-US\"  ").unwrap(), "en-US");
-        assert!(parse_ui_language("not-json").is_err());
-        assert!(parse_ui_language("\"\"").is_err());
     }
 
     #[test]

@@ -1,3 +1,4 @@
+import { backupLabel, compactNumber, formatError, formatMessage, technicalLabel } from './uiText';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
@@ -340,7 +341,7 @@ const TELEMETRY_OPTIONS: {
   {
     value: 'default',
     label: '关闭',
-    desc: '不注入任何隐私 env，保持 Claude Code 默认行为（遥测照常上报）。',
+    desc: '不注入任何隐私环境变量，保持 Claude Code 默认行为（遥测照常上报）。',
   },
   {
     value: 'disableTelemetry',
@@ -399,13 +400,6 @@ function relativeTime(value?: string | null) {
   return diff >= 0 ? `${days} 天后` : `${days} 天前`;
 }
 
-function compactNumber(value?: number | null) {
-  const next = value ?? 0;
-  if (next >= 1_000_000_000) return `${(next / 1_000_000_000).toFixed(next >= 10_000_000_000 ? 0 : 1)}B`;
-  if (next >= 1_000_000) return `${(next / 1_000_000).toFixed(next >= 10_000_000 ? 0 : 1)}M`;
-  if (next >= 1_000) return `${(next / 1_000).toFixed(next >= 10_000 ? 0 : 1)}K`;
-  return `${next}`;
-}
 
 function usagePercent(window: UsageWindow | undefined, max: number) {
   if (!window || max <= 0) return 0;
@@ -419,7 +413,7 @@ function usageLabel(window?: UsageWindow | null) {
   if (typeof window?.used_percent === 'number') {
     return `${Math.round(Math.max(0, Math.min(100, 100 - window.used_percent)))}% 剩余`;
   }
-  return `${compactNumber(window?.totals.total_tokens)} token`;
+  return `${compactNumber(window?.totals.total_tokens)} 词元`;
 }
 
 function StatusPill({ ok, label }: { ok: boolean; label: string }) {
@@ -459,14 +453,14 @@ function UsageRow({ item, max }: { item: UsageWindow; max: number }) {
   return (
     <div className="usage-row">
       <div className="usage-row-head">
-        <strong>{item.label}</strong>
+        <strong>{formatMessage(item.label)}</strong>
         <span>{usageLabel(item)}</span>
       </div>
       <div className="usage-bar">
         <span style={{ width: `${usagePercent(item, max)}%` }} />
       </div>
       <div className="usage-row-foot">
-        <span>{compactNumber(item.totals.total_tokens)} token · {item.message_count} 条 usage</span>
+        <span>{compactNumber(item.totals.total_tokens)} 词元 · {item.message_count} 条用量记录</span>
         <span>{item.reset_at ? `${relativeTime(item.reset_at)}重置` : '无重置估算'}</span>
       </div>
     </div>
@@ -520,6 +514,7 @@ function App() {
   }
 
   const [status, setStatus] = useState<ClaudeStatus | null>(null);
+  const [statusLoadFailed, setStatusLoadFailed] = useState(false);
   const [profiles, setProfiles] = useState<ProfileSummary[]>([]);
   const [usage, setUsage] = useState<ClaudeUsageSnapshot | null>(null);
   const [name, setName] = useState('');
@@ -549,7 +544,7 @@ function App() {
   const [claudeConfigDir, setClaudeConfigDir] = useState('');
   const [claudeConfigOverride, setClaudeConfigOverride] = useState('');
 
-  const credentialLabel = platform === 'windows' ? '凭据文件' : 'Keychain';
+  const credentialLabel = platform === 'windows' ? '凭据文件' : '钥匙串';
   const credentialFullText = platform === 'windows' ? '.credentials.json 登录态' : '钥匙串登录态';
 
   useEffect(() => {
@@ -611,7 +606,7 @@ function App() {
         invoke<ClaudeUsageSnapshot>('get_claude_usage'),
         8000,
         'Claude 用量刷新',
-      ).catch((err) => usageFallback(String(err)));
+      ).catch((err) => usageFallback(formatError(err)));
       setUsage(nextUsage);
     } finally {
       setUsageRefreshing(false);
@@ -630,13 +625,15 @@ function App() {
         invoke<BackupSummary[]>('list_backups'),
       ]);
       setStatus(nextStatus);
+      setStatusLoadFailed(false);
       setProfiles(nextProfiles);
       setBackups(nextBackups);
 
       // 遥测模式：get_status 始终带 telemetry_mode（后端非 Option 字段）。
       setTelemetryMode(nextStatus.telemetry_mode);
     } catch (err) {
-      if (!opts?.keepError) setError(String(err));
+      setStatusLoadFailed(true);
+      if (!opts?.keepError) setError(formatError(err));
       return;
     } finally {
       // 主数据已就绪：立刻解除 busy，让按钮可用（用量/Clash 是渐进加载）。
@@ -647,14 +644,14 @@ function App() {
     // 在后续 load() 之后落地而显示过期数据。
     const [nextUsage, nextClashStatus] = await Promise.all([
       withTimeout(invoke<ClaudeUsageSnapshot>('get_claude_usage'), 8000, 'Claude 用量刷新').catch(
-        (err) => usageFallback(String(err)),
+        (err) => usageFallback(formatError(err)),
       ),
       withTimeout(invoke<ClashStatus>('get_clash_status'), 6000, 'Clash 状态刷新').catch((err) => ({
         available: false,
         controller: 'http://127.0.0.1:9090',
         group: 'Auto-Claude',
         nodes: [],
-        error: String(err),
+        error: formatError(err),
       })),
     ]);
     setUsage(nextUsage);
@@ -673,7 +670,7 @@ function App() {
       const message = await fn();
       if (message) setToast(message);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       // 无论成败都刷新列表：删除场景里「快照已删、目录清理失败」invoke 会抛错，
       // 但账号确实已不在——不刷新会让界面残留已不存在的快照。
@@ -746,7 +743,7 @@ function App() {
       setNewAccountModalState('done');
       await load().catch(() => undefined);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
       setNewAccountStep('准备失败，请看错误提示');
       setNewAccountModalState('draft');
       setNewAccountProgress(0);
@@ -787,7 +784,7 @@ function App() {
       const clash = result.clash
         ? `Auto-Claude 已切到 ${result.clash.node}；`
         : '';
-      return `${result.switched_to} 已切换；${clash}${result.restart_hint}`;
+      return `${result.switched_to} 已切换；${clash}${formatMessage(result.restart_hint)}`;
     });
 
   // P1-3：并行模式——为该账号开一个独立终端（CLAUDE_CONFIG_DIR 隔离），
@@ -795,7 +792,7 @@ function App() {
   const openParallel = (id: string) =>
     run('parallel', async () => {
       const result = await invoke<ParallelTerminalResult>('open_parallel_terminal', { id });
-      const via = result.launcher === 'wt' ? 'Windows Terminal' : 'PowerShell（未装 Terminal，已退回）';
+      const via = result.launcher === 'wt' ? 'Windows Terminal' : 'PowerShell（未安装 Windows Terminal，已使用备用方式）';
       return `已用 ${via} 打开并行终端；配置目录：${result.config_dir}`;
     });
 
@@ -819,7 +816,7 @@ function App() {
   const restore = (id: string, label: string) => {
     if (
       !window.confirm(
-        `完整还原到备份「${label}」？\n\n会用该备份覆盖当前 ~/.claude.json、settings.json 和${credentialFullText}；备份中缺失的项会被删除 / 清空。\n还原前会自动创建一次 before-restore 备份以便回滚。`,
+        `完整还原到备份「${label}」？\n\n会用该备份覆盖当前 ~/.claude.json、settings.json 和${credentialFullText}；备份中缺失的项会被删除 / 清空。\n还原前会自动创建一次恢复前备份以便回滚。`,
       )
     )
       return;
@@ -845,13 +842,13 @@ function App() {
         password: exportPassword,
       });
       setExportPassword('');
-      return `已加密导出（${(result.bytes / 1024).toFixed(1)} KB）→ ${result.path}`;
+      return `已加密导出（${(result.bytes / 1024).toFixed(1)} 千字节）→ ${result.path}`;
     });
 
   const importStore = () => {
     if (
       !window.confirm(
-        '导入会覆盖当前全部账号快照（现有 store 会先备份为 store.private.json.pre-import-*）。确定继续？',
+        '导入会覆盖当前全部账号快照（现有账号库会先备份为 store.private.json.pre-import-*）。确定继续？',
       )
     )
       return;
@@ -862,7 +859,7 @@ function App() {
       });
       setImportPassword('');
       await load().catch(() => undefined);
-      return `导入完成；原 store 已备份到 ${result.backup_of_previous}`;
+      return `导入完成；原账号库已备份到 ${result.backup_of_previous}`;
     });
   };
 
@@ -870,7 +867,7 @@ function App() {
     run('update', async () => {
       const result = await invoke<UpdateCheckResult>('check_for_update');
       setUpdateInfo(result);
-      return result.message;
+      return formatMessage(result.message);
     });
 
   const remove = (id: string, label: string) => {
@@ -978,7 +975,7 @@ function App() {
     <main className="app">
       <section className="header">
         <div>
-          <div className="eyebrow">Claude Code Local Account Switcher</div>
+          <div className="eyebrow">Claude 本地账号切换器</div>
           <h1>账号快照控制台</h1>
         </div>
         <div className="header-actions">
@@ -1028,9 +1025,9 @@ function App() {
           <ShieldAlert />
           <div className="warnings" style={{ marginTop: 0 }}>
             {actionWarnings.map((warning, i) => (
-              <div key={`${i}-${warning}`}>
+              <div key={`${i}-${formatMessage(warning)}`}>
                 <ShieldAlert />
-                {warning}
+                {formatMessage(warning)}
               </div>
             ))}
           </div>
@@ -1056,8 +1053,8 @@ function App() {
               </div>
             </div>
             <p className="telemetry-intro" id="delete-desc">
-              请选择删除范围。会话历史包含该账号的 projects 会话记录，可能占用大量磁盘空间；
-              删除后<strong>不可恢复</strong>。按 Esc 等同「取消」。
+              请选择删除范围。会话历史包含该账号的项目会话记录，可能占用大量磁盘空间；
+              删除后<strong>不可恢复</strong>。按退出键（Esc）等同「取消」。
             </p>
             <div className="modal-actions">
               <button className="ghost" onClick={() => setDeleteTarget(null)} ref={deleteCancelRef}>
@@ -1109,7 +1106,7 @@ function App() {
                 onChange={(event) => setCurrentWorkNote(event.target.value)}
                 disabled={newAccountModalState !== 'draft'}
                 rows={4}
-                placeholder="例如：BuildYou 5050 hook 清理，下一步验证 hiddenSelectedImageDefaults 是否能原生化"
+                placeholder="例如：正在整理项目配置，切回后继续验证功能"
               />
             </label>
 
@@ -1153,24 +1150,24 @@ function App() {
             <span>{statusOrganizationLabel(status)}</span>
           </div>
           <div className="pills">
-            <StatusPill ok={!!status?.claude_json_exists} label="~/.claude.json" />
+            <StatusPill ok={!!status?.claude_json_exists} label="全局配置" />
             <StatusPill ok={!!status?.keychain_exists} label={credentialLabel} />
-            <StatusPill ok={!!status?.keychain_parse_ok} label="凭据 JSON" />
-            <StatusPill ok={!!status?.settings_json_exists} label="settings.json" />
+            <StatusPill ok={!!status?.keychain_parse_ok} label="凭据格式" />
+            <StatusPill ok={!!status?.settings_json_exists} label="设置文件" />
           </div>
           <div className="fields two">
             <Field label="账号 UUID" value={shortId(status?.meta.account_uuid)} />
             <Field label="组织 UUID" value={shortId(status?.meta.organization_uuid)} />
-            <Field label="Device ID 哈希" value={status?.meta.user_id_hash} />
+            <Field label="设备标识哈希" value={status?.meta.user_id_hash} />
             <Field label="订阅" value={status?.meta.subscription_type} />
             <Field label="限额层级" value={status?.meta.rate_limit_tier} />
           </div>
           {!!status?.warnings.length && (
             <div className="warnings">
               {status.warnings.map((warning, i) => (
-                <div key={`${i}-${warning}`}>
+                <div key={`${i}-${formatMessage(warning)}`}>
                   <ShieldAlert />
-                  {warning}
+                  {formatMessage(warning)}
                 </div>
               ))}
             </div>
@@ -1188,13 +1185,13 @@ function App() {
             />
             <StatusIcon
               ok={!!clashStatus?.available}
-              label="Auto-Claude"
+              label="代理节点"
               detail={clashStatus?.now || '未连接'}
             />
             <StatusIcon
               ok={typeof usage?.session.used_percent === 'number' || !!usage?.scanned_messages}
               label="额度"
-              detail={usage ? usageLabel(usage.session) : '读取中'}
+              detail={usage ? usageLabel(usage.session) : statusLoadFailed ? '读取失败' : '读取中'}
             />
           </div>
         </div>
@@ -1250,10 +1247,10 @@ function App() {
                 </strong>
               </div>
               <div>
-                <span>Chrome</span>
+                <span>Chrome 用户配置</span>
                 <strong>{status.pending_new_account.runtime.chrome_profile || '未绑定'}</strong>
               </div>
-              <p>环境已准备好。确认 IP / Chrome Profile 都正确后，手动打开 Claude Code 授权；完成 OAuth 后点下面保存成正式账号。</p>
+              <p>环境已准备好。确认 出口 IP 和 Chrome 用户配置都正确后，手动打开 Claude Code 授权；完成 OAuth 后点下面保存成正式账号。</p>
               <button className="primary wide" onClick={finishNewAccount} disabled={!canFinishNewAccount}>
                 {busy === 'finish-new' ? <Loader2 className="spin" /> : <CheckCircle2 />}
                 登录完成后保存
@@ -1303,7 +1300,7 @@ function App() {
                   <input
                     value={newAccountTimezone}
                     onChange={(event) => setNewAccountTimezone(event.target.value)}
-                    placeholder="Africa/Lagos"
+                    placeholder="时区，例如 Africa/Lagos"
                   />
                 </label>
                 <label>
@@ -1311,15 +1308,15 @@ function App() {
                   <input
                     value={newAccountLocale}
                     onChange={(event) => setNewAccountLocale(event.target.value)}
-                    placeholder="en_US.UTF-8"
+                    placeholder="区域设置，例如 en_US.UTF-8"
                   />
                 </label>
                 <label>
-                  Chrome Profile
+                  Chrome 用户配置
                   <input
                     value={newAccountChromeProfile}
                     onChange={(event) => setNewAccountChromeProfile(event.target.value)}
-                    placeholder="Profile 4"
+                    placeholder="用户配置目录，例如 Profile 4"
                   />
                 </label>
               </div>
@@ -1351,12 +1348,12 @@ function App() {
             </div>
             <div>
               <span>组类型</span>
-              <strong>{clashStatus?.group_type || '未知'}</strong>
+              <strong>{technicalLabel(clashStatus?.group_type)}</strong>
             </div>
           </div>
-          {clashStatus?.error && <div className="inline-error">{clashStatus.error}</div>}
+          {clashStatus?.error && <div className="inline-error">{formatError(clashStatus.error)}</div>}
           {clashStatus?.group_type && clashStatus.group_type !== 'Selector' && (
-            <div className="inline-warning">Auto-Claude 不是 select 组，固定账号节点可能被自动测速覆盖。</div>
+            <div className="inline-warning">Auto-Claude 不是手动选择组，固定账号节点可能被自动测速覆盖。</div>
           )}
           <button className="ghost wide" onClick={() => load()} disabled={!!busy}>
             <RefreshCw />
@@ -1372,7 +1369,7 @@ function App() {
           <div className="usage-hero">
             <div>
               <span>更新于 {relativeTime(usage?.updated_at)}</span>
-              <strong>{usage ? usageLabel(usage.session) : '读取中'}</strong>
+              <strong>{usage ? usageLabel(usage.session) : statusLoadFailed ? '读取失败' : '读取中'}</strong>
             </div>
             <button className="usage-refresh" onClick={refreshUsage} disabled={usageRefreshing} title="刷新 Claude 用量">
               {usageRefreshing ? <Loader2 className="spin" /> : <RefreshCw />}
@@ -1400,11 +1397,11 @@ function App() {
               <strong>{usage?.scanned_files ?? 0} 文件</strong>
             </div>
           </div>
-          <div className="daily-bars" aria-label="近 30 天 token 用量">
+          <div className="daily-bars" aria-label="近 30 天词元用量">
             {(usage?.daily ?? []).map((item) => (
               <span
                 key={item.date}
-                title={`${item.date} · ${compactNumber(item.totals.total_tokens)} token`}
+                title={`${item.date} · ${compactNumber(item.totals.total_tokens)} 词元`}
                 style={{
                   height: `${Math.max(4, (item.totals.total_tokens / dailyMax) * 76)}px`,
                 }}
@@ -1412,14 +1409,14 @@ function App() {
             ))}
           </div>
           <p className="usage-note">
-            额度百分比来自官方 Claude OAuth API；token 和柱状图来自本地日志，用于判断消耗趋势。
+            额度百分比来自官方 Claude OAuth API；词元和柱状图来自本地日志，用于判断消耗趋势。
           </p>
           {!!usage?.warnings.length && (
             <div className="warnings compact">
               {usage.warnings.map((warning, i) => (
-                <div key={`${i}-${warning}`}>
+                <div key={`${i}-${formatMessage(warning)}`}>
                   <Activity />
-                  {warning}
+                  {formatMessage(warning)}
                 </div>
               ))}
             </div>
@@ -1437,13 +1434,13 @@ function App() {
             <code>{status?.data_dir}</code>
           </div>
           <div className="link-mode-row">
-            <span>session 隔离链接</span>
-            <strong>{status?.session_isolation.link_mode ?? '读取中'}</strong>
+            <span>会话隔离链接</span>
+            <strong>{technicalLabel(status?.session_isolation.link_mode, statusLoadFailed ? '读取失败' : '读取中')}</strong>
           </div>
           {platform === 'windows' && status?.session_isolation.degraded && (
             <div className="inline-warning">
               <div>
-                Windows 未开启「开发者模式」时目录/文件链接会降级为 Junction / 硬链接：硬链接模式下
+                Windows 未开启「开发者模式」时目录/文件链接会降级为目录联接 / 硬链接：硬链接模式下
                 Claude Code 若用「写临时文件再改名」更新 config.json，隔离可能被悄悄解除。
                 建议打开开发者模式后，重新点一次「切换」以恢复符号链接。
               </div>
@@ -1496,7 +1493,7 @@ function App() {
                     ]);
                     setClaudeConfigDir(next);
                     setClaudeConfigOverride(override ?? '');
-                    return message;
+                    return formatMessage(message);
                   })
                 }
                 disabled={!!busy}
@@ -1633,7 +1630,7 @@ function App() {
                 <div className="mini-fields">
                   <span>
                     <Fingerprint />
-                    Device {profile.meta.user_id_hash || '无'}
+                    设备标识 {profile.meta.user_id_hash || '无'}
                   </span>
                   <span>
                     <Clock />
@@ -1671,19 +1668,19 @@ function App() {
                     defaultValue={profile.runtime?.timezone ?? ''}
                     onBlur={(event) => bindRuntime(profile, { timezone: event.target.value })}
                     disabled={!!busy}
-                    placeholder="TZ: America/Los_Angeles"
+                    placeholder="时区：America/Los_Angeles"
                   />
                   <input
                     defaultValue={profile.runtime?.locale ?? ''}
                     onBlur={(event) => bindRuntime(profile, { locale: event.target.value })}
                     disabled={!!busy}
-                    placeholder="Locale: en_US.UTF-8"
+                    placeholder="区域设置：en_US.UTF-8"
                   />
                   <input
                     defaultValue={profile.runtime?.chrome_profile ?? ''}
                     onBlur={(event) => bindRuntime(profile, { chrome_profile: event.target.value })}
                     disabled={!!busy}
-                    placeholder="Chrome: Profile 35"
+                    placeholder="Chrome 用户配置：Profile 35"
                   />
                 </div>
                 {profile.notes && <p>{profile.notes}</p>}
@@ -1720,7 +1717,7 @@ function App() {
         <div className="section-title">
           <h2>遥测去关联</h2>
           <span>
-            {TELEMETRY_OPTIONS.find((o) => o.value === telemetryMode)?.label ?? '读取中'}
+            {TELEMETRY_OPTIONS.find((o) => o.value === telemetryMode)?.label ?? (statusLoadFailed ? '读取失败' : '读取中')}
           </span>
         </div>
         <div className="panel telemetry-panel">
@@ -1729,7 +1726,7 @@ function App() {
             <span>隐私环境变量注入</span>
           </div>
           <p className="telemetry-intro">
-            统一写入 ~/.claude/settings.json 的 env；三档隐私 env 互斥，切换时只动这两个 key，不影响 settings 里其它字段。
+            统一写入 ~/.claude/settings.json 的环境变量字段；三个隐私档位互斥，切换时只修改相关的两个环境变量，不影响其他设置。
           </p>
           <div className="telemetry-options">
             {TELEMETRY_OPTIONS.map((option) => {
@@ -1765,7 +1762,7 @@ function App() {
           </div>
           {telemetryMode === 'essentialOnly' && (
             <div className="inline-error">
-              最强档还会关掉 auto-update / 新模型能力拉取 / trusted-device（手机 bridge）注册——需手动更新 Claude Code。
+              最强档还会关闭自动更新、新模型能力拉取和可信设备（手机桥接）注册——需手动更新 Claude Code。
             </div>
           )}
         </div>
@@ -1807,7 +1804,7 @@ function App() {
           </div>
           <div className="export-import-card">
             <strong>加密导入（恢复快照库）</strong>
-            <span>覆盖当前快照库；导入前现有 store 自动备份。</span>
+            <span>覆盖当前快照库；导入前现有账号库自动备份。</span>
             <input
               placeholder="导入文件路径（.csbk）"
               value={importPath}
@@ -1836,7 +1833,7 @@ function App() {
           </button>
           {updateInfo && (
             <span className="version-check-result">
-              {updateInfo.message}
+              {formatMessage(updateInfo.message)}
               {updateInfo.has_update && updateInfo.release_url && (
                 <>
                   {' '}
@@ -1860,7 +1857,7 @@ function App() {
               <article className="profile" key={item.id}>
                 <div className="profile-head">
                   <div>
-                    <strong>{item.label}</strong>
+                    <strong>{backupLabel(item.label)}</strong>
                     <span>{dateLabel(item.created_at)}</span>
                   </div>
                 </div>

@@ -1,3 +1,4 @@
+import { formatError } from '../uiText';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Globe, Loader2, Plug, Trash2 } from 'lucide-react';
@@ -48,7 +49,7 @@ export function ProviderPanel() {
   }, []);
 
   useEffect(() => {
-    refresh().catch((e) => setError(String(e)));
+    refresh().catch((e) => setError(formatError(e)));
   }, [refresh]);
 
   const run = useCallback(
@@ -60,7 +61,7 @@ export function ProviderPanel() {
         await refresh();
         setNote(success);
       } catch (e) {
-        setError(String(e));
+        setError(formatError(e));
       } finally {
         setBusy(null);
       }

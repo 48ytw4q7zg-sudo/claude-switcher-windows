@@ -1,3 +1,4 @@
+import { formatError, formatMessage } from '../uiText';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -10,9 +11,9 @@ import {
 import type { AppConfig, RulesReport } from './types';
 
 const MODE_LABELS: Record<string, string> = {
-  rule: '规则模式 (rule)',
-  global: '全局模式 (global)',
-  direct: '直连模式 (direct)',
+  rule: '规则模式',
+  global: '全局模式',
+  direct: '直连模式',
   unknown: '未知',
 };
 
@@ -33,7 +34,8 @@ export function ClashModePanel() {
       const m = await invoke<string>('get_clash_mode');
       setMode(m);
     } catch (err) {
-      setError(String(err));
+      setMode(null);
+      setError(formatError(err));
     } finally {
       setLoadingMode(false);
     }
@@ -64,7 +66,7 @@ export function ClashModePanel() {
       setRules(report);
       setMode(report.mode);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setWritingRules(false);
     }
@@ -77,7 +79,7 @@ export function ClashModePanel() {
     try {
       await invoke('set_webrtc_policy', { policy });
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setSettingWebrtc(false);
     }
@@ -89,7 +91,7 @@ export function ClashModePanel() {
     try {
       await invoke('set_proxy_group', { group: proxyGroup });
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setSavingGroup(false);
     }
@@ -107,7 +109,7 @@ export function ClashModePanel() {
       <div className="clash-summary" style={{ gridTemplateColumns: 'repeat(2, minmax(0,1fr))' }}>
         <div>
           <span>当前模式</span>
-          <strong>{mode ? MODE_LABELS[mode] ?? mode : '读取中'}</strong>
+          <strong>{mode ? MODE_LABELS[mode] ?? '未知模式' : loadingMode ? '读取中' : '读取失败'}</strong>
         </div>
         <div>
           <span>内核校验</span>
@@ -134,13 +136,13 @@ export function ClashModePanel() {
             {rules.script_backup ? `（备份：${rules.script_backup}）` : ''}
           </div>
           <div>
-            Merge 变更：{rules.merge_changed ? '是' : '否'}
+            合并配置变更：{rules.merge_changed ? '是' : '否'}
             {rules.merge_backup ? `（备份：${rules.merge_backup}）` : ''}
           </div>
           <div>重启 Clash：{rules.restart_attempted ? '已尝试' : '未尝试'}</div>
           {rules.messages.length > 0 && (
             <div style={{ marginTop: 6, fontSize: 12, fontWeight: 600, whiteSpace: 'pre-line' }}>
-              {rules.messages.join('\n')}
+              {rules.messages.map(formatMessage).join('\n')}
             </div>
           )}
         </div>
@@ -173,7 +175,7 @@ export function ClashModePanel() {
         <input
           value={proxyGroup}
           onChange={(e) => setProxyGroup(e.target.value)}
-          placeholder="Auto-Claude"
+          placeholder="代理组名，例如 Auto-Claude"
           disabled={busy}
         />
       </label>

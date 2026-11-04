@@ -1447,7 +1447,7 @@ async fn list_wsl_distros() -> Result<Vec<String>, String> {
 #[tauri::command]
 async fn write_wsl_credentials(distro: String) -> Result<wsl::WslSyncReport, String> {
     blocking(move || {
-        let (current_id, blob, profile_uuid) = {
+        let (current_id, blob, profile_uuid, observed_store_blob) = {
             let store_data = store::load_store()?;
             let current_id = store_data
                 .current_profile_id
@@ -1462,19 +1462,24 @@ async fn write_wsl_credentials(distro: String) -> Result<wsl::WslSyncReport, Str
                 .keychain_password
                 .clone()
                 .ok_or_else(|| "当前账号没有可写入 WSL 的凭据".to_string())?;
+            // I-09：联网核对 WSL 身份要数秒，期间库内快照可能被别的写入改动。
+            // 记下此刻的原文，提交时比对，变化即放弃（不用过期结果覆盖新值）。
+            let observed_store_blob = blob.clone();
             // K-4：账号库登记的 uuid，用于核对 WSL 里的凭据是否属于同一账号。
             let profile_uuid = profile.meta.account_uuid.clone();
-            (current_id, blob, profile_uuid)
+            (current_id, blob, profile_uuid, observed_store_blob)
         };
         let report = wsl::sync_to_wsl_blocking(distro, blob, profile_uuid)?;
-        // WSL 副本更新**且身份已核对一致**才回写账号库。
+        // WSL 副本更新**且身份已核对一致**才回写账号库。提交时必须确认目标账号
+        // 仍是当前账号、且核对期间库内快照未被别的写入改动（I-09 竞态防护）。
         if let Some(remote_blob) = report.remote_newer_blob.clone() {
             store::with_store(|data| {
-                if let Some(profile) = data.profiles.iter_mut().find(|p| p.id == current_id) {
-                    profile.keychain_password = Some(remote_blob);
-                    profile.updated_at = chrono::Utc::now();
-                }
-                Ok(())
+                parallel::commit_wsl_credential_if_current(
+                    data,
+                    &current_id,
+                    &observed_store_blob,
+                    &remote_blob,
+                )
             })?;
         }
         Ok(report)
@@ -2619,7 +2624,7 @@ pub fn run() {
     // 启动早期探测数据目录可写（H-1）：解压到 Program Files 等只读位置时
     // 弹明确原生提示并退出，而不是静默失败。
     if let Err(error) = paths::probe_data_dir_writable() {
-        platform::imp::show_startup_error("无法启动 Claude Switcher", &error);
+        platform::imp::show_startup_error("无法启动账号切换器", &error);
         std::process::exit(1);
     }
 

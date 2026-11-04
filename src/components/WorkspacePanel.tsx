@@ -1,3 +1,4 @@
+import { formatError } from '../uiText';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -49,7 +50,7 @@ export function WorkspacePanel() {
       setItems(result);
       setError(null);
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     }
   }, []);
 
@@ -68,7 +69,7 @@ export function WorkspacePanel() {
       });
       await load();
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     } finally {
       setBusy(null);
     }

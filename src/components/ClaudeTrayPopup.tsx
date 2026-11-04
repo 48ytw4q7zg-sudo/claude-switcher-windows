@@ -1,3 +1,4 @@
+import { compactNumber, formatError } from '../uiText';
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { getCurrentWebviewWindow } from '@tauri-apps/api/webviewWindow';
@@ -66,13 +67,6 @@ const PLAN_CAPACITY = {
   },
 };
 
-function compactNumber(value?: number | null) {
-  const next = value ?? 0;
-  if (next >= 1_000_000_000) return `${(next / 1_000_000_000).toFixed(next >= 10_000_000_000 ? 0 : 1)}B`;
-  if (next >= 1_000_000) return `${(next / 1_000_000).toFixed(next >= 10_000_000 ? 0 : 1)}M`;
-  if (next >= 1_000) return `${(next / 1_000).toFixed(next >= 10_000 ? 0 : 1)}K`;
-  return `${next}`;
-}
 
 function displayedTokens(totals?: TokenTotals | null) {
   if (!totals) return 0;
@@ -86,7 +80,7 @@ function formatCountdown(value?: string | null) {
   const minutes = Math.floor(diff / 60000);
   const hours = Math.floor(minutes / 60);
   const rest = minutes % 60;
-  return hours > 0 ? `${hours}h ${rest}m` : `${rest}m`;
+  return hours > 0 ? `${hours} 小时 ${rest} 分钟` : `${rest} 分钟`;
 }
 
 function shortEmail(value?: string | null) {
@@ -126,9 +120,9 @@ function statusClass(percent: number) {
 }
 
 function statusLabel(percent: number) {
-  if (percent > 50) return 'HEALTHY';
-  if (percent > 10) return 'WARNING';
-  return 'CRITICAL';
+  if (percent > 50) return '充足';
+  if (percent > 10) return '偏低';
+  return '不足';
 }
 
 function QuotaCard({
@@ -153,12 +147,12 @@ function QuotaCard({
       <div className="ctp-card-value">
         {percent}
         <span className="ctp-unit">%</span>
-        <span className="ctp-remaining">Remaining</span>
+        <span className="ctp-remaining">剩余</span>
       </div>
       <div className="ctp-progress">
         <div className={`ctp-progress-bar ${level}`} style={{ width: `${percent}%` }} />
       </div>
-      <div className="ctp-reset">Resets in {formatCountdown(resetAt)}</div>
+      <div className="ctp-reset">距离重置：{formatCountdown(resetAt)}</div>
     </div>
   );
 }
@@ -239,31 +233,31 @@ export function ClaudeTrayPopup() {
         <div className="ctp-title">
           <div className="ctp-logo">✦</div>
           <div>
-            <div className="ctp-name">Claude Switcher</div>
-            <div className="ctp-subtitle">Usage Monitor</div>
+            <div className="ctp-name">Claude 账号切换器</div>
+            <div className="ctp-subtitle">用量监测</div>
           </div>
         </div>
         <div className={proxyOn ? 'ctp-badge running' : 'ctp-badge'}>
-          ● {proxyOn ? 'Proxy ON' : 'Proxy OFF'}
+          ● {proxyOn ? '代理可用' : '代理未连接'}
         </div>
       </div>
 
       <div className="ctp-account">
         {accountLabel(data.status)}
         <span className="ctp-plan">{planLabel(data.status)}</span>
-        <span className={keychainOk ? 'ctp-auth ok' : 'ctp-auth'}>{keychainOk ? 'AUTH OK' : 'AUTH MISS'}</span>
+        <span className={keychainOk ? 'ctp-auth ok' : 'ctp-auth'}>{keychainOk ? '凭据正常' : '凭据缺失'}</span>
       </div>
 
       <div className="ctp-cards">
         <QuotaCard
           icon="⚡"
-          title="SESSION EST."
+          title="会话额度估算"
           percent={sessionLeft}
           resetAt={data.usage?.session.reset_at}
         />
         <QuotaCard
           icon="◷"
-          title="WEEKLY EST."
+          title="每周额度估算"
           percent={weeklyLeft}
           resetAt={data.usage?.weekly.reset_at}
         />
@@ -273,48 +267,48 @@ export function ClaudeTrayPopup() {
         <div className="ctp-card today">
           <div className="ctp-card-header">
             <span className="ctp-card-icon">☉</span>
-            <span>TODAY</span>
+            <span>今日用量</span>
           </div>
           <div className="ctp-card-value today-value">
             {compactNumber(todayTokens)}
-            <span className="ctp-remaining">Tokens</span>
+            <span className="ctp-remaining">词元</span>
           </div>
           <div className="ctp-token-detail">
-            {data.usage?.today.message_count ?? 0} usage rows
+            {data.usage?.today.message_count ?? 0} 条用量记录
           </div>
         </div>
 
         <div className="ctp-card tokens">
           <div className="ctp-card-header">
             <span className="ctp-card-icon">#</span>
-            <span>TOKEN USAGE</span>
+            <span>会话词元用量</span>
           </div>
           <div className="ctp-card-value token-value">
             {compactNumber(sessionTokens)}
-            <span className="ctp-remaining">Tokens</span>
+            <span className="ctp-remaining">词元</span>
           </div>
           <div className="ctp-token-detail">
-            In {compactNumber(data.usage?.session.totals.input_tokens)} / Out{' '}
+            输入 {compactNumber(data.usage?.session.totals.input_tokens)} / 输出{' '}
             {compactNumber(data.usage?.session.totals.output_tokens)}
           </div>
         </div>
       </div>
 
       <div className="ctp-meta">
-        <span>Model</span>
+        <span>模型</span>
         <b>{data.usage?.top_model || '暂无'}</b>
       </div>
       <div className="ctp-meta">
-        <span>Auto-Claude</span>
+        <span>代理节点</span>
         <b>{data.clash?.now || '未读取'}</b>
       </div>
 
       <div className="ctp-actions">
         <button className="ctp-btn primary" onClick={openDashboard}>
-          Dashboard
+          打开主界面
         </button>
         <button className="ctp-btn" onClick={fetchData} disabled={loading}>
-          {loading ? 'Refreshing' : 'Refresh'}
+          {loading ? '刷新中' : '刷新'}
         </button>
       </div>
     </div>

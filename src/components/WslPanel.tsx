@@ -1,3 +1,4 @@
+import { formatError, formatMessage } from '../uiText';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Eraser, Loader2, RefreshCw, Terminal } from 'lucide-react';
@@ -34,7 +35,7 @@ export function WslPanel() {
       );
       setWarnings(report.warnings);
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     } finally {
       setBusy(null);
     }
@@ -50,7 +51,7 @@ export function WslPanel() {
     invoke<boolean>('set_wsl_integration_enabled', { enabled: false })
       .then(() => undefined)
       .catch(() => undefined);
-    refreshDistros().catch((e) => setError(String(e)));
+    refreshDistros().catch((e) => setError(formatError(e)));
     // 仅在挂载时加载一次。
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -63,7 +64,7 @@ export function WslPanel() {
         await action();
         setNote(success);
       } catch (e) {
-        setError(String(e));
+        setError(formatError(e));
       } finally {
         setBusy(null);
       }
@@ -81,7 +82,7 @@ export function WslPanel() {
       });
       setEnabled(result);
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     } finally {
       setBusy(null);
     }
@@ -101,7 +102,7 @@ export function WslPanel() {
             onClick={toggle}
           >
             {busy === 'toggle' ? <Loader2 className="spin" /> : <Terminal />}
-            {t('wsl.enable')}（{enabled ? 'ON' : 'OFF'}）
+            {t('wsl.enable')}（{enabled ? '已开启' : '已关闭'}）
           </button>
         </div>
 
@@ -162,7 +163,7 @@ export function WslPanel() {
       {warnings.length > 0 && (
         <div className="inline-warnings">
           {warnings.map((w, i) => (
-            <p key={i}>{w}</p>
+            <p key={i}>{formatMessage(w)}</p>
           ))}
         </div>
       )}

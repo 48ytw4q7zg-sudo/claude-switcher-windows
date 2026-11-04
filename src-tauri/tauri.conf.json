@@ -16,7 +16,7 @@
       "iconAsTemplate": true,
       "showMenuOnLeftClick": false,
       "title": "",
-      "tooltip": "Claude Switcher"
+      "tooltip": "账号切换器"
     },
     "security": {
       "csp": null
@@ -24,7 +24,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Claude Switcher",
+        "title": "账号切换器",
         "width": 1120,
         "height": 760,
         "minWidth": 980,

@@ -22,6 +22,7 @@ pub struct ClashRuntimeConfig {
     pub controller: String,
     pub secret: Option<String>,
     pub proxy: Option<String>,
+    controller_error: Option<String>,
 }
 
 /// 用户手动覆盖文件 `~/.claude-switcher/clash.json` 的形状。
@@ -60,6 +61,8 @@ fn probe_default_controller() -> String {
         .find(|candidate| {
             let client = reqwest::blocking::Client::builder()
                 .timeout(Duration::from_secs(1))
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
                 .build();
             client
                 .map(|c| {
@@ -87,10 +90,10 @@ fn read_override() -> Option<ClashOverride> {
 
 /// 探测运行时配置：手动覆盖 > Clash Verge 配置文件 > 默认端口。
 ///
-/// 控制器地址规范化失败（远程主机 / https）时记日志并回落到本机默认端口，
-/// **绝不把 secret 发给非回环目标**。
+/// 地址无效时记录错误，携带密钥的控制器请求在发送前失败。
 pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
     if let Some(override_cfg) = read_override() {
+        let mut controller_error = None;
         let controller = override_cfg
             .controller
             .as_deref()
@@ -100,6 +103,7 @@ pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
                 Ok(url) => Some(url),
                 Err(e) => {
                     crate::log_error(&format!("clash.json 控制器地址被拒绝：{e}"));
+                    controller_error = Some(e);
                     None
                 }
             });
@@ -114,16 +118,25 @@ pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
             .or(override_cfg.mixed_port)
             .filter(|port| *port > 0)
             .map(|port| format!("http://127.0.0.1:{port}"));
-        if controller.is_some() || secret.is_some() || proxy.is_some() {
+        if controller.is_some() || secret.is_some() || proxy.is_some() || controller_error.is_some()
+        {
             return ClashRuntimeConfig {
-                controller: controller.unwrap_or_else(probe_default_controller),
+                controller: controller.unwrap_or_else(|| {
+                    if controller_error.is_some() {
+                        DEFAULT_CONTROLLERS[0].to_string()
+                    } else {
+                        probe_default_controller()
+                    }
+                }),
                 secret,
                 proxy,
+                controller_error,
             };
         }
     }
 
     for path in paths::clash_config_candidates().unwrap_or_default() {
+        let mut controller_error = None;
         // read_yaml_optional 取得 PathBuf 所有权，日志里还要用 path，先克隆一份。
         let path_for_log = path.clone();
         let Ok(Some(value)) = crate::jsonio::read_yaml_optional(path) else {
@@ -140,13 +153,20 @@ pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
                 Ok(url) => Some(url),
                 Err(e) => {
                     crate::log_error(&format!(
-                        "{} 的 external-controller 被拒绝（{e}），回落到本机默认端口",
+                        "{} 的 external-controller 被拒绝（{e}），已停止控制器请求",
                         path_for_log.display()
                     ));
+                    controller_error = Some(e);
                     None
                 }
             })
-            .unwrap_or_else(probe_default_controller);
+            .unwrap_or_else(|| {
+                if controller_error.is_some() {
+                    DEFAULT_CONTROLLERS[0].to_string()
+                } else {
+                    probe_default_controller()
+                }
+            });
         let secret = value
             .get("secret")
             .and_then(|v| v.as_str())
@@ -162,6 +182,7 @@ pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
             controller,
             secret,
             proxy,
+            controller_error,
         };
     }
 
@@ -169,6 +190,7 @@ pub fn detect_clash_runtime_config() -> ClashRuntimeConfig {
         controller: probe_default_controller(),
         secret: None,
         proxy: None,
+        controller_error: None,
     }
 }
 
@@ -188,7 +210,9 @@ fn http_client(
         .user_agent("claude-code/2.1.0");
     if no_proxy_when_local {
         // 整个 client 不走代理（本机服务专用）。
-        builder = builder.no_proxy();
+        builder = builder
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none());
     }
     builder
         .build()
@@ -208,61 +232,78 @@ fn http_client(
 fn normalize_controller(raw: &str) -> Result<String, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Ok(probe_default_controller());
+        return Ok(DEFAULT_CONTROLLERS[0].to_string());
     }
-    // 补协议头，便于后续按 host:port 拆解。
-    let with_scheme = if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
-        trimmed.to_string()
-    } else {
-        format!("http://{trimmed}")
-    };
-    let Some(rest) = with_scheme.strip_prefix("http://") else {
-        // https:// 一律拒绝：本机控制器不使用 TLS，出现 https 只可能是误配置。
-        return Err(format!("控制器必须是本机 http 地址，拒绝: {trimmed}"));
-    };
-
-    // 拆 host 与 port。IPv6 用方括号包住地址，只有端口分隔符在 `]` 后才拆；
-    // 无 `]` 时普通 host:port 与 `:9097` 都要拆开（`:9097` 的 host 是空串）。
-    let (host, port) = match (rest.rfind(':'), rest.rfind(']')) {
-        (Some(idx), Some(bracket)) if idx > bracket => (&rest[..idx], &rest[idx + 1..]),
-        (Some(idx), None) => (&rest[..idx], &rest[idx + 1..]),
-        _ => (rest, ""),
-    };
-    let host_clean = host.trim_matches(|c| c == '[' || c == ']');
-    // 回环判定：空主机/0.0.0.0/:: 视为通配（本机），以及字面回环地址。
-    let is_loopback = host_clean.is_empty()
-        || host_clean == "0.0.0.0"
-        || host_clean == "::"
-        || host_clean.eq_ignore_ascii_case("localhost")
-        || host_clean == "127.0.0.1"
-        || host_clean == "::1"
-        || host_clean.starts_with("127.");
-    if !is_loopback {
-        return Err(format!(
-            "Clash 控制器必须是本机回环地址，拒绝连接远程主机: {trimmed}"
-        ));
+    if trimmed.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err("控制器地址包含无效空白字符".to_string());
     }
-    let effective_port = if port.is_empty() { "9097" } else { port };
-    // 通配地址（空主机 / 0.0.0.0 / ::）必须先改写成 127.0.0.1——Windows 上
-    // connect 0.0.0.0 必然失败，而 `[::]:9090` 这种形式同样连不上。
-    // 顺序很重要：`::` 含冒号，若先走「IPv6 保留方括号」分支就永远改不掉。
-    let host_out = if host_clean.is_empty() || host_clean == "0.0.0.0" || host_clean == "::" {
-        "127.0.0.1".to_string()
-    } else if host_clean.contains(':') {
-        // 其余 IPv6 字面量必须保留方括号，否则 `http://::1:9097` 无法解析。
-        format!("[{host_clean}]")
+    let authority = if let Some((scheme, rest)) = trimmed.split_once("://") {
+        if !scheme.eq_ignore_ascii_case("http") {
+            return Err("控制器必须使用本机 HTTP 地址".to_string());
+        }
+        rest
     } else {
-        host_clean.to_string()
+        trimmed
     };
-    Ok(format!("http://{host_out}:{effective_port}"))
+    let authority = authority.strip_suffix('/').unwrap_or(authority);
+    if authority.contains(['@', '/', '\\', '?', '#']) {
+        return Err("控制器地址不能包含用户信息、路径或查询参数".to_string());
+    }
+    let authority = if authority.starts_with(':') && !authority.starts_with("::") {
+        format!("127.0.0.1{authority}")
+    } else {
+        authority.to_string()
+    };
+    let parsed = url::Url::parse(&format!("http://{authority}"))
+        .map_err(|_| "控制器地址或端口格式无效".to_string())?;
+    // Preserve explicit port 80: URL parsers omit the scheme's default port.
+    let port_text = if authority.starts_with('[') {
+        authority
+            .split_once(']')
+            .and_then(|(_, tail)| tail.strip_prefix(':'))
+    } else {
+        authority.split_once(':').map(|(_, port)| port)
+    };
+    let port = match port_text {
+        None | Some("") => 9097,
+        Some(value) => value
+            .parse::<u16>()
+            .ok()
+            .filter(|port| *port != 0)
+            .ok_or_else(|| "控制器端口必须介于 1 和 65535 之间".to_string())?,
+    };
+    let host = match parsed.host() {
+        Some(url::Host::Ipv4(ip)) if ip.is_unspecified() => "127.0.0.1".to_string(),
+        Some(url::Host::Ipv4(ip)) if ip.is_loopback() => ip.to_string(),
+        Some(url::Host::Ipv6(ip)) if ip.is_unspecified() => "127.0.0.1".to_string(),
+        Some(url::Host::Ipv6(ip)) if ip.is_loopback() => format!("[{ip}]"),
+        Some(url::Host::Domain(host)) if host.eq_ignore_ascii_case("localhost") => {
+            "127.0.0.1".to_string()
+        }
+        _ => return Err("Clash 控制器必须是本机回环地址".to_string()),
+    };
+    Ok(format!("http://{host}:{port}"))
 }
 
 /// Clash RESTful API 调用。控制器是本机服务，故走 no_proxy。
 pub fn clash_api(method: &str, path: &str, body: Option<Value>) -> Result<Value, String> {
     let cfg = detect_clash_runtime_config();
+    clash_api_with_config(&cfg, method, path, body)
+}
+
+fn clash_api_with_config(
+    cfg: &ClashRuntimeConfig,
+    method: &str,
+    path: &str,
+    body: Option<Value>,
+) -> Result<Value, String> {
+    if let Some(error) = &cfg.controller_error {
+        return Err(error.clone());
+    }
+    let controller = normalize_controller(&cfg.controller)?;
     let url = format!(
         "{}/{}",
-        cfg.controller.trim_end_matches('/'),
+        controller.trim_end_matches('/'),
         path.trim_start_matches('/')
     );
     let client = http_client(8, true)?;
@@ -273,7 +314,7 @@ pub fn clash_api(method: &str, path: &str, body: Option<Value>) -> Result<Value,
         other => return Err(format!("不支持的 HTTP 方法: {other}")),
     };
     let mut request = request;
-    if let Some(secret) = cfg.secret {
+    if let Some(secret) = &cfg.secret {
         request = request.bearer_auth(secret);
     }
     if let Some(body) = body {
@@ -282,6 +323,12 @@ pub fn clash_api(method: &str, path: &str, body: Option<Value>) -> Result<Value,
     let response = request
         .send()
         .map_err(|e| format!("调用 Clash 控制器失败: {e}"))?;
+    if !response.status().is_success() {
+        return Err(format!(
+            "Clash 控制器返回状态码 {}",
+            response.status().as_u16()
+        ));
+    }
     let text = response
         .text()
         .map_err(|e| format!("读取 Clash 响应失败: {e}"))?;
@@ -369,7 +416,26 @@ pub fn clash_proxy_path(node: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::normalize_controller;
+    use super::*;
+
+    #[test]
+    fn controller_rejects_deceptive_hosts_userinfo_and_invalid_authorities() {
+        for input in [
+            "127.attacker.invalid:9090",
+            "127.0.0.1:9097@attacker.invalid",
+            "http://127.0.0.1:9097@attacker.invalid",
+            "localhost:9097/path",
+            "127.0.0.1:9097?host=example.invalid",
+            "127.0.0.1:9097#fragment",
+            "127.0.0.1:65536",
+            "127.0.0.1:0",
+            "127.0.0.1:not-a-port",
+            "127.0.0.1:9097\\@example.invalid",
+            "127.0.0.1:90\t97",
+        ] {
+            assert!(normalize_controller(input).is_err(), "accepted {input}");
+        }
+    }
 
     #[test]
     fn controller_normalization_table() {
@@ -382,10 +448,13 @@ mod tests {
             ("[::1]", "http://[::1]:9097"),
             ("[::1]:9097", "http://[::1]:9097"),
             ("127.0.0.1", "http://127.0.0.1:9097"),
-            ("localhost:9097", "http://localhost:9097"),
+            ("localhost:9097", "http://127.0.0.1:9097"),
             ("http://0.0.0.0:9097", "http://127.0.0.1:9097"),
             ("127.0.0.1:9097", "http://127.0.0.1:9097"),
             ("127.0.0.5:9097", "http://127.0.0.5:9097"),
+            ("localhost:80", "http://127.0.0.1:80"),
+            ("http://[::1]:80/", "http://[::1]:80"),
+            ("127.0.0.1:0080", "http://127.0.0.1:80"),
         ];
         for (input, expected) in cases {
             assert_eq!(
@@ -394,7 +463,7 @@ mod tests {
                 "input={input}"
             );
         }
-        // 空串会探测默认端口，结果依赖本机控制器，不能写死。
+        // 纯地址规范化不执行端口探测；运行时探测由配置解析层处理。
         assert!(normalize_controller("")
             .unwrap()
             .starts_with("http://127.0.0.1:"));
@@ -413,5 +482,93 @@ mod tests {
                 "远程/非 http 控制器必须被拒绝: {remote}"
             );
         }
+    }
+
+    #[test]
+    fn invalid_override_blocks_authenticated_request_before_fallback() {
+        let _env_lock = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _restore = crate::test_support::set_env("USERPROFILE", dir.path());
+        let data_dir = dir.path().join(".claude-switcher");
+        std::fs::create_dir_all(&data_dir).unwrap();
+        std::fs::write(
+            data_dir.join("clash.json"),
+            r#"{"controller":"127.attacker.invalid:9097","secret":"fixture-only"}"#,
+        )
+        .unwrap();
+        let cfg = detect_clash_runtime_config();
+        assert!(cfg.controller_error.is_some());
+        let result = clash_api_with_config(&cfg, "GET", "/version", None);
+        assert_eq!(result.unwrap_err(), cfg.controller_error.unwrap());
+    }
+
+    #[test]
+    fn controller_does_not_follow_redirect_or_forward_fixture_authorization() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let server = std::thread::spawn(move || {
+            let accept_deadline = Instant::now() + Duration::from_secs(3);
+            let mut stream = loop {
+                match listener.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::WouldBlock
+                            && Instant::now() < accept_deadline =>
+                    {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(e) => panic!("local fixture did not receive a request: {e}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                let mut byte = [0u8; 1];
+                stream.read_exact(&mut byte).unwrap();
+                request.push(byte[0]);
+            }
+            assert!(String::from_utf8(request)
+                .unwrap()
+                .to_ascii_lowercase()
+                .contains("authorization: bearer fixture-only"));
+            stream.write_all(b"HTTP/1.1 302 Found\r\nLocation: /redirect-target\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").unwrap();
+            drop(stream);
+            listener.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_millis(500);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut unexpected, _)) => {
+                        let _ = unexpected.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                        );
+                        return true;
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(e) => panic!("local fixture failed: {e}"),
+                }
+            }
+            false
+        });
+        let cfg = ClashRuntimeConfig {
+            controller: format!("http://{address}"),
+            secret: Some("fixture-only".into()),
+            proxy: None,
+            controller_error: None,
+        };
+        let result = clash_api_with_config(&cfg, "GET", "/version", None);
+        assert!(
+            !server.join().unwrap(),
+            "redirect caused a second authenticated request"
+        );
+        assert!(result.unwrap_err().contains("302"));
     }
 }

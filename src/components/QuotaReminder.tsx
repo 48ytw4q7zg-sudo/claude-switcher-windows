@@ -1,3 +1,4 @@
+import { formatError } from '../uiText';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Bell, BellOff, Loader2, Repeat, TriangleAlert } from 'lucide-react';
@@ -18,7 +19,7 @@ export function QuotaReminderPanel() {
       setReminder(await invoke<QuotaReminder>('get_quota_reminder'));
       setError(null);
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     }
   }, []);
 
@@ -37,7 +38,7 @@ export function QuotaReminderPanel() {
       });
       await load();
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     } finally {
       setBusy(null);
     }
@@ -50,7 +51,7 @@ export function QuotaReminderPanel() {
       await invoke('set_quota_reminder', { enabled: true, threshold: value });
       await load();
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     } finally {
       setBusy(null);
     }
@@ -62,7 +63,7 @@ export function QuotaReminderPanel() {
       await invoke('switch_profile', { id });
       await load();
     } catch (e) {
-      setError(String(e));
+      setError(formatError(e));
     } finally {
       setBusy(null);
     }

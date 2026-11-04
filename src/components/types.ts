@@ -168,8 +168,8 @@ export interface CliInfo {
 
 /** 把字节数格式化成可读字符串。 */
 export function humanBytes(bytes?: number | null): string {
-  if (!bytes || bytes <= 0) return '0 B';
-  const units = ['B', 'KB', 'MB', 'GB'];
+  if (!bytes || bytes <= 0) return '0 字节';
+  const units = ['字节', '千字节', '兆字节', '吉字节'];
   let value = bytes;
   let unit = 0;
   while (value >= 1024 && unit < units.length - 1) {

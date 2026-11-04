@@ -1,3 +1,4 @@
+import { formatError, formatMessage } from '../uiText';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import {
@@ -50,7 +51,7 @@ export function DesktopProfiles() {
       const list = await invoke<DesktopProfile[]>('list_desktop_profiles_cmd');
       setProfiles(list);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setBusy(null);
     }
@@ -75,7 +76,7 @@ export function DesktopProfiles() {
       await load();
     } catch (err) {
       // 后端要求 Desktop 完全退出；失败文本直接展示。
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setBusy(null);
     }
@@ -94,7 +95,7 @@ export function DesktopProfiles() {
         setWarnings(result ?? []);
         await load();
       } catch (err) {
-        setError(String(err));
+        setError(formatError(err));
       } finally {
         setBusy(null);
       }
@@ -105,7 +106,7 @@ export function DesktopProfiles() {
         await invoke('delete_desktop_profile_cmd', { id: t.profile.id, alsoFiles: t.alsoFiles });
         await load();
       } catch (err) {
-        setError(String(err));
+        setError(formatError(err));
       } finally {
         setBusy(null);
       }
@@ -128,7 +129,7 @@ export function DesktopProfiles() {
       await invoke<DesktopProfile>('rename_desktop_profile_cmd', { id, name: renameValue.trim() });
       await load();
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setBusy(null);
       setRenamingId(null);
@@ -156,7 +157,7 @@ export function DesktopProfiles() {
             <input
               value={captureName}
               onChange={(e) => setCaptureName(e.target.value)}
-              placeholder="例如 Desktop 主号"
+              placeholder="例如桌面版主号"
             />
           </label>
           <label style={{ marginTop: 0 }}>
@@ -189,7 +190,7 @@ export function DesktopProfiles() {
           切换后提示：
           {warnings.map((w, i) => (
             <div key={i} style={{ marginTop: 4, fontSize: 12, fontWeight: 600 }}>
-              · {w}
+              · {formatMessage(w)}
             </div>
           ))}
         </div>
@@ -283,7 +284,7 @@ export function DesktopProfiles() {
                 </strong>
                 <span>
                   {target.kind === 'switch'
-                    ? `将把 Claude Desktop 登录态切到「${target.profile.name}」。建议先完全退出 Desktop。`
+                    ? `将把 Claude Desktop 登录态切到「${target.profile.name}」。建议先完全退出桌面版。`
                     : `将删除快照「${target.profile.name}」。此操作不可恢复。`}
                 </span>
               </div>

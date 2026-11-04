@@ -241,7 +241,23 @@ pub fn apply_account_material(
                 }
             }
         }
-        (WriteMode::Merge, None) => {}
+        (WriteMode::Merge, None) => {
+            let result = (|| {
+                let path = paths::claude_settings_path()?;
+                let current = read_json_optional(path.clone())?;
+                let (next, authentication) = store::split_auth_settings(current);
+                if authentication.is_some() {
+                    restore_json_file(path, next.as_ref())?;
+                }
+                Ok::<(), String>(())
+            })();
+            if let Err(error) = result {
+                return Err(fail_with_rollback(
+                    format!("清除上一账号的认证设置失败: {error}"),
+                    rollback_from,
+                ));
+            }
+        }
     }
 
     // ── 凭据 ──
@@ -446,6 +462,110 @@ pub fn clean_live_account_for_new_login(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_without_settings_clears_live_auth_and_preserves_unrelated_fields() {
+        let _lock = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let _config = crate::test_support::set_env("CLAUDE_CONFIG_DIR", &config);
+        assert!(paths::portable_root().is_none());
+        std::fs::create_dir_all(&config).unwrap();
+        let path = paths::claude_settings_path().unwrap();
+        assert_eq!(path, config.join("settings.json"));
+
+        let expected = json!({
+            "env": { "CUSTOM_KEEP": "keep", "TZ": "UTC" },
+            "permissions": { "deny": ["Bash(*)"] },
+            "hooks": { "FutureEvent": [{ "unknown": true }] },
+            "futureSetting": [1, 2, 3]
+        });
+        let mut original = expected.clone();
+        original["apiKeyHelper"] = json!("synthetic-helper");
+        for key in store::AUTH_ENV_KEYS {
+            original["env"][*key] = json!("synthetic-auth");
+        }
+        write_json_pretty(path.clone(), &original).unwrap();
+        let backup = BackupSnapshot {
+            claude_json: None,
+            settings_json: Some(original),
+            keychain: None,
+        };
+
+        apply_account_material(WriteMode::Merge, None, None, None, &backup).unwrap();
+
+        assert_eq!(read_json_optional(path).unwrap(), Some(expected));
+    }
+
+    #[test]
+    fn merge_without_settings_handles_absent_auth_only_and_non_object_files() {
+        let _lock = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let _config = crate::test_support::set_env("CLAUDE_CONFIG_DIR", &config);
+        assert!(paths::portable_root().is_none());
+        std::fs::create_dir_all(&config).unwrap();
+        let path = paths::claude_settings_path().unwrap();
+        assert_eq!(path, config.join("settings.json"));
+
+        for (original, expected) in [
+            (None, None),
+            (
+                Some(json!({ "apiKeyHelper": "synthetic-helper", "env": {
+                    "ANTHROPIC_AUTH_TOKEN": "synthetic-auth"
+                } })),
+                None,
+            ),
+            (Some(json!(["keep"])), Some(json!(["keep"]))),
+        ] {
+            restore_json_file(path.clone(), original.as_ref()).unwrap();
+            let backup = BackupSnapshot {
+                claude_json: None,
+                settings_json: original,
+                keychain: None,
+            };
+
+            apply_account_material(WriteMode::Merge, None, None, None, &backup).unwrap();
+
+            assert_eq!(read_json_optional(path.clone()).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn explicit_settings_are_restored_and_full_replace_none_deletes_settings() {
+        let _lock = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let config = dir.path().join("config");
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let _config = crate::test_support::set_env("CLAUDE_CONFIG_DIR", &config);
+        assert!(paths::portable_root().is_none());
+        std::fs::create_dir_all(&config).unwrap();
+        let path = paths::claude_settings_path().unwrap();
+        assert_eq!(path, config.join("settings.json"));
+        let source = json!({
+            "apiKeyHelper": "synthetic-target-helper",
+            "env": { "ANTHROPIC_AUTH_TOKEN": "synthetic-target-auth" }
+        });
+        let backup = BackupSnapshot {
+            claude_json: None,
+            settings_json: None,
+            keychain: None,
+        };
+
+        for mode in [WriteMode::Merge, WriteMode::FullReplace] {
+            write_json_pretty(path.clone(), &json!({ "old": true })).unwrap();
+            apply_account_material(mode, None, Some(&source), None, &backup).unwrap();
+            assert_eq!(
+                read_json_optional(path.clone()).unwrap(),
+                Some(source.clone())
+            );
+        }
+
+        apply_account_material(WriteMode::FullReplace, None, None, None, &backup).unwrap();
+        assert!(!path.exists());
+    }
 
     #[test]
     fn merge_claude_json_keeps_other_fields_and_overrides_account_fields() {

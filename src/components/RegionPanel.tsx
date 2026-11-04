@@ -1,3 +1,4 @@
+import { formatError, formatMessage } from '../uiText';
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { Globe, Loader2, MapPin, RefreshCw, Settings2 } from 'lucide-react';
@@ -31,7 +32,7 @@ export function RegionPanel() {
       const info = await invoke<EgressInfo>('detect_egress');
       setEgress(info);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setProbing(false);
     }
@@ -60,7 +61,7 @@ export function RegionPanel() {
       const report = await invoke<RegionLockReport>('lock_region', { apply: applyNow });
       setRegionReport(report);
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setLocking(false);
     }
@@ -73,7 +74,7 @@ export function RegionPanel() {
     try {
       await invoke('set_client', { mode: value });
     } catch (err) {
-      setError(String(err));
+      setError(formatError(err));
     } finally {
       setSettingClient(false);
     }
@@ -144,7 +145,7 @@ export function RegionPanel() {
 
       {regionReport && (
         <div className="inline-warning" style={{ marginTop: 12 }}>
-          <Settings2 /> {regionReport.message}
+          <Settings2 /> {formatMessage(regionReport.message)}
           <div style={{ marginTop: 6, fontSize: 12, fontWeight: 600 }}>
             目标：{regionReport.plan.country} · {regionReport.plan.iana_tz} · {regionReport.plan.locale}
             {regionReport.applied ? '（已应用到系统）' : '（仅保存，未应用）'}
