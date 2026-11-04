@@ -58,10 +58,48 @@ pub struct Gate {
     pub already_tripped: bool,
     /// **P0-06**：上次熔断是否只部分成功（需要补齐）。
     pub partial_protection: bool,
-    /// **P0-07**：出口是否已恢复正常（可自动解除隔离）。
-    pub egress_recovered: bool,
+    /// **P0-03**：自动恢复资格（目标/接入/泄漏/手动保持）。
+    pub recovery: RecoveryEligibility,
     /// 门禁总开关是否开启。
     pub enabled: bool,
+}
+
+/// **P0-03**：自动恢复资格（不能用单一布尔值代表所有条件）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryEligibility {
+    /// 所有启用目标是否通过（Pass）。
+    pub targets_pass: bool,
+    /// 接入路径是否可靠（SystemProxy/Tun）。
+    pub access_ok: bool,
+    /// 直连泄漏是否已解除（未启用 leak_trip 时恒 true）。
+    pub leak_clear: bool,
+    /// 是否处于用户手动保持的隔离（不得自动解除）。
+    pub manual_hold: bool,
+}
+
+impl RecoveryEligibility {
+    /// 是否允许自动恢复。
+    pub fn allowed(self) -> bool {
+        self.targets_pass && self.access_ok && self.leak_clear && !self.manual_hold
+    }
+
+    /// 不合格原因（供日志）。
+    pub fn blockers(self) -> Vec<&'static str> {
+        let mut out = Vec::new();
+        if !self.targets_pass {
+            out.push("目标未全部通过");
+        }
+        if !self.access_ok {
+            out.push("接入路径不可靠");
+        }
+        if !self.leak_clear {
+            out.push("仍存在直连泄漏");
+        }
+        if self.manual_hold {
+            out.push("用户手动保持隔离");
+        }
+        out
+    }
 }
 
 /// 决定一轮该做什么。
@@ -82,13 +120,18 @@ pub fn decide(gate: Gate) -> RoundAction {
     if gate.paused {
         return RoundAction::Idle;
     }
-    // P0-06：部分熔断必须继续补齐，不能因为「已标记熔断」就不再尝试。
+    // **P0-03**：部分熔断时先看风险是否已消失——若恢复资格满足则进入恢复，
+    // 否则继续补齐隔离（原实现无条件补齐，会导致环境恢复后仍不断重试）。
     if gate.partial_protection {
-        return RoundAction::RetryProtection;
+        return if gate.recovery.allowed() {
+            RoundAction::Recover
+        } else {
+            RoundAction::RetryProtection
+        };
     }
-    // P0-07：已完整熔断但出口已恢复 → 自动解除。
+    // **P0-03**：已完整熔断 → 只有恢复资格全部满足才自动解除。
     if gate.already_tripped {
-        return if gate.egress_recovered {
+        return if gate.recovery.allowed() {
             RoundAction::Recover
         } else {
             RoundAction::Idle
@@ -329,7 +372,7 @@ pub fn current_gate(
     enabled: bool,
     threshold_reached: bool,
     at_warning_point: bool,
-    egress_recovered: bool,
+    recovery: RecoveryEligibility,
 ) -> Gate {
     Gate {
         intent: protection_intent(),
@@ -338,7 +381,7 @@ pub fn current_gate(
         paused: is_paused(),
         already_tripped: is_tripped(),
         partial_protection: is_partial(),
-        egress_recovered,
+        recovery,
         enabled,
     }
 }
@@ -505,12 +548,27 @@ fn run_monitor_round(
 
     // 直连泄露：默认只告警；开启 egate_leak_trip 后与目标失败同等对待。
     let leak = leak_round(config);
-    let egress_recovered = report.overall.verdict == crate::egate::Verdict::Pass;
+    // **P0-03**：恢复资格必须综合目标、接入、泄漏三项——不能只看目标 Pass。
+    let access_ok = matches!(report.access.path.as_str(), "system_proxy" | "tun");
+    let recovery = RecoveryEligibility {
+        targets_pass: report.overall.verdict == crate::egate::Verdict::Pass,
+        access_ok,
+        // 启用 leak_trip 时，仍有达阈值的直连泄漏则不允许恢复。
+        leak_clear: !(config.egate_leak_trip && leak.trip),
+        // 用户手动锁定/保持隔离的意图（当前无独立手动接口，保守为 false）。
+        manual_hold: false,
+    };
+    if !recovery.allowed() && is_tripped() {
+        crate::log_error(&format!(
+            "自动恢复条件未满足：{}",
+            recovery.blockers().join("、")
+        ));
+    }
     let gate = current_gate(
         config.egate_enabled,
         report.should_trip || leak.trip,
         report.should_warn || leak.warn,
-        egress_recovered,
+        recovery,
     );
     match decide(gate) {
         RoundAction::Trip => {
@@ -634,7 +692,12 @@ mod tests {
             paused: false,
             already_tripped: false,
             partial_protection: false,
-            egress_recovered: false,
+            recovery: RecoveryEligibility {
+                targets_pass: false,
+                access_ok: false,
+                leak_clear: true,
+                manual_hold: false,
+            },
             enabled: true,
         }
     }
@@ -745,7 +808,17 @@ mod tests {
     #[test]
     fn current_gate_reflects_inputs() {
         // 纯函数语义：各字段如实映射到 Gate（不依赖全局磁盘状态）。
-        let g = current_gate(true, true, false, false);
+        let g = current_gate(
+            true,
+            true,
+            false,
+            RecoveryEligibility {
+                targets_pass: false,
+                access_ok: false,
+                leak_clear: true,
+                manual_hold: false,
+            },
+        );
         assert!(g.enabled && g.threshold_reached && !g.already_tripped);
         // 部分保护优先于已熔断的判断由 decide() 覆盖（见 decide 测试）。
     }

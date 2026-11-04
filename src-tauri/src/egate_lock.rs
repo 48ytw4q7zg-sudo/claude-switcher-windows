@@ -58,7 +58,12 @@ pub struct OperationGuard {
 /// 内部函数接收 `&OperationGuard` 而不是自己再申请一次。
 pub fn acquire(operation: SystemOperation) -> Result<OperationGuard, String> {
     let dir = crate::paths::app_data_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
+    acquire_in(&dir, operation)
+}
+
+/// 可注入目录的获取实现（测试用临时目录）。
+fn acquire_in(dir: &std::path::Path, operation: SystemOperation) -> Result<OperationGuard, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
     let path = dir.join("eguard-operation.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -81,7 +86,14 @@ pub fn acquire(operation: SystemOperation) -> Result<OperationGuard, String> {
 /// 然后单独执行，是不具原子性的伪互斥。
 pub fn try_acquire(operation: SystemOperation) -> Result<Option<OperationGuard>, String> {
     let dir = crate::paths::app_data_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
+    try_acquire_in(&dir, operation)
+}
+
+fn try_acquire_in(
+    dir: &std::path::Path,
+    operation: SystemOperation,
+) -> Result<Option<OperationGuard>, String> {
+    std::fs::create_dir_all(dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
     let path = dir.join("eguard-operation.lock");
     let file = OpenOptions::new()
         .read(true)
@@ -136,8 +148,10 @@ mod tests {
         let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
 
+        let dir = tempfile::tempdir().unwrap();
+        let dir_holder = dir.path().to_path_buf();
         let holder = std::thread::spawn(move || {
-            let guard = try_acquire(SystemOperation::FullRestore).unwrap();
+            let guard = try_acquire_in(&dir_holder, SystemOperation::FullRestore).unwrap();
             assert!(guard.is_some(), "无竞争时应拿到锁");
             acquired_tx.send(()).unwrap();
             // 等待主线程确认「B 已被阻塞」后再释放。
@@ -148,7 +162,7 @@ mod tests {
 
         acquired_rx.recv().unwrap();
         // 线程 B（主线程）此刻尝试非阻塞获取：必须失败。
-        let contended = try_acquire(SystemOperation::Isolate).unwrap();
+        let contended = try_acquire_in(dir.path(), SystemOperation::Isolate).unwrap();
         assert!(contended.is_none(), "A 持锁期间 B 绝不能拿到锁");
 
         release_tx.send(()).unwrap();
@@ -156,7 +170,7 @@ mod tests {
         holder.join().unwrap();
 
         // A 释放后 B 应能拿到。
-        let after = try_acquire(SystemOperation::Isolate).unwrap();
+        let after = try_acquire_in(dir.path(), SystemOperation::Isolate).unwrap();
         assert!(after.is_some(), "A 释放后 B 应能获取");
     }
 

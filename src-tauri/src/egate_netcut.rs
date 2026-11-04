@@ -69,6 +69,19 @@ pub enum CutPhase {
     Applied,
 }
 
+/// **P0-04**：网卡快照（保存稳定身份与原始管理状态）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdapterSnapshot {
+    /// 显示名称（仅展示/旧账本兼容）。
+    pub name: String,
+    /// 稳定接口标识（InterfaceGuid；旧账本为空）。
+    #[serde(default)]
+    pub guid: String,
+    /// 事务开始时的管理启用状态（AdminStatus）。
+    #[serde(default)]
+    pub admin_up: bool,
+}
+
 /// 断网现场（落盘，供崩溃后自愈）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CutState {
@@ -83,6 +96,9 @@ pub struct CutState {
     /// 已确认禁用的网卡（进度记录，仅用于诊断与增量核验）。
     #[serde(default)]
     pub completed_adapters: Vec<String>,
+    /// **P0-04**：网卡原始快照（含稳定身份与原始管理状态）。
+    #[serde(default)]
+    pub adapter_snapshots: Vec<AdapterSnapshot>,
     /// 旧版兼容字段（= planned_adapters 的别名，读取时回退）。
     #[serde(default)]
     pub nics: Vec<String>,
@@ -188,6 +204,7 @@ pub fn cut(mode: CutMode) -> (bool, String) {
         firewall: false,
         planned_adapters: Vec::new(),
         completed_adapters: Vec::new(),
+        adapter_snapshots: Vec::new(),
         nics: Vec::new(),
         since: now_secs(),
         phase: CutPhase::Prepared,
@@ -205,6 +222,7 @@ pub fn cut(mode: CutMode) -> (bool, String) {
         firewall: true,
         planned_adapters: Vec::new(),
         completed_adapters: Vec::new(),
+        adapter_snapshots: Vec::new(),
         nics: Vec::new(),
         phase: CutPhase::FirewallApplied,
         ..prepared
@@ -229,6 +247,7 @@ pub fn cut(mode: CutMode) -> (bool, String) {
                 );
             }
         };
+        let targets: Vec<String> = targets.iter().map(|s| s.name.clone()).collect();
         // 先把「计划禁用的全部网卡」写入账本。
         let planned = CutState {
             mode: "nics".to_string(),
@@ -396,6 +415,8 @@ pub(crate) fn restore_locked(_guard: &crate::egate_lock::OperationGuard) -> (boo
 
 /// 查询指定网卡是否处于 Up 状态；返回仍处于 Down 的网卡名。
 fn verify_nics_up(nics: &[String]) -> Result<Vec<String>, String> {
+    // **P0-04**：按**原始管理启用状态**核验，不再要求 Status=Up——
+    // 未插网线的正常网卡会显示 Disconnected，不应被误判为恢复失败。
     let list = nics
         .iter()
         .map(|n| ps_quote(n))
@@ -406,7 +427,8 @@ fn verify_nics_up(nics: &[String]) -> Result<Vec<String>, String> {
          $down = @()
          foreach ($n in @({list})) {{
            $a = Get-NetAdapter -Name $n -ErrorAction SilentlyContinue
-           if (-not $a -or $a.Status -ne 'Up') {{ $down += $n }}
+           if (-not $a) {{ $down += $n; continue }}
+           if ($a.AdminStatus -ne 'Up') {{ $down += $n }}
          }}
          ConvertTo-Json @($down) -Compress"
     );
@@ -414,14 +436,16 @@ fn verify_nics_up(nics: &[String]) -> Result<Vec<String>, String> {
         .map_err(|e| format!("查询网卡状态失败：{e}"))?;
     let value: serde_json::Value =
         serde_json::from_str(json.trim()).map_err(|e| format!("网卡状态解析失败：{e}"))?;
-    Ok(match value {
-        serde_json::Value::Array(items) => items
+    // **P0-04**：无法识别的输出类型必须报错，不能当成「没有失败项」。
+    match value {
+        serde_json::Value::Array(items) => Ok(items
             .into_iter()
             .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        serde_json::Value::String(one) if !one.is_empty() => vec![one],
-        _ => Vec::new(),
-    })
+            .collect()),
+        serde_json::Value::String(one) if !one.is_empty() => Ok(vec![one]),
+        serde_json::Value::Null => Ok(Vec::new()),
+        other => Err(format!("网卡状态输出格式异常：{other}")),
+    }
 }
 
 /// 查询某条防火墙规则是否存在。
@@ -485,20 +509,46 @@ fn remove_cut_rule() -> Result<(), String> {
 ///
 /// 必须在执行任何禁用之前调用，并把结果连同原始状态一起写入账本——
 /// 否则中途崩溃时账本里没有「哪些网卡已被禁用」的信息。
-pub fn list_up_physical_nics() -> Result<Vec<String>, String> {
+pub fn list_up_physical_nics() -> Result<Vec<AdapterSnapshot>, String> {
+    // **P0-04**：同时取 InterfaceGuid 与 AdminStatus（原始管理状态）。
     let script = "$ErrorActionPreference='Stop'
-@(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | Select-Object -ExpandProperty Name) | ConvertTo-Json -Compress";
+$items = @(Get-NetAdapter -Physical | Where-Object { $_.Status -eq 'Up' } | ForEach-Object {
+  [PSCustomObject]@{ name = $_.Name; guid = [string]$_.InterfaceGuid; admin_up = ($_.AdminStatus -eq 'Up') }
+})
+ConvertTo-Json @($items) -Compress";
     let json = crate::platform::imp::run_powershell(script)?;
     let value: serde_json::Value =
         serde_json::from_str(json.trim()).map_err(|e| format!("网卡列表解析失败：{e}"))?;
-    Ok(match value {
-        serde_json::Value::Array(items) => items
-            .into_iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        serde_json::Value::String(one) if !one.is_empty() => vec![one],
-        _ => Vec::new(),
-    })
+    let items = match value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(_) => vec![value],
+        serde_json::Value::Null => Vec::new(),
+        other => return Err(format!("网卡列表格式异常：{other}")),
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let name = item
+            .get("name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        out.push(AdapterSnapshot {
+            name,
+            guid: item
+                .get("guid")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            admin_up: item
+                .get("admin_up")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+        });
+    }
+    Ok(out)
 }
 
 /// 禁用**一块**网卡（供逐块处理，每块之间更新账本）。
@@ -568,6 +618,7 @@ mod tests {
             firewall: true,
             planned_adapters: vec!["以太网".to_string(), "WLAN".to_string()],
             completed_adapters: vec!["以太网".to_string()],
+            adapter_snapshots: Vec::new(),
             nics: Vec::new(),
             since: 1_760_000_000,
             phase: CutPhase::Applied,
