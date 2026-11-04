@@ -2882,7 +2882,12 @@ fn egate_pause(minutes: u64) -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn egate_resume() -> Result<serde_json::Value, String> {
     egate_monitor::resume();
-    Ok(serde_json::json!({ "paused": egate_monitor::is_paused() }))
+    // 用户主动「恢复守护」也意味着重新启用保护（清除停止保护意图）。
+    egate_monitor::rearm();
+    Ok(serde_json::json!({
+        "paused": egate_monitor::is_paused(),
+        "disarmed": egate_monitor::is_disarmed(),
+    }))
 }
 
 /// 出口门禁：监控状态（是否暂停/剩余时间/是否已熔断）。
@@ -2892,6 +2897,8 @@ fn egate_monitor_status() -> serde_json::Value {
         "paused": egate_monitor::is_paused(),
         "remaining_secs": egate_monitor::paused_remaining_secs(),
         "tripped": egate_monitor::is_tripped(),
+        "partial": egate_monitor::is_partial(),
+        "disarmed": egate_monitor::is_disarmed(),
     })
 }
 

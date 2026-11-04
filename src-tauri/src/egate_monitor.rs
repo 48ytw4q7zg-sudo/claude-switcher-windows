@@ -68,6 +68,10 @@ pub struct Gate {
 /// 「已暂停」压过一切熔断动作——暂停期间照常检测但不熔断，这是用户显式表达
 /// 的意图，任何阈值都不该覆盖它。
 pub fn decide(gate: Gate) -> RoundAction {
+    // P0-F：用户主动停止保护时，任何阈值都不触发动作。
+    if is_disarmed() {
+        return RoundAction::Idle;
+    }
     if !gate.enabled {
         return RoundAction::Idle;
     }
@@ -93,6 +97,66 @@ pub fn decide(gate: Gate) -> RoundAction {
         return RoundAction::Warn;
     }
     RoundAction::Idle
+}
+
+/// **P0-F**：用户主动停止保护的持久化意图（跨进程）。
+///
+/// 与「暂停」不同：暂停是临时的（到期自动恢复），停止保护是**持续**的——
+/// 用户明确要求「别再保护了」，后台守护下一轮也不能重新施加规则。
+fn disarm_file() -> Result<std::path::PathBuf, String> {
+    Ok(crate::paths::app_data_dir()?.join("eguard-disarmed.json"))
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DisarmState {
+    /// 是否处于停止保护状态。
+    disarmed: bool,
+    /// 操作时间（unix 秒）。
+    #[serde(default)]
+    since: u64,
+    /// 原因（供界面展示）。
+    #[serde(default)]
+    reason: String,
+}
+
+/// 写入「停止保护」意图（CLI 急救、托盘紧急停止调用）。
+pub fn disarm(reason: &str) {
+    let state = DisarmState {
+        disarmed: true,
+        since: now_secs(),
+        reason: reason.to_string(),
+    };
+    if let Ok(path) = disarm_file() {
+        if let Ok(text) = serde_json::to_string_pretty(&state) {
+            if let Err(error) = crate::fsx::write_atomically(&path, &text) {
+                crate::log_error(&format!("写入停止保护意图失败：{error}"));
+            }
+        }
+    }
+}
+
+/// 清除「停止保护」意图（用户重新启用保护时调用）。
+pub fn rearm() {
+    let state = DisarmState::default();
+    if let Ok(path) = disarm_file() {
+        if let Ok(text) = serde_json::to_string_pretty(&state) {
+            let _ = crate::fsx::write_atomically(&path, &text);
+        }
+    }
+}
+
+/// 是否处于「用户主动停止保护」状态。
+pub fn is_disarmed() -> bool {
+    let Ok(path) = disarm_file() else {
+        return false;
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return false;
+    };
+    let text = crate::jsonio::decode_text(&bytes);
+    serde_json::from_str::<DisarmState>(&text)
+        .map(|state| state.disarmed)
+        .unwrap_or(false)
 }
 
 /// **P0-E**：暂停状态文件（跨进程共享）。
