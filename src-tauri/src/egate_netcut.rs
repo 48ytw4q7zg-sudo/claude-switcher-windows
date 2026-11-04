@@ -54,6 +54,21 @@ impl CutMode {
     }
 }
 
+/// 断网事务阶段。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CutPhase {
+    /// 已记录意图，尚未执行任何系统修改。
+    #[default]
+    Prepared,
+    /// 防火墙规则已添加。
+    FirewallApplied,
+    /// 网卡已禁用（仅 Nics 档）。
+    NicsApplied,
+    /// 全部完成并核验通过。
+    Applied,
+}
+
 /// 断网现场（落盘，供崩溃后自愈）。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CutState {
@@ -66,6 +81,9 @@ pub struct CutState {
     pub nics: Vec<String>,
     /// 断网开始时间（unix 秒）。
     pub since: u64,
+    /// 事务阶段（用于崩溃恢复时判断做到哪一步）。
+    #[serde(default)]
+    pub phase: CutPhase,
 }
 
 fn state_path() -> Result<PathBuf, String> {
@@ -114,68 +132,102 @@ pub fn cut(mode: CutMode) -> (bool, String) {
     if mode == CutMode::Off {
         return (true, "档位为「不断网」，未执行断网".to_string());
     }
-    // 已有现场：先按账本恢复，避免把「已断网」当成「未断网」再动一次网卡。
-    if let Ok(Some(_)) = load_state() {
-        let (ok, note) = restore();
-        if !ok {
+    // 已有现场：先严格检查账本状态。
+    match load_state() {
+        Ok(Some(_)) => {
+            // 有效的未完成事务：先恢复。
+            let (ok, note) = restore();
+            if !ok {
+                return (
+                    false,
+                    format!("上次断网现场恢复失败（{note}），已拒绝再次断网"),
+                );
+            }
+        }
+        Ok(None) => {}
+        Err(error) => {
+            // 账本损坏或无法读取：拒绝操作，避免叠加现场。
             return (
                 false,
-                format!("上次断网现场恢复失败（{note}），已拒绝再次断网"),
+                format!("断网账本损坏或无法读取（{error}），已拒绝操作；请先手动清理 netcut.json"),
             );
         }
     }
 
-    if let Err(error) = ensure_firewall_cut_rule() {
-        return (false, format!("加全局阻断规则失败：{error}"));
-    }
-
-    let mut nics = Vec::new();
-    if mode == CutMode::Nics {
-        match disable_up_nics() {
-            Ok((disabled, errors)) => {
-                nics = disabled;
-                if !errors.is_empty() {
-                    // 网卡禁用部分失败：规则仍挡着出站，但如实报告。
-                    let _ = save_state(&CutState {
-                        mode: "nics".to_string(),
-                        firewall: true,
-                        nics: nics.clone(),
-                        since: now_secs(),
-                    });
-                    return (false, format!("部分网卡禁用失败：{}", errors.join("；")));
-                }
-            }
-            Err(error) => {
-                // 规则已加上（出站仍被挡），但不能谎称「已断网」。
-                let _ = save_state(&CutState {
-                    mode: "firewall".to_string(),
-                    firewall: true,
-                    nics: Vec::new(),
-                    since: now_secs(),
-                });
-                return (
-                    false,
-                    format!("禁用网卡失败（已降级为防火墙阻断）：{error}"),
-                );
-            }
-        }
-    }
-
-    let state = CutState {
+    // **P0-04：先写 Prepared 账本，再执行系统修改。**
+    let prepared = CutState {
         mode: if mode == CutMode::Nics {
             "nics"
         } else {
             "firewall"
         }
         .to_string(),
-        firewall: true,
-        nics,
+        firewall: false,
+        nics: Vec::new(),
         since: now_secs(),
+        phase: CutPhase::Prepared,
     };
-    if let Err(error) = save_state(&state) {
+    if let Err(error) = save_state(&prepared) {
+        return (false, format!("写入断网意图失败，未做任何修改：{error}"));
+    }
+
+    // 步骤 2：添加防火墙规则。
+    if let Err(error) = ensure_firewall_cut_rule() {
+        // 规则添加失败：账本保留 Prepared 状态，restore 时不会破坏任何东西。
+        return (false, format!("加全局阻断规则失败：{error}"));
+    }
+    let after_firewall = CutState {
+        firewall: true,
+        phase: CutPhase::FirewallApplied,
+        ..prepared
+    };
+    if let Err(error) = save_state(&after_firewall) {
+        // 账本更新失败：规则已加上但账本显示 Prepared。恢复时会尝试删规则（无害）。
+        return (false, format!("防火墙已加但账本更新失败：{error}"));
+    }
+
+    // 步骤 3：禁用网卡（仅 Nics 档）。
+    let final_state = if mode == CutMode::Nics {
+        match disable_up_nics() {
+            Ok((disabled, errors)) => {
+                if !errors.is_empty() {
+                    let partial = CutState {
+                        mode: "nics".to_string(),
+                        nics: disabled,
+                        phase: CutPhase::FirewallApplied,
+                        ..after_firewall
+                    };
+                    let _ = save_state(&partial);
+                    return (false, format!("部分网卡禁用失败：{}", errors.join("；")));
+                }
+                CutState {
+                    mode: "nics".to_string(),
+                    nics: disabled,
+                    phase: CutPhase::Applied,
+                    ..after_firewall
+                }
+            }
+            Err(error) => {
+                // 网卡禁用失败：降级为防火墙阻断，账本保留 FirewallApplied。
+                let _ = save_state(&after_firewall);
+                return (
+                    false,
+                    format!("禁用网卡失败（已降级为防火墙阻断）：{error}"),
+                );
+            }
+        }
+    } else {
+        CutState {
+            phase: CutPhase::Applied,
+            ..after_firewall
+        }
+    };
+
+    // 步骤 4：标记 Applied。
+    if let Err(error) = save_state(&final_state) {
         return (
             false,
-            format!("断网已执行但写现场失败（重启后无法自愈）：{error}"),
+            format!("断网已执行但账本更新失败（重启后可能无法自愈）：{error}"),
         );
     }
     (true, format!("已断网（{}）", mode.label()))
@@ -338,6 +390,7 @@ mod tests {
             firewall: true,
             nics: vec!["以太网".to_string(), "WLAN".to_string()],
             since: 1_760_000_000,
+            phase: CutPhase::Applied,
         };
         let text = serde_json::to_string(&state).unwrap();
         let back: CutState = serde_json::from_str(&text).unwrap();
