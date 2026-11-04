@@ -82,6 +82,23 @@ fn build_client() -> Result<reqwest::blocking::Client, String> {
 
 /// 探测出口（阻塞，必须经 `blocking()` 调用）。
 /// 先取 cloudflare（ip/国家/时区），再尽力补 ipinfo 的 org（ASN）。
+/// **P1-02**：只有两个来源指向**同一个 IP** 时才允许合并组织信息。
+///
+/// 两个请求可能走不同出口（负载均衡、节点切换），把 A 的 IP 配上 B 的 ASN
+/// 会给出错误的安全结论。IP 不一致时保留各自的原始观测，不混合。
+pub fn merge_org_if_same_ip(
+    cloudflare: (&str, &str, &str),
+    ipinfo: Option<(&str, &str, &str, Option<&str>)>,
+) -> Option<String> {
+    let (cf_ip, _, _) = cloudflare;
+    let (ii_ip, _, _, org) = ipinfo?;
+    // IP 必须完全一致（规范化后比较）。
+    if cf_ip.trim() != ii_ip.trim() {
+        return None;
+    }
+    org.map(str::to_string)
+}
+
 pub fn detect_egress_blocking() -> Result<EgressInfo, String> {
     let client = build_client()?;
 
@@ -104,10 +121,14 @@ pub fn detect_egress_blocking() -> Result<EgressInfo, String> {
 
     if let Ok(text) = &cf_text {
         if let Some((ip, country, tz)) = parse_cloudflare_trace(text) {
-            let org = ipinfo_value
-                .as_ref()
-                .and_then(parse_ipinfo)
-                .and_then(|(_, _, _, org)| org);
+            // P1-02：只有 ipinfo 返回同一 IP 时才合并 org。
+            let ipinfo_parsed = ipinfo_value.as_ref().and_then(parse_ipinfo);
+            let org = merge_org_if_same_ip(
+                (&ip, &country, &tz),
+                ipinfo_parsed
+                    .as_ref()
+                    .map(|(i, c, t, o)| (i.as_str(), c.as_str(), t.as_str(), o.as_deref())),
+            );
             return Ok(EgressInfo {
                 ip,
                 country,
@@ -137,6 +158,46 @@ pub fn detect_egress_blocking() -> Result<EgressInfo, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn org_merges_only_when_both_sources_report_same_ip() {
+        // 同一 IP：允许合并。
+        assert_eq!(
+            merge_org_if_same_ip(
+                ("1.2.3.4", "US", "America/New_York"),
+                Some((
+                    "1.2.3.4",
+                    "US",
+                    "America/New_York",
+                    Some("AS123 Example ISP")
+                )),
+            )
+            .as_deref(),
+            Some("AS123 Example ISP")
+        );
+        // IP 不同：绝不合并（否则会把 A 的 IP 配上 B 的 ASN）。
+        assert_eq!(
+            merge_org_if_same_ip(
+                ("1.2.3.4", "US", "America/New_York"),
+                Some(("9.9.9.9", "JP", "Asia/Tokyo", Some("AS456 Other"))),
+            ),
+            None,
+            "不同出口的 org 不能混用"
+        );
+        // ipinfo 缺失：无 org。
+        assert_eq!(
+            merge_org_if_same_ip(("1.2.3.4", "US", "America/New_York"), None),
+            None
+        );
+        // ipinfo 有 IP 但无 org：无 org。
+        assert_eq!(
+            merge_org_if_same_ip(
+                ("1.2.3.4", "US", "America/New_York"),
+                Some(("1.2.3.4", "US", "America/New_York", None))
+            ),
+            None
+        );
+    }
 
     #[test]
     fn parses_cloudflare_trace() {

@@ -3137,11 +3137,6 @@ pub fn run() {
     egate_monitor::start_monitor();
 
     tauri::Builder::default()
-        // 把 AppHandle 交给常驻监控线程，让它能发桌面通知。
-        .setup(|app| {
-            egate_monitor::set_app_handle(app.handle().clone());
-            Ok(())
-        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         // 单实例：第二个进程的 argv 会回调到运行实例——--switch 转交执行，
@@ -3163,6 +3158,10 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            // P1-01：把 AppHandle 交给常驻监控线程（Tauri 的 .setup 是替换而非追加，
+            // 必须放在唯一的 setup 里，否则先前的回调会失效）。
+            egate_monitor::set_app_handle(app.handle().clone());
+
             // CLI --switch 且未被单实例插件转交（说明本进程是唯一实例）：
             // 执行切换、打印结果后立即退出，不安装托盘、不显示主窗口。
             match &cli_command {
