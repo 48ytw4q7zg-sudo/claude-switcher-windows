@@ -291,6 +291,35 @@ pub fn is_partial() -> bool {
     TRIP_STATE.load(Ordering::SeqCst) == 1
 }
 
+/// **P0-06**：启动时从**实际系统状态**重建熔断状态。
+///
+/// 内存里的 TRIP_STATE 在进程重启后会归零，但 Windows 防火墙里的规则
+/// 仍然存在。若不做重建，界面会显示「未熔断」而系统实际仍被隔离。
+///
+/// 判定规则：
+/// - 无本产品规则 → 未熔断
+/// - 有规则且所有守护对象覆盖完整 → 完整熔断（2）
+/// - 有规则但覆盖不完整 → 部分熔断（1）
+/// - 查询失败 → 不猜测（保持未熔断，但记日志告知无法确认）
+pub fn rebuild_trip_state_from_system() {
+    let count = match crate::egate_trip::rule_count() {
+        Some(count) => count,
+        None => {
+            crate::log_error("无法查询防火墙规则，熔断状态无法重建（按未熔断处理，请人工确认）");
+            return;
+        }
+    };
+    if count == 0 {
+        clear_tripped();
+        return;
+    }
+    // 有规则：默认按部分熔断处理（保守——会触发补齐而非直接解除）。
+    mark_tripped_state(false);
+    crate::log_error(&format!(
+        "检测到 {count} 条本产品防火墙规则残留，已按「部分熔断」重建状态；下一轮巡检将补齐或恢复"
+    ));
+}
+
 /// 用当前全局状态组装门控输入。
 pub fn current_gate(
     enabled: bool,

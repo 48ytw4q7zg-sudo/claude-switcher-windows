@@ -3178,6 +3178,9 @@ pub fn run() {
     for message in egate_netcut::heal() {
         log_error(&message);
     }
+    // **P0-06**：先从真实系统状态重建熔断状态（进程重启后内存归零，
+    // 但防火墙规则仍在）。
+    egate_monitor::rebuild_trip_state_from_system();
     // 出口门禁常驻巡检（幂等：门禁未开启时线程空转，不产生副作用）。
     egate_monitor::start_monitor();
 
