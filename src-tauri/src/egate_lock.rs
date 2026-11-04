@@ -38,28 +38,65 @@ impl SystemOperation {
 }
 
 /// 持有期间独占系统保护操作的守卫；Drop 时释放。
+///
+/// **P0-NEW-01**：本进程内的嵌套调用共享同一把已持有的锁，不会自我等待。
+/// 只有最外层（计数归零）才真正释放文件锁。
 pub struct OperationGuard {
-    _file: std::fs::File,
+    /// 最外层持有的文件句柄；嵌套层为 None（共享外层）。
+    _file: Option<std::fs::File>,
 }
 
-/// 获取系统保护操作独占权。
+/// 本进程持锁深度（**可重入**）。
+static HOLD_DEPTH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// 获取系统保护操作独占权（**可重入**）。
 ///
-/// 阻塞等待直到拿到锁（同一时刻只允许一个进程修改系统保护资源）。
-/// 获取失败返回 `Err`——调用方**不得**在未持有锁的情况下执行系统修改。
+/// 同一进程内嵌套调用（如 restore_all → restore → release_all_verified）
+/// 直接复用已持有的锁，不重复申请文件锁——否则 Windows 上会自我死锁。
+///
+/// 跨进程仍严格互斥：只有本进程深度为 0 时才真正申请文件锁。
 pub fn acquire(operation: SystemOperation) -> Result<OperationGuard, String> {
-    let dir = crate::paths::app_data_dir()?;
-    std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
-    let path = dir.join("eguard-operation.lock");
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|e| format!("打开系统操作锁失败：{e}"))?;
-    fs4::FileExt::lock(&file)
-        .map_err(|e| format!("获取系统操作锁失败（{}）：{e}", operation.label()))?;
-    Ok(OperationGuard { _file: file })
+    use std::sync::atomic::Ordering;
+    let depth = HOLD_DEPTH.fetch_add(1, Ordering::SeqCst);
+    if depth > 0 {
+        // 嵌套调用：复用外层锁，不申请文件锁。
+        return Ok(OperationGuard { _file: None });
+    }
+    // 最外层：真正申请跨进程文件锁。
+    let result = (|| -> Result<std::fs::File, String> {
+        let dir = crate::paths::app_data_dir()?;
+        std::fs::create_dir_all(&dir).map_err(|e| format!("创建数据目录失败：{e}"))?;
+        let path = dir.join("eguard-operation.lock");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)
+            .map_err(|e| format!("打开系统操作锁失败：{e}"))?;
+        fs4::FileExt::lock(&file)
+            .map_err(|e| format!("获取系统操作锁失败（{}）：{e}", operation.label()))?;
+        Ok(file)
+    })();
+    match result {
+        Ok(file) => Ok(OperationGuard { _file: Some(file) }),
+        Err(error) => {
+            // 申请失败：回退深度计数，否则后续调用会误判为「已持锁」。
+            HOLD_DEPTH.fetch_sub(1, Ordering::SeqCst);
+            Err(error)
+        }
+    }
+}
+
+impl Drop for OperationGuard {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        // 只有最外层（持有文件句柄）真正释放；嵌套层只减计数。
+        HOLD_DEPTH.fetch_sub(1, Ordering::SeqCst);
+        if let Some(file) = self._file.take() {
+            let _ = fs4::FileExt::unlock(&file);
+        }
+    }
 }
 
 /// 尝试获取（非阻塞）；已被占用时返回 `Ok(None)`。
@@ -76,7 +113,10 @@ pub fn try_acquire(operation: SystemOperation) -> Result<Option<OperationGuard>,
         .open(&path)
         .map_err(|e| format!("打开系统操作锁失败：{e}"))?;
     match fs4::FileExt::try_lock(&file) {
-        Ok(()) => Ok(Some(OperationGuard { _file: file })),
+        Ok(()) => {
+            HOLD_DEPTH.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(Some(OperationGuard { _file: Some(file) }))
+        }
         Err(_) => Ok(None),
     }
 }
@@ -84,6 +124,35 @@ pub fn try_acquire(operation: SystemOperation) -> Result<Option<OperationGuard>,
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nested_acquire_does_not_deadlock() {
+        // **P0-NEW-01** 回归：同进程嵌套加锁必须立即返回，不能自我等待。
+        // 用超时保护：若回归，测试会失败而不是挂死。
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let outer = acquire(SystemOperation::FullRestore);
+            if outer.is_err() {
+                let _ = tx.send(false);
+                return;
+            }
+            let outer = outer.unwrap();
+            // 模拟 restore_all → restore → release_all_verified 的嵌套。
+            let inner1 = acquire(SystemOperation::RestoreNetwork);
+            let inner2 = acquire(SystemOperation::ReleaseIsolation);
+            let ok = inner1.is_ok() && inner2.is_ok();
+            drop(inner2);
+            drop(inner1);
+            drop(outer);
+            // 释放后应能再次获取。
+            let again = acquire(SystemOperation::Isolate).is_ok();
+            let _ = tx.send(ok && again);
+        });
+        match rx.recv_timeout(std::time::Duration::from_secs(10)) {
+            Ok(ok) => assert!(ok, "嵌套加锁必须成功且释放后可重获"),
+            Err(_) => panic!("嵌套加锁发生死锁（10 秒未返回）"),
+        }
+    }
 
     #[test]
     fn operation_labels_are_chinese_and_distinct() {

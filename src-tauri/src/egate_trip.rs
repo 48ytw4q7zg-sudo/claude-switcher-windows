@@ -416,10 +416,6 @@ pub struct ReleaseReport {
     pub failures: Vec<String>,
 }
 
-pub fn release_all() -> Result<u32, String> {
-    Ok(release_all_verified()?.requested)
-}
-
 /// **P0-04**：删除应用隔离规则并回查确认真的消失。
 pub fn release_all_verified() -> Result<ReleaseReport, String> {
     // **P0-02**：解除隔离必须独占系统操作权。

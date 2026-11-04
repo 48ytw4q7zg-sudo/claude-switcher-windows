@@ -46,6 +46,8 @@ pub enum RoundAction {
 /// 决定输入。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Gate {
+    /// **P0-NEW-04**：当前保护意图（Armed/Disarmed/Unknown）。
+    pub intent: ProtectionIntent,
     /// 本轮是否有目标达到熔断阈值。
     pub threshold_reached: bool,
     /// 是否处于预警点（阈值 - 1 次连续失败）。
@@ -68,8 +70,10 @@ pub struct Gate {
 /// 「已暂停」压过一切熔断动作——暂停期间照常检测但不熔断，这是用户显式表达
 /// 的意图，任何阈值都不该覆盖它。
 pub fn decide(gate: Gate) -> RoundAction {
-    // P0-F：用户主动停止保护时，任何阈值都不触发动作。
-    if is_disarmed() {
+    // **P0-NEW-04**：只有明确 Armed 才允许开始新的自动保护副作用。
+    // Disarmed（用户主动停止）与 Unknown（状态损坏）都必须停止——
+    // 与 guard_tick 采用同一解释，避免两个守护器行为相反。
+    if gate.intent != ProtectionIntent::Armed {
         return RoundAction::Idle;
     }
     if !gate.enabled {
@@ -328,6 +332,7 @@ pub fn current_gate(
     egress_recovered: bool,
 ) -> Gate {
     Gate {
+        intent: protection_intent(),
         threshold_reached,
         at_warning_point,
         paused: is_paused(),
@@ -567,8 +572,10 @@ fn run_monitor_round(
         }
         RoundAction::Recover => {
             // P0-07：出口已恢复，自动解除隔离。
-            match crate::egate_trip::release_all() {
-                Ok(removed) => {
+            // **P0-NEW-02**：只有核验通过才清除熔断状态。
+            match crate::egate_trip::release_all_verified() {
+                Ok(report) if report.verified => {
+                    let removed = report.requested;
                     clear_tripped();
                     if let Some(app) = ensure_app_handle(app_handle) {
                         crate::egate_notify::notify(
@@ -579,6 +586,13 @@ fn run_monitor_round(
                     }
                     crate::log_error(&format!(
                         "出口已恢复，自动解除隔离（清理 {removed} 条规则）"
+                    ));
+                }
+                Ok(report) => {
+                    crate::log_error(&format!(
+                        "自动解除隔离未完成（剩余 {} 条：{}），保持熔断状态",
+                        report.remaining,
+                        report.failures.join("；")
                     ));
                 }
                 Err(error) => {
@@ -614,6 +628,7 @@ mod tests {
 
     fn gate() -> Gate {
         Gate {
+            intent: ProtectionIntent::Armed,
             threshold_reached: false,
             at_warning_point: false,
             paused: false,

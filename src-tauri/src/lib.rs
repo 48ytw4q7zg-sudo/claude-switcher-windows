@@ -3007,10 +3007,17 @@ async fn egate_trip_now() -> Result<egate_trip::TripReport, String> {
 #[tauri::command]
 async fn egate_release_now() -> Result<u32, String> {
     blocking(|| {
-        let removed = egate_trip::release_all()?;
-        // 解除隔离即视为退出熔断态，下一轮失败才会再次熔断。
+        // **P0-NEW-02**：只有回查确认规则真的消失才清除熔断状态。
+        let report = egate_trip::release_all_verified()?;
+        if !report.verified {
+            return Err(format!(
+                "隔离规则未能全部清除（剩余 {} 条）：{}",
+                report.remaining,
+                report.failures.join("；")
+            ));
+        }
         egate_monitor::clear_tripped();
-        Ok(removed)
+        Ok(report.requested)
     })
     .await
 }

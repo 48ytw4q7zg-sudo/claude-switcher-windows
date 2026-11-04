@@ -516,8 +516,14 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
     //
     // 做法：闭包内记录本次切换前的活目录备份路径；若 save_store 失败
     // （with_store 返回 Err 且错误来自保存），用该备份把活目录回滚。
-    let mut rollback_source: Option<std::path::PathBuf> = None;
-    let mut switched_id: Option<String> = None;
+    // **P0-NEW-03**：由 switch_desktop_profile_in 通过 out-param 回传**本次**精确备份路径。
+    // 绝不用 «扫描备份目录取最新» 猜测——那可能选中其他账号的历史备份。
+    let transaction = DesktopTransaction {
+        target_id: id.to_string(),
+        backup_path: std::cell::RefCell::new(None),
+        original_existed: std::cell::Cell::new(false),
+    };
+    let mut switched = false;
     let result = store::with_store(|store| {
         let outcome = switch_desktop_profile_in(
             id,
@@ -528,11 +534,10 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
             &|| claude_desktop_running(),
             &backup_root,
             &copy_dir_recursive,
+            &transaction,
         );
         if outcome.is_ok() {
-            switched_id = Some(id.to_string());
-            // 取最新的备份（switch_desktop_profile_in 已写入 backup_root）。
-            rollback_source = latest_backup_in(&backup_root);
+            switched = true;
         }
         outcome
     });
@@ -541,8 +546,9 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
         Ok(warnings) => Ok(warnings),
         Err(error) => {
             // 若是保存账号库失败且文件已切换 → 回滚活目录，恢复一致状态。
-            if switched_id.is_some() {
-                if let Some(backup) = &rollback_source {
+            if switched {
+                let backup = transaction.backup_path.borrow().clone();
+                if let Some(backup) = &backup {
                     let rollback = (|| -> Result<(), String> {
                         if live.exists() || links::path_is_link(&live) {
                             fsx::retry_io(|| fs::remove_dir_all(&live))
@@ -561,6 +567,18 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
                             backup.display()
                         ),
                     });
+                } else if !transaction.original_existed.get() {
+                    // **P0-NEW-03**：原本没有活目录 → 回滚应恢复「不存在」，
+                    // 不能错误复制任何历史备份。
+                    let cleared = fsx::retry_io(|| fs::remove_dir_all(&live)).is_ok();
+                    return Err(if cleared {
+                        format!("{error}；账号库保存失败，已清理本次载入内容（原本无活目录）")
+                    } else {
+                        format!(
+                            "{error}；账号库保存失败且清理失败，请手动删除 {}",
+                            live.display()
+                        )
+                    });
                 }
             }
             Err(error)
@@ -568,15 +586,13 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
     }
 }
 
-/// 取备份目录下最新的一个备份（按名称排序，名称含时间戳）。
-fn latest_backup_in(root: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut entries: Vec<_> = fs::read_dir(root)
-        .ok()?
-        .filter_map(|entry| entry.ok())
-        .filter(|entry| entry.path().is_dir())
-        .collect();
-    entries.sort_by_key(|entry| entry.file_name());
-    entries.last().map(|entry| entry.path())
+/// **P0-NEW-03**：Desktop 切换事务上下文（记录本次切换的精确备份）。
+struct DesktopTransaction {
+    target_id: String,
+    /// 本次切换创建的原活目录备份（精确路径，不靠扫描猜测）。
+    backup_path: std::cell::RefCell<Option<std::path::PathBuf>>,
+    /// 切换前活目录是否存在。
+    original_existed: std::cell::Cell<bool>,
 }
 
 /// [`switch_desktop_profile`] 的可注入版本：`kill`/`running`/`copy` 均可替换，
@@ -591,6 +607,7 @@ fn switch_desktop_profile_in(
     running: &RunningFn,
     backup_root: &Path,
     copy: &CopyFn,
+    transaction: &DesktopTransaction,
 ) -> Result<Vec<String>, String> {
     if id.trim().is_empty() {
         return Err("缺少目标账号 id".to_string());
@@ -730,6 +747,9 @@ fn switch_desktop_profile_in(
     }
 
     // 3. 备份当前活目录到 staging（随后清空/回滚都靠它兜底）。
+    transaction.original_existed.set(live_dir.is_dir());
+    // target_id 用于诊断日志（事务归属）。
+    let _ = &transaction.target_id;
     let backup_path = if live_dir.is_dir() {
         fs::create_dir_all(backup_root)
             .map_err(|e| format!("创建备份目录失败 {}: {e}", backup_root.display()))?;
@@ -739,6 +759,8 @@ fn switch_desktop_profile_in(
             Uuid::new_v4().simple()
         ));
         let outcome = copy(live_dir, &path)?;
+        // **P0-NEW-03**：把本次备份的精确路径交给事务上下文。
+        *transaction.backup_path.borrow_mut() = Some(path.clone());
         warnings.push(format!(
             "切换前已备份当前 Claude Desktop 数据到 {}（{} 字节，跳过链接 {} 个）",
             path.display(),
@@ -1291,6 +1313,11 @@ mod tests {
         fs::write(live.join("cache/old.tmp"), b"old").unwrap();
 
         let backup_root = dir.path().join("backups");
+        let tx = DesktopTransaction {
+            target_id: String::new(),
+            backup_path: std::cell::RefCell::new(None),
+            original_existed: std::cell::Cell::new(false),
+        };
         let warnings = switch_desktop_profile_in(
             "b-id",
             &live,
@@ -1300,6 +1327,7 @@ mod tests {
             &|| Ok(false),
             &backup_root,
             &copy_dir_recursive,
+            &tx,
         )
         .unwrap();
 
@@ -1368,6 +1396,11 @@ mod tests {
         fs::write(live.join("who.txt"), b"A-after-use").unwrap();
         fs::write(live.join("cache/new.tmp"), b"new").unwrap();
 
+        let tx = DesktopTransaction {
+            target_id: String::new(),
+            backup_path: std::cell::RefCell::new(None),
+            original_existed: std::cell::Cell::new(false),
+        };
         switch_desktop_profile_in(
             "b-id",
             &live,
@@ -1377,6 +1410,7 @@ mod tests {
             &|| Ok(false),
             &dir.path().join("backups"),
             &copy_dir_recursive,
+            &tx,
         )
         .unwrap();
 
@@ -1422,6 +1456,11 @@ mod tests {
         fs::create_dir_all(&live).unwrap();
         fs::write(live.join("who.txt"), b"unknown-account").unwrap();
 
+        let tx = DesktopTransaction {
+            target_id: String::new(),
+            backup_path: std::cell::RefCell::new(None),
+            original_existed: std::cell::Cell::new(false),
+        };
         switch_desktop_profile_in(
             "b-id",
             &live,
@@ -1431,6 +1470,7 @@ mod tests {
             &|| Ok(false),
             &dir.path().join("backups"),
             &copy_dir_recursive,
+            &tx,
         )
         .unwrap();
 
@@ -1479,6 +1519,11 @@ mod tests {
             copy_dir_recursive(src, dst)
         };
 
+        let tx = DesktopTransaction {
+            target_id: String::new(),
+            backup_path: std::cell::RefCell::new(None),
+            original_existed: std::cell::Cell::new(false),
+        };
         let err = switch_desktop_profile_in(
             "b-id",
             &live,
@@ -1488,6 +1533,7 @@ mod tests {
             &|| Ok(false),
             &backup_root,
             &copy,
+            &tx,
         )
         .unwrap_err();
 
@@ -1515,6 +1561,11 @@ mod tests {
         let mut store = Store::default();
 
         // 未知 id。
+        let tx = DesktopTransaction {
+            target_id: String::new(),
+            backup_path: std::cell::RefCell::new(None),
+            original_existed: std::cell::Cell::new(false),
+        };
         let err = switch_desktop_profile_in(
             "nobody",
             &live,
@@ -1524,6 +1575,7 @@ mod tests {
             &|| Ok(false),
             &dir.path().join("backups"),
             &copy_dir_recursive,
+            &tx,
         )
         .unwrap_err();
         assert!(err.contains("未找到"), "{err}");
@@ -1540,6 +1592,11 @@ mod tests {
             size_bytes: 0,
             meta: None,
         });
+        let tx = DesktopTransaction {
+            target_id: String::new(),
+            backup_path: std::cell::RefCell::new(None),
+            original_existed: std::cell::Cell::new(false),
+        };
         let err = switch_desktop_profile_in(
             "ghost",
             &live,
@@ -1549,6 +1606,7 @@ mod tests {
             &|| Ok(false),
             &dir.path().join("backups"),
             &copy_dir_recursive,
+            &tx,
         )
         .unwrap_err();
         assert!(err.contains("快照目录缺失"), "{err}");
@@ -1558,6 +1616,11 @@ mod tests {
         // 才能走到 wait_until_quite 这一步。
         fs::create_dir_all(accounts.join("ghost")).unwrap();
         fs::write(live.join("who.txt"), b"A").unwrap();
+        let tx = DesktopTransaction {
+            target_id: String::new(),
+            backup_path: std::cell::RefCell::new(None),
+            original_existed: std::cell::Cell::new(false),
+        };
         let err = switch_desktop_profile_in(
             "ghost",
             &live,
@@ -1567,6 +1630,7 @@ mod tests {
             &|| Ok(true),
             &dir.path().join("backups"),
             &copy_dir_recursive,
+            &tx,
         )
         .unwrap_err();
         assert!(err.contains("未能完全退出"), "{err}");
@@ -1641,6 +1705,11 @@ mod tests {
         let running_calls = Rc::clone(&calls);
         let copy_calls = Rc::clone(&calls);
         let backup_root = dir.path().join("backups");
+        let tx = DesktopTransaction {
+            target_id: String::new(),
+            backup_path: std::cell::RefCell::new(None),
+            original_existed: std::cell::Cell::new(false),
+        };
         let warnings = switch_desktop_profile_in(
             "current",
             &live,
@@ -1659,6 +1728,7 @@ mod tests {
                 copy_calls.set(copy_calls.get() + 1);
                 copy_dir_recursive(src, dst)
             },
+            &tx,
         )
         .unwrap();
         assert_eq!(
@@ -1697,6 +1767,11 @@ mod tests {
             if snapshot_exists {
                 fs::create_dir_all(accounts.join("current")).unwrap();
             }
+            let tx = DesktopTransaction {
+                target_id: String::new(),
+                backup_path: std::cell::RefCell::new(None),
+                original_existed: std::cell::Cell::new(false),
+            };
             let result = switch_desktop_profile_in(
                 "current",
                 &live,
@@ -1706,6 +1781,7 @@ mod tests {
                 &|| panic!("同账号已有活目录时不得检测进程"),
                 &dir.path().join("backups"),
                 &|_, _| panic!("同账号已有活目录时不得复制文件"),
+                &tx,
             )
             .unwrap();
             assert!(result.iter().any(|message| message.contains("当前已是")));
@@ -1739,6 +1815,11 @@ mod tests {
         let copy_calls = Rc::new(Cell::new(0));
         let kill_count = Rc::clone(&kill_calls);
         let copy_count = Rc::clone(&copy_calls);
+        let tx = DesktopTransaction {
+            target_id: String::new(),
+            backup_path: std::cell::RefCell::new(None),
+            original_existed: std::cell::Cell::new(false),
+        };
         let warnings = switch_desktop_profile_in(
             "current",
             &live,
@@ -1754,6 +1835,7 @@ mod tests {
                 copy_count.set(copy_count.get() + 1);
                 copy_dir_recursive(src, dst)
             },
+            &tx,
         )
         .unwrap();
         assert_eq!(file_tree(&live), snapshot_before);
@@ -1776,6 +1858,11 @@ mod tests {
         let mut store = current_desktop_store();
         let store_before = serde_json::to_value(&store).unwrap();
         for (target, expected) in [("current", "快照目录缺失"), ("unknown", "未找到")] {
+            let tx = DesktopTransaction {
+                target_id: String::new(),
+                backup_path: std::cell::RefCell::new(None),
+                original_existed: std::cell::Cell::new(false),
+            };
             let error = switch_desktop_profile_in(
                 target,
                 &live,
@@ -1785,6 +1872,7 @@ mod tests {
                 &|| panic!("材料缺失时不得检测进程"),
                 &dir.path().join("backups"),
                 &|_, _| panic!("材料缺失时不得复制文件"),
+                &tx,
             )
             .unwrap_err();
             assert!(error.contains(expected), "{error}");
