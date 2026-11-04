@@ -2772,7 +2772,20 @@ fn egate_env_ledger() -> Option<egate_env::AppliedEnv> {
 #[tauri::command]
 async fn egate_launch_check() -> Result<egate_launch::LaunchDecision, String> {
     blocking(|| {
-        let config = appconfig::load();
+        // P0-I：配置损坏时禁止放行——不能用默认配置（egate_enabled=false）冒充
+        // 「用户主动关闭门禁」。首次未配置仍按默认放行。
+        let config = match appconfig::load_checked() {
+            appconfig::ConfigLoad::Ok(config) => *config,
+            appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+            appconfig::ConfigLoad::Corrupt(error) => {
+                return Ok(egate_launch::LaunchDecision {
+                    allowed: false,
+                    reason: Some(format!(
+                        "应用配置损坏（{error}），已阻止启动；请修复 appconfig.json 或恢复备份"
+                    )),
+                });
+            }
+        };
         let targets = if config.egate_targets.is_empty() {
             egate_defaults::builtin_targets()
         } else {
@@ -2803,7 +2816,19 @@ async fn egate_launch_check() -> Result<egate_launch::LaunchDecision, String> {
 #[tauri::command]
 async fn egate_launch_claude() -> Result<serde_json::Value, String> {
     blocking(|| {
-        let config = appconfig::load();
+        // P0-I：配置损坏时**不得**走「门禁未启用直接启动」的分支。
+        let config = match appconfig::load_checked() {
+            appconfig::ConfigLoad::Ok(config) => *config,
+            appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+            appconfig::ConfigLoad::Corrupt(error) => {
+                return Ok(serde_json::json!({
+                    "launched": false,
+                    "reason": format!(
+                        "应用配置损坏（{error}），已阻止启动；请修复 appconfig.json 或恢复备份"
+                    ),
+                }));
+            }
+        };
         // 门禁未开启时不做检查，直接启动（用户没启用的功能不该拦路）。
         if !config.egate_enabled {
             let note = egate_launch::launch_claude()?;

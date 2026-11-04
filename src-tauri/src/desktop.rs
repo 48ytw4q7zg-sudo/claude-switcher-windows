@@ -754,10 +754,36 @@ fn switch_desktop_profile_in(
             );
         }
         Err(e) => {
-            // 保留原活目录与账号 ID，让用户能看到真实状态并手动恢复。
-            return Err(format!(
-                "跨身份保留合并失败，切换已中止（活目录已恢复为目标账号内容，                 账号记录保持原样；暂存文件保留在 keep 沙箱，可手动恢复）：{e}"
-            ));
+            // P0-L：合并失败必须**真正回滚活目录**，不能留下「活目录是 B、
+            // 账号记录是 A」的不一致状态——下次切换会把 B 的内容归档进 A。
+            let mut message = format!("跨身份保留合并失败，正在回滚：{e}");
+            match &backup_path {
+                Some(backup) => {
+                    // 先删掉已载入的目标账号内容，再还原切换前的备份。
+                    let cleaned = fsx::retry_io(|| fs::remove_dir_all(live_dir)).is_ok();
+                    if !cleaned {
+                        message.push_str("；清理目标账号内容失败");
+                    }
+                    match copy(backup, live_dir) {
+                        Ok(..) => {
+                            message.push_str("；已回滚到切换前状态（账号记录未改动）");
+                        }
+                        Err(rollback_error) => {
+                            message.push_str(&format!(
+                                "；自动回滚失败（{rollback_error}），请用备份手动恢复：{}",
+                                backup.display()
+                            ));
+                        }
+                    }
+                }
+                None => {
+                    // 首次切换（原本没有活目录）：清空载入内容即可，
+                    // 账号记录同样保持未改动。
+                    let _ = fsx::retry_io(|| fs::remove_dir_all(live_dir));
+                    message.push_str("；首次切换无原数据，已清理目标账号内容（账号记录未改动）");
+                }
+            }
+            return Err(message);
         }
     }
 

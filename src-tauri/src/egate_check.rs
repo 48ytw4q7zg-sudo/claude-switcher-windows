@@ -196,9 +196,11 @@ pub fn run_round(
 /// 按路由探测单个目标（跳过路由返回「无法确认」而不是失败）。
 fn probe_with_route(target: &EgateTarget, route: &ProbeRoute) -> ProbeResult {
     match route {
-        // 探测本身走系统代理（reqwest system-proxy 特性已启用）；
-        // 这里显式指定地址，确保测的就是应用真实出口。
-        ProbeRoute::Proxy(_) | ProbeRoute::Direct => crate::egate_probe::probe(target),
+        // P0-J：把**验证过的代理地址**显式传给探测客户端，确保
+        // 「本轮门禁验证的代理」就是「实际请求使用的代理」。
+        ProbeRoute::Proxy(address) => crate::egate_probe::probe_via(target, Some(address)),
+        // TUN 接管：直连即与应用同路，显式 no_proxy。
+        ProbeRoute::Direct => crate::egate_probe::probe_via(target, None),
         ProbeRoute::Skip => ProbeResult::skipped("未接入代理链路，已跳过探测"),
     }
 }

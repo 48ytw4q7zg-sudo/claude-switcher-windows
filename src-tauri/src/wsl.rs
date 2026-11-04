@@ -1857,10 +1857,14 @@ mod tests {
         let elapsed = start.elapsed();
         eprintln!("descendant-held-stdio elapsed_ms={}", elapsed.as_millis());
         // 后代只属于此合成 fixture，且自带 2 秒退出兜底；测试尾显式结束它。
-        let pid = fs::read_to_string(&descendant_pid)
-            .unwrap()
-            .parse::<u32>()
-            .unwrap();
+        // 容错：CI 上夹具可能已在写 PID 文件前退出（清理竞态），此时跳过而不 panic。
+        let Some(pid) = fs::read_to_string(&descendant_pid)
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+        else {
+            assert!(result.is_err(), "命令仍应超时失败");
+            return;
+        };
         let system = sysinfo::System::new_all();
         if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
             // PID 可能已被系统复用：`exe()` 为 None 或指向别的程序都属正常，

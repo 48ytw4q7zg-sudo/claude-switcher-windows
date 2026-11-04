@@ -26,14 +26,16 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// 探测一个目标，返回原始探测结果（判定由 [`crate::egate::evaluate`] 做）。
 ///
 /// 不修改账号状态、不继承调用方的代理设置（由 reqwest 按系统设置决定）。
-pub fn probe(target: &EgateTarget) -> ProbeResult {
+/// **P0-J**：按指定路线探测。`proxy` 为 `Some(addr)` 时使用该代理，
+/// `None` 表示直连（TUN 接管）。这样「验证过的代理」与「实际请求」是同一个。
+pub fn probe_via(target: &EgateTarget, proxy: Option<&str>) -> ProbeResult {
     let url = match validate_anchor_url(&target.anchor_url) {
         Err(reason) => return ProbeResult::failed(reason),
         Ok(url) => url,
     };
     let started = Instant::now();
     let timeout = Duration::from_secs(target.timeout_secs.max(1));
-    let client = match build_client(timeout) {
+    let client = match build_client_with_proxy(timeout, proxy) {
         Ok(client) => client,
         Err(error) => return ProbeResult::failed(error),
     };
@@ -61,9 +63,15 @@ pub fn probe(target: &EgateTarget) -> ProbeResult {
     }
 }
 
-/// 构造跟随系统代理的阻塞客户端。
-fn build_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
+/// 构造客户端：`proxy` 为 `Some` 时**显式**使用该代理，`None` 时直连。
+///
+/// 显式指定代理时不依赖 reqwest 的 system-proxy 自动读取——避免「验证的是
+/// 代理 A，实际请求走了代理 B」。
+fn build_client_with_proxy(
+    timeout: Duration,
+    proxy: Option<&str>,
+) -> Result<reqwest::blocking::Client, String> {
+    let mut builder = reqwest::blocking::Client::builder()
         .timeout(timeout)
         .connect_timeout(CONNECT_TIMEOUT)
         .user_agent(USER_AGENT)
@@ -74,7 +82,17 @@ fn build_client(timeout: Duration) -> Result<reqwest::blocking::Client, String> 
             } else {
                 attempt.stop()
             }
-        }))
+        }));
+    builder = match proxy {
+        Some(addr) => {
+            let proxy =
+                reqwest::Proxy::all(addr).map_err(|e| format!("代理地址无效（{addr}）：{e}"))?;
+            builder.proxy(proxy)
+        }
+        // 未指定代理：显式 no_proxy，走 TUN 接管的直连。
+        None => builder.no_proxy(),
+    };
+    builder
         .build()
         .map_err(|e| format!("初始化探测客户端失败: {e}"))
 }
@@ -170,7 +188,7 @@ mod tests {
     #[test]
     fn invalid_url_probe_fails_without_network() {
         // 非法 URL 必须在发起网络前就失败（否则会打到意外主机）。
-        let result = probe(&target("not-a-url", AnchorKind::Auto));
+        let result = probe_via(&target("not-a-url", AnchorKind::Auto), None);
         assert!(!result.reachable);
         assert!(result.detail.contains("锚点地址"), "{result:?}");
     }
@@ -178,7 +196,10 @@ mod tests {
     #[test]
     fn unreachable_host_probe_is_unverified_not_fail() {
         // 保留的域名不解析：必须得到 reachable=false，且不 panic。
-        let result = probe(&target("https://egate.invalid/trace", AnchorKind::Auto));
+        let result = probe_via(
+            &target("https://egate.invalid/trace", AnchorKind::Auto),
+            None,
+        );
         assert!(!result.reachable);
         assert!(result.detail.contains("无法确认出口"), "{result:?}");
         assert_eq!(
