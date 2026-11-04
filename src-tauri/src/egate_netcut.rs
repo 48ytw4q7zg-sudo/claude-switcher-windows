@@ -353,6 +353,20 @@ pub fn restore() -> (bool, String) {
         }
     }
 
+    // **P0-05**：网卡恢复失败时**不解除全局阻断**——保留规则作为最后一道
+    // 保护，进入待恢复状态；下次恢复会重试。
+    let nics_failed = failures.iter().any(|f| f.contains("网卡"));
+    if nics_failed {
+        // 保留账本与阻断规则，明确报告未完成。
+        return (
+            false,
+            format!(
+                "网卡恢复未完成，已保留全局阻断规则（防止断网真空）；{}",
+                failures.join("；")
+            ),
+        );
+    }
+
     // 删除阻断规则并核验。
     if let Err(error) = remove_cut_rule() {
         failures.push(format!("删除阻断规则失败：{error}"));
