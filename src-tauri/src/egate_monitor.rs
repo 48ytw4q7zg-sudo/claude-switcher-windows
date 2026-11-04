@@ -480,6 +480,15 @@ fn run_monitor_round(
     );
     match decide(gate) {
         RoundAction::Trip => {
+            // P0-02：若另一进程正在修改系统保护资源，本轮跳过（下轮再试），
+            // 不能阻塞监控线程。
+            if matches!(
+                crate::egate_lock::try_acquire(crate::egate_lock::SystemOperation::Isolate),
+                Ok(None)
+            ) {
+                crate::log_error("另一保护操作正在进行，本轮熔断推迟");
+                return;
+            }
             let agents = if config.egate_guarded_agents.is_empty() {
                 crate::egate_defaults::DEFAULT_GUARDED_AGENTS
                     .iter()

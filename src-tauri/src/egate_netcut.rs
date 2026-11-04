@@ -150,6 +150,11 @@ pub fn cut(mode: CutMode) -> (bool, String) {
     if mode == CutMode::Off {
         return (true, "档位为「不断网」，未执行断网".to_string());
     }
+    // **P0-02**：断网必须独占系统操作权。
+    let _guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::NetworkCut) {
+        Ok(guard) => guard,
+        Err(error) => return (false, format!("无法获取系统操作锁：{error}")),
+    };
     // 已有现场：先严格检查账本状态。
     match load_state() {
         Ok(Some(_)) => {
@@ -313,6 +318,12 @@ pub fn cut(mode: CutMode) -> (bool, String) {
 /// **逐项核验**：每一步执行后都查询实际状态，只有确认恢复完成才清理账本。
 /// 任何一项失败都保留账本，允许重复恢复。
 pub fn restore() -> (bool, String) {
+    // **P0-02**：恢复网络必须独占系统操作权。
+    let _guard =
+        match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::RestoreNetwork) {
+            Ok(guard) => guard,
+            Err(error) => return (false, format!("无法获取系统操作锁：{error}")),
+        };
     let state = match load_state() {
         Ok(state) => state,
         Err(error) => return (false, format!("读取断网现场失败，未做任何恢复：{error}")),
@@ -585,6 +596,19 @@ pub struct RecoveryReport {
 /// CLI 急救、托盘退出、卸载前恢复都调用这一份实现，确保三者行为一致。
 /// 只有全部必要项核验通过才返回 `network_ok && isolation_ok`。
 pub fn restore_all() -> RecoveryReport {
+    // **P0-02**：完整恢复必须独占系统操作权，避免与监控/保镖并发。
+    let _guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::FullRestore) {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            return RecoveryReport {
+                network_ok: false,
+                isolation_ok: false,
+                env_ok: false,
+                failures: vec![format!("无法获取系统操作锁：{error}")],
+                note: format!("恢复未执行（{error}）"),
+            };
+        }
+    };
     // **P0-01**：先写入持久化的「停止保护」意图。写入失败时必须报告——
     // 否则后台守护会在下一轮重新施加保护，急救等于没做。
     let mut failures = Vec::new();

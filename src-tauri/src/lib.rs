@@ -33,6 +33,7 @@ mod egate_check;
 mod egate_defaults;
 mod egate_env;
 mod egate_launch;
+mod egate_lock;
 mod egate_monitor;
 mod egate_netcut;
 mod egate_netwatch;
