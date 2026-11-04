@@ -35,6 +35,7 @@ mod egate_launch;
 mod egate_monitor;
 mod egate_netcut;
 mod egate_netwatch;
+mod egate_notify;
 mod egate_probe;
 mod egate_trip;
 mod egress;
@@ -2618,6 +2619,15 @@ async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
     .await
 }
 
+/// 出口门禁：发送一条测试通知（`--notify-test <kind>` 与界面按钮共用）。
+#[tauri::command]
+fn egate_notify_test(app: tauri::AppHandle, kind: String) -> Result<String, String> {
+    let parsed = egate_notify::NotifyKind::parse(&kind)
+        .ok_or_else(|| format!("未知通知类别：{kind}（可用 trip/recover/launch_blocked/warning/client_update/self_update）"))?;
+    egate_notify::notify(&app, parsed, "这是一条测试通知");
+    Ok(parsed.title().to_string())
+}
+
 /// 出口门禁：检查是否允许启动 Claude（只读，不启动）。
 #[tauri::command]
 async fn egate_launch_check() -> Result<egate_launch::LaunchDecision, String> {
@@ -2987,6 +2997,11 @@ pub fn run() {
     egate_monitor::start_monitor();
 
     tauri::Builder::default()
+        // 把 AppHandle 交给常驻监控线程，让它能发桌面通知。
+        .setup(|app| {
+            egate_monitor::set_app_handle(app.handle().clone());
+            Ok(())
+        })
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
         // 单实例：第二个进程的 argv 会回调到运行实例——--switch 转交执行，
@@ -3140,6 +3155,7 @@ pub fn run() {
             egate_cut_network,
             egate_pause,
             egate_launch_check,
+            egate_notify_test,
             egate_launch_claude,
             egate_resume,
             egate_monitor_status,

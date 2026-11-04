@@ -31,7 +31,7 @@ region 锁定继续保留（它们是「主动锁环境」，ClaudeGuard 是「�
 | 9 | 熔断动作（杀 GUI 进程 + CLI 仅提醒 + 防火墙隔离 + 断网两档 off/firewall/nics；TripInfo） | `guard.rs` `netcut.rs` | **部分完成**：`egate_trip` 已实现杀 GUI + 防火墙隔离 + 回查；CLI 只提醒语义一致；**断网两档未做** | 部分完成 |
 | 10 | 断网现场持久化与自愈（netcut.json 账本、启动恢复、规则去重、--restore 急救） | `netcut.rs` `recover.rs` | **已完成** `egate_netcut`（账本 netcut.json / 启动 heal / 两档 / 先恢复网卡后删规则）；`--restore` CLI 急救未接 | 基本完成 |
 | 11 | Claude 进程清理引擎（桌面/CLI 二分、一键全清/熔断清/退出清残留、残留监视线程） | `guard.rs` §5 | 部分（processes.rs 精确检测/结束） | **扩展** processes：补 sweep 三态 |
-| 12 | 桌面通知六类 + AUMID 幂等登记（trip/recover/launch_blocked/warning/client_update/self_update） | `notify.rs` | 部分（notify_state + Toast/AUMID 有；无六类语义） | **扩展** notify_state |
+| 12 | 桌面通知六类 + AUMID 幂等登记（trip/recover/launch_blocked/warning/client_update/self_update） | `notify.rs` | **已完成六类语义** `egate_notify`（4 项文案测试 + 监控/启动/测试命令接线）；AUMID 由 tauri-plugin 以 bundle id 承担 | 基本完成 |
 | 13 | 飞书群通知（签名校验、DPAPI 加密凭据、持久队列、失败补发） | `feishu.rs` | 无 | **新增** `feishu.rs` |
 | 14 | Claude/Codex 客户端更新（只走官方 MSIX 源、签名校验、原位升级、注册版本核验） | `claude_update.rs` `claude_package.ps1` | 无 | **新增** `msix_update.rs` |
 | 15 | 自身更新（GitHub Releases 静默周期检查 + 下载自替换 + 同版本只提醒一次） | `update.rs` | 部分（update.rs 只有检查；下载/安装/回滚缺——与 YOURSJEYO 缺口重合） | **扩展** update.rs |

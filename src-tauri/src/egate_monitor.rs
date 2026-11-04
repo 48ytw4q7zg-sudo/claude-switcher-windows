@@ -153,6 +153,8 @@ pub fn start_monitor() {
         return;
     }
     std::thread::spawn(|| {
+        // 通知需要 AppHandle；启动早期可能还没有，拿到后缓存。
+        let mut app_handle: Option<tauri::AppHandle> = None;
         let mut last_run = 0u64;
         loop {
             std::thread::sleep(std::time::Duration::from_millis(TICK_MS));
@@ -166,13 +168,35 @@ pub fn start_monitor() {
                 continue;
             }
             last_run = now;
-            run_monitor_round(&config);
+            run_monitor_round(&config, &mut app_handle);
         }
     });
 }
 
+/// 应用句柄（由 Tauri `setup` 钩子注入；之前为 None）。
+static APP_HANDLE: OnceLock<tauri::AppHandle> = OnceLock::new();
+
+/// 由 `setup` 钩子调用，让监控线程能发桌面通知。
+pub fn set_app_handle(app: tauri::AppHandle) {
+    let _ = APP_HANDLE.set(app);
+}
+
+/// 拿到 AppHandle。启动早期窗口还没建好时返回 None，
+/// 此时只记日志不发通知——通知是附加信息，不能阻塞熔断本身。
+fn ensure_app_handle(cache: &mut Option<tauri::AppHandle>) -> Option<&tauri::AppHandle> {
+    if cache.is_none() {
+        if let Some(app) = APP_HANDLE.get() {
+            *cache = Some(app.clone());
+        }
+    }
+    cache.as_ref()
+}
+
 /// 跑一轮监控（含熔断执行）。
-fn run_monitor_round(config: &crate::appconfig::AppConfig) {
+fn run_monitor_round(
+    config: &crate::appconfig::AppConfig,
+    app_handle: &mut Option<tauri::AppHandle>,
+) {
     let targets = if config.egate_targets.is_empty() {
         crate::egate_defaults::builtin_targets()
     } else {
@@ -202,6 +226,13 @@ fn run_monitor_round(config: &crate::appconfig::AppConfig) {
             };
             let trip = crate::egate_trip::trip(&agents);
             mark_tripped();
+            if let Some(app) = ensure_app_handle(app_handle) {
+                crate::egate_notify::notify(
+                    app,
+                    crate::egate_notify::NotifyKind::Trip,
+                    &crate::egate_notify::trip_detail(&report),
+                );
+            }
             crate::log_error(&format!(
                 "出口门禁已熔断：{}；失败项：{}",
                 trip.note,
@@ -215,6 +246,13 @@ fn run_monitor_round(config: &crate::appconfig::AppConfig) {
             ));
         }
         RoundAction::Warn => {
+            if let Some(app) = ensure_app_handle(app_handle) {
+                crate::egate_notify::notify(
+                    app,
+                    crate::egate_notify::NotifyKind::Warning,
+                    &crate::egate_notify::warning_detail(&report),
+                );
+            }
             crate::log_error(&format!(
                 "出口门禁预警：{} 再失败一次将熔断",
                 report
