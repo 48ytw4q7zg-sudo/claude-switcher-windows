@@ -553,9 +553,12 @@ pub struct RecoveryReport {
 /// CLI 急救、托盘退出、卸载前恢复都调用这一份实现，确保三者行为一致。
 /// 只有全部必要项核验通过才返回 `network_ok && isolation_ok`。
 pub fn restore_all() -> RecoveryReport {
-    // **P0-F**：先写入持久化的「停止保护」意图，阻止后台守护下一轮重新施加。
-    crate::egate_monitor::disarm("用户执行紧急恢复");
+    // **P0-01**：先写入持久化的「停止保护」意图。写入失败时必须报告——
+    // 否则后台守护会在下一轮重新施加保护，急救等于没做。
     let mut failures = Vec::new();
+    if let Err(error) = crate::egate_monitor::disarm("用户执行紧急恢复") {
+        failures.push(format!("停止保护意图写入失败（后台可能继续保护）：{error}"));
+    }
 
     // 1. 恢复网络（删阻断规则 + 启用网卡）。
     let (network_ok, network_note) = restore();

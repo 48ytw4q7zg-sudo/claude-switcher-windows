@@ -20,7 +20,10 @@ pub struct LaunchGate {
     pub failing: Vec<String>,
     /// 是否处于熔断态。
     pub tripped: bool,
-    /// 是否暂停守护（暂停期间不阻止启动：用户显式要求「现在别管我」）。
+    /// 是否暂停守护。
+    ///
+    /// **P0-10**：暂停只停止自动副作用，**不参与**「是否允许启动」的判定；
+    /// 保留该字段供界面展示当前处于暂停状态。
     pub paused: bool,
     /// 门禁总开关。
     pub enabled: bool,
@@ -60,9 +63,8 @@ pub fn decide(gate: &LaunchGate) -> LaunchDecision {
     if !gate.enabled {
         return LaunchDecision::allow();
     }
-    if gate.paused {
-        return LaunchDecision::allow();
-    }
+    // **P0-10**：暂停只停止「新的自动副作用」（自动隔离/查杀），
+    // **不等于安全检查通过**。已熔断/未通过仍必须阻止启动。
     if gate.tripped {
         return LaunchDecision::block("当前处于熔断状态，请先解除隔离并确认出口正常");
     }
@@ -72,7 +74,12 @@ pub fn decide(gate: &LaunchGate) -> LaunchDecision {
         } else {
             gate.failing.join("、")
         };
-        return LaunchDecision::block(format!("出口校验未通过：{names}"));
+        let suffix = if gate.paused {
+            "（守护已暂停，但启动仍需出口通过）"
+        } else {
+            ""
+        };
+        return LaunchDecision::block(format!("出口校验未通过：{names}{suffix}"));
     }
     LaunchDecision::allow()
 }
@@ -171,11 +178,24 @@ mod tests {
     }
 
     #[test]
-    fn paused_gate_allows_launch() {
+    fn paused_still_blocks_unsafe_launch() {
+        // P0-10：暂停 ≠ 安全检查通过。
         let mut g = gate();
         g.paused = true;
         g.all_pass = false;
-        assert!(decide(&g).allowed, "暂停期间用户显式要求别管，应放行");
+        g.failing = vec!["Claude 出口".to_string()];
+        assert!(!decide(&g).allowed, "暂停期间出口未通过仍必须阻止启动");
+
+        // 暂停 + 已熔断：同样阻止。
+        let mut tripped = gate();
+        tripped.paused = true;
+        tripped.tripped = true;
+        assert!(!decide(&tripped).allowed, "暂停不能解除已熔断状态");
+
+        // 暂停 + 全部通过：允许（安全检查确实通过）。
+        let mut ok = gate();
+        ok.paused = true;
+        assert!(decide(&ok).allowed, "暂停但出口全通过时应允许");
     }
 
     #[test]

@@ -119,44 +119,71 @@ struct DisarmState {
     reason: String,
 }
 
+/// 保护意图的三态（**P0-01**：不能把「读不到」当成 Armed）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtectionIntent {
+    /// 保护已布防（正常）。
+    Armed,
+    /// 用户主动停止保护。
+    Disarmed,
+    /// 状态文件损坏或无法读取——**不得**当作 Armed，应保守处理。
+    Unknown,
+}
+
 /// 写入「停止保护」意图（CLI 急救、托盘紧急停止调用）。
-pub fn disarm(reason: &str) {
+///
+/// **P0-01**：返回 `Result`，调用方必须确认写入成功才能声称急救有效。
+pub fn disarm(reason: &str) -> Result<(), String> {
     let state = DisarmState {
         disarmed: true,
         since: now_secs(),
         reason: reason.to_string(),
     };
-    if let Ok(path) = disarm_file() {
-        if let Ok(text) = serde_json::to_string_pretty(&state) {
-            if let Err(error) = crate::fsx::write_atomically(&path, &text) {
-                crate::log_error(&format!("写入停止保护意图失败：{error}"));
-            }
-        }
-    }
+    let path = disarm_file()?;
+    let text =
+        serde_json::to_string_pretty(&state).map_err(|e| format!("序列化停止保护意图失败：{e}"))?;
+    crate::fsx::write_atomically(&path, &text)
+        .map_err(|e| format!("写入停止保护意图失败（后台可能继续保护）：{e}"))
 }
 
 /// 清除「停止保护」意图（用户重新启用保护时调用）。
-pub fn rearm() {
+///
+/// **P0-01**：返回 `Result`，写失败时前端不能声称已重新布防。
+pub fn rearm() -> Result<(), String> {
     let state = DisarmState::default();
-    if let Ok(path) = disarm_file() {
-        if let Ok(text) = serde_json::to_string_pretty(&state) {
-            let _ = crate::fsx::write_atomically(&path, &text);
-        }
+    let path = disarm_file()?;
+    let text =
+        serde_json::to_string_pretty(&state).map_err(|e| format!("序列化布防状态失败：{e}"))?;
+    crate::fsx::write_atomically(&path, &text).map_err(|e| format!("写入布防状态失败：{e}"))
+}
+
+/// 读取保护意图（**P0-01**：严格三态）。
+///
+/// - 文件不存在 → Armed（首次安装的默认）
+/// - 文件存在且可解析 → 按 `disarmed` 字段
+/// - 文件存在但损坏/不可读 → **Unknown**（不得当作 Armed）
+pub fn protection_intent() -> ProtectionIntent {
+    let Ok(path) = disarm_file() else {
+        return ProtectionIntent::Unknown;
+    };
+    if !path.exists() {
+        return ProtectionIntent::Armed;
+    }
+    let Ok(bytes) = std::fs::read(&path) else {
+        return ProtectionIntent::Unknown;
+    };
+    let text = crate::jsonio::decode_text(&bytes);
+    match serde_json::from_str::<DisarmState>(&text) {
+        Ok(state) if state.disarmed => ProtectionIntent::Disarmed,
+        Ok(_) => ProtectionIntent::Armed,
+        Err(_) => ProtectionIntent::Unknown,
     }
 }
 
-/// 是否处于「用户主动停止保护」状态。
+/// 是否处于「用户主动停止保护」状态（兼容旧调用）。
 pub fn is_disarmed() -> bool {
-    let Ok(path) = disarm_file() else {
-        return false;
-    };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return false;
-    };
-    let text = crate::jsonio::decode_text(&bytes);
-    serde_json::from_str::<DisarmState>(&text)
-        .map(|state| state.disarmed)
-        .unwrap_or(false)
+    protection_intent() == ProtectionIntent::Disarmed
 }
 
 /// **P0-E**：暂停状态文件（跨进程共享）。

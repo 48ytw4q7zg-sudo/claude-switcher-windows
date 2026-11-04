@@ -184,6 +184,24 @@ static OFFLINE: AtomicBool = AtomicBool::new(false);
 
 /// 单次巡检：判定 TUN/客户端 → 离线则 fail-closed 杀 Claude 并记日志。
 pub fn guard_tick() -> GuardTick {
+    // **P0-01**：用户主动停止保护（Disarmed）时，旧保镖必须停止查杀。
+    // Unknown（状态文件损坏）也不得继续——保守优先，避免误杀。
+    let intent = crate::egate_monitor::protection_intent();
+    if intent != crate::egate_monitor::ProtectionIntent::Armed {
+        let reason = if intent == crate::egate_monitor::ProtectionIntent::Disarmed {
+            "用户已停止保护"
+        } else {
+            "保护状态无法确认（状态文件损坏）"
+        };
+        return GuardTick {
+            alive: true,
+            tun_up: false,
+            client_up: false,
+            tun_detail: format!("已跳过巡检：{reason}"),
+            killed: Vec::new(),
+        };
+    }
+
     // P0-08：与新出口门禁共享暂停状态——用户在 GUI 里暂停守门后，
     // 旧保镖不能继续按自己的节奏查杀。
     if crate::egate_monitor::is_paused() {

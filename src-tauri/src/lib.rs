@@ -2764,7 +2764,7 @@ async fn egate_env_restore() -> Result<String, String> {
 
 /// 出口门禁：当前环境账本（未改动时为 null）。
 #[tauri::command]
-fn egate_env_ledger() -> Option<egate_env::AppliedEnv> {
+fn egate_env_ledger() -> Result<Option<egate_env::AppliedEnv>, String> {
     egate_env::load()
 }
 
@@ -2882,11 +2882,22 @@ fn egate_pause(minutes: u64) -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn egate_resume() -> Result<serde_json::Value, String> {
     egate_monitor::resume();
-    // 用户主动「恢复守护」也意味着重新启用保护（清除停止保护意图）。
-    egate_monitor::rearm();
     Ok(serde_json::json!({
         "paused": egate_monitor::is_paused(),
         "disarmed": egate_monitor::is_disarmed(),
+        "intent": egate_monitor::protection_intent(),
+    }))
+}
+
+/// 出口门禁：重新布防（清除「停止保护」意图）。
+///
+/// **P0-01**：与「恢复暂停」分开——用户可能只想取消暂停，不希望
+/// 立刻重新启用自动查杀。
+#[tauri::command]
+fn egate_rearm() -> Result<serde_json::Value, String> {
+    egate_monitor::rearm()?;
+    Ok(serde_json::json!({
+        "intent": egate_monitor::protection_intent(),
     }))
 }
 
@@ -2899,6 +2910,7 @@ fn egate_monitor_status() -> serde_json::Value {
         "tripped": egate_monitor::is_tripped(),
         "partial": egate_monitor::is_partial(),
         "disarmed": egate_monitor::is_disarmed(),
+        "intent": egate_monitor::protection_intent(),
     })
 }
 
@@ -3340,6 +3352,7 @@ pub fn run() {
             egate_env_ledger,
             egate_launch_claude,
             egate_resume,
+            egate_rearm,
             egate_monitor_status,
             egate_restore_network,
             egate_cut_state,

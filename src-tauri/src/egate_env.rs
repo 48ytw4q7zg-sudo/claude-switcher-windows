@@ -132,15 +132,21 @@ fn ledger_path() -> Result<std::path::PathBuf, String> {
     Ok(crate::paths::app_data_dir()?.join(LEDGER_FILE))
 }
 
-/// 读账本；不存在返回 None。
-pub fn load() -> Option<AppliedEnv> {
-    let path = ledger_path().ok()?;
+/// **P0-11**：读账本，严格区分「不存在」「损坏」「正常」。
+///
+/// - 文件不存在 → `Ok(None)`（确实没有改动）
+/// - 文件存在且可解析 → `Ok(Some(...))`
+/// - 文件存在但损坏/不可读 → `Err(...)`（**不能**当成「没有改动」）
+pub fn load() -> Result<Option<AppliedEnv>, String> {
+    let path = ledger_path()?;
     if !path.exists() {
-        return None;
+        return Ok(None);
     }
-    let bytes = std::fs::read(&path).ok()?;
+    let bytes = std::fs::read(&path).map_err(|e| format!("读取环境账本失败：{e}"))?;
     let text = crate::jsonio::decode_text(&bytes);
-    serde_json::from_str(&text).ok()
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("环境账本损坏（未清理，可手动修复）：{e}"))
 }
 
 fn save(record: &AppliedEnv) -> Result<(), String> {
@@ -181,8 +187,15 @@ pub fn align_timezone(egress_country: &str, city: &str) -> Result<AppliedEnv, St
         return Err("当前时区已与出口一致，无需改动".to_string());
     }
     // 已有账本时先还原，避免把「上次改后的值」当成原值记下来。
-    if load().is_some() {
-        restore()?;
+    match load() {
+        Ok(Some(_)) => {
+            restore()?;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            // 账本损坏：拒绝覆盖，避免丢失原值。
+            return Err(format!("{error}；请先修复或删除环境账本再对齐"));
+        }
     }
     let current = crate::platform::imp::current_timezone_id()?;
 
@@ -211,8 +224,10 @@ pub fn align_timezone(egress_country: &str, city: &str) -> Result<AppliedEnv, St
 
 /// 按账本还原到改动前的状态（幂等：没有账本时返回 Ok）。
 pub fn restore() -> Result<String, String> {
-    let Some(record) = load() else {
-        return Ok("没有需要还原的环境改动".to_string());
+    // **P0-11**：账本损坏必须报错，不能假装「没有改动」。
+    let record = match load()? {
+        Some(record) => record,
+        None => return Ok("没有需要还原的环境改动".to_string()),
     };
     if record.touched_tz() && !record.tz_from.is_empty() {
         crate::platform::imp::set_timezone_id(&record.tz_from)
