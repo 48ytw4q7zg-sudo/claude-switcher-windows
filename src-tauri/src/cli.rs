@@ -121,10 +121,13 @@ fn run_egate_restore() -> i32 {
     for failure in &report.failures {
         eprintln!("{failure}");
     }
-    // 退出码：只有网络与隔离都核验通过才算成功。
-    if report.network_ok && report.isolation_ok {
+    // **P0-02**：只有全部必要项完成（含停用意图）才返回成功。
+    if report.complete {
         0
     } else {
+        if !report.pending_resources.is_empty() {
+            eprintln!("待恢复资源：{}", report.pending_resources.join("、"));
+        }
         1
     }
 }

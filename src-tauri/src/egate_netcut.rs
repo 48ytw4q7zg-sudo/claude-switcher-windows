@@ -151,15 +151,15 @@ pub fn cut(mode: CutMode) -> (bool, String) {
         return (true, "档位为「不断网」，未执行断网".to_string());
     }
     // **P0-02**：断网必须独占系统操作权。
-    let _guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::NetworkCut) {
+    let guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::NetworkCut) {
         Ok(guard) => guard,
         Err(error) => return (false, format!("无法获取系统操作锁：{error}")),
     };
     // 已有现场：先严格检查账本状态。
     match load_state() {
         Ok(Some(_)) => {
-            // 有效的未完成事务：先恢复。
-            let (ok, note) = restore();
+            // 有效的未完成事务：先恢复（已持锁，走无锁版本）。
+            let (ok, note) = restore_locked(&guard);
             if !ok {
                 return (
                     false,
@@ -318,12 +318,17 @@ pub fn cut(mode: CutMode) -> (bool, String) {
 /// **逐项核验**：每一步执行后都查询实际状态，只有确认恢复完成才清理账本。
 /// 任何一项失败都保留账本，允许重复恢复。
 pub fn restore() -> (bool, String) {
-    // **P0-02**：恢复网络必须独占系统操作权。
-    let _guard =
-        match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::RestoreNetwork) {
-            Ok(guard) => guard,
-            Err(error) => return (false, format!("无法获取系统操作锁：{error}")),
-        };
+    // 公开入口：自己持锁一次。
+    let guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::RestoreNetwork)
+    {
+        Ok(guard) => guard,
+        Err(error) => return (false, format!("无法获取系统操作锁：{error}")),
+    };
+    restore_locked(&guard)
+}
+
+/// **P0-01**：已持锁版本的网络恢复——内部**不再申请锁**，避免自我死锁。
+pub(crate) fn restore_locked(_guard: &crate::egate_lock::OperationGuard) -> (bool, String) {
     let state = match load_state() {
         Ok(state) => state,
         Err(error) => return (false, format!("读取断网现场失败，未做任何恢复：{error}")),
@@ -593,12 +598,18 @@ mod tests {
 /// **P0-15**：统一恢复报告。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RecoveryReport {
+    /// **P0-02**：停止保护意图是否成功提交（后台不会重新施加）。
+    pub intent_ok: bool,
     /// 网络是否已恢复并核验。
     pub network_ok: bool,
     /// 应用隔离是否已解除并核验。
     pub isolation_ok: bool,
     /// 环境账本是否已还原。
     pub env_ok: bool,
+    /// **P0-02**：是否全部必要项完成（只有此时才清除熔断状态）。
+    pub complete: bool,
+    /// 尚未恢复的资源。
+    pub pending_resources: Vec<String>,
     /// 所有失败的说明。
     pub failures: Vec<String>,
     /// 最终结论。
@@ -611,68 +622,96 @@ pub struct RecoveryReport {
 /// 只有全部必要项核验通过才返回 `network_ok && isolation_ok`。
 pub fn restore_all() -> RecoveryReport {
     // **P0-02**：完整恢复必须独占系统操作权，避免与监控/保镖并发。
-    let _guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::FullRestore) {
-        Ok(guard) => Some(guard),
+    let guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::FullRestore) {
+        Ok(guard) => guard,
         Err(error) => {
             return RecoveryReport {
+                intent_ok: false,
                 network_ok: false,
                 isolation_ok: false,
                 env_ok: false,
+                complete: false,
+                pending_resources: vec!["系统操作锁".to_string()],
                 failures: vec![format!("无法获取系统操作锁：{error}")],
                 note: format!("恢复未执行（{error}）"),
             };
         }
     };
-    // **P0-01**：先写入持久化的「停止保护」意图。写入失败时必须报告——
-    // 否则后台守护会在下一轮重新施加保护，急救等于没做。
-    let mut failures = Vec::new();
-    if let Err(error) = crate::egate_monitor::disarm("用户执行紧急恢复") {
-        failures.push(format!("停止保护意图写入失败（后台可能继续保护）：{error}"));
-    }
 
-    // 1. 恢复网络（删阻断规则 + 启用网卡）。
-    let (network_ok, network_note) = restore();
+    let mut failures = Vec::new();
+    let mut pending = Vec::new();
+
+    // 1. **P0-02**：停止保护意图必须先成功提交——否则后台会在下一轮重新施加。
+    let intent_ok = match crate::egate_monitor::disarm("用户执行紧急恢复") {
+        Ok(()) => true,
+        Err(error) => {
+            failures.push(format!("停止保护意图写入失败（后台可能继续保护）：{error}"));
+            pending.push("停止保护意图".to_string());
+            false
+        }
+    };
+
+    // 2. 恢复网络（已持锁，走无锁版本）。
+    let (network_ok, network_note) = restore_locked(&guard);
     if !network_ok {
         failures.push(format!("网络：{network_note}"));
+        pending.push("网络（网卡/阻断规则）".to_string());
     }
 
-    // 2. 解除应用隔离并回查（P0-04：删除命令成功不等于规则消失）。
-    let isolation_ok = match crate::egate_trip::release_all_verified() {
+    // 3. 解除应用隔离并回查（已持锁）。
+    let isolation_ok = match crate::egate_trip::release_all_verified_locked(&guard) {
         Ok(report) if report.verified => true,
         Ok(report) => {
             failures.push(format!("应用隔离：{}", report.failures.join("；")));
+            pending.push(format!("应用隔离（剩余 {} 条规则）", report.remaining));
             false
         }
         Err(error) => {
             failures.push(format!("应用隔离：{error}"));
+            pending.push("应用隔离".to_string());
             false
         }
     };
 
-    // 3. 还原环境账本（时区改动）。
+    // 4. 还原环境账本。
     let env_ok = match crate::egate_env::restore() {
         Ok(_) => true,
         Err(error) => {
             failures.push(format!("环境账本：{error}"));
+            pending.push("环境设置（时区）".to_string());
             false
         }
     };
 
-    // 4. 清除熔断与部分状态标记。
-    crate::egate_monitor::clear_tripped();
+    // 5. **P0-02**：只有全部必要项完成才清除熔断状态。
+    let complete = intent_ok && network_ok && isolation_ok && env_ok;
+    if complete {
+        crate::egate_monitor::clear_tripped();
+    } else {
+        // 保留熔断状态与账本，允许重试。
+        crate::egate_monitor::mark_tripped_state(false);
+    }
 
-    let all_ok = network_ok && isolation_ok;
     RecoveryReport {
+        intent_ok,
         network_ok,
         isolation_ok,
         env_ok,
-        note: if all_ok && env_ok {
-            "已完整恢复：网络、隔离与环境设置均已核验".to_string()
-        } else if all_ok {
-            "网络与隔离已恢复，环境账本还原失败（见 failures）".to_string()
+        complete,
+        note: if complete {
+            "已完整恢复：意图、网络、隔离与环境设置均已核验".to_string()
         } else {
-            format!("恢复未完成：{}", failures.join("；"))
+            format!(
+                "恢复未完成（待处理：{}）：{}",
+                if pending.is_empty() {
+                    "无".to_string()
+                } else {
+                    pending.join("、")
+                },
+                failures.join("；")
+            )
         },
         failures,
+        pending_resources: pending,
     }
 }

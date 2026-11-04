@@ -325,7 +325,7 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
 /// 与上游一致：**只处理 GUI 应用**；CLI 宿主不在守护列表里，避免误伤终端。
 pub fn trip(guarded_agents: &[String]) -> TripReport {
     // **P0-02**：熔断必须独占系统操作权。
-    let _guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::Isolate) {
+    let guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::Isolate) {
         Ok(guard) => guard,
         Err(error) => {
             return TripReport {
@@ -337,6 +337,7 @@ pub fn trip(guarded_agents: &[String]) -> TripReport {
             };
         }
     };
+    let _keep = &guard;
     let mut agents = Vec::new();
     let mut failures = Vec::new();
     for id in guarded_agents {
@@ -418,8 +419,14 @@ pub struct ReleaseReport {
 
 /// **P0-04**：删除应用隔离规则并回查确认真的消失。
 pub fn release_all_verified() -> Result<ReleaseReport, String> {
-    // **P0-02**：解除隔离必须独占系统操作权。
-    let _guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::ReleaseIsolation)?;
+    let guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::ReleaseIsolation)?;
+    release_all_verified_locked(&guard)
+}
+
+/// **P0-01**：已持锁版本的解除隔离——内部**不再申请锁**。
+pub(crate) fn release_all_verified_locked(
+    _guard: &crate::egate_lock::OperationGuard,
+) -> Result<ReleaseReport, String> {
     // P0-C：先尝试清理旧版残留（升级兼容），失败不阻断主流程。
     let legacy = cleanup_legacy_rules().unwrap_or(0);
     let script = format!(

@@ -281,6 +281,11 @@ pub fn guard_tick() -> GuardTick {
 
 /// 时区看门狗：当前时区与 `appconfig.tz_target` 不一致则回滚并记日志。
 fn tz_watchdog_tick() {
+    // **P0-09**：用户主动停止保护（Disarmed）或状态损坏（Unknown）时，
+    // 看门狗不得继续修改系统时区——否则会立即推翻用户刚恢复的设置。
+    if crate::egate_monitor::protection_intent() != crate::egate_monitor::ProtectionIntent::Armed {
+        return;
+    }
     let cfg = appconfig::load();
     let Some(target) = cfg.tz_target.clone() else {
         return; // 未锁定目标时区，无可守护
