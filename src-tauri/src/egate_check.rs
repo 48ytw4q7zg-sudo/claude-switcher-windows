@@ -149,7 +149,7 @@ pub fn run_round(
         let probe: ProbeResult = if !target.enabled {
             ProbeResult::default()
         } else if skip {
-            ProbeResult::failed("未接入代理链路，已跳过探测")
+            ProbeResult::skipped("未接入代理链路，已跳过探测")
         } else {
             probe_with_route(target, &route)
         };
@@ -199,7 +199,7 @@ fn probe_with_route(target: &EgateTarget, route: &ProbeRoute) -> ProbeResult {
         // 探测本身走系统代理（reqwest system-proxy 特性已启用）；
         // 这里显式指定地址，确保测的就是应用真实出口。
         ProbeRoute::Proxy(_) | ProbeRoute::Direct => crate::egate_probe::probe(target),
-        ProbeRoute::Skip => ProbeResult::failed("未接入代理链路，已跳过探测"),
+        ProbeRoute::Skip => ProbeResult::skipped("未接入代理链路，已跳过探测"),
     }
 }
 

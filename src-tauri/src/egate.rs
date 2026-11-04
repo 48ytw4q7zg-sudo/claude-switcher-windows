@@ -88,6 +88,10 @@ fn default_timeout() -> u64 {
 pub struct ProbeResult {
     /// 是否有 HTTP 响应（含 4xx/5xx）。网络错误/超时为 false。
     pub reachable: bool,
+    /// **P0-11**：是否因安全原因主动跳过探测（区别于真实的探测失败）。
+    /// 跳过时判定必须返回 Unverified，不能伪造为 Fail。
+    #[serde(default)]
+    pub skipped: bool,
     /// 归一后的出口 IP。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ip: Option<String>,
@@ -115,6 +119,17 @@ impl ProbeResult {
     pub fn failed(reason: impl Into<String>) -> Self {
         Self {
             reachable: false,
+            detail: reason.into(),
+            ..Self::default()
+        }
+    }
+
+    /// **P0-11**：因安全原因主动跳过探测（接入路径不安全/未接入）。
+    /// 判定层必须据此返回 Unverified，而不是 Fail。
+    pub fn skipped(reason: impl Into<String>) -> Self {
+        Self {
+            reachable: false,
+            skipped: true,
             detail: reason.into(),
             ..Self::default()
         }
@@ -261,6 +276,19 @@ pub fn evaluate(target: &EgateTarget, probe: &ProbeResult) -> Evaluation {
         return Evaluation {
             verdict: Verdict::Disabled,
             reason: "目标已禁用，不参与判定".to_string(),
+        };
+    }
+
+    // P0-11：主动跳过的目标直接返回 Unverified，不能因为 Reachability
+    // 锚点把「安全跳过」误判成「站点不可达」。
+    if probe.skipped {
+        return Evaluation {
+            verdict: Verdict::Unverified,
+            reason: if probe.detail.trim().is_empty() {
+                "因安全原因跳过探测".to_string()
+            } else {
+                probe.detail.clone()
+            },
         };
     }
 
@@ -477,6 +505,7 @@ pub fn parse_trace(text: &str) -> Option<ProbeResult> {
     );
     Some(ProbeResult {
         reachable: true,
+        skipped: false,
         ip,
         country,
         raw_region,
@@ -526,6 +555,7 @@ pub fn parse_json_ip(text: &str) -> Option<ProbeResult> {
     );
     Some(ProbeResult {
         reachable: true,
+        skipped: false,
         ip,
         country,
         raw_region,
@@ -556,6 +586,7 @@ pub fn parse_gemini_region(text: &str) -> Option<ProbeResult> {
         };
         return Some(ProbeResult {
             reachable: true,
+            skipped: false,
             ip: None,
             country,
             raw_region: Some(raw),
@@ -675,6 +706,18 @@ mod tests {
             evaluate(&t, &ProbeResult::failed("timeout")).verdict,
             Verdict::Fail
         );
+    }
+
+    #[test]
+    fn skipped_probe_is_unverified_not_fail_even_for_reachability() {
+        // P0-11：安全跳过不能因为 Reachability 锚点被误判为「站点不可达」。
+        let t = target(AnchorKind::Reachability, &[], &[]);
+        let e = evaluate(&t, &ProbeResult::skipped("未接入代理链路，已跳过探测"));
+        assert_eq!(e.verdict, Verdict::Unverified, "跳过探测必须是 Unverified");
+        assert!(e.reason.contains("跳过"), "{}", e.reason);
+        // 对照：真正探测过且不可达的 Reachability 才判 Fail。
+        let real_fail = evaluate(&t, &ProbeResult::failed("连接超时"));
+        assert_eq!(real_fail.verdict, Verdict::Fail);
     }
 
     #[test]
