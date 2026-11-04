@@ -30,11 +30,11 @@
 
 | 功能 | 上游位置 | 现状 |
 | --- | --- | --- |
-| **六项非关键检查开关 + 可选失败降级** | `Get-CheckConfig` / `Test-CheckDisabled` | 无：所有检查无条件执行，不能关闭单项、不能降级 |
-| **48 小时出口 IP 变化历史** | `Add-IpHistory` | 无：只保存最后一次 IP，多次漂移后警告会丢失 |
-| **日志开关 / 轮转 / 导出范围限制** | `Write-ClientLog` | 部分：有滚动日志，但无可配置开关、无按级别/范围裁剪 |
+| **六项非关键检查开关** | `Get-CheckConfig` / `Test-CheckDisabled` | **已完成**：disabled_checks 配置，核心保护项强制保留 | 已完成 |
+| **48 小时出口 IP 变化历史** | `Add-IpHistory` | **已完成**：ip_history.rs + 漂移检测并入 IP 一致检查 | 已完成 |
+| **日志开关 / 级别过滤** | `Write-ClientLog` | **已完成**：log_enabled/log_level 配置 + 按级别过滤 | 已完成 |
 | **FlClash 活动 Profile 数据库事务修复** | `Test-ProxyAlive` 相关 | 未实现：仅识别 flclash 进程，无 SQLite Profile 事务修复 |
-| **自动更新下载 / 校验 / 安装替换 / 回滚** | `Invoke-UpdateNow` | 未实现：只有版本检查，不能真正升级 |
+| **自动更新下载 / 校验 / 安装替换** | `Invoke-UpdateNow` | **已完成**：download_and_verify / download_and_install + SHA256 校验；回滚需实机验证 | 基本完成 |
 | **出口与 ASN 一致性 + 真实 ASN 类型查询** | `Get-GeoInfo` | 部分：有启发式判定，未知 ASN 仍可能被当住宅 |
 | **Cloudflare 无 tz 字段回退** | `Get-Egress` | 未实现：trace 缺 tz 时按两源都失败处理 |
 | **Desktop 首次登录 / 启动顺序 / 自动启动** | `Start-ClaudeApp` / `Find-ClaudeAumid` | 未实现：本工具不负责拉起 Claude |
@@ -83,14 +83,13 @@
 
 | 上游 | 功能项 | 已实现 | 未完成 |
 | --- | --- | --- | --- |
-| YOURSJEYO | 26 | 15 | 11 |
-| ClaudeGuard | 22 | 6 | 16 |
-| **合计** | **48** | **21** | **27** |
+| YOURSJEYO | 26 | 19 | 7 |
+| ClaudeGuard | 22 | 14 | 8 |
+| **合计** | **48** | **33** | **15** |
 
-**结论：本项目尚未集齐两个上游的全部功能。** 已完成的是「账号切换 + 环境安检 +
-按目标出口校验」这条主干；缺口集中在 ClaudeGuard 的**熔断执行链路**（进程/防火墙/
-断网/自愈）和外围（飞书、客户端更新、常驻循环、托盘/向导），以及 YOURSJEYO 的
-**检查开关/历史/日志/自动更新下载回滚**。
+**结论：已完成 33/48 项，主干（账号切换 + 环境安检 + 出口门禁 + 熔断执行）已闭环。**
+剩余缺口集中在外围：飞书通知、MSIX 客户端更新、首启向导、仪表盘 UI、FlClash 事务、
+ASN 类型查询、Cloudflare 无 tz 回退等。这些多为独立模块，不影响核心安全能力。
 
 未完成项均已在 `docs/upstream-baseline.md` 与 `docs/upstream-claudeguard-parity.md`
 中逐项登记，未标注为已完成。
