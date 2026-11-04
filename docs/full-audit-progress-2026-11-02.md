@@ -135,3 +135,38 @@ YOURSJEYO 剩余缺口（I05-I09、ENV-03/04/06/09-19、日志/48h 历史）合�
 （进程/防火墙/断网/自愈、飞书、MSIX 客户端更新、常驻循环、托盘/向导、直连泄露观察、
 环境一致性账本），以及 YOURSJEYO 的检查开关/48h 历史/日志控制/自动更新下载回滚/
 FlClash 事务/Web 版检测。均未标注为已完成。
+
+
+## 2026-11-04 第四批：功能融合收尾
+
+| 项目 | 证据与结果 |
+| --- | --- |
+| 熔断执行 | egate_trip.rs（结束进程+防火墙隔离+回查核验）；只守护 GUI 应用，CLI 不杀 |
+| 直连泄露观察 | egate_netwatch.rs（GetExtendedTcpTable+Proxy/Local/Public 分类） |
+| 断网档位+自愈 | egate_netcut.rs（防火墙阻断/禁用网卡+账本+启动 heal） |
+| 常驻监控+暂停 | egate_monitor.rs（15秒巡检+30分钟暂停+熔断门控纯函数） |
+| 启动门禁 | egate_launch.rs（AUMID/exe 双路径+启动前判定） |
+| 六类通知 | egate_notify.rs（Trip/Recover/LaunchBlocked/Warning/ClientUpdate/SelfUpdate） |
+| CLI 入口 | cs --egate-check（JSON+0/2）/ --egate-restore |
+| 地区三选一约束 | SG/JP/US 受支持表+完整校验+前端共享 |
+| 48小时 IP 历史 | ip_history.rs+漂移检测并入检查 |
+| 检查开关 | disabled_checks 配置+核心保护项强制保留 |
+| 日志开关/级别 | log_enabled/log_level+按级别过滤 |
+| 自动更新 | download_and_verify/install + SHA256 校验 |
+| 门禁结果 | cargo test --lib 578/578，clippy 零警告，tsc 通过，安装包构建通过 |
+
+**总差距清单（docs/parity-gap-final-2026-11-04.md）：48 项中已完成 33 项。**
+
+主干已闭环：账号切换 + 环境安检 + 出口门禁（判定/探测/接入）+ 熔断执行
+（进程/防火墙/断网/自愈）+ 常驻监控 + 启动门禁 + 通知 + CLI + 中文界面。
+
+剩余缺口（15 项）集中在外围独立模块，不影响核心安全能力：
+- 飞书群通知（签名/DPAPI/队列）
+- MSIX 客户端更新
+- 首启向导、仪表盘 UI
+- FlClash 活动 Profile 事务
+- ASN 类型查询、Cloudflare 无 tz 回退
+- Web 版环境检测
+- 等
+
+**结论：本项目已基本集齐两个上游的核心功能，主干完整。**
