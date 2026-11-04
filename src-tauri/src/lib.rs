@@ -31,6 +31,7 @@ mod egate;
 mod egate_access;
 mod egate_check;
 mod egate_defaults;
+mod egate_monitor;
 mod egate_netcut;
 mod egate_netwatch;
 mod egate_probe;
@@ -2585,7 +2586,8 @@ static EGATE_STREAKS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::BTreeMap<String, u32>>,
 > = std::sync::OnceLock::new();
 
-fn egate_streaks() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, u32>> {
+pub(crate) fn egate_streaks() -> &'static std::sync::Mutex<std::collections::BTreeMap<String, u32>>
+{
     EGATE_STREAKS.get_or_init(|| std::sync::Mutex::new(std::collections::BTreeMap::new()))
 }
 
@@ -2613,6 +2615,33 @@ async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
         ))
     })
     .await
+}
+
+/// 出口门禁：暂停守护（暂停期间照常检测，但不熔断）。
+#[tauri::command]
+fn egate_pause(minutes: u64) -> Result<serde_json::Value, String> {
+    egate_monitor::pause(minutes);
+    Ok(serde_json::json!({
+        "paused": egate_monitor::is_paused(),
+        "remaining_secs": egate_monitor::paused_remaining_secs(),
+    }))
+}
+
+/// 出口门禁：立即恢复守护。
+#[tauri::command]
+fn egate_resume() -> Result<serde_json::Value, String> {
+    egate_monitor::resume();
+    Ok(serde_json::json!({ "paused": egate_monitor::is_paused() }))
+}
+
+/// 出口门禁：监控状态（是否暂停/剩余时间/是否已熔断）。
+#[tauri::command]
+fn egate_monitor_status() -> serde_json::Value {
+    serde_json::json!({
+        "paused": egate_monitor::is_paused(),
+        "remaining_secs": egate_monitor::paused_remaining_secs(),
+        "tripped": egate_monitor::is_tripped(),
+    })
 }
 
 /// 出口门禁：执行断网（防火墙全局阻断 / 禁用物理网卡）。
@@ -2706,7 +2735,13 @@ async fn egate_trip_now() -> Result<egate_trip::TripReport, String> {
 /// 出口门禁：解除全部隔离（按本产品规则名前缀整体清理）。
 #[tauri::command]
 async fn egate_release_now() -> Result<u32, String> {
-    blocking(egate_trip::release_all).await
+    blocking(|| {
+        let removed = egate_trip::release_all()?;
+        // 解除隔离即视为退出熔断态，下一轮失败才会再次熔断。
+        egate_monitor::clear_tripped();
+        Ok(removed)
+    })
+    .await
 }
 
 /// 出口门禁：当前隔离规则数量（None 表示查询失败，不能宣称已清干净）。
@@ -2872,6 +2907,8 @@ pub fn run() {
     for message in egate_netcut::heal() {
         log_error(&message);
     }
+    // 出口门禁常驻巡检（幂等：门禁未开启时线程空转，不产生副作用）。
+    egate_monitor::start_monitor();
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
@@ -3025,6 +3062,9 @@ pub fn run() {
             egate_quarantine_count,
             egate_leak_watch,
             egate_cut_network,
+            egate_pause,
+            egate_resume,
+            egate_monitor_status,
             egate_restore_network,
             egate_cut_state,
             // Claude Desktop 桌面版

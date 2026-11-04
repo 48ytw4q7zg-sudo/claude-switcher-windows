@@ -64,6 +64,7 @@ export function EgatePanel() {
   const [cutState, setCutState] = useState<CutState | null>(null);
   const [cutMode, setCutMode] = useState<'off' | 'firewall' | 'nics'>('off');
   const [networkNote, setNetworkNote] = useState<string | null>(null);
+  const [monitor, setMonitor] = useState<{ paused: boolean; remaining_secs: number; tripped: boolean } | null>(null);
   const [quarantineCount, setQuarantineCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
@@ -118,7 +119,32 @@ export function EgatePanel() {
     invoke<CutState | null>('egate_cut_state')
       .then(setCutState)
       .catch(() => setCutState(null));
+    invoke<{ paused: boolean; remaining_secs: number; tripped: boolean }>('egate_monitor_status')
+      .then(setMonitor)
+      .catch(() => setMonitor(null));
   }, [refreshQuarantine]);
+
+  /** 暂停 / 恢复守护。 */
+  const togglePause = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      if (monitor?.paused) {
+        await invoke('egate_resume');
+      } else {
+        await invoke('egate_pause', { minutes: 30 });
+      }
+      setMonitor(
+        await invoke<{ paused: boolean; remaining_secs: number; tripped: boolean }>(
+          'egate_monitor_status',
+        ).catch(() => null),
+      );
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   /** 执行断网（最高强度动作，需二次确认）。 */
   const cutNetwork = async () => {
@@ -326,6 +352,15 @@ export function EgatePanel() {
           <ShieldAlert />
           直连泄露观察
         </button>
+        <button className="ghost" onClick={togglePause} disabled={busy} title="暂停期间照常检测，但不会执行熔断">
+          {monitor?.paused ? '恢复守护' : '暂停守护 30 分钟'}
+        </button>
+        {monitor?.paused && (
+          <span className="pill muted">
+            已暂停（剩余 {Math.max(1, Math.round((monitor.remaining_secs ?? 0) / 60))} 分钟）
+          </span>
+        )}
+        {monitor?.tripped && <span className="pill bad">熔断中</span>}
         {quarantineCount !== null && (
           <span className="pill muted">当前隔离规则：{quarantineCount} 条</span>
         )}
