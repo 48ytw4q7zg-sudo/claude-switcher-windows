@@ -77,6 +77,51 @@ export interface AppConfig {
   quota_reminder_threshold?: number;
   /** H-6：检测到未登记账号时是否自动收养（默认开启）。 */
   auto_adopt_enabled?: boolean;
+  /** 出口门禁：被监控的出口链路目标表。 */
+  egate_targets?: EgateTarget[];
+  /** 出口门禁总开关（默认关闭）。 */
+  egate_enabled?: boolean;
+  /** 熔断防抖阈值（连续 N 次失败才熔断；0 表示关闭熔断）。 */
+  egate_trip_threshold?: number;
+  /** 检查间隔秒数。 */
+  egate_interval_secs?: number;
+  /** 是否启用接入路径检查。 */
+  egate_enforce_access?: boolean;
+  /** 被守护的桌面应用 id。 */
+  egate_guarded_agents?: string[];
+}
+
+/** 出口门禁：一个被监控的出口链路。 */
+export interface EgateTarget {
+  id: string;
+  name: string;
+  anchor_url: string;
+  anchor_kind: 'auto' | 'trace' | 'json_ip' | 'gemini_region' | 'reachability';
+  expect_ips: string[];
+  expect_regions: string[];
+  enabled: boolean;
+  timeout_secs: number;
+}
+
+/** 出口门禁：单个目标的一轮结果。 */
+export interface EgateTargetReport {
+  id: string;
+  name: string;
+  verdict: 'pass' | 'fail' | 'unverified' | 'disabled';
+  reason: string;
+  fail_streak: number;
+  ip?: string | null;
+  country?: string | null;
+  latency_ms: number;
+}
+
+/** 出口门禁：一轮检查的完整结果。 */
+export interface EgateReport {
+  access: { path: string; note: string };
+  overall: { verdict: 'pass' | 'fail' | 'unverified' | 'disabled'; note: string };
+  targets: EgateTargetReport[];
+  probed: boolean;
+  skipped_reason?: string | null;
 }
 
 /** P1-3：并行终端启动结果。 */

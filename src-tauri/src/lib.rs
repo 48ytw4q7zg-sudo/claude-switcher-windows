@@ -27,6 +27,11 @@ mod credentials;
 mod desktop;
 mod diagnostics;
 mod dirbinding;
+mod egate;
+mod egate_access;
+mod egate_check;
+mod egate_defaults;
+mod egate_probe;
 mod egress;
 mod export;
 mod fsx;
@@ -2493,6 +2498,140 @@ fn get_appconfig() -> appconfig::AppConfig {
     appconfig::load()
 }
 
+/// 出口门禁：保存目标表（整体替换，与上游「保存整表」语义一致）。
+///
+/// 先校验再落盘：id 重复、锚点地址非法、名称为空等一律拒绝并返回全部问题，
+/// 避免把半合法的配置写进去后门禁静默不工作。
+#[tauri::command]
+fn egate_save_targets(targets: Vec<egate::EgateTarget>) -> Result<(), String> {
+    let errors = egate_defaults::validate_targets(&targets);
+    if !errors.is_empty() {
+        return Err(format!("目标配置有问题：{}", errors.join("；")));
+    }
+    // 内置目标不允许删除（只能停用）：删掉后用户若改主意就得手动照文档重建，
+    // 而内置锚点是「这个应用此刻走哪条路」的权威定义。
+    let saved: Vec<&str> = targets.iter().map(|t| t.id.trim()).collect();
+    for builtin in egate_defaults::builtin_targets() {
+        if !saved.contains(&builtin.id.as_str()) {
+            return Err(format!(
+                "内置目标「{}」不能删除，可以取消勾选停用",
+                builtin.name
+            ));
+        }
+    }
+    // 内置目标的 id 不能改：id 是熔断执行与配置迁移的稳定标识。
+    for target in &targets {
+        if egate_defaults::is_builtin(target.id.trim()) {
+            let expected = egate_defaults::builtin_targets()
+                .into_iter()
+                .find(|builtin| builtin.id == target.id.trim());
+            if let Some(expected) = expected {
+                if expected.anchor_url != target.anchor_url.trim() {
+                    return Err(format!("内置目标「{}」的探测地址不能修改", expected.name));
+                }
+            }
+        }
+    }
+    let normalized: Vec<egate::EgateTarget> = targets
+        .into_iter()
+        .map(|mut target| {
+            target.expect_regions =
+                egate_defaults::normalize_expect_regions(&target.expect_regions);
+            target.expect_ips = egate_defaults::normalize_expect_ips(&target.expect_ips);
+            target.timeout_secs = egate_check::clamp_timeout(target.timeout_secs);
+            target
+        })
+        .collect();
+    appconfig::update(|config| {
+        config.egate_targets = normalized.clone();
+    })?;
+    Ok(())
+}
+
+/// 出口门禁：恢复内置默认目标表。
+#[tauri::command]
+fn egate_reset_targets() -> Result<Vec<egate::EgateTarget>, String> {
+    let defaults = egate_defaults::builtin_targets();
+    appconfig::update(|config| config.egate_targets = defaults.clone())?;
+    Ok(defaults)
+}
+
+/// 出口门禁：读取当前生效的目标表（未配置时返回内置默认表，便于首次配置）。
+#[tauri::command]
+fn egate_get_targets() -> Vec<egate::EgateTarget> {
+    let config = appconfig::load();
+    if config.egate_targets.is_empty() {
+        egate_defaults::builtin_targets()
+    } else {
+        config.egate_targets
+    }
+}
+
+/// 出口门禁：开关与参数（整体更新，缺省保持原值由前端回读保证）。
+#[tauri::command]
+fn egate_update_settings(
+    enabled: bool,
+    trip_threshold: u32,
+    interval_secs: u64,
+    enforce_access: bool,
+) -> Result<(), String> {
+    appconfig::update(|config| {
+        config.egate_enabled = enabled;
+        config.egate_trip_threshold = trip_threshold;
+        config.egate_interval_secs = egate_check::clamp_timeout(interval_secs);
+        config.egate_enforce_access = enforce_access;
+        // 首次开启门禁时若还没选守护对象，回落到内置默认（claude/chatgpt/antigravity），
+        // 否则熔断执行阶段不知道该结束哪些进程。
+        if config.egate_guarded_agents.is_empty() {
+            config.egate_guarded_agents = egate_defaults::DEFAULT_GUARDED_AGENTS
+                .iter()
+                .map(|id| id.to_string())
+                .collect();
+        }
+    })?;
+    Ok(())
+}
+
+/// 出口门禁：立即跑一轮检查（只读探测，不结束进程、不断网）。
+///
+/// 熔断执行按批次接入（当前只报告结果）；未接入代理链路时按开关跳过探测。
+#[tauri::command]
+async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
+    blocking(|| {
+        let config = appconfig::load();
+        let targets = if config.egate_targets.is_empty() {
+            egate_defaults::builtin_targets()
+        } else {
+            config.egate_targets.clone()
+        };
+        let mut streaks = std::collections::BTreeMap::new();
+        Ok(egate_check::run_round(
+            &targets,
+            &mut streaks,
+            config.egate_enforce_access,
+            config.egate_trip_threshold,
+        ))
+    })
+    .await
+}
+
+/// 出口门禁：当前接入路径（只读注册表与网卡，不探测）。
+#[tauri::command]
+fn egate_access_status() -> egate_access::AccessInfo {
+    let config = appconfig::load();
+    let targets = if config.egate_targets.is_empty() {
+        egate_defaults::builtin_targets()
+    } else {
+        config.egate_targets
+    };
+    let path = egate_check::current_access(&egate_check::monitored_hosts(&targets));
+    let mut info = egate_access::AccessInfo::from(&path);
+    // note 里补上中文标签：前端按 path 自己映射会与后端语义漂移，
+    // 这里以 [`egate_access::AccessPath::label`] 为唯一真源。
+    info.note = format!("{} · {}", path.label(), path.note());
+    info
+}
+
 /// 设置 Clash 代理组名（Script.js 置顶规则的目标）。空串清除，回落到默认组。
 #[tauri::command]
 fn set_proxy_group(group: String) -> Result<(), String> {
@@ -2768,6 +2907,13 @@ pub fn run() {
             set_webrtc_policy,
             get_appconfig,
             set_proxy_group,
+            // 出口门禁（融合 ClaudeGuard）
+            egate_save_targets,
+            egate_reset_targets,
+            egate_get_targets,
+            egate_update_settings,
+            egate_check_once,
+            egate_access_status,
             // Claude Desktop 桌面版
             list_desktop_profiles_cmd,
             capture_desktop_profile_cmd,

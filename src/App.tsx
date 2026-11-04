@@ -31,6 +31,7 @@ import {
 } from 'lucide-react';
 import { ClaudeTrayPopup } from './components/ClaudeTrayPopup';
 import { SecurityPanel } from './components/SecurityPanel';
+import { EgatePanel } from './components/EgatePanel';
 import { RegionPanel } from './components/RegionPanel';
 import { GuardPanel } from './components/GuardPanel';
 import { ClashModePanel } from './components/ClashModePanel';
@@ -1572,6 +1573,14 @@ function App() {
 
       {/* ── 新增：环境安检 / 地区与客户端 / 保镖 / Clash 模式 / 桌面版 / 隐私诊断 ── */}
       <SecurityPanel />
+
+      <section className="profiles">
+        <div className="section-title">
+          <h2>出口门禁</h2>
+          <span>按目标校验出口 · 接入路径 · 单轮检查</span>
+        </div>
+        <EgatePanel />
+      </section>
 
       <section className="profiles">
         <div className="section-title">

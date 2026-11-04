@@ -1,0 +1,325 @@
+import { formatError, formatMessage } from '../uiText';
+import { useCallback, useEffect, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+import {
+  CheckCircle2,
+  Globe2,
+  Loader2,
+  RefreshCw,
+  RotateCcw,
+  Save,
+  ShieldAlert,
+  XCircle,
+} from 'lucide-react';
+import type { AppConfig, EgateReport, EgateTarget } from './types';
+
+/** 锚点类型的中文名（技术值只在展示时翻译）。 */
+const ANCHOR_LABELS: Record<string, string> = {
+  auto: '自动识别',
+  trace: 'Cloudflare trace',
+  json_ip: 'JSON IP',
+  gemini_region: '页面地区标记',
+  reachability: '仅可达性',
+};
+
+/** 判定结果的中文标签与样式类。 */
+const VERDICT_LABELS: Record<string, { text: string; cls: string }> = {
+  pass: { text: '通过', cls: 'pill ok' },
+  fail: { text: '未通过', cls: 'pill bad' },
+  unverified: { text: '无法确认', cls: 'pill muted' },
+  disabled: { text: '已停用', cls: 'pill muted' },
+};
+
+/** 接入路径的中文标签。 */
+const ACCESS_LABELS: Record<string, string> = {
+  system_proxy: '系统代理',
+  tun: 'TUN 直连',
+  uncovered: '未接入代理',
+  unknown: '无法确认',
+};
+
+const emptyTarget = (): EgateTarget => ({
+  id: '',
+  name: '',
+  anchor_url: 'https://',
+  anchor_kind: 'auto',
+  expect_ips: [],
+  expect_regions: [],
+  enabled: true,
+  timeout_secs: 10,
+});
+
+/**
+ * 出口门禁面板（融合 ClaudeGuard 的按目标出口校验）。
+ *
+ * 当前批次交付：目标表查看/编辑/保存/恢复默认、开关与阈值、单轮检查与接入路径。
+ * 熔断执行（结束进程 / 防火墙隔离 / 断网）按批次接入，界面会明确说明当前只报告不熔断。
+ */
+export function EgatePanel() {
+  const [config, setConfig] = useState<AppConfig | null>(null);
+  const [targets, setTargets] = useState<EgateTarget[]>([]);
+  const [report, setReport] = useState<EgateReport | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [checking, setChecking] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [note, setNote] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    setLoading(true);
+    try {
+      const cfg = await invoke<AppConfig>('get_appconfig');
+      setConfig(cfg);
+      setTargets(cfg.egate_targets?.length ? cfg.egate_targets : await invoke<EgateTarget[]>('egate_get_targets'));
+    } catch (e) {
+      setConfig(null);
+      setError(formatError(e));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    load();
+  }, [load]);
+
+  const check = async () => {
+    setChecking(true);
+    setError(null);
+    setNote(null);
+    try {
+      const result = await invoke<EgateReport>('egate_check_once');
+      setReport(result);
+    } catch (e) {
+      setReport(null);
+      setError(formatError(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  const save = async () => {
+    setSaving(true);
+    setError(null);
+    setNote(null);
+    try {
+      await invoke('egate_save_targets', { targets });
+      const enabled = config?.egate_enabled ?? false;
+      await invoke('egate_update_settings', {
+        enabled,
+        tripThreshold: config?.egate_trip_threshold ?? 2,
+        intervalSecs: config?.egate_interval_secs ?? 15,
+        enforceAccess: config?.egate_enforce_access ?? true,
+      });
+      setNote('目标配置已保存。');
+      await load();
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const reset = async () => {
+    setSaving(true);
+    setError(null);
+    setNote(null);
+    try {
+      const defaults = await invoke<EgateTarget[]>('egate_reset_targets');
+      setTargets(defaults);
+      setNote('已恢复内置默认目标。保存后生效。');
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const update = (index: number, patch: Partial<EgateTarget>) => {
+    setTargets((prev) => prev.map((item, i) => (i === index ? { ...item, ...patch } : item)));
+  };
+
+  const busy = loading || checking || saving;
+  const overall = report?.overall;
+
+  return (
+    <div className="panel">
+      <div className="panel-title">
+        <Globe2 />
+        <span>出口门禁（按目标校验）</span>
+      </div>
+
+      <p className="telemetry-intro">
+        每个被守护的目标各测各的出口：Claude 走 claude.ai、Codex 走 chatgpt.com，互不牵连。
+        任一启用目标未通过才判定失败；拿不到出口信息时只报告「无法确认」，不会误判。
+      </p>
+
+      <div className="clash-summary" style={{ gridTemplateColumns: 'repeat(3, minmax(0,1fr))' }}>
+        <div>
+          <span>整体判定</span>
+          <strong>
+            {overall
+              ? VERDICT_LABELS[overall.verdict]?.text ?? overall.verdict
+              : loading
+                ? '读取中'
+                : '未检查'}
+          </strong>
+        </div>
+        <div>
+          <span>接入路径</span>
+          <strong>
+            {report ? ACCESS_LABELS[report.access.path] ?? report.access.path : '未检查'}
+          </strong>
+        </div>
+        <div>
+          <span>启用状态</span>
+          <strong>{config?.egate_enabled ? '已开启' : '已关闭'}</strong>
+        </div>
+      </div>
+
+      {report?.skipped_reason && (
+        <div className="inline-warning" style={{ marginTop: 10 }}>
+          {formatMessage(report.skipped_reason)}
+        </div>
+      )}
+
+      <div className="profile-actions" style={{ marginTop: 12 }}>
+        <button className="primary" onClick={check} disabled={busy}>
+          {checking ? <Loader2 className="spin" /> : <RefreshCw />}
+          立即检查一轮
+        </button>
+        <button className="ghost" onClick={save} disabled={busy || !targets.length}>
+          {saving ? <Loader2 className="spin" /> : <Save />}
+          保存目标配置
+        </button>
+        <button className="ghost" onClick={reset} disabled={busy} title="恢复内置默认目标表">
+          <RotateCcw />
+          恢复默认
+        </button>
+      </div>
+
+      {note && <div className="inline-success" style={{ marginTop: 10 }}>{note}</div>}
+      {error && (
+        <div className="inline-error" style={{ marginTop: 10 }}>
+          <ShieldAlert /> {error}
+        </div>
+      )}
+
+      {report && report.targets.length > 0 && (
+        <div className="check-list" style={{ marginTop: 14 }}>
+          {report.targets.map((item) => {
+            const info = VERDICT_LABELS[item.verdict] ?? VERDICT_LABELS.unverified;
+            return (
+              <div className="check-row" key={item.id}>
+                <span className={`check-dot ${item.verdict === 'pass' ? 'ok' : item.verdict === 'fail' ? 'fail' : 'warn'}`}>
+                  {item.verdict === 'pass' ? <CheckCircle2 /> : <XCircle />}
+                </span>
+                <div className="check-row-body">
+                  <strong>
+                    {item.name} <span className={info.cls}>{info.text}</span>
+                  </strong>
+                  <span>
+                    {formatMessage(item.reason)}
+                    {item.ip ? ` · 出口 ${item.ip}` : ''}
+                    {item.country ? `（${item.country}）` : ''}
+                    {` · ${item.latency_ms}ms`}
+                    {item.fail_streak > 0 ? ` · 连续失败 ${item.fail_streak} 次` : ''}
+                  </span>
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      <div style={{ marginTop: 16 }}>
+        <strong style={{ fontSize: 13 }}>监控目标</strong>
+        {loading && <div className="empty">正在读取目标配置…</div>}
+        {!loading && targets.length === 0 && (
+          <div className="empty">没有配置任何目标。点「恢复默认」写入内置目标表。</div>
+        )}
+        {targets.map((target, index) => (
+          <div key={`${index}-${target.id}`} className="mcp-form" style={{ marginTop: 10 }}>
+            <div className="mcp-form-head">
+              <input
+                value={target.name}
+                placeholder="目标名称，例如 Claude 出口"
+                onChange={(e) => update(index, { name: e.target.value })}
+                disabled={busy}
+                style={{ flex: 1 }}
+              />
+              <select
+                value={target.anchor_kind}
+                onChange={(e) => update(index, { anchor_kind: e.target.value as EgateTarget['anchor_kind'] })}
+                disabled={busy}
+              >
+                {Object.entries(ANCHOR_LABELS).map(([value, label]) => (
+                  <option key={value} value={value}>
+                    {label}
+                  </option>
+                ))}
+              </select>
+              <label className="perm-check">
+                <input
+                  type="checkbox"
+                  checked={target.enabled}
+                  onChange={(e) => update(index, { enabled: e.target.checked })}
+                  disabled={busy}
+                />
+                启用
+              </label>
+            </div>            <input
+              value={target.anchor_url}
+              placeholder="探测地址，例如 https://claude.ai/cdn-cgi/trace"
+              onChange={(e) => update(index, { anchor_url: e.target.value })}
+              disabled={busy}
+            />
+            <div className="mcp-form-head">
+              <input
+                value={target.expect_ips.join(', ')}
+                placeholder="期望出口 IP（逗号分隔，可留空）"
+                onChange={(e) =>
+                  update(index, {
+                    expect_ips: e.target.value
+                      .split(/[,，]/)
+                      .map((v) => v.trim())
+                      .filter(Boolean),
+                  })
+                }
+                disabled={busy}
+              />
+              <input
+                value={target.expect_regions.join(', ')}
+                placeholder="期望地区码（逗号分隔，如 US,JP）"
+                onChange={(e) =>
+                  update(index, {
+                    expect_regions: e.target.value
+                      .split(/[,，]/)
+                      .map((v) => v.trim())
+                      .filter(Boolean),
+                  })
+                }
+                disabled={busy}
+              />
+              <input
+                type="number"
+                value={target.timeout_secs}
+                min={1}
+                max={30}
+                title="单次探测超时（秒）"
+                onChange={(e) => update(index, { timeout_secs: Number(e.target.value) || 10 })}
+                disabled={busy}
+                style={{ width: 80 }}
+              />
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <p className="usage-note" style={{ marginTop: 12 }}>
+        本批次只做出口校验与报告；结束进程、防火墙隔离与断网等熔断动作尚未接入。
+        未接入代理链路时本工具不会发起探测，避免把真实家宽出口暴露给被测站点。
+      </p>
+    </div>
+  );
+}

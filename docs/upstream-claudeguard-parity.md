@@ -20,10 +20,10 @@ region 锁定继续保留（它们是「主动锁环境」，ClaudeGuard 是「�
 
 | # | ClaudeGuard 能力（入口） | 上游位置 | 本项目现状 | 处置 |
 | --- | --- | --- | --- | --- |
-| 1 | 监控目标模型（Target：名称/锚点/期望 IP+地区/开关，增删改/恢复默认，内置 local/claude/codex/antigravity） | `model.rs` `targets.rs` | 无（egress.rs 只测单一出口） | **新增** `egtargets.rs` |
-| 2 | 锚点四类 + auto 探测（Cloudflare trace / JSON IP / Gemini 地区标记 / 仅可达性；alpha-3→alpha-2 归一；解析失败=Unverified） | `anchors.rs` | 部分（egress.rs trace+ipinfo） | **新增** `egprobe.rs`（复用 net.rs HTTP 边界） |
-| 3 | 判定矩阵（Pass/Fail/Unverified/Disabled；期望为空宁可错杀；信息缺失不熔断；整体判定） | `policy.rs` | 无 | **新增**纯函数 + 表测 |
-| 4 | 接入路径检查（系统代理/TUN/Uncovered；ProxyOverride 绕过清单按 AI 域名判定；未接入不直连探测） | `access.rs` | 部分（guard.rs TUN 检测、net.rs 系统代理） | **扩展** guard/net + 新纯函数 |
+| 1 | 监控目标模型（Target：名称/锚点/期望 IP+地区/开关，增删改/恢复默认，内置 local/claude/codex/antigravity） | `model.rs` `targets.rs` | **已完成模型层** `egate.rs`（25 测试）；CRUD/内置默认表与配置持久化待接 | 部分完成 |
+| 2 | 锚点四类 + auto 探测（Cloudflare trace / JSON IP / Gemini 地区标记 / 仅可达性；alpha-3→alpha-2 归一；解析失败=Unverified） | `anchors.rs` | **已完成** `egate.rs`（解析/归一）+ `egate_probe.rs`（网络，URL 校验/3MB 上限/不跟随跨主机跳转） | 已完成 |
+| 3 | 判定矩阵（Pass/Fail/Unverified/Disabled；期望为空宁可错杀；信息缺失不熔断；整体判定） | `policy.rs` | **已完成** `egate::evaluate` + `egate::overall`（表测） | 已完成 |
+| 4 | 接入路径检查（系统代理/TUN/Uncovered；ProxyOverride 绕过清单按 AI 域名判定；未接入不直连探测） | `access.rs` | **已完成判定层** `egate_access.rs`（18 测试）+ `egate_check.rs`（注册表读取/TUN 枚举/路由/防抖） | 已完成 |
 | 5 | 防火墙兜底封锁（未接入→每守护对象出站 Block；fw_ensure_on 只开不关；手动封锁/解除；intent 差分） | `guard.rs` `netcut.rs` §3.6 | 无 | **新增** `firewall.rs` |
 | 6 | 直连泄露观察（GetExtendedTcpTable 筛守护对象连接，Proxy/Local/Public 分类；默认只告警） | `netwatch.rs` | 无 | **新增** `netwatch.rs` |
 | 7 | 环境一致性检查/对齐（tz/locale vs 出口；离线地点表；账本式自动对齐与一键还原） | `envcheck.rs` `envfix.rs` `geo.rs` | 部分（region.rs 锁定时区/区域，checks 查一致性；无账本还原） | **扩展** region：补账本式对齐/还原 |
@@ -52,7 +52,7 @@ region 锁定继续保留（它们是「主动锁环境」，ClaudeGuard 是「�
 
 ## 实施顺序（与 YOURSJEYO 剩余缺口合并排批）
 
-1. **B3a 核心门禁**：#1–#3 目标/探测/判定（纯函数 + 表测）→ #4 接入路径 → #8/#9 监控防抖与熔断编排。
+1. **B3a 核心门禁**：#1–#3 目标/探测/判定 + #4 接入路径判定已完成（50 项测试）；目标 CRUD/配置持久化、#8 监控循环与 #9 熔断编排待接。
 2. **B3b 熔断执行**：#5 防火墙、#10 断网账本/自愈、#11 进程清理、#16 启动门禁。
 3. **B3c 通知与外围**：#12 六类通知、#13 飞书、#17 CLI、#18 托盘、#19 向导、#20 UI 分区。
 4. **B3d 客户端更新**：#14 MSIX 更新（与 YOURSJEYO 自动更新回滚 #15 一并闭环）。

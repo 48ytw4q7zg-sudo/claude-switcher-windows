@@ -48,6 +48,40 @@ pub struct AppConfig {
     /// 才向该 WSL 发行版写入凭据；不开启则不做任何 WSL 操作。
     #[serde(default)]
     pub wsl_integration_enabled: bool,
+    /// 出口门禁（融合 ClaudeGuard）：被监控的出口链路目标表。
+    /// 空表示未配置；内置默认表由 [`crate::egate_defaults`] 提供。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egate_targets: Vec<crate::egate::EgateTarget>,
+    /// 出口门禁总开关（默认关：这是「持续校验 + 熔断」能力，需用户显式启用）。
+    #[serde(default)]
+    pub egate_enabled: bool,
+    /// 熔断防抖阈值：连续 N 次失败才熔断（默认 2，0 表示关闭熔断）。
+    #[serde(default = "default_egate_trip_threshold")]
+    pub egate_trip_threshold: u32,
+    /// 检查间隔秒数（下限 5，上限 3600；默认 15）。
+    #[serde(default = "default_egate_interval")]
+    pub egate_interval_secs: u64,
+    /// 是否启用「接入路径检查」：未接入代理链路时跳过探测并按阈值处理（默认开）。
+    #[serde(default = "default_egate_enforce_access")]
+    pub egate_enforce_access: bool,
+    /// 被守护的桌面应用 id（claude / chatgpt / antigravity）。
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egate_guarded_agents: Vec<String>,
+}
+
+/// 熔断默认连续 2 次失败（单次网络抖动不熔断）。
+fn default_egate_trip_threshold() -> u32 {
+    2
+}
+
+/// 默认 15 秒复查一次。
+fn default_egate_interval() -> u64 {
+    15
+}
+
+/// 默认启用接入路径检查。
+fn default_egate_enforce_access() -> bool {
+    true
 }
 
 /// H-6：自动收养默认开启。
@@ -75,6 +109,12 @@ impl Default for AppConfig {
             quota_reminder_threshold: default_quota_reminder_threshold(),
             auto_adopt_enabled: default_auto_adopt_enabled(),
             wsl_integration_enabled: false,
+            egate_targets: Vec::new(),
+            egate_enabled: false,
+            egate_trip_threshold: default_egate_trip_threshold(),
+            egate_interval_secs: default_egate_interval(),
+            egate_enforce_access: default_egate_enforce_access(),
+            egate_guarded_agents: Vec::new(),
         }
     }
 }
