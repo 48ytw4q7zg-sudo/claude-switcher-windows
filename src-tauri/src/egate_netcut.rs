@@ -598,9 +598,13 @@ pub fn restore_all() -> RecoveryReport {
         failures.push(format!("网络：{network_note}"));
     }
 
-    // 2. 解除应用隔离。
-    let isolation_ok = match crate::egate_trip::release_all() {
-        Ok(_) => true,
+    // 2. 解除应用隔离并回查（P0-04：删除命令成功不等于规则消失）。
+    let isolation_ok = match crate::egate_trip::release_all_verified() {
+        Ok(report) if report.verified => true,
+        Ok(report) => {
+            failures.push(format!("应用隔离：{}", report.failures.join("；")));
+            false
+        }
         Err(error) => {
             failures.push(format!("应用隔离：{error}"));
             false

@@ -394,7 +394,21 @@ pub fn cleanup_legacy_rules() -> Result<u32, String> {
 ///
 /// 使用 `AppIsolation` 前缀，与 `Cut All` 断网规则严格区分。
 /// 按名字删而不是按记录的状态删：崩溃后重启也能清干净。
+/// **P0-04**：删除结果（结构化，必须回查确认）。
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct ReleaseReport {
+    pub requested: u32,
+    pub remaining: u32,
+    pub verified: bool,
+    pub failures: Vec<String>,
+}
+
 pub fn release_all() -> Result<u32, String> {
+    Ok(release_all_verified()?.requested)
+}
+
+/// **P0-04**：删除应用隔离规则并回查确认真的消失。
+pub fn release_all_verified() -> Result<ReleaseReport, String> {
     // P0-C：先尝试清理旧版残留（升级兼容），失败不阻断主流程。
     let legacy = cleanup_legacy_rules().unwrap_or(0);
     let script = format!(
@@ -408,19 +422,57 @@ pub fn release_all() -> Result<u32, String> {
     let json = crate::platform::imp::run_powershell(&script)?;
     let value: serde_json::Value =
         serde_json::from_str(json.trim()).map_err(|e| format!("清理结果解析失败：{e}"))?;
-    let removed = value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    Ok(removed + legacy)
+    let requested = value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32 + legacy;
+
+    // P0-04：回查——删除命令返回成功不等于规则真的消失。
+    let mut failures = Vec::new();
+    match rule_count() {
+        Some(0) => Ok(ReleaseReport {
+            requested,
+            remaining: 0,
+            verified: true,
+            failures,
+        }),
+        Some(remaining) => {
+            failures.push(format!(
+                "删除后仍有 {remaining} 条本产品规则残留（可能被组策略或其他程序持有）"
+            ));
+            Ok(ReleaseReport {
+                requested,
+                remaining,
+                verified: false,
+                failures,
+            })
+        }
+        None => {
+            failures.push("删除后无法查询规则状态，无法确认已清理".to_string());
+            Ok(ReleaseReport {
+                requested,
+                remaining: 0,
+                verified: false,
+                failures,
+            })
+        }
+    }
 }
 
 /// 当前存在的本产品隔离规则数（恢复后核验用）。
 pub fn rule_count() -> Option<u32> {
+    // 同时统计新版前缀与旧版应用隔离（不含 Cut All，避免把断网规则算进来）。
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'\n\
-         @(Get-NetFirewallRule -DisplayName {}*).Count | ConvertTo-Json -Compress",
+        "$ErrorActionPreference='SilentlyContinue'
+         $new = @(Get-NetFirewallRule -DisplayName {}* -ErrorAction SilentlyContinue).Count
+         $legacy = @(Get-NetFirewallRule -DisplayName 'ClaudeSwitcher Egate * Out' -ErrorAction SilentlyContinue).Count
+         $legacy += @(Get-NetFirewallRule -DisplayName 'ClaudeSwitcher Egate * In' -ErrorAction SilentlyContinue).Count
+         ConvertTo-Json @{{ total = ($new + $legacy) }} -Compress",
         ps_quote(RULE_PREFIX)
     );
     let json = crate::platform::imp::run_powershell(&script).ok()?;
-    json.trim().parse::<u32>().ok()
+    let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    value
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
 }
 
 #[cfg(test)]
