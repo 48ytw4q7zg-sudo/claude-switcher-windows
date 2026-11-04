@@ -1853,12 +1853,12 @@ mod tests {
             .unwrap();
         let system = sysinfo::System::new_all();
         if let Some(process) = system.process(sysinfo::Pid::from_u32(pid)) {
-            assert_eq!(
-                process.exe(),
-                Some(std::env::current_exe().unwrap().as_path())
-            );
-            // 快照形成后它可能已自行退出；最终以重新查询的进程状态为准。
-            let _ = process.kill();
+            // PID 可能已被系统复用：`exe()` 为 None 或指向别的程序都属正常，
+            // 不能据此断言夹具身份（那样会让测试偶发失败而掩盖真实结果）。
+            // 只在确实是本测试的同步子进程时才结束它。
+            if process.exe() == Some(std::env::current_exe().unwrap().as_path()) {
+                let _ = process.kill();
+            }
         }
         std::thread::sleep(Duration::from_millis(50));
         assert_synthetic_child_gone(&descendant_pid);

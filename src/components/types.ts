@@ -273,3 +273,13 @@ export function humanBytes(bytes?: number | null): string {
   }
   return `${value.toFixed(value >= 100 ? 0 : 1)} ${units[unit]}`;
 }
+
+/** 出口门禁：环境一致性检查结果。 */
+export interface EnvCheck {
+  tz_key: string;
+  egress_country: string;
+  expected_tz: string;
+  tz_match: boolean;
+  mismatched: boolean;
+  note: string;
+}

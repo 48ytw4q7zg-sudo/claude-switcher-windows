@@ -11,7 +11,7 @@ import {
   ShieldAlert,
   XCircle,
 } from 'lucide-react';
-import type { AppConfig, CutState, EgateReport, EgateTarget, LeakReport, TripReport } from './types';
+import type { AppConfig, CutState, EgateReport, EgateTarget, EnvCheck, LeakReport, TripReport } from './types';
 
 /** 锚点类型的中文名（技术值只在展示时翻译）。 */
 const ANCHOR_LABELS: Record<string, string> = {
@@ -66,6 +66,8 @@ export function EgatePanel() {
   const [networkNote, setNetworkNote] = useState<string | null>(null);
   const [monitor, setMonitor] = useState<{ paused: boolean; remaining_secs: number; tripped: boolean } | null>(null);
   const [launchNote, setLaunchNote] = useState<string | null>(null);
+  const [envCheck, setEnvCheck] = useState<EnvCheck | null>(null);
+  const [envNote, setEnvNote] = useState<string | null>(null);
   const [quarantineCount, setQuarantineCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
@@ -139,6 +141,55 @@ export function EgatePanel() {
           ? formatMessage(result.note ?? '已请求启动 Claude')
           : formatMessage(result.reason ?? '出口校验未通过，已阻止启动'),
       );
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /** 环境一致性检查（只读）。 */
+  const checkEnv = async () => {
+    setChecking(true);
+    setError(null);
+    setEnvNote(null);
+    try {
+      setEnvCheck(await invoke<EnvCheck>('egate_env_check'));
+    } catch (e) {
+      setEnvCheck(null);
+      setError(formatError(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
+  /** 把时区对齐到出口（走账本，可还原）。 */
+  const alignEnv = async () => {
+    setSaving(true);
+    setError(null);
+    setEnvNote(null);
+    try {
+      const record = await invoke<{ city: string; tz_from: string; tz_to: string }>(
+        'egate_env_align',
+        { city: '' },
+      );
+      setEnvNote(`已将时区从 ${record.tz_from} 改为 ${record.tz_to}（可随时还原）`);
+      setEnvCheck(await invoke<EnvCheck>('egate_env_check').catch(() => null));
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /** 按账本还原环境。 */
+  const restoreEnv = async () => {
+    setSaving(true);
+    setError(null);
+    setEnvNote(null);
+    try {
+      setEnvNote(formatMessage(await invoke<string>('egate_env_restore')));
+      setEnvCheck(await invoke<EnvCheck>('egate_env_check').catch(() => null));
     } catch (e) {
       setError(formatError(e));
     } finally {
@@ -310,6 +361,7 @@ export function EgatePanel() {
       <p className="telemetry-intro">
         每个被守护的目标各测各的出口：Claude 走 claude.ai、Codex 走 chatgpt.com，互不牵连。
         任一启用目标未通过才判定失败；拿不到出口信息时只报告「无法确认」，不会误判。
+        受支持的出口地区为新加坡、日本、美国三选一。
       </p>
 
       <div className="clash-summary" style={{ gridTemplateColumns: 'repeat(3, minmax(0,1fr))' }}>
@@ -437,6 +489,31 @@ export function EgatePanel() {
         <p className="usage-note" style={{ marginTop: 8 }}>
           断网会让整台电脑暂时无法上网。断网现场会写入本机账本，程序崩溃或被结束后
           下次启动会自动恢复网络。
+        </p>
+      </div>
+
+      <div style={{ marginTop: 14, paddingTop: 12, borderTop: '1px dashed rgba(72,66,52,0.25)' }}>
+        <strong style={{ fontSize: 13 }}>环境一致性（时区与出口）</strong>
+        <div className="profile-actions" style={{ marginTop: 8 }}>
+          <button className="ghost" onClick={checkEnv} disabled={busy}>
+            检查一致性
+          </button>
+          <button className="ghost" onClick={alignEnv} disabled={busy}>
+            对齐到时区出口
+          </button>
+          <button className="ghost" onClick={restoreEnv} disabled={busy}>
+            还原环境改动
+          </button>
+        </div>
+        {envCheck && (
+          <div className={envCheck.mismatched ? 'inline-warning' : 'inline-success'} style={{ marginTop: 8 }}>
+            {formatMessage(envCheck.note)}
+          </div>
+        )}
+        {envNote && <div className="inline-success" style={{ marginTop: 8 }}>{envNote}</div>}
+        <p className="usage-note" style={{ marginTop: 8 }}>
+          检查只提示不熔断（保持中文系统是正当选择）。对齐会记录改动前的值，
+          随时可以一键还原。
         </p>
       </div>
 

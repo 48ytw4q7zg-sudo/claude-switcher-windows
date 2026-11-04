@@ -201,6 +201,158 @@ pub fn geo_id_for_country(country: &str) -> u32 {
         .unwrap_or(GEO_FALLBACK)
 }
 
+/// 单时区国家的默认 Windows 时区（国家码 → 时区 ID）。
+///
+/// **故意只收单时区国家**：US/CA/RU/BR/AU/MX/ID 等多时区国家拿首都猜会改错，
+/// 宁可返回空让调用方「不做判定」，也不给一个可能错误的建议。
+const COUNTRY_DEFAULT_TZ: &[(&str, &str)] = &[
+    ("JP", "Tokyo Standard Time"),
+    ("KR", "Korea Standard Time"),
+    ("SG", "Singapore Standard Time"),
+    ("HK", "China Standard Time"),
+    ("TW", "Taipei Standard Time"),
+    ("PH", "Singapore Standard Time"),
+    ("TH", "SE Asia Standard Time"),
+    ("VN", "SE Asia Standard Time"),
+    ("MY", "Singapore Standard Time"),
+    ("GB", "GMT Standard Time"),
+    ("IE", "GMT Standard Time"),
+    ("FR", "Romance Standard Time"),
+    ("DE", "W. Europe Standard Time"),
+    ("NL", "W. Europe Standard Time"),
+    ("BE", "Romance Standard Time"),
+    ("ES", "Romance Standard Time"),
+    ("IT", "W. Europe Standard Time"),
+    ("CH", "W. Europe Standard Time"),
+    ("AT", "W. Europe Standard Time"),
+    ("SE", "W. Europe Standard Time"),
+    ("NO", "W. Europe Standard Time"),
+    ("DK", "W. Europe Standard Time"),
+    ("FI", "FLE Standard Time"),
+    ("PL", "Central European Standard Time"),
+    ("CZ", "Central Europe Standard Time"),
+    ("GR", "GTB Standard Time"),
+    ("TR", "Turkey Standard Time"),
+    ("AE", "Arabian Standard Time"),
+    ("SA", "Arab Standard Time"),
+    ("IL", "Israel Standard Time"),
+    ("EG", "Egypt Standard Time"),
+    ("ZA", "South Africa Standard Time"),
+    ("NG", "W. Central Africa Standard Time"),
+    ("KE", "E. Africa Standard Time"),
+    ("IN", "India Standard Time"),
+    ("PK", "Pakistan Standard Time"),
+    ("BD", "Bangladesh Standard Time"),
+    ("LK", "Sri Lanka Standard Time"),
+    ("NP", "Nepal Standard Time"),
+    ("NZ", "New Zealand Standard Time"),
+];
+
+/// 给定两位国家码，返回该国的默认 Windows 时区。
+///
+/// **只对单时区国家返回非空**；多时区国家（US/CA/RU/BR/AU/MX/ID/CN 等）返回空串，
+/// 表示「无法用国家推断出唯一时区」——调用方据此不做判定，而不是套一个可能
+/// 错误的建议。大小写不敏感。
+pub fn country_default_windows_tz(country: &str) -> &'static str {
+    COUNTRY_DEFAULT_TZ
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(country.trim()))
+        .map(|(_, v)| *v)
+        .unwrap_or("")
+}
+
+/// Windows 时区 ID → 它所属的国家码（用于「系统时区是否属于出口国家」判定）。
+///
+/// 与 [`COUNTRY_DEFAULT_TZ`] 的方向相反：那个回答「这个国家应该是哪个时区」，
+/// 这个回答「这个时区属于哪个国家」。多时区国家的多个时区都要列进来
+/// （例如 US 的 Eastern/Central/Mountain/Pacific 等），否则「出口美国 + 系统
+/// 时区纽约」会被误判为不一致。
+const TZ_TO_COUNTRIES: &[(&str, &[&str])] = &[
+    ("China Standard Time", &["CN", "HK", "TW"]),
+    ("Taipei Standard Time", &["TW"]),
+    ("Tokyo Standard Time", &["JP"]),
+    ("Korea Standard Time", &["KR"]),
+    ("Singapore Standard Time", &["SG", "PH", "MY"]),
+    (
+        "SE Asia Standard Time",
+        &["TH", "VN", "ID", "KH", "LA", "MM"],
+    ),
+    ("India Standard Time", &["IN"]),
+    ("Pakistan Standard Time", &["PK"]),
+    ("Bangladesh Standard Time", &["BD"]),
+    ("Sri Lanka Standard Time", &["LK"]),
+    ("Nepal Standard Time", &["NP"]),
+    ("GMT Standard Time", &["GB", "IE", "PT"]),
+    ("Romance Standard Time", &["FR", "BE", "ES"]),
+    (
+        "W. Europe Standard Time",
+        &["DE", "NL", "IT", "CH", "AT", "SE", "NO", "DK"],
+    ),
+    ("Central European Standard Time", &["PL"]),
+    ("Central Europe Standard Time", &["CZ", "HU", "SK"]),
+    ("FLE Standard Time", &["FI", "EE", "LV", "LT", "UA"]),
+    ("GTB Standard Time", &["GR", "RO", "BG"]),
+    ("Turkey Standard Time", &["TR"]),
+    ("Arabian Standard Time", &["AE", "OM"]),
+    ("Arab Standard Time", &["SA", "KW", "QA", "BH"]),
+    ("Israel Standard Time", &["IL"]),
+    ("Egypt Standard Time", &["EG"]),
+    ("South Africa Standard Time", &["ZA"]),
+    ("W. Central Africa Standard Time", &["NG"]),
+    ("E. Africa Standard Time", &["KE", "TZ", "UG"]),
+    ("New Zealand Standard Time", &["NZ"]),
+    // 美国：覆盖各主要时区（多时区国家必须逐个列出）。
+    ("Eastern Standard Time", &["US", "CA"]),
+    ("Central Standard Time", &["US", "CA", "MX"]),
+    ("Mountain Standard Time", &["US", "CA"]),
+    ("Pacific Standard Time", &["US", "CA", "MX"]),
+    ("Alaskan Standard Time", &["US"]),
+    ("Hawaiian Standard Time", &["US"]),
+    // 加拿大/墨西哥/巴西/俄罗斯/澳大利亚的常见时区。
+    ("Atlantic Standard Time", &["CA"]),
+    ("Newfoundland Standard Time", &["CA"]),
+    ("Central America Standard Time", &["MX", "GT", "CR", "PA"]),
+    ("E. South America Standard Time", &["BR"]),
+    ("Russian Standard Time", &["RU"]),
+    ("AUS Eastern Standard Time", &["AU"]),
+    ("W. Australia Standard Time", &["AU"]),
+    ("Cen. Australia Standard Time", &["AU"]),
+    ("E. Europe Standard Time", &["MD"]),
+    ("UTC", &[]),
+];
+
+/// 国家码是否为本表能识别出的国家（任一映射表里出现过）。
+pub fn is_known_country(country: &str) -> bool {
+    let country = country.trim();
+    if country.len() != 2 {
+        return false;
+    }
+    COUNTRY_DEFAULT_TZ
+        .iter()
+        .any(|(k, _)| k.eq_ignore_ascii_case(country))
+        || TZ_TO_COUNTRIES
+            .iter()
+            .any(|(_, list)| list.iter().any(|c| c.eq_ignore_ascii_case(country)))
+}
+
+/// 给定 Windows 时区 ID，判断它是否属于某个国家。
+///
+/// 用途：出口是**多时区国家**时，无法用「国家 → 唯一时区」推断，但可以反过来
+/// 检查「当前时区是否属于该国」。两者都失败时才说「无法判定」，绝不因为查不到
+/// 就默认一致。
+pub fn timezone_belongs_to_country(tz_key: &str, country: &str) -> Option<bool> {
+    let tz = tz_key.trim();
+    let country = country.trim();
+    let entry = TZ_TO_COUNTRIES
+        .iter()
+        .find(|(key, _)| key.eq_ignore_ascii_case(tz))?;
+    // 空国家列表表示「该时区不属于任何特定国家」（UTC），无从判定。
+    if entry.1.is_empty() {
+        return None;
+    }
+    Some(entry.1.iter().any(|c| c.eq_ignore_ascii_case(country)))
+}
+
 /// 给定 IANA 时区名（如 `Asia/Tokyo`），返回 Windows 时区 ID（如 `Tokyo Standard Time`）。
 ///
 /// 未知时区回退 [`TZ_FALLBACK`]（`UTC`）。大小写不敏感。
@@ -230,6 +382,21 @@ pub fn plan_for_egress(country: &str, iana_tz: &str) -> RegionPlan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn country_default_tz_covers_single_zone_countries_only() {
+        assert_eq!(country_default_windows_tz("JP"), "Tokyo Standard Time");
+        assert_eq!(country_default_windows_tz(" jp "), "Tokyo Standard Time");
+        // 多时区国家必须返回空：拿首都猜会改错用户系统。
+        for multi in ["US", "CA", "RU", "BR", "AU", "MX", "ID", "CN"] {
+            assert_eq!(
+                country_default_windows_tz(multi),
+                "",
+                "{multi} 是多时区国家，不能给唯一时区"
+            );
+        }
+        assert_eq!(country_default_windows_tz("ZZ"), "");
+    }
 
     #[test]
     fn all_eleven_countries_plan_correctly() {

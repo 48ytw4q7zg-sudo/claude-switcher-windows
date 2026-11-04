@@ -31,6 +31,7 @@ mod egate;
 mod egate_access;
 mod egate_check;
 mod egate_defaults;
+mod egate_env;
 mod egate_launch;
 mod egate_monitor;
 mod egate_netcut;
@@ -58,6 +59,7 @@ mod processes;
 mod provider;
 mod reconcile;
 mod region;
+mod regions_supported;
 mod rules;
 mod sanitize;
 mod shortcuts;
@@ -2391,7 +2393,24 @@ pub struct RegionLockReport {
 async fn lock_region(apply: bool) -> Result<RegionLockReport, String> {
     blocking(move || {
         let info = egress::detect_egress_blocking()?;
+        // 产品约束：只允许新加坡/日本/美国。先按实时出口推导计划，再用共享的
+        // 受支持地区表统一校验「国家 + 时区」组合——出口在其它国家、或推导出的
+        // 时区不属于该国时都明确拒绝，而不是把系统锁到不支持的地区。
         let plan = region::plan_for_egress(&info.country, &info.iana_tz);
+        let errors = regions_supported::validate(&plan.country, &plan.windows_tz);
+        if !errors.is_empty() {
+            let names = regions_supported::SUPPORTED_REGIONS
+                .iter()
+                .map(|region| format!("{}（{}）", region.name, region.country))
+                .collect::<Vec<_>>()
+                .join("、");
+            return Err(format!(
+                "当前出口 {} 无法按受支持地区锁定（{}）；本工具仅支持 {}，请先切换到受支持的节点",
+                info.country,
+                errors.join("；"),
+                names
+            ));
+        }
         appconfig::update(|c| {
             c.country_target = Some(plan.country.clone());
             c.tz_target = Some(plan.windows_tz.clone());
@@ -2626,6 +2645,45 @@ fn egate_notify_test(app: tauri::AppHandle, kind: String) -> Result<String, Stri
         .ok_or_else(|| format!("未知通知类别：{kind}（可用 trip/recover/launch_blocked/warning/client_update/self_update）"))?;
     egate_notify::notify(&app, parsed, "这是一条测试通知");
     Ok(parsed.title().to_string())
+}
+
+/// 受支持的出口地区列表（前端选择器与后端校验共用同一份定义）。
+#[tauri::command]
+fn egate_supported_regions() -> Vec<regions_supported::SupportedRegion> {
+    regions_supported::SUPPORTED_REGIONS.to_vec()
+}
+
+/// 出口门禁：环境一致性检查（只读，不修改系统）。
+#[tauri::command]
+async fn egate_env_check() -> Result<egate_env::EnvCheck, String> {
+    blocking(|| {
+        let info = egress::detect_egress_blocking().map_err(|e| format!("探测出口失败：{e}"))?;
+        let tz = platform::imp::current_timezone_id()?;
+        Ok(egate_env::evaluate(&tz, &info.country))
+    })
+    .await
+}
+
+/// 出口门禁：把系统时区对齐到出口国家（走账本，可一键还原）。
+#[tauri::command]
+async fn egate_env_align(city: String) -> Result<egate_env::AppliedEnv, String> {
+    blocking(move || {
+        let info = egress::detect_egress_blocking().map_err(|e| format!("探测出口失败：{e}"))?;
+        egate_env::align_timezone(&info.country, &city)
+    })
+    .await
+}
+
+/// 出口门禁：按账本还原环境改动。
+#[tauri::command]
+async fn egate_env_restore() -> Result<String, String> {
+    blocking(egate_env::restore).await
+}
+
+/// 出口门禁：当前环境账本（未改动时为 null）。
+#[tauri::command]
+fn egate_env_ledger() -> Option<egate_env::AppliedEnv> {
+    egate_env::load()
 }
 
 /// 出口门禁：检查是否允许启动 Claude（只读，不启动）。
@@ -3156,6 +3214,11 @@ pub fn run() {
             egate_pause,
             egate_launch_check,
             egate_notify_test,
+            egate_env_check,
+            egate_supported_regions,
+            egate_env_align,
+            egate_env_restore,
+            egate_env_ledger,
             egate_launch_claude,
             egate_resume,
             egate_monitor_status,
