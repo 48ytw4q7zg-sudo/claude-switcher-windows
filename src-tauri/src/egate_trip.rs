@@ -20,10 +20,19 @@ const RULE_PREFIX: &str = "ClaudeSwitcher Egate";
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct QuarantineReport {
     pub agent: String,
-    /// 实际写入的规则数（出站 + 入站，按 exe 去重后）。
+    /// 实际写入的规则数。
     pub rules_added: u32,
     /// 回查确认生效的规则数。
     pub rules_verified: u32,
+    /// **期望覆盖的规则总数**（exe × 出入站方向）。
+    /// 必须以此为核验对象，不能用「本次添加了几条」作为成功标准。
+    pub rules_expected: u32,
+    /// 规则查询是否成功（失败时不得宣称成功）。
+    pub query_ok: bool,
+    /// **覆盖是否完整**（期望集合全部满足）。
+    pub coverage_complete: bool,
+    /// 失败的规则描述。
+    pub failed_rules: Vec<String>,
     /// 命中并结束的进程描述。
     pub killed: Vec<String>,
     /// 回查是否成功；`false` 时不得宣称隔离已生效。
@@ -37,7 +46,9 @@ pub struct QuarantineReport {
 pub struct TripReport {
     pub agents: Vec<QuarantineReport>,
     /// 是否有任何应用被真正隔离（回查通过）。
-    pub isolated: bool,
+    pub any_isolated: bool,
+    /// **是否全部应用都已完整隔离**（每个应用 coverage_complete）。
+    pub all_isolated: bool,
     /// 所有失败的说明（空表示全部成功）。
     pub failures: Vec<String>,
     pub note: String,
@@ -118,18 +129,39 @@ pub fn agent_pids(agents: &[String]) -> std::collections::BTreeMap<u32, String> 
 /// 查询某个 exe 路径对应的防火墙规则是否已存在且生效。
 ///
 /// 返回 `(查询成功, 生效规则数)`。查询失败时调用方**不得**宣称隔离成功。
-fn count_rules_for(agent: &str, exe: &str) -> (bool, u32) {
+/// 防火墙规则核验结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RuleVerification {
+    query_ok: bool,
+    expected: u32,
+    verified: u32,
+    failed: Vec<String>,
+}
+
+/// 查询某个 exe 路径对应的防火墙规则是否已存在且生效。
+///
+/// 核验语义：期望集合是「该 exe × 出站/入站」，每条规则都必须满足：
+/// 存在、启用、动作=Block、方向正确、程序路径匹配。只有全部期望满足才算完整。
+fn count_rules_for(agent: &str, exe: &str) -> RuleVerification {
     let out_name = rule_name(agent, "Out");
     let in_name = rule_name(agent, "In");
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'\n\
-         $rules = @(Get-NetFirewallRule -DisplayName {} , {} | Where-Object {{ $_.Enabled -eq 'True' -and $_.Action -eq 'Block' }})\n\
-         $count = 0\n\
-         foreach ($r in $rules) {{\n\
-           $f = $r | Get-NetFirewallApplicationFilter\n\
-           if ($f -and $f.Program -and $f.Program -ieq {}) {{ $count++ }}\n\
-         }}\n\
-         ConvertTo-Json @{{ ok = $true; count = $count }} -Compress",
+        "$ErrorActionPreference='Stop'
+         $outName = {}
+         $inName = {}
+         $exe = {}
+         $outOk = $false; $inOk = $false
+         try {{
+           $r = Get-NetFirewallRule -DisplayName $outName -ErrorAction Stop
+           $f = $r | Get-NetFirewallApplicationFilter
+           if ($r.Enabled -eq 'True' -and $r.Action -eq 'Block' -and $r.Direction -eq 'Outbound' -and $f.Program -and $f.Program -ieq $exe) {{ $outOk = $true }}
+         }} catch {{}}
+         try {{
+           $r = Get-NetFirewallRule -DisplayName $inName -ErrorAction Stop
+           $f = $r | Get-NetFirewallApplicationFilter
+           if ($r.Enabled -eq 'True' -and $r.Action -eq 'Block' -and $r.Direction -eq 'Inbound' -and $f.Program -and $f.Program -ieq $exe) {{ $inOk = $true }}
+         }} catch {{}}
+         ConvertTo-Json @{{ out = $outOk; in = $inOk }} -Compress",
         ps_quote(&out_name),
         ps_quote(&in_name),
         ps_quote(exe)
@@ -138,12 +170,37 @@ fn count_rules_for(agent: &str, exe: &str) -> (bool, u32) {
         Ok(json) => {
             let value: serde_json::Value = match serde_json::from_str(json.trim()) {
                 Ok(value) => value,
-                Err(_) => return (false, 0),
+                Err(_) => {
+                    return RuleVerification {
+                        query_ok: false,
+                        expected: 2,
+                        verified: 0,
+                        failed: vec!["规则查询结果无法解析".to_string()],
+                    }
+                }
             };
-            let count = value.get("count").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-            (true, count)
+            let out_ok = value.get("out").and_then(|v| v.as_bool()).unwrap_or(false);
+            let in_ok = value.get("in").and_then(|v| v.as_bool()).unwrap_or(false);
+            let mut failed = Vec::new();
+            if !out_ok {
+                failed.push("出站规则未生效".to_string());
+            }
+            if !in_ok {
+                failed.push("入站规则未生效".to_string());
+            }
+            RuleVerification {
+                query_ok: true,
+                expected: 2,
+                verified: out_ok as u32 + in_ok as u32,
+                failed,
+            }
         }
-        Err(_) => (false, 0),
+        Err(_) => RuleVerification {
+            query_ok: false,
+            expected: 2,
+            verified: 0,
+            failed: vec!["规则查询失败".to_string()],
+        },
     }
 }
 
@@ -183,6 +240,10 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
         agent: agent.to_string(),
         rules_added: 0,
         rules_verified: 0,
+        rules_expected: 0,
+        query_ok: false,
+        coverage_complete: false,
+        failed_rules: Vec::new(),
         killed: Vec::new(),
         verified: false,
         note: String::new(),
@@ -232,24 +293,33 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
     }
 
     // 4. 回查：netsh/New-NetFirewallRule 返回成功不等于规则生效。
-    let (query_ok, verified) = count_rules_for(agent, &exe);
-    report.rules_verified = verified;
-    report.verified = query_ok && verified >= report.rules_added.min(2);
-    if !query_ok {
+    let verification = count_rules_for(agent, &exe);
+    report.query_ok = verification.query_ok;
+    report.rules_expected = verification.expected;
+    report.rules_verified = verification.verified;
+    report.coverage_complete =
+        verification.query_ok && verification.verified >= verification.expected;
+    report.verified = report.coverage_complete;
+    report.failed_rules = verification.failed;
+
+    if !verification.query_ok {
         report.note.push_str("规则回查失败，无法确认隔离是否生效；");
-    } else if !report.verified {
+    } else if !report.coverage_complete {
         report.note.push_str(&format!(
-            "规则回查仅确认 {verified} 条，隔离可能未完全生效；"
+            "规则覆盖不完整（{}条生效，期望{}条）；",
+            verification.verified, verification.expected
         ));
+        for fail in &report.failed_rules {
+            report.note.push_str(&format!("{fail}；"));
+        }
     }
-    if report.verified {
+    if report.coverage_complete {
         report
             .note
-            .push_str(&format!("已隔离 {exe}（出/入站各一条阻断规则）"));
+            .push_str(&format!("已隔离 {exe}（出/入站阻断规则完整生效）"));
     }
     report
 }
-
 /// 执行一次熔断：对配置里所有守护对象结束进程并隔离。
 ///
 /// 与上游一致：**只处理 GUI 应用**；CLI 宿主不在守护列表里，避免误伤终端。
@@ -263,17 +333,19 @@ pub fn trip(guarded_agents: &[String]) -> TripReport {
         }
         agents.push(report);
     }
-    let isolated = agents.iter().any(|agent| agent.verified);
+    let any_isolated = agents.iter().any(|agent| agent.verified);
+    let all_isolated = agents.iter().all(|agent| agent.coverage_complete);
     TripReport {
-        note: if failures.is_empty() {
+        note: if failures.is_empty() && all_isolated {
             "全部守护对象已结束进程并施加防火墙隔离".to_string()
-        } else if isolated {
+        } else if any_isolated {
             "部分守护对象已隔离，其余见失败说明".to_string()
         } else {
             "未能确认任何隔离生效".to_string()
         },
         agents,
-        isolated,
+        any_isolated,
+        all_isolated,
         failures,
     }
 }
@@ -350,7 +422,7 @@ mod tests {
     #[test]
     fn trip_with_no_agents_reports_not_isolated() {
         let report = trip(&[]);
-        assert!(!report.isolated);
+        assert!(!report.any_isolated);
         assert!(report.agents.is_empty());
         assert_eq!(report.failures.len(), 0, "没有守护对象不算失败");
     }
