@@ -234,6 +234,10 @@ pub fn cut(mode: CutMode) -> (bool, String) {
 }
 
 /// 恢复网络：删规则 + 重新启用记录在案的网卡 + 删现场。
+/// 恢复网络：删规则 + 重新启用记录在案的网卡 + 删现场。
+///
+/// **逐项核验**：每一步执行后都查询实际状态，只有确认恢复完成才清理账本。
+/// 任何一项失败都保留账本，允许重复恢复。
 pub fn restore() -> (bool, String) {
     let state = match load_state() {
         Ok(state) => state,
@@ -244,21 +248,87 @@ pub fn restore() -> (bool, String) {
     // 顺序：先恢复网卡、最后删规则——恢复过程中网络始终被规则挡着。
     if let Some(state) = &state {
         if !state.nics.is_empty() {
+            // 启用网卡并核验。
             if let Err(error) = enable_nics(&state.nics) {
                 failures.push(format!("启用网卡失败：{error}"));
+            } else {
+                // 回查：确认网卡确实已 Up（驱动加载可能延迟）。
+                match verify_nics_up(&state.nics) {
+                    Ok(gone) if !gone.is_empty() => {
+                        failures.push(format!("网卡未能恢复（可能驱动延迟）：{}", gone.join("、")));
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        failures.push(format!("网卡状态核验失败：{error}"));
+                    }
+                }
             }
         }
     }
+
+    // 删除阻断规则并核验。
     if let Err(error) = remove_cut_rule() {
         failures.push(format!("删除阻断规则失败：{error}"));
+    } else {
+        // 回查：确认规则确实已删除。
+        match rule_exists(CUT_RULE) {
+            Ok(true) => failures.push("阻断规则仍然存在（删除未生效）".to_string()),
+            Ok(false) => {}
+            Err(error) => failures.push(format!("规则删除核验失败：{error}")),
+        }
     }
+
     if failures.is_empty() {
         if let Err(error) = clear_state() {
             return (false, format!("网络已恢复但清理现场失败：{error}"));
         }
-        return (true, "已恢复网络".to_string());
+        return (true, "已恢复网络（网卡与规则均已核验）".to_string());
     }
+    // 保留账本，允许重复恢复。
     (false, failures.join("；"))
+}
+
+/// 查询指定网卡是否处于 Up 状态；返回仍处于 Down 的网卡名。
+fn verify_nics_up(nics: &[String]) -> Result<Vec<String>, String> {
+    let list = nics
+        .iter()
+        .map(|n| ps_quote(n))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'
+         $down = @()
+         foreach ($n in @({list})) {{
+           $a = Get-NetAdapter -Name $n -ErrorAction SilentlyContinue
+           if (-not $a -or $a.Status -ne 'Up') {{ $down += $n }}
+         }}
+         ConvertTo-Json @($down) -Compress"
+    );
+    let json = crate::platform::imp::run_powershell(&script)
+        .map_err(|e| format!("查询网卡状态失败：{e}"))?;
+    let value: serde_json::Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("网卡状态解析失败：{e}"))?;
+    Ok(match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        serde_json::Value::String(one) if !one.is_empty() => vec![one],
+        _ => Vec::new(),
+    })
+}
+
+/// 查询某条防火墙规则是否存在。
+fn rule_exists(name: &str) -> Result<bool, String> {
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'
+         $r = Get-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue
+         if ($r) {{ 'true' }} else {{ 'false' }}",
+        ps_quote(name)
+    );
+    let out =
+        crate::platform::imp::run_powershell(&script).map_err(|e| format!("查询规则失败：{e}"))?;
+    Ok(out.trim().eq_ignore_ascii_case("true"))
 }
 
 /// 启动自愈：若存在断网现场就恢复（进程崩溃/被杀后由下次启动调用）。
