@@ -10,7 +10,7 @@
 //! 结论调用 [`crate::egate_trip`]。这样「暂停期间绝不熔断」这条最要紧的语义
 //! 可以被单测锁死，而不需要真的去断网。
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -37,6 +37,10 @@ pub enum RoundAction {
     Trip,
     /// 只发预警（再失败一次就会熔断）。
     Warn,
+    /// **P0-06**：上次熔断只部分成功，本轮应补齐缺失的隔离。
+    RetryProtection,
+    /// **P0-07**：出口已恢复，应自动解除隔离。
+    Recover,
 }
 
 /// 决定输入。
@@ -48,8 +52,12 @@ pub struct Gate {
     pub at_warning_point: bool,
     /// 是否已暂停守护。
     pub paused: bool,
-    /// 是否已经处于熔断状态（避免重复执行）。
+    /// 是否已经处于**完整**熔断状态（避免重复执行）。
     pub already_tripped: bool,
+    /// **P0-06**：上次熔断是否只部分成功（需要补齐）。
+    pub partial_protection: bool,
+    /// **P0-07**：出口是否已恢复正常（可自动解除隔离）。
+    pub egress_recovered: bool,
     /// 门禁总开关是否开启。
     pub enabled: bool,
 }
@@ -66,8 +74,17 @@ pub fn decide(gate: Gate) -> RoundAction {
     if gate.paused {
         return RoundAction::Idle;
     }
+    // P0-06：部分熔断必须继续补齐，不能因为「已标记熔断」就不再尝试。
+    if gate.partial_protection {
+        return RoundAction::RetryProtection;
+    }
+    // P0-07：已完整熔断但出口已恢复 → 自动解除。
     if gate.already_tripped {
-        return RoundAction::Idle;
+        return if gate.egress_recovered {
+            RoundAction::Recover
+        } else {
+            RoundAction::Idle
+        };
     }
     if gate.threshold_reached {
         return RoundAction::Trip;
@@ -80,8 +97,8 @@ pub fn decide(gate: Gate) -> RoundAction {
 
 /// 暂停截止时间（unix 秒；0 表示未暂停）。
 static PAUSED_UNTIL: AtomicU64 = AtomicU64::new(0);
-/// 是否已熔断（避免重复执行熔断动作）。
-static TRIPPED: AtomicBool = AtomicBool::new(false);
+/// 熔断状态：0=未熔断，1=部分熔断，2=完整熔断。
+static TRIP_STATE: AtomicU64 = AtomicU64::new(0);
 /// 监控线程是否已启动（单例）。
 static MONITOR_STARTED: OnceLock<()> = OnceLock::new();
 
@@ -118,28 +135,40 @@ pub fn paused_remaining_secs() -> u64 {
     until.saturating_sub(now_secs())
 }
 
-/// 标记已熔断。
-pub fn mark_tripped() {
-    TRIPPED.store(true, Ordering::SeqCst);
+/// 标记熔断完成（0=未熔断，1=部分成功，2=完整成功）。
+pub fn mark_tripped_state(complete: bool) {
+    TRIP_STATE.store(if complete { 2 } else { 1 }, Ordering::SeqCst);
 }
 
 /// 清除熔断标记（解除隔离后调用）。
 pub fn clear_tripped() {
-    TRIPPED.store(false, Ordering::SeqCst);
+    TRIP_STATE.store(0, Ordering::SeqCst);
 }
 
-/// 是否已熔断。
+/// 是否已完整熔断。
 pub fn is_tripped() -> bool {
-    TRIPPED.load(Ordering::SeqCst)
+    TRIP_STATE.load(Ordering::SeqCst) == 2
+}
+
+/// **P0-06**：是否处于部分熔断（需要补齐隔离）。
+pub fn is_partial() -> bool {
+    TRIP_STATE.load(Ordering::SeqCst) == 1
 }
 
 /// 用当前全局状态组装门控输入。
-pub fn current_gate(enabled: bool, threshold_reached: bool, at_warning_point: bool) -> Gate {
+pub fn current_gate(
+    enabled: bool,
+    threshold_reached: bool,
+    at_warning_point: bool,
+    egress_recovered: bool,
+) -> Gate {
     Gate {
         threshold_reached,
         at_warning_point,
         paused: is_paused(),
         already_tripped: is_tripped(),
+        partial_protection: is_partial(),
+        egress_recovered,
         enabled,
     }
 }
@@ -289,10 +318,12 @@ fn run_monitor_round(
 
     // 直连泄露：默认只告警；开启 egate_leak_trip 后与目标失败同等对待。
     let leak = leak_round(config);
+    let egress_recovered = report.overall.verdict == crate::egate::Verdict::Pass;
     let gate = current_gate(
         config.egate_enabled,
         report.should_trip || leak.trip,
         report.should_warn || leak.warn,
+        egress_recovered,
     );
     match decide(gate) {
         RoundAction::Trip => {
@@ -305,7 +336,8 @@ fn run_monitor_round(
                 config.egate_guarded_agents.clone()
             };
             let trip = crate::egate_trip::trip(&agents);
-            mark_tripped();
+            // P0-06：只有全部隔离成功才标记完整熔断；部分成功进入可重试状态。
+            mark_tripped_state(trip.all_isolated);
             if let Some(app) = ensure_app_handle(app_handle) {
                 crate::egate_notify::notify(
                     app,
@@ -324,6 +356,44 @@ fn run_monitor_round(
                     .collect::<Vec<_>>()
                     .join("、")
             ));
+        }
+        RoundAction::RetryProtection => {
+            // P0-06：上次只部分隔离，本轮补齐缺失的规则。
+            let agents = if config.egate_guarded_agents.is_empty() {
+                crate::egate_defaults::DEFAULT_GUARDED_AGENTS
+                    .iter()
+                    .map(|id| id.to_string())
+                    .collect::<Vec<_>>()
+            } else {
+                config.egate_guarded_agents.clone()
+            };
+            let trip = crate::egate_trip::trip(&agents);
+            mark_tripped_state(trip.all_isolated);
+            crate::log_error(&format!(
+                "出口门禁补齐隔离：{}（完整={}）",
+                trip.note, trip.all_isolated
+            ));
+        }
+        RoundAction::Recover => {
+            // P0-07：出口已恢复，自动解除隔离。
+            match crate::egate_trip::release_all() {
+                Ok(removed) => {
+                    clear_tripped();
+                    if let Some(app) = ensure_app_handle(app_handle) {
+                        crate::egate_notify::notify(
+                            app,
+                            crate::egate_notify::NotifyKind::Recover,
+                            "",
+                        );
+                    }
+                    crate::log_error(&format!(
+                        "出口已恢复，自动解除隔离（清理 {removed} 条规则）"
+                    ));
+                }
+                Err(error) => {
+                    crate::log_error(&format!("自动解除隔离失败：{error}"));
+                }
+            }
         }
         RoundAction::Warn => {
             if let Some(app) = ensure_app_handle(app_handle) {
@@ -357,6 +427,8 @@ mod tests {
             at_warning_point: false,
             paused: false,
             already_tripped: false,
+            partial_protection: false,
+            egress_recovered: false,
             enabled: true,
         }
     }
@@ -449,7 +521,7 @@ mod tests {
     fn tripped_flag_round_trips() {
         clear_tripped();
         assert!(!is_tripped());
-        mark_tripped();
+        mark_tripped_state(true);
         assert!(is_tripped());
         clear_tripped();
         assert!(!is_tripped());
@@ -459,11 +531,11 @@ mod tests {
     fn current_gate_reflects_global_state() {
         resume();
         clear_tripped();
-        let g = current_gate(true, true, false);
+        let g = current_gate(true, true, false, false);
         assert!(!g.paused && !g.already_tripped && g.threshold_reached);
         pause(5);
-        mark_tripped();
-        let g = current_gate(true, true, false);
+        mark_tripped_state(true);
+        let g = current_gate(true, true, false, false);
         assert!(g.paused && g.already_tripped);
         resume();
         clear_tripped();
