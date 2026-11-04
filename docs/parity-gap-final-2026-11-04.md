@@ -41,6 +41,7 @@
 | **一次性浏览器地区语言跟随 + 多浏览器发现** | `Open-SafeUrl` | 部分：固定 en-US，只发现 Edge/Chrome |
 | **完整桌面快照随加密包迁移** | `Export-EncryptedSnapshot` | 部分：加密包导账号库，Desktop 数据迁移需核实 |
 | **规则回滚原子性 / 旧托管块迁移 / 适用性预检** | `Restore-ClashScriptChange` | 未闭环：审查发现回滚失败会被报成功 |
+| **Web 版环境检测（零安装）** | `claude-switcher.sh` Web 检测页 | 无：上游提供浏览器端检测（出口/时区/WebRTC/IPv6/DNS/Canvas 指纹展示），本工具只有原生侧检测 |
 
 ## 二、daha1216/ClaudeGuard（固定 1967377）
 
