@@ -115,23 +115,18 @@ fn run_egate_check() -> i32 {
 ///
 /// 与上游一致：**先恢复网络**（断网状态下没人能来点界面），再解隔离。
 fn run_egate_restore() -> i32 {
-    let mut code = 0;
-    let (network_ok, network_note) = crate::egate_netcut::restore();
-    if !network_ok {
-        eprintln!("恢复网络失败: {network_note}");
-        code = 1;
+    // P0-15：CLI 急救也走统一恢复入口，与托盘/卸载行为一致。
+    let report = crate::egate_netcut::restore_all();
+    println!("{}", report.note);
+    for failure in &report.failures {
+        eprintln!("{failure}");
     }
-    match crate::egate_trip::release_all() {
-        Ok(removed) => {
-            crate::egate_monitor::clear_tripped();
-            println!("已恢复网络并解除隔离（清理 {removed} 条规则）");
-        }
-        Err(error) => {
-            eprintln!("解除隔离失败: {error}");
-            code = 1;
-        }
+    // 退出码：只有网络与隔离都核验通过才算成功。
+    if report.network_ok && report.isolation_ok {
+        0
+    } else {
+        1
     }
-    code
 }
 
 fn print_list() -> i32 {

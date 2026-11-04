@@ -483,3 +483,68 @@ mod tests {
         assert_eq!(CUT_RULE, "ClaudeSwitcher Egate Cut All");
     }
 }
+
+/// **P0-15**：统一恢复报告。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RecoveryReport {
+    /// 网络是否已恢复并核验。
+    pub network_ok: bool,
+    /// 应用隔离是否已解除并核验。
+    pub isolation_ok: bool,
+    /// 环境账本是否已还原。
+    pub env_ok: bool,
+    /// 所有失败的说明。
+    pub failures: Vec<String>,
+    /// 最终结论。
+    pub note: String,
+}
+
+/// **P0-15**：统一恢复入口——网络 + 应用隔离 + 环境账本。
+///
+/// CLI 急救、托盘退出、卸载前恢复都调用这一份实现，确保三者行为一致。
+/// 只有全部必要项核验通过才返回 `network_ok && isolation_ok`。
+pub fn restore_all() -> RecoveryReport {
+    let mut failures = Vec::new();
+
+    // 1. 恢复网络（删阻断规则 + 启用网卡）。
+    let (network_ok, network_note) = restore();
+    if !network_ok {
+        failures.push(format!("网络：{network_note}"));
+    }
+
+    // 2. 解除应用隔离。
+    let isolation_ok = match crate::egate_trip::release_all() {
+        Ok(_) => true,
+        Err(error) => {
+            failures.push(format!("应用隔离：{error}"));
+            false
+        }
+    };
+
+    // 3. 还原环境账本（时区改动）。
+    let env_ok = match crate::egate_env::restore() {
+        Ok(_) => true,
+        Err(error) => {
+            failures.push(format!("环境账本：{error}"));
+            false
+        }
+    };
+
+    // 4. 清除熔断与部分状态标记。
+    crate::egate_monitor::clear_tripped();
+
+    let all_ok = network_ok && isolation_ok;
+    RecoveryReport {
+        network_ok,
+        isolation_ok,
+        env_ok,
+        note: if all_ok && env_ok {
+            "已完整恢复：网络、隔离与环境设置均已核验".to_string()
+        } else if all_ok {
+            "网络与隔离已恢复，环境账本还原失败（见 failures）".to_string()
+        } else {
+            format!("恢复未完成：{}", failures.join("；"))
+        },
+        failures,
+    }
+}

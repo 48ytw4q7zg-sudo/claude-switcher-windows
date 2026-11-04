@@ -184,6 +184,18 @@ static OFFLINE: AtomicBool = AtomicBool::new(false);
 
 /// 单次巡检：判定 TUN/客户端 → 离线则 fail-closed 杀 Claude 并记日志。
 pub fn guard_tick() -> GuardTick {
+    // P0-08：与新出口门禁共享暂停状态——用户在 GUI 里暂停守门后，
+    // 旧保镖不能继续按自己的节奏查杀。
+    if crate::egate_monitor::is_paused() {
+        return GuardTick {
+            alive: true,
+            tun_up: false,
+            client_up: false,
+            tun_detail: "已暂停守护（出口门禁暂停中，保镖同步跳过）".to_string(),
+            killed: Vec::new(),
+        };
+    }
+
     let cfg = appconfig::load();
     let mode = cfg
         .proxy_mode
