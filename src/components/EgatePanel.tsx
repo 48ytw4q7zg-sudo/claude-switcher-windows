@@ -11,7 +11,7 @@ import {
   ShieldAlert,
   XCircle,
 } from 'lucide-react';
-import type { AppConfig, EgateReport, EgateTarget, TripReport } from './types';
+import type { AppConfig, EgateReport, EgateTarget, LeakReport, TripReport } from './types';
 
 /** 锚点类型的中文名（技术值只在展示时翻译）。 */
 const ANCHOR_LABELS: Record<string, string> = {
@@ -60,6 +60,7 @@ export function EgatePanel() {
   const [targets, setTargets] = useState<EgateTarget[]>([]);
   const [report, setReport] = useState<EgateReport | null>(null);
   const [tripReport, setTripReport] = useState<TripReport | null>(null);
+  const [leakReport, setLeakReport] = useState<LeakReport | null>(null);
   const [quarantineCount, setQuarantineCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
@@ -129,9 +130,23 @@ export function EgatePanel() {
     }
   };
 
+  /** 观察被守护进程是否绕过系统代理直连公网（只读）。 */
+  const watchLeak = async () => {
+    setChecking(true);
+    setError(null);
+    setNote(null);
+    try {
+      setLeakReport(await invoke<LeakReport>('egate_leak_watch'));
+    } catch (e) {
+      setLeakReport(null);
+      setError(formatError(e));
+    } finally {
+      setChecking(false);
+    }
+  };
+
   /** 解除全部隔离规则。 */
-  const release = async () => {
-    setSaving(true);
+  const release = async () => {    setSaving(true);
     setError(null);
     setNote(null);
     try {
@@ -260,10 +275,37 @@ export function EgatePanel() {
           <RotateCcw />
           解除隔离
         </button>
+        <button className="ghost" onClick={watchLeak} disabled={busy} title="检查被守护进程是否绕过代理直连公网">
+          <ShieldAlert />
+          直连泄露观察
+        </button>
         {quarantineCount !== null && (
           <span className="pill muted">当前隔离规则：{quarantineCount} 条</span>
         )}
       </div>
+
+      {leakReport && (
+        <div
+          className={leakReport.direct_total > 0 ? 'inline-warning' : 'inline-success'}
+          style={{ marginTop: 10 }}
+        >
+          <strong>
+            {leakReport.applicable
+              ? `直连观察：${leakReport.direct_total} 条直连`
+              : '直连观察：本次不具备判定条件'}
+          </strong>
+          <div style={{ marginTop: 4, fontSize: 12 }}>
+            {formatMessage(leakReport.note)}
+            {leakReport.applicable &&
+              `（被守护连接 ${leakReport.agent_conns}：走代理 ${leakReport.proxied}，本地 ${leakReport.local}）`}
+          </div>
+          {leakReport.direct.map((conn) => (
+            <div key={`${conn.pid}-${conn.remote}-${conn.port}`} style={{ marginTop: 2, fontSize: 12 }}>
+              {conn.agent}（PID {conn.pid}）→ {conn.remote}:{conn.port}
+            </div>
+          ))}
+        </div>
+      )}
 
       {tripReport && (
         <div className={tripReport.isolated ? 'inline-warning' : 'inline-error'} style={{ marginTop: 10 }}>

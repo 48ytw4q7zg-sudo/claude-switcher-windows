@@ -147,6 +147,25 @@ export interface TripReport {
   note: string;
 }
 
+/** 出口门禁：直连泄露观察结果。 */
+export interface LeakConn {
+  pid: number;
+  agent: string;
+  remote: string;
+  port: number;
+}
+
+export interface LeakReport {
+  applicable: boolean;
+  mode: string;
+  agent_conns: number;
+  proxied: number;
+  local: number;
+  direct: LeakConn[];
+  direct_total: number;
+  note: string;
+}
+
 /** P1-3：并行终端启动结果。 */
 export interface ParallelTerminalResult {
   profile_id: string;

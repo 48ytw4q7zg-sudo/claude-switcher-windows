@@ -75,6 +75,46 @@ pub fn kill_agent_processes(agent: &str) -> Result<Vec<String>, String> {
     crate::platform::imp::kill_processes_by_names(exe_names)
 }
 
+/// 枚举当前运行的被守护应用进程（pid → 应用 id）。
+///
+/// 供直连泄露观察使用：只有 GUI 应用本体参与，CLI 宿主（node/bun）不在此列。
+pub fn agent_pids(agents: &[String]) -> std::collections::BTreeMap<u32, String> {
+    let mut out = std::collections::BTreeMap::new();
+    for agent in agents {
+        let Some((_, exe_names)) = agent_spec(agent) else {
+            continue;
+        };
+        let names = exe_names
+            .iter()
+            .map(|n| ps_quote(n))
+            .collect::<Vec<_>>()
+            .join(",");
+        let script = format!(
+            "$ErrorActionPreference='SilentlyContinue'\n\
+             @(Get-Process -Name {names} | Select-Object -ExpandProperty Id) | ConvertTo-Json -Compress"
+        );
+        let Ok(json) = crate::platform::imp::run_powershell(&script) else {
+            continue;
+        };
+        let value: serde_json::Value = match serde_json::from_str(json.trim()) {
+            Ok(value) => value,
+            Err(_) => continue,
+        };
+        let pids: Vec<u32> = match value {
+            serde_json::Value::Array(items) => items
+                .into_iter()
+                .filter_map(|v| v.as_u64().map(|n| n as u32))
+                .collect(),
+            serde_json::Value::Number(n) => n.as_u64().map(|n| vec![n as u32]).unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        for pid in pids {
+            out.insert(pid, agent.clone());
+        }
+    }
+    out
+}
+
 /// 查询某个 exe 路径对应的防火墙规则是否已存在且生效。
 ///
 /// 返回 `(查询成功, 生效规则数)`。查询失败时调用方**不得**宣称隔离成功。

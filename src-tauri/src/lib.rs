@@ -31,6 +31,7 @@ mod egate;
 mod egate_access;
 mod egate_check;
 mod egate_defaults;
+mod egate_netwatch;
 mod egate_probe;
 mod egate_trip;
 mod egress;
@@ -2613,6 +2614,44 @@ async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
     .await
 }
 
+/// 出口门禁：观察被守护进程是否绕过系统代理直连公网。
+///
+/// 只读：不改系统状态、不结束进程。TUN/未接入模式下不具备判定条件，
+/// 如实返回 `applicable: false` 与原因（避免误报）。
+#[tauri::command]
+async fn egate_leak_watch() -> Result<egate_netwatch::LeakReport, String> {
+    blocking(|| {
+        let evidence = egate_check::read_proxy_evidence();
+        let proxy_port = egate_netwatch::proxy_port_from_evidence(&evidence);
+        let config = appconfig::load();
+        let targets = if config.egate_targets.is_empty() {
+            egate_defaults::builtin_targets()
+        } else {
+            config.egate_targets.clone()
+        };
+        let access = egate_check::current_access(&egate_check::monitored_hosts(&targets));
+        let agents = if config.egate_guarded_agents.is_empty() {
+            egate_defaults::DEFAULT_GUARDED_AGENTS
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            config.egate_guarded_agents.clone()
+        };
+        // 只取被守护应用自身的连接；CLI 宿主不在此列（会与终端噪声混在一起）。
+        let pids = egate_trip::agent_pids(&agents);
+        let conns = egate_netwatch::collect_agent_conns();
+        let mode = match &access {
+            egate_access::AccessPath::SystemProxy { .. } => "system_proxy",
+            egate_access::AccessPath::Tun { .. } => "tun",
+            egate_access::AccessPath::Uncovered => "uncovered",
+            egate_access::AccessPath::Unknown { .. } => "unknown",
+        };
+        Ok(egate_netwatch::summarize(mode, proxy_port, &conns, &pids))
+    })
+    .await
+}
+
 /// 出口门禁：执行熔断（结束守护对象进程 + 防火墙隔离 + 回查核验）。
 ///
 /// 这是**真实系统修改**：会结束 Claude/ChatGPT 等进程并写入防火墙规则。
@@ -2948,6 +2987,7 @@ pub fn run() {
             egate_trip_now,
             egate_release_now,
             egate_quarantine_count,
+            egate_leak_watch,
             // Claude Desktop 桌面版
             list_desktop_profiles_cmd,
             capture_desktop_profile_cmd,

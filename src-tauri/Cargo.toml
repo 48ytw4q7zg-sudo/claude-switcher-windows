@@ -104,6 +104,9 @@ windows-sys = { version = "0.59", features = [
     "Win32_Globalization",
     # 只读位置启动时弹原生 MessageBox 明确提示。
     "Win32_UI_WindowsAndMessaging",
+    # 出口门禁直连泄露观察：GetExtendedTcpTable 枚举带 owning pid 的 TCP 连接。
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_Networking_WinSock",
 ] }
 # junction 是纯 API 调用，替代 cmd /C mklink /J（cmd 解析 % & ^ 出错、GBK 输出乱码）。
 junction = "1"
