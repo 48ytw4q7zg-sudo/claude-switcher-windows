@@ -30,11 +30,7 @@
 
 | 功能 | 上游位置 | 现状 |
 | --- | --- | --- |
-| **六项非关键检查开关** | `Get-CheckConfig` / `Test-CheckDisabled` | **已完成**：disabled_checks 配置，核心保护项强制保留 | 已完成 |
-| **48 小时出口 IP 变化历史** | `Add-IpHistory` | **已完成**：ip_history.rs + 漂移检测并入 IP 一致检查 | 已完成 |
-| **日志开关 / 级别过滤** | `Write-ClientLog` | **已完成**：log_enabled/log_level 配置 + 按级别过滤 | 已完成 |
 | **FlClash 活动 Profile 数据库事务修复** | `Test-ProxyAlive` 相关 | 未实现：仅识别 flclash 进程，无 SQLite Profile 事务修复 |
-| **自动更新下载 / 校验 / 安装替换** | `Invoke-UpdateNow` | **已完成**：download_and_verify / download_and_install + SHA256 校验；回滚需实机验证 | 基本完成 |
 | **出口与 ASN 一致性 + 真实 ASN 类型查询** | `Get-GeoInfo` | 部分：有启发式判定，未知 ASN 仍可能被当住宅 |
 | **Cloudflare 无 tz 字段回退** | `Get-Egress` | 未实现：trace 缺 tz 时按两源都失败处理 |
 | **Desktop 首次登录 / 启动顺序 / 自动启动** | `Start-ClaudeApp` / `Find-ClaudeAumid` | 未实现：本工具不负责拉起 Claude |
