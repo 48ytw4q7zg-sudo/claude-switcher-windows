@@ -23,8 +23,17 @@ pub struct EgressInfo {
     pub source: String,
 }
 
-/// 解析 cloudflare trace（`key=value` 行）：(ip, loc, tz)。
-pub fn parse_cloudflare_trace(text: &str) -> Option<(String, String, String)> {
+/// Cloudflare trace 解析结果（**QW-03**：字段独立可选）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CloudflareTrace {
+    pub ip: Option<String>,
+    pub country: Option<String>,
+    pub tz: Option<String>,
+}
+
+/// 解析 cloudflare trace。ip 或 loc 任一存在即返回——
+/// 时区缺失时保留有效 IP 与国家，不再整体丢弃。
+pub fn parse_cloudflare_trace(text: &str) -> Option<CloudflareTrace> {
     let mut ip = None;
     let mut loc = None;
     let mut tz = None;
@@ -33,14 +42,24 @@ pub fn parse_cloudflare_trace(text: &str) -> Option<(String, String, String)> {
             continue;
         };
         let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
         match key.trim() {
-            "ip" if !value.is_empty() => ip = Some(value.to_string()),
-            "loc" if !value.is_empty() => loc = Some(value.to_uppercase()),
-            "tz" if !value.is_empty() => tz = Some(value.to_string()),
+            "ip" if ip.is_none() => ip = Some(value.to_string()),
+            "loc" if loc.is_none() => loc = Some(value.to_uppercase()),
+            "tz" if tz.is_none() => tz = Some(value.to_string()),
             _ => {}
         }
     }
-    Some((ip?, loc?, tz?))
+    if ip.is_none() && loc.is_none() {
+        return None;
+    }
+    Some(CloudflareTrace {
+        ip,
+        country: loc,
+        tz,
+    })
 }
 
 /// 解析 ipinfo JSON：(ip, country, timezone, org)。
@@ -51,6 +70,47 @@ pub fn parse_ipinfo(value: &serde_json::Value) -> Option<(String, String, String
     let timezone = get("timezone")?;
     let org = get("org");
     Some((ip, country, timezone, org))
+}
+
+/// **QW-04**：ASN 类型三态——未知不等于住宅。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsnKind {
+    /// 已识别为机房/托管。
+    Datacenter,
+    /// 已识别为运营商/ISP 关键词。
+    Isp,
+    /// 无法确认（**不得**当作住宅）。
+    Unknown,
+}
+
+/// **QW-04**：判定 ASN 类型。
+///
+/// 未命中机房关键词**不等于**住宅——只有明确命中 ISP 关键词才算运营商，
+/// 其余一律 Unknown。
+pub fn classify_asn(org: &str) -> AsnKind {
+    let hay = org.to_lowercase();
+    if hay.trim().is_empty() {
+        return AsnKind::Unknown;
+    }
+    if is_datacenter_org(org) {
+        return AsnKind::Datacenter;
+    }
+    const ISP_HINTS: [&str; 10] = [
+        "telecom",
+        "unicom",
+        "mobile",
+        "broadband",
+        "cable",
+        "dsl",
+        "isp",
+        "communications",
+        "telephone",
+        "cellular",
+    ];
+    if ISP_HINTS.iter().any(|hint| hay.contains(hint)) {
+        return AsnKind::Isp;
+    }
+    AsnKind::Unknown
 }
 
 /// 机房/托管 ASN 启发式：org 含这些关键词则判为机房（非住宅）。
@@ -120,11 +180,19 @@ pub fn detect_egress_blocking() -> Result<EgressInfo, String> {
         .ok();
 
     if let Ok(text) = &cf_text {
-        if let Some((ip, country, tz)) = parse_cloudflare_trace(text) {
-            // P1-02：只有 ipinfo 返回同一 IP 时才合并 org。
+        if let Some(trace) = parse_cloudflare_trace(text) {
+            let ip = trace.ip.unwrap_or_default();
+            let country = trace.country.unwrap_or_default();
             let ipinfo_parsed = ipinfo_value.as_ref().and_then(parse_ipinfo);
+            // QW-03：trace 缺 tz 时，从**同一 IP** 的 ipinfo 补齐；否则标注未验证。
+            let same_ip_tz = ipinfo_parsed
+                .as_ref()
+                .filter(|(i, _, _, _)| i == &ip)
+                .map(|(_, _, t, _)| t.clone());
+            let had_tz = trace.tz.is_some();
+            let iana_tz = trace.tz.or(same_ip_tz).unwrap_or_default();
             let org = merge_org_if_same_ip(
-                (&ip, &country, &tz),
+                (&ip, &country, &iana_tz),
                 ipinfo_parsed
                     .as_ref()
                     .map(|(i, c, t, o)| (i.as_str(), c.as_str(), t.as_str(), o.as_deref())),
@@ -132,9 +200,13 @@ pub fn detect_egress_blocking() -> Result<EgressInfo, String> {
             return Ok(EgressInfo {
                 ip,
                 country,
-                iana_tz: tz,
+                iana_tz,
                 org,
-                source: "cloudflare".to_string(),
+                source: if had_tz {
+                    "cloudflare".to_string()
+                } else {
+                    "cloudflare（时区未验证）".to_string()
+                },
             });
         }
     }
@@ -202,15 +274,38 @@ mod tests {
     #[test]
     fn parses_cloudflare_trace() {
         let text = "fl=12\nh=example.com\nip=203.0.113.9\nts=123\nloc=us\ntz=America/New_York\n";
-        let (ip, loc, tz) = parse_cloudflare_trace(text).expect("parse");
-        assert_eq!(ip, "203.0.113.9");
-        assert_eq!(loc, "US");
-        assert_eq!(tz, "America/New_York");
+        let trace = parse_cloudflare_trace(text).expect("parse");
+        assert_eq!(trace.ip.as_deref(), Some("203.0.113.9"));
+        assert_eq!(trace.country.as_deref(), Some("US"));
+        assert_eq!(trace.tz.as_deref(), Some("America/New_York"));
+        // QW-03：缺 tz 时仍保留 IP 与国家。
+        let partial = parse_cloudflare_trace(
+            "ip=1.2.3.4
+loc=jp
+",
+        )
+        .expect("partial");
+        assert_eq!(partial.ip.as_deref(), Some("1.2.3.4"));
+        assert_eq!(partial.country.as_deref(), Some("JP"));
+        assert!(partial.tz.is_none());
     }
 
     #[test]
-    fn missing_field_returns_none() {
-        assert!(parse_cloudflare_trace("loc=us\ntz=America/New_York\n").is_none());
+    fn trace_requires_ip_or_country() {
+        // QW-03：只有 loc 也算有效（保留国家），完全无线索才 None。
+        let country_only = parse_cloudflare_trace(
+            "loc=us
+tz=America/New_York
+",
+        );
+        assert!(country_only.is_some(), "有国家码就应保留");
+        assert_eq!(country_only.unwrap().country.as_deref(), Some("US"));
+        assert!(parse_cloudflare_trace(
+            "ts=1234
+colo=LAX
+"
+        )
+        .is_none());
     }
 
     #[test]

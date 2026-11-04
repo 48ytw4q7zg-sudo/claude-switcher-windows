@@ -2872,7 +2872,7 @@ async fn egate_launch_claude() -> Result<serde_json::Value, String> {
 /// 出口门禁：暂停守护（暂停期间照常检测，但不熔断）。
 #[tauri::command]
 fn egate_pause(minutes: u64) -> Result<serde_json::Value, String> {
-    egate_monitor::pause(minutes);
+    egate_monitor::pause(minutes)?;
     Ok(serde_json::json!({
         "paused": egate_monitor::is_paused(),
         "remaining_secs": egate_monitor::paused_remaining_secs(),
@@ -2882,7 +2882,7 @@ fn egate_pause(minutes: u64) -> Result<serde_json::Value, String> {
 /// 出口门禁：立即恢复守护。
 #[tauri::command]
 fn egate_resume() -> Result<serde_json::Value, String> {
-    egate_monitor::resume();
+    egate_monitor::resume()?;
     Ok(serde_json::json!({
         "paused": egate_monitor::is_paused(),
         "disarmed": egate_monitor::is_disarmed(),

@@ -281,26 +281,20 @@ fn now_secs() -> u64 {
 }
 
 /// 暂停守护 `minutes` 分钟（0 或负数按 0 处理，等于立即恢复）。
-pub fn pause(minutes: u64) {
+pub fn pause(minutes: u64) -> Result<(), String> {
     let until = now_secs().saturating_add(minutes.saturating_mul(60));
     let mut state = read_pause_state();
     state.until = until;
     state.generation = state.generation.saturating_add(1);
-    if let Err(error) = write_pause_state(&state) {
-        crate::log_error(&format!(
-            "写入暂停状态失败（GUI 与后台可能不同步）：{error}"
-        ));
-    }
+    write_pause_state(&state).map_err(|e| format!("写入暂停状态失败（后台可能仍在保护）：{e}"))
 }
 
 /// 立即恢复守护。
-pub fn resume() {
+pub fn resume() -> Result<(), String> {
     let mut state = read_pause_state();
     state.until = 0;
     state.generation = state.generation.saturating_add(1);
-    if let Err(error) = write_pause_state(&state) {
-        crate::log_error(&format!("写入恢复状态失败：{error}"));
-    }
+    write_pause_state(&state).map_err(|e| format!("写入恢复状态失败：{e}"))
 }
 
 /// 是否处于暂停中（到达截止时间自动视为已恢复）。

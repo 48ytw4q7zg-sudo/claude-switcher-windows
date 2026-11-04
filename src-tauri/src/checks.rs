@@ -333,10 +333,18 @@ fn judge_client_language(
 
 /// 13. ASN 属性：org 为空→warn；命中机房启发式→warn；否则住宅 ok。
 fn judge_asn(org: Option<&str>) -> (&'static str, String) {
+    // **QW-04**：未知不当作住宅——只有明确 ISP 关键词才判为运营商，
+    // 其余 Unknown 一律 warn（如实表达「无法确认」）。
     match org {
         None => ("warn", "未获取 ASN/组织信息".to_string()),
-        Some(org) if egress::is_datacenter_org(org) => ("warn", format!("疑似机房/专线（{org}）")),
-        Some(org) => ("ok", format!("住宅/宽带（{org}）")),
+        Some(org) => match egress::classify_asn(org) {
+            egress::AsnKind::Datacenter => ("warn", format!("疑似机房/专线（{org}）")),
+            egress::AsnKind::Isp => ("ok", format!("运营商网络（{org}）")),
+            egress::AsnKind::Unknown => (
+                "warn",
+                format!("无法确认网络类型（{org}）；未命中机房或 ISP 关键词"),
+            ),
+        },
     }
 }
 
