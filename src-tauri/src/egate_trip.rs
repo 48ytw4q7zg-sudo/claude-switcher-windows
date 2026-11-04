@@ -253,22 +253,22 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
         return report;
     }
 
-    // 1. 结束进程（失败不阻断后续隔离：进程可能已退出）。
-    match kill_agent_processes(agent) {
-        Ok(killed) => report.killed = killed,
-        Err(error) => report.note.push_str(&format!("结束进程失败（{error}）；")),
-    }
-
-    // 2. 解析 exe；解析不到就没有可加的规则对象。
+    // 1. **先查 exe**：在进程还活着时获取安装路径（进程结束后无法从 Get-Process 取）。
     let exe = exe_path
         .map(str::to_string)
         .or_else(|| resolve_agent_exe(agent));
     let Some(exe) = exe else {
         report
             .note
-            .push_str("未找到运行中的程序，未添加防火墙规则（进程退出后规则无对象）");
+            .push_str("未找到可执行文件，无法添加防火墙规则（应用可能未安装或已退出）");
         return report;
     };
+
+    // 2. 再结束进程（失败不阻断后续隔离：进程可能已退出）。
+    match kill_agent_processes(agent) {
+        Ok(killed) => report.killed = killed,
+        Err(error) => report.note.push_str(&format!("结束进程失败（{error}）；")),
+    }
 
     // 3. 加出/入站阻断规则（已存在则不重复加）。
     for (direction, label) in [("out", "Out"), ("in", "In")] {
