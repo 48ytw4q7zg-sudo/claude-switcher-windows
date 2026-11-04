@@ -1327,6 +1327,15 @@ fn parse_killed(json: &str) -> Result<Vec<String>, String> {
     }
 }
 
+/// 执行一段 PowerShell 脚本并返回其 stdout（UTF-8，脚本已强制
+/// `$ErrorActionPreference='Stop'`）。
+///
+/// 仅供本项目的**专用平台能力**调用（如防火墙规则）；业务代码不要直接用它拼
+/// 任意脚本——需要新能力时在这里加一个有名字、可被单测覆盖的函数。
+pub fn run_powershell(script: &str) -> Result<String, String> {
+    run_ps(script)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

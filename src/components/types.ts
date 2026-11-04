@@ -122,6 +122,29 @@ export interface EgateReport {
   targets: EgateTargetReport[];
   probed: boolean;
   skipped_reason?: string | null;
+  /** 是否达到熔断阈值。 */
+  should_trip: boolean;
+  /** 是否到预警点。 */
+  should_warn: boolean;
+  trip_threshold: number;
+}
+
+/** 出口门禁：单个应用的隔离结果。 */
+export interface QuarantineReport {
+  agent: string;
+  rules_added: number;
+  rules_verified: number;
+  killed: string[];
+  verified: boolean;
+  note: string;
+}
+
+/** 出口门禁：一次熔断的完整结果。 */
+export interface TripReport {
+  agents: QuarantineReport[];
+  isolated: boolean;
+  failures: string[];
+  note: string;
 }
 
 /** P1-3：并行终端启动结果。 */

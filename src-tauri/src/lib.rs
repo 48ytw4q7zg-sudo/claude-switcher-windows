@@ -32,6 +32,7 @@ mod egate_access;
 mod egate_check;
 mod egate_defaults;
 mod egate_probe;
+mod egate_trip;
 mod egress;
 mod export;
 mod fsx;
@@ -2612,6 +2613,39 @@ async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
     .await
 }
 
+/// 出口门禁：执行熔断（结束守护对象进程 + 防火墙隔离 + 回查核验）。
+///
+/// 这是**真实系统修改**：会结束 Claude/ChatGPT 等进程并写入防火墙规则。
+/// 前置条件由调用方保证（门禁已开启且本轮判定达到阈值）。
+#[tauri::command]
+async fn egate_trip_now() -> Result<egate_trip::TripReport, String> {
+    blocking(|| {
+        let config = appconfig::load();
+        let agents = if config.egate_guarded_agents.is_empty() {
+            egate_defaults::DEFAULT_GUARDED_AGENTS
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            config.egate_guarded_agents.clone()
+        };
+        Ok(egate_trip::trip(&agents))
+    })
+    .await
+}
+
+/// 出口门禁：解除全部隔离（按本产品规则名前缀整体清理）。
+#[tauri::command]
+async fn egate_release_now() -> Result<u32, String> {
+    blocking(egate_trip::release_all).await
+}
+
+/// 出口门禁：当前隔离规则数量（None 表示查询失败，不能宣称已清干净）。
+#[tauri::command]
+async fn egate_quarantine_count() -> Result<Option<u32>, String> {
+    blocking(|| Ok(egate_trip::rule_count())).await
+}
+
 /// 出口门禁：当前接入路径（只读注册表与网卡，不探测）。
 #[tauri::command]
 fn egate_access_status() -> egate_access::AccessInfo {
@@ -2911,6 +2945,9 @@ pub fn run() {
             egate_update_settings,
             egate_check_once,
             egate_access_status,
+            egate_trip_now,
+            egate_release_now,
+            egate_quarantine_count,
             // Claude Desktop 桌面版
             list_desktop_profiles_cmd,
             capture_desktop_profile_cmd,

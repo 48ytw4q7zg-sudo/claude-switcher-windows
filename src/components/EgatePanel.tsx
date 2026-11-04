@@ -11,7 +11,7 @@ import {
   ShieldAlert,
   XCircle,
 } from 'lucide-react';
-import type { AppConfig, EgateReport, EgateTarget } from './types';
+import type { AppConfig, EgateReport, EgateTarget, TripReport } from './types';
 
 /** 锚点类型的中文名（技术值只在展示时翻译）。 */
 const ANCHOR_LABELS: Record<string, string> = {
@@ -59,6 +59,8 @@ export function EgatePanel() {
   const [config, setConfig] = useState<AppConfig | null>(null);
   const [targets, setTargets] = useState<EgateTarget[]>([]);
   const [report, setReport] = useState<EgateReport | null>(null);
+  const [tripReport, setTripReport] = useState<TripReport | null>(null);
+  const [quarantineCount, setQuarantineCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -95,6 +97,52 @@ export function EgatePanel() {
       setError(formatError(e));
     } finally {
       setChecking(false);
+    }
+  };
+
+  const refreshQuarantine = useCallback(async () => {
+    try {
+      const count = await invoke<number | null>('egate_quarantine_count');
+      setQuarantineCount(count);
+    } catch {
+      setQuarantineCount(null);
+    }
+  }, []);
+
+  useEffect(() => {
+    refreshQuarantine();
+  }, [refreshQuarantine]);
+
+  /** 执行熔断：结束守护对象进程 + 防火墙隔离（真实系统修改）。 */
+  const trip = async () => {
+    setSaving(true);
+    setError(null);
+    setNote(null);
+    try {
+      const result = await invoke<TripReport>('egate_trip_now');
+      setTripReport(result);
+      await refreshQuarantine();
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  /** 解除全部隔离规则。 */
+  const release = async () => {
+    setSaving(true);
+    setError(null);
+    setNote(null);
+    try {
+      const removed = await invoke<number>('egate_release_now');
+      setTripReport(null);
+      await refreshQuarantine();
+      setNote(`已解除隔离（清理 ${removed} 条规则）。`);
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
     }
   };
 
@@ -197,6 +245,41 @@ export function EgatePanel() {
           恢复默认
         </button>
       </div>
+
+      <div className="profile-actions" style={{ marginTop: 8 }}>
+        <button
+          className="danger"
+          onClick={trip}
+          disabled={busy}
+          title="结束守护对象进程并按 exe 施加防火墙隔离（真实系统修改）"
+        >
+          {saving ? <Loader2 className="spin" /> : <ShieldAlert />}
+          执行熔断（结束进程 + 隔离）
+        </button>
+        <button className="ghost" onClick={release} disabled={busy} title="删除本工具添加的全部隔离规则">
+          <RotateCcw />
+          解除隔离
+        </button>
+        {quarantineCount !== null && (
+          <span className="pill muted">当前隔离规则：{quarantineCount} 条</span>
+        )}
+      </div>
+
+      {tripReport && (
+        <div className={tripReport.isolated ? 'inline-warning' : 'inline-error'} style={{ marginTop: 10 }}>
+          <strong>{tripReport.note}</strong>
+          {tripReport.agents.map((agent) => (
+            <div key={agent.agent} style={{ marginTop: 4, fontSize: 12 }}>
+              {agent.agent}：
+              {agent.verified
+                ? `已隔离（${agent.rules_verified} 条规则生效${
+                    agent.killed.length ? `，结束 ${agent.killed.length} 个进程` : ''
+                  }）`
+                : `未确认生效（${formatMessage(agent.note)}）`}
+            </div>
+          ))}
+        </div>
+      )}
 
       {note && <div className="inline-success" style={{ marginTop: 10 }}>{note}</div>}
       {error && (
@@ -317,8 +400,9 @@ export function EgatePanel() {
       </div>
 
       <p className="usage-note" style={{ marginTop: 12 }}>
-        本批次只做出口校验与报告；结束进程、防火墙隔离与断网等熔断动作尚未接入。
-        未接入代理链路时本工具不会发起探测，避免把真实家宽出口暴露给被测站点。
+        熔断会结束守护对象的进程并按可执行文件施加出/入站防火墙阻断（需管理员权限），
+        隔离后回查规则确已生效才报告成功。未接入代理链路时本工具不会发起探测，
+        避免把真实家宽出口暴露给被测站点。断网档位、自愈账本与常驻循环尚未接入。
       </p>
     </div>
   );
