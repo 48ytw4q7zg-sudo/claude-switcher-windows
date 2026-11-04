@@ -217,6 +217,121 @@ fn failure(current: &str, message: String) -> UpdateCheckResult {
     }
 }
 
+/// 下载 + 校验 + 安装更新的完整流程结果。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UpdateInstallResult {
+    /// 是否成功完成下载。
+    pub downloaded: bool,
+    /// 是否成功校验 SHA256。
+    pub verified: bool,
+    /// 是否已触发安装替换。
+    pub installed: bool,
+    /// 人话说明（含失败原因）。
+    pub message: String,
+    /// 下载到本地的安装包路径。
+    pub local_path: Option<String>,
+}
+
+/// 计算 SHA256（纯函数）。
+pub fn compute_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// 下载 + 校验 + 安装更新（完整流程）。
+pub fn download_and_install_blocking(
+    version: &str,
+    sha256: &str,
+) -> Result<UpdateInstallResult, String> {
+    let asset_name = format!("ClaudeSwitcher_{version}_x64-setup.exe");
+    let url = format!(
+        "https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/download/v{version}/{asset_name}"
+    );
+    let local_path = std::env::temp_dir().join(&asset_name);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("初始化下载客户端失败：{e}"))?;
+    let response = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("下载安装包失败：{e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("下载失败（HTTP {}）", response.status()));
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|e| format!("读取下载内容失败：{e}"))?;
+    std::fs::write(&local_path, &bytes).map_err(|e| format!("保存安装包失败：{e}"))?;
+
+    let local_bytes = std::fs::read(&local_path).map_err(|e| format!("读取安装包失败：{e}"))?;
+    let actual = compute_sha256(&local_bytes);
+    if actual != sha256.trim().to_ascii_lowercase() {
+        return Err("SHA256 校验失败，已拒绝安装".to_string());
+    }
+
+    crate::platform::imp::silent_command(&local_path.to_string_lossy())
+        .spawn()
+        .map_err(|e| format!("启动安装包失败：{e}"))?;
+
+    Ok(UpdateInstallResult {
+        downloaded: true,
+        verified: true,
+        installed: true,
+        message: "已下载并校验，安装已启动".to_string(),
+        local_path: Some(local_path.to_string_lossy().to_string()),
+    })
+}
+
+/// 下载 + 校验但不安装。
+pub fn download_and_verify_blocking(
+    version: &str,
+    sha256: &str,
+) -> Result<UpdateInstallResult, String> {
+    let asset_name = format!("ClaudeSwitcher_{version}_x64-setup.exe");
+    let url = format!(
+        "https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/download/v{version}/{asset_name}"
+    );
+    let local_path = std::env::temp_dir().join(&asset_name);
+
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(600))
+        .build()
+        .map_err(|e| format!("初始化下载客户端失败：{e}"))?;
+    let response = client
+        .get(&url)
+        .send()
+        .map_err(|e| format!("下载安装包失败：{e}"))?;
+    if !response.status().is_success() {
+        return Err(format!("下载失败（HTTP {}）", response.status()));
+    }
+    let bytes = response
+        .bytes()
+        .map_err(|e| format!("读取下载内容失败：{e}"))?;
+    std::fs::write(&local_path, &bytes).map_err(|e| format!("保存安装包失败：{e}"))?;
+
+    let local_bytes = std::fs::read(&local_path).map_err(|e| format!("读取安装包失败：{e}"))?;
+    let actual = compute_sha256(&local_bytes);
+    if actual != sha256.trim().to_ascii_lowercase() {
+        return Err("SHA256 校验失败，已拒绝安装".to_string());
+    }
+
+    Ok(UpdateInstallResult {
+        downloaded: true,
+        verified: true,
+        installed: false,
+        message: "已下载并校验，可安装".to_string(),
+        local_path: Some(local_path.to_string_lossy().to_string()),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

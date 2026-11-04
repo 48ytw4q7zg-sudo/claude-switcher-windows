@@ -2589,6 +2589,24 @@ fn egate_get_targets() -> Vec<egate::EgateTarget> {
     }
 }
 
+/// 下载并校验更新（不安装，供用户确认后安装）。
+#[tauri::command]
+async fn download_update_verify(
+    version: String,
+    sha256: String,
+) -> Result<update::UpdateInstallResult, String> {
+    blocking(move || update::download_and_verify_blocking(&version, &sha256)).await
+}
+
+/// 下载 + 校验 + 安装更新（触发安装向导）。
+#[tauri::command]
+async fn download_update_install(
+    version: String,
+    sha256: String,
+) -> Result<update::UpdateInstallResult, String> {
+    blocking(move || update::download_and_install_blocking(&version, &sha256)).await
+}
+
 /// 日志开关与级别设置。
 #[tauri::command]
 fn set_log_config(enabled: bool, level: String) -> Result<(), String> {
@@ -3282,6 +3300,8 @@ pub fn run() {
             egate_supported_regions,
             egate_set_disabled_checks,
             set_log_config,
+            download_update_verify,
+            download_update_install,
             get_log_config,
             egate_disabled_checks,
             egate_env_align,
