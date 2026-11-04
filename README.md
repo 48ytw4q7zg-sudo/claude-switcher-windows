@@ -40,7 +40,8 @@
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
 | 安装包 | **Release v0.6.0**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计，SHA256 见 Release 说明 |
-| 开发分支验证 | 11 月 3 日完成 WSL 超时修复后，完整 Rust 回归为 **443 passed / 0 failed / 0 ignored**，全目标 clippy 零警告；最终前端、安装包和后续修改的集成验证仍需完成。详见[本轮进度](docs/full-audit-progress-2026-11-02.md)。已发布 v0.6.0 的历史结果为 394 项 |
+| 开发分支验证 | 11 月 4 日更新：完整 Rust 回归 **515 passed / 0 failed / 0 ignored**，全目标 clippy 零警告，`npx tsc --noEmit` 与前端构建通过。详见[本轮进度](docs/full-audit-progress-2026-11-02.md)。已发布 v0.6.0 的历史结果为 394 项 |
+| 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；**尚未集齐全部功能**，逐项差距见[最终核对](docs/parity-gap-final-2026-11-04.md)（48 项中已完成 21 项） |
 | 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
 
