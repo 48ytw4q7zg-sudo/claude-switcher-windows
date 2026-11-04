@@ -35,7 +35,7 @@ region 锁定继续保留（它们是「主动锁环境」，ClaudeGuard 是「�
 | 13 | 飞书群通知（签名校验、DPAPI 加密凭据、持久队列、失败补发） | `feishu.rs` | 无 | **新增** `feishu.rs` |
 | 14 | Claude/Codex 客户端更新（只走官方 MSIX 源、签名校验、原位升级、注册版本核验） | `claude_update.rs` `claude_package.ps1` | 无 | **新增** `msix_update.rs` |
 | 15 | 自身更新（GitHub Releases 静默周期检查 + 下载自替换 + 同版本只提醒一次） | `update.rs` | 部分（update.rs 只有检查；下载/安装/回滚缺——与 YOURSJEYO 缺口重合） | **扩展** update.rs |
-| 16 | 启动门禁（全部启用目标 Pass 才允许启动 Claude；失败阻止 + 通知 + 记录） | `monitor.rs` launch | 部分（guard kill-switch 有启动拦截语义） | **扩展** guard |
+| 16 | 启动门禁（全部启用目标 Pass 才允许启动 Claude；失败阻止 + 通知 + 记录） | `monitor.rs` launch | **已完成** `egate_launch`（同步判定 + AUMID/exe 双路径启动 + 暂停放行）；通知未接 | 基本完成 |
 | 17 | CLI（--check JSON/退出码、--restore、--settings、--tray、--install/--uninstall、--notify-test、状态查询） | `main.rs` | 部分（cs.exe --list/--status/--switch/run） | **扩展** cli.rs/cs |
 | 18 | 托盘菜单（显示/立即检测/暂停守护/解除隔离恢复网络/打开数据目录/退出） | `main.rs` | 部分（tray.rs 一键切换等） | **扩展** tray |
 | 19 | 首启向导（代理端口 → 白名单 → 守护对象/自启 三步） | UI + `config.rs` | 未实现；当前由「出口门禁」分区手动配目标 | 待实现 |

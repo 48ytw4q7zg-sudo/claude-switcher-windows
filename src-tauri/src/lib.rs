@@ -31,6 +31,7 @@ mod egate;
 mod egate_access;
 mod egate_check;
 mod egate_defaults;
+mod egate_launch;
 mod egate_monitor;
 mod egate_netcut;
 mod egate_netwatch;
@@ -2617,6 +2618,81 @@ async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
     .await
 }
 
+/// 出口门禁：检查是否允许启动 Claude（只读，不启动）。
+#[tauri::command]
+async fn egate_launch_check() -> Result<egate_launch::LaunchDecision, String> {
+    blocking(|| {
+        let config = appconfig::load();
+        let targets = if config.egate_targets.is_empty() {
+            egate_defaults::builtin_targets()
+        } else {
+            config.egate_targets.clone()
+        };
+        let mut streaks = egate_streaks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let report = egate_check::run_round(
+            &targets,
+            &mut streaks,
+            config.egate_enforce_access,
+            config.egate_trip_threshold,
+        );
+        drop(streaks);
+        let gate = egate_launch::gate_from_round(
+            &report,
+            config.egate_enabled,
+            egate_monitor::is_paused(),
+            egate_monitor::is_tripped(),
+        );
+        Ok(egate_launch::decide(&gate))
+    })
+    .await
+}
+
+/// 出口门禁：通过门禁后启动 Claude（未通过则拒绝，不启动）。
+#[tauri::command]
+async fn egate_launch_claude() -> Result<serde_json::Value, String> {
+    blocking(|| {
+        let config = appconfig::load();
+        // 门禁未开启时不做检查，直接启动（用户没启用的功能不该拦路）。
+        if !config.egate_enabled {
+            let note = egate_launch::launch_claude()?;
+            return Ok(serde_json::json!({ "launched": true, "note": note }));
+        }
+        let targets = if config.egate_targets.is_empty() {
+            egate_defaults::builtin_targets()
+        } else {
+            config.egate_targets.clone()
+        };
+        let mut streaks = egate_streaks()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let report = egate_check::run_round(
+            &targets,
+            &mut streaks,
+            config.egate_enforce_access,
+            config.egate_trip_threshold,
+        );
+        drop(streaks);
+        let gate = egate_launch::gate_from_round(
+            &report,
+            config.egate_enabled,
+            egate_monitor::is_paused(),
+            egate_monitor::is_tripped(),
+        );
+        let decision = egate_launch::decide(&gate);
+        if !decision.allowed {
+            return Ok(serde_json::json!({
+                "launched": false,
+                "reason": decision.reason,
+            }));
+        }
+        let note = egate_launch::launch_claude()?;
+        Ok(serde_json::json!({ "launched": true, "note": note }))
+    })
+    .await
+}
+
 /// 出口门禁：暂停守护（暂停期间照常检测，但不熔断）。
 #[tauri::command]
 fn egate_pause(minutes: u64) -> Result<serde_json::Value, String> {
@@ -3063,6 +3139,8 @@ pub fn run() {
             egate_leak_watch,
             egate_cut_network,
             egate_pause,
+            egate_launch_check,
+            egate_launch_claude,
             egate_resume,
             egate_monitor_status,
             egate_restore_network,

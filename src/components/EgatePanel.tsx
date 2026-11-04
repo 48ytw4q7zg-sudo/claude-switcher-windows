@@ -65,6 +65,7 @@ export function EgatePanel() {
   const [cutMode, setCutMode] = useState<'off' | 'firewall' | 'nics'>('off');
   const [networkNote, setNetworkNote] = useState<string | null>(null);
   const [monitor, setMonitor] = useState<{ paused: boolean; remaining_secs: number; tripped: boolean } | null>(null);
+  const [launchNote, setLaunchNote] = useState<string | null>(null);
   const [quarantineCount, setQuarantineCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [checking, setChecking] = useState(false);
@@ -123,6 +124,27 @@ export function EgatePanel() {
       .then(setMonitor)
       .catch(() => setMonitor(null));
   }, [refreshQuarantine]);
+
+  /** 通过门禁启动 Claude（出口未通过会被拒绝）。 */
+  const launchClaude = async () => {
+    setSaving(true);
+    setError(null);
+    setLaunchNote(null);
+    try {
+      const result = await invoke<{ launched: boolean; reason?: string; note?: string }>(
+        'egate_launch_claude',
+      );
+      setLaunchNote(
+        result.launched
+          ? formatMessage(result.note ?? '已请求启动 Claude')
+          : formatMessage(result.reason ?? '出口校验未通过，已阻止启动'),
+      );
+    } catch (e) {
+      setError(formatError(e));
+    } finally {
+      setSaving(false);
+    }
+  };
 
   /** 暂停 / 恢复守护。 */
   const togglePause = async () => {
@@ -363,6 +385,18 @@ export function EgatePanel() {
         {monitor?.tripped && <span className="pill bad">熔断中</span>}
         {quarantineCount !== null && (
           <span className="pill muted">当前隔离规则：{quarantineCount} 条</span>
+        )}
+      </div>
+
+      <div className="profile-actions" style={{ marginTop: 8 }}>
+        <button className="primary" onClick={launchClaude} disabled={busy} title="通过出口校验后才启动 Claude">
+          <CheckCircle2 />
+          通过门禁启动 Claude
+        </button>
+        {launchNote && (
+          <span className="usage-note" style={{ alignSelf: 'center' }}>
+            {launchNote}
+          </span>
         )}
       </div>
 
