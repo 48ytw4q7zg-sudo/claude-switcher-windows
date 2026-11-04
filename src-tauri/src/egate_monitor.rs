@@ -302,15 +302,38 @@ struct PauseState {
     generation: u64,
 }
 
+/// 读取暂停状态。
+///
+/// 文件不存在 = 未暂停（正常）。文件存在但损坏/不可读时**仍然**按未暂停
+/// 处理，但记一次日志——暂停是「减少保护」的方向，读不出来时保守按
+/// 「没有暂停」对待（保护继续生效），而不是让损坏文件延长暂停。
 fn read_pause_state() -> PauseState {
     let Ok(path) = pause_file() else {
         return PauseState::default();
     };
-    let Ok(bytes) = std::fs::read(&path) else {
+    if !path.exists() {
         return PauseState::default();
-    };
-    let text = crate::jsonio::decode_text(&bytes);
-    serde_json::from_str(&text).unwrap_or_default()
+    }
+    match std::fs::read(&path) {
+        Ok(bytes) => {
+            let text = crate::jsonio::decode_text(&bytes);
+            match serde_json::from_str(&text) {
+                Ok(state) => state,
+                Err(error) => {
+                    crate::log_error(&format!(
+                        "暂停状态文件损坏（{error}），按未暂停处理（保护继续生效）"
+                    ));
+                    PauseState::default()
+                }
+            }
+        }
+        Err(error) => {
+            crate::log_error(&format!(
+                "暂停状态文件无法读取（{error}），按未暂停处理（保护继续生效）"
+            ));
+            PauseState::default()
+        }
+    }
 }
 
 fn write_pause_state(state: &PauseState) -> Result<(), String> {

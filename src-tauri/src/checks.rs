@@ -57,7 +57,9 @@ pub struct ChecksSummary {
     pub ok: u32,
     pub warn: u32,
     pub fail: u32,
-    /// fail == 0。
+    /// **已关闭的检查项**：既不算通过也不算失败。
+    pub skipped: u32,
+    /// fail == 0（skipped 不影响通过判定）。
     pub passed: bool,
 }
 
@@ -523,7 +525,12 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
     let culture = imp::current_culture();
     let client_lang = desktop::client_locale();
     let bindings = imp::ipv6_bindings();
-    let dns = resolve_claude_ai();
+    // **小改动**：DNS 检查关闭后不再发起独立解析请求（该查询只为 DNS 检查服务）。
+    let dns = if enabled("dns") {
+        resolve_claude_ai()
+    } else {
+        Err("DNS 检查已关闭".to_string())
+    };
     let stun_result = if !enabled("webrtc") {
         None
     } else {
@@ -686,10 +693,14 @@ pub fn check_summary(items: &[CheckItem]) -> ChecksSummary {
     let mut ok = 0u32;
     let mut warn = 0u32;
     let mut fail = 0u32;
+    let mut skipped = 0u32;
     for item in items {
         match item.status.as_str() {
             "ok" => ok += 1,
             "warn" => warn += 1,
+            // **关闭的检查既不算通过也不算失败**——否则关闭一项非核心检查
+            // 反而会让整体汇总判为不通过。
+            "skipped" => skipped += 1,
             _ => fail += 1,
         }
     }
@@ -698,6 +709,7 @@ pub fn check_summary(items: &[CheckItem]) -> ChecksSummary {
         ok,
         warn,
         fail,
+        skipped,
         passed: fail == 0,
     }
 }

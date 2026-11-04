@@ -272,7 +272,8 @@ pub fn update(mut f: impl FnMut(&mut AppConfig)) -> Result<AppConfig, String> {
         .open(path.with_extension("lock"))
         .map_err(|error| format!("打开配置锁失败：{error}"))?;
     fs4::FileExt::lock(&lock).map_err(|error| format!("获取配置锁失败：{error}"))?;
-    let mut config = load_from(&path)?;
+    // **P1-02**：写入路径也走迁移——避免旧程序把高版本配置覆盖成旧结构。
+    let mut config = load_from_migrated(&path)?;
     f(&mut config);
     let text = serde_json::to_string_pretty(&config)
         .map_err(|error| format!("序列化应用配置失败：{error}"))?;

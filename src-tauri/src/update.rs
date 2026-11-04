@@ -224,7 +224,7 @@ pub struct UpdateInstallResult {
     pub downloaded: bool,
     /// 是否成功校验 SHA256。
     pub verified: bool,
-    /// 是否已触发安装替换。
+    /// **仅表示安装器进程已启动**（不代表安装完成或版本已替换）。
     pub installed: bool,
     /// 人话说明（含失败原因）。
     pub message: String,
@@ -284,8 +284,11 @@ pub fn download_and_install_blocking(
     Ok(UpdateInstallResult {
         downloaded: true,
         verified: true,
-        installed: true,
-        message: "已下载并校验，安装已启动".to_string(),
+        // **P1-04**：仅表示安装器已启动，不表示安装完成。安装结果需要用户
+        // 在向导中确认并重启应用后由版本号核验。
+        installed: false,
+        message: "已下载并校验安装包，安装向导已启动。请按向导完成安装并重启应用后生效（本工具不核验安装结果）"
+            .to_string(),
         local_path: Some(local_path.to_string_lossy().to_string()),
     })
 }

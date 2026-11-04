@@ -2635,17 +2635,14 @@ fn get_log_config() -> serde_json::Value {
 /// 出口门禁：更新已关闭的检查项（核心保护项拒绝关闭）。
 #[tauri::command]
 fn egate_set_disabled_checks(disabled: Vec<String>) -> Result<Vec<String>, String> {
+    // 先整体验证：存在禁止关闭的核心项时直接拒绝，**不写入任何内容**——
+    // 避免「界面报失败、部分设置却已生效」的不一致。
     let rejected = checks::rejected_disables(&disabled);
-    let allowed: Vec<String> = disabled
-        .into_iter()
-        .filter(|key| !checks::is_core_check(key))
-        .collect();
-    appconfig::update(|config| config.disabled_checks = allowed.clone())?;
-    if rejected.is_empty() {
-        Ok(Vec::new())
-    } else {
-        Err(format!("这些核心保护项不能关闭：{}", rejected.join("、")))
+    if !rejected.is_empty() {
+        return Err(format!("这些核心保护项不能关闭：{}", rejected.join("、")));
     }
+    appconfig::update(|config| config.disabled_checks = disabled.clone())?;
+    Ok(Vec::new())
 }
 
 /// 出口门禁：列出可关闭的检查项（不含核心保护项）。

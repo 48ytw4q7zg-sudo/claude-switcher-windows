@@ -120,20 +120,33 @@ fn run_egate_check() -> i32 {
 /// 与上游一致：**先恢复网络**（断网状态下没人能来点界面），再解隔离。
 /// **P1-04**：输出真实保护状态（意图 / 隔离规则数 / 断网账本）。
 fn run_egate_status() -> i32 {
+    // **P1-03**：CLI 是独立进程——is_tripped/is_partial 的内存静态值在本进程里
+    // 永远是初始值，不能冒充 GUI 的真实状态。改从**系统资源**判定熔断。
     let intent = crate::egate_monitor::protection_intent();
     let rules = crate::egate_trip::rule_count();
-    let cut = crate::egate_netcut::load_state().ok().flatten();
+    // 断网账本读取失败要显示出来，不能与「没有账本」混淆。
+    let (cut, cut_error) = match crate::egate_netcut::load_state() {
+        Ok(state) => (state, None),
+        Err(error) => (None, Some(error)),
+    };
+    // 熔断以系统上的隔离规则为准：无规则=未熔断，有规则=处于隔离。
+    // 查询失败输出 unknown（不能当成未熔断）。
+    let tripped = match rules {
+        Some(0) => Some(false),
+        Some(_) => Some(true),
+        None => None,
+    };
     let status = serde_json::json!({
         "intent": intent,
         "paused": crate::egate_monitor::is_paused(),
-        "tripped": crate::egate_monitor::is_tripped(),
-        "partial": crate::egate_monitor::is_partial(),
+        "tripped": tripped,
         "isolation_rules": rules,
         "network_cut": cut.as_ref().map(|s| serde_json::json!({
             "mode": s.mode,
             "phase": s.phase,
             "since": s.since,
         })),
+        "network_cut_error": cut_error,
     });
     match serde_json::to_string_pretty(&status) {
         Ok(json) => {
