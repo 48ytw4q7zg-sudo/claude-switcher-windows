@@ -524,27 +524,45 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
         backup_path: std::cell::RefCell::new(None),
         original_existed: std::cell::Cell::new(false),
     };
-    // **P0-08**：切换前写入持久化账本（崩溃后可恢复）。
-    let from_id = store::load_store()
-        .ok()
-        .and_then(|s| s.current_desktop_profile_id.clone());
+    // **P0-08 / P0-F**：账本必须**在取得账号库执行权之后**才写。
+    //
+    // 原实现先写账本、再进 `with_store`：两个并发的 Desktop 切换会在等锁期间
+    // 互相覆盖对方的账本（后写的赢），导致先执行的那次切换丢失恢复依据。
+    // 现在把建账本 + 检查未完成事务都放进闭包内（已持 STORE_LOCK）。
     let tx_id = Uuid::new_v4().simple().to_string();
-    let ledger = DesktopSwitchLedger {
-        transaction_id: tx_id.clone(),
-        from_id,
-        to_id: id.to_string(),
-        backup_path: None,
-        original_existed: live.is_dir(),
-        live_dir: live.to_string_lossy().to_string(),
-        phase: DesktopSwitchPhase::Prepared,
-        started_at: chrono::Utc::now().timestamp(),
-    };
-    if let Err(error) = write_switch_ledger(&ledger) {
-        return Err(format!("写入 Desktop 切换账本失败，已放弃切换：{error}"));
-    }
+    let mut ledger_slot: Option<DesktopSwitchLedger> = None;
 
     let mut switched = false;
     let result = store::with_store(|store| {
+        // **P0-F**：已有未完成**迁移**事务时同样拒绝——迁移会整体替换
+        // `desktop-accounts`，此时切换 Desktop 会拿到即将被替换的目录。
+        if crate::export::has_pending_migration() {
+            return Err(
+                "检测到未完成的完整迁移事务，请先重启应用让恢复器处理后再切换 Desktop".to_string(),
+            );
+        }
+        // **P0-F**：已有未完成事务时拒绝新的破坏性操作，避免覆盖现场。
+        if let Some(existing) = read_pending_switch_ledger()? {
+            return Err(format!(
+                "检测到未完成的 Desktop 切换（事务 {}，目标 {}）。                 请先重启应用让恢复器处理，或人工核对后再操作",
+                existing.transaction_id, existing.to_id
+            ));
+        }
+        let ledger = DesktopSwitchLedger {
+            transaction_id: tx_id.clone(),
+            from_id: store.current_desktop_profile_id.clone(),
+            to_id: id.to_string(),
+            backup_path: None,
+            original_existed: live.is_dir(),
+            live_dir: live.to_string_lossy().to_string(),
+            store_commit: None,
+            phase: DesktopSwitchPhase::Prepared,
+            started_at: chrono::Utc::now().timestamp(),
+        };
+        write_switch_ledger(&ledger)
+            .map_err(|e| format!("写入 Desktop 切换账本失败，已放弃切换：{e}"))?;
+        ledger_slot = Some(ledger);
+
         let outcome = switch_desktop_profile_in(
             id,
             &live,
@@ -563,7 +581,16 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
     });
 
     // 更新账本：记录精确备份路径与阶段。
-    let mut final_ledger = ledger.clone();
+    //
+    // 闭包可能在建账本之前就失败（例如「已有未完成事务」），此时
+    // `ledger_slot` 为空——直接用临时账本占位，后续分支不会再写盘。
+    let Some(base_ledger) = ledger_slot.clone() else {
+        return Err(match result {
+            Ok(_) => "Desktop 切换未建立事务账本".to_string(),
+            Err(error) => error,
+        });
+    };
+    let mut final_ledger = base_ledger.clone();
     final_ledger.backup_path = transaction
         .backup_path
         .borrow()
@@ -576,6 +603,13 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
     match result {
         Ok(mut warnings) => {
             // `with_store` 已成功返回 → 账号库确实落盘，此时才是 StoreCommitted。
+            // **P0-A**：先把「提交标记」写进账本，再改阶段——标记里带事务 ID 与
+            // 目标账号，恢复器据此判断账号库到底提交了哪一次切换。
+            final_ledger.store_commit = Some(StoreCommitMarker {
+                transaction_id: base_ledger.transaction_id.clone(),
+                to_id: base_ledger.to_id.clone(),
+                committed_at: chrono::Utc::now().timestamp(),
+            });
             final_ledger.phase = DesktopSwitchPhase::StoreCommitted;
             if let Err(error) = write_switch_ledger(&final_ledger) {
                 // 账本写不进去不影响本次切换的正确性（数据已一致），
@@ -661,6 +695,17 @@ struct DesktopTransaction {
     original_existed: std::cell::Cell<bool>,
 }
 
+/// **P0-A**：账号库提交标记（写入账本，用于崩溃后判定提交归属）。
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct StoreCommitMarker {
+    /// 本次事务 ID（与账本一致，防止把别的切换当成自己）。
+    transaction_id: String,
+    /// 提交后账号库记录的当前 Desktop 账号。
+    to_id: String,
+    /// 提交时间（unix 秒）。
+    committed_at: i64,
+}
+
 /// **P0-08**：Desktop 切换事务账本（落盘，崩溃后恢复用）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DesktopSwitchLedger {
@@ -676,6 +721,13 @@ struct DesktopSwitchLedger {
     original_existed: bool,
     /// 活目录路径。
     live_dir: String,
+    /// **P0-A**：账号库提交标记。
+    ///
+    /// 只有 `with_store()` **真正返回 Ok** 之后才写入，并在同一次账本更新里
+    /// 带上 `to_id`。恢复器据此判断「账号库是否已经提交了这次切换」——
+    /// 阶段枚举本身不足以证明：崩溃可能恰好发生在保存成功与阶段更新之间。
+    #[serde(default)]
+    store_commit: Option<StoreCommitMarker>,
     /// 事务阶段。
     ///
     /// **P0-02**：从任意字符串改为枚举。原实现用 `"prepared"` / `"backup_verified"`
@@ -798,6 +850,23 @@ fn advance_ledger_phase(phase: DesktopSwitchPhase, live_dir: &Path) -> Result<()
     write_switch_ledger(&ledger).map_err(|e| format!("写入切换阶段失败：{e}"))
 }
 
+/// 读取未完成的切换账本（不存在返回 `None`）。
+///
+/// **P0-F**：用于在取得执行权后拒绝「已有未完成事务时再开新事务」。
+/// 账本损坏时返回 Err——不能当成「没有未完成事务」而放行。
+fn read_pending_switch_ledger() -> Result<Option<DesktopSwitchLedger>, String> {
+    let path = desktop_switch_ledger_path()?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("读取切换账本失败：{error}")),
+    };
+    let text = crate::jsonio::decode_text(&bytes);
+    let ledger: DesktopSwitchLedger = serde_json::from_str(&text)
+        .map_err(|e| format!("切换账本损坏，请先人工核对后再操作：{e}"))?;
+    Ok(Some(ledger))
+}
+
 /// 删除事务账本。
 ///
 /// **P0-02**：改为返回 `Result`。原实现吞掉删除失败，调用方以为「已清理」，
@@ -836,6 +905,42 @@ pub fn heal_desktop_switch() -> Vec<String> {
 
     let mut messages = Vec::new();
     let live = std::path::PathBuf::from(&ledger.live_dir);
+
+    // **P0-A**：阶段不足以判定「账号库是否已提交」。
+    //
+    // 崩溃可能正好落在 `with_store()` 保存成功之后、账本阶段更新为
+    // `StoreCommitted` 之前——此时账本还写着 `FilesSwitching`，但账号库
+    // 已经是 B。若只看阶段就回滚，会造成「活目录 A + 账号库 B」的不一致。
+    //
+    // 判定顺序：
+    // 1. 先看账号库里的 `current_desktop_profile_id` 是否等于本次目标；
+    // 2. 若是 → 视为已提交，保持活目录并清账本；
+    // 3. 若账号库**读不出来** → 不猜，保留现场与账本；
+    // 4. 只有确认「账号库不是本次目标」时，才按阶段回滚。
+    let store_state = store::load_store();
+    let committed_target: Option<bool> = match &store_state {
+        Ok(data) => Some(data.current_desktop_profile_id.as_deref() == Some(ledger.to_id.as_str())),
+        Err(_) => None,
+    };
+    if committed_target == Some(true) {
+        messages.push(format!(
+            "检测到 Desktop 切换已完成（→ {}），账号库已提交；活目录保持现状，仅清理账本",
+            ledger.to_id
+        ));
+        if let Err(error) = clear_switch_ledger() {
+            messages.push(error);
+        }
+        return messages;
+    }
+    if committed_target.is_none() && !matches!(ledger.phase, DesktopSwitchPhase::Prepared) {
+        // 账号库读不出来：不能判断该回滚还是该保留。
+        messages.push(format!(
+            "检测到未完成的 Desktop 切换（→ {}），但账号库无法读取，             无法判断是否已提交。已保留活目录 {} 与账本，请人工核对",
+            ledger.to_id, ledger.live_dir
+        ));
+        return messages;
+    }
+
     // **P0-02**：穷尽匹配所有阶段。新增阶段若忘记处理，这里会编译失败
     // （而不是像原实现那样静默落到「未知阶段」分支）。
     match ledger.phase {
@@ -2340,6 +2445,7 @@ mod tests {
                 backup_path: Some(backup.to_string_lossy().to_string()),
                 original_existed: true,
                 live_dir: live.to_string_lossy().to_string(),
+                store_commit: None,
                 phase,
                 started_at: 0,
             };
@@ -2387,6 +2493,7 @@ mod tests {
             backup_path: Some(data.join("gone-backup").to_string_lossy().to_string()),
             original_existed: true,
             live_dir: live.to_string_lossy().to_string(),
+            store_commit: None,
             phase: DesktopSwitchPhase::BackupVerified,
             started_at: 0,
         };
@@ -2424,5 +2531,111 @@ mod tests {
         let ledger: DesktopSwitchLedger = serde_json::from_str(&json).unwrap();
         // 旧版的 "committed" 不是枚举变体名 → Unknown（保守，不自动清理）。
         assert_eq!(ledger.phase, DesktopSwitchPhase::Unknown);
+    }
+
+    /// **P0-A**：崩溃恰好落在「账号库已保存成功、账本阶段还没改成
+    /// StoreCommitted」这一窗口时，恢复器必须以**账号库实际状态**为准，
+    /// 保持活目录而不是回滚——否则会产生「活目录 A + 账号库 B」的不一致。
+    #[test]
+    fn heal_prefers_store_state_over_stale_phase() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let data = dir.path().join(".claude-switcher");
+        fs::create_dir_all(&data).unwrap();
+
+        let backup = data.join("backup-A");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("who.txt"), b"A-account").unwrap();
+        let live = dir.path().join("Claude");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("who.txt"), b"B-account").unwrap();
+
+        // 账号库已经提交到 B（模拟 with_store 保存成功）。
+        let store_data = Store {
+            desktop_profiles: vec![DesktopProfile {
+                id: "b".into(),
+                name: "B".into(),
+                notes: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                last_switched_at: None,
+                snapshot_rel: "desktop-accounts/b".into(),
+                size_bytes: 0,
+                meta: None,
+            }],
+            current_desktop_profile_id: Some("b".into()),
+            ..Default::default()
+        };
+        store::save_store(&store_data).unwrap();
+
+        // 账本仍停在 FilesSwitching（阶段还没来得及推进）。
+        let ledger = DesktopSwitchLedger {
+            transaction_id: "t".to_string(),
+            from_id: Some("a".to_string()),
+            to_id: "b".to_string(),
+            backup_path: Some(backup.to_string_lossy().to_string()),
+            original_existed: true,
+            live_dir: live.to_string_lossy().to_string(),
+            store_commit: None,
+            phase: DesktopSwitchPhase::FilesSwitching,
+            started_at: 0,
+        };
+        write_switch_ledger(&ledger).unwrap();
+
+        let messages = heal_desktop_switch();
+        assert_eq!(
+            fs::read_to_string(live.join("who.txt")).unwrap(),
+            "B-account",
+            "账号库已提交 B，绝不能把活目录回滚成 A；消息：{messages:?}"
+        );
+        assert!(
+            !desktop_switch_ledger_path().unwrap().exists(),
+            "应清理账本"
+        );
+    }
+
+    /// **P0-A**：账号库未提交本次目标时，仍按备份回滚。
+    #[test]
+    fn heal_rolls_back_when_store_did_not_commit() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let data = dir.path().join(".claude-switcher");
+        fs::create_dir_all(&data).unwrap();
+
+        let backup = data.join("backup-A");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("who.txt"), b"A-account").unwrap();
+        let live = dir.path().join("Claude");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("who.txt"), b"B-account").unwrap();
+
+        // 账号库仍是 A（保存失败/尚未保存）。
+        let store_data = Store {
+            current_desktop_profile_id: Some("a".into()),
+            ..Default::default()
+        };
+        store::save_store(&store_data).unwrap();
+
+        let ledger = DesktopSwitchLedger {
+            transaction_id: "t".to_string(),
+            from_id: Some("a".to_string()),
+            to_id: "b".to_string(),
+            backup_path: Some(backup.to_string_lossy().to_string()),
+            original_existed: true,
+            live_dir: live.to_string_lossy().to_string(),
+            store_commit: None,
+            phase: DesktopSwitchPhase::FilesSwitching,
+            started_at: 0,
+        };
+        write_switch_ledger(&ledger).unwrap();
+
+        let _ = heal_desktop_switch();
+        assert_eq!(
+            fs::read_to_string(live.join("who.txt")).unwrap(),
+            "A-account",
+            "账号库未提交，必须回滚到切换前内容"
+        );
     }
 }

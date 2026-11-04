@@ -185,9 +185,18 @@ fn write_switch_journal(journal: &SwitchJournal) -> Result<(), String> {
 }
 
 /// 清除切换事务日志（**只能在账号库真正保存成功之后调用**，见 P0-05）。
-fn clear_switch_journal() {
-    if let Ok(path) = paths::switch_journal_path() {
-        let _ = fsx::remove_file_with_retry(&path);
+///
+/// **QW-02**：返回 `Result`。删除失败时日志还在，下次启动会误报
+/// 「有未完成切换」——必须让调用方知道，而不是静默留下虚假待恢复状态。
+fn clear_switch_journal() -> Result<(), String> {
+    let path = paths::switch_journal_path()?;
+    match fsx::remove_file_with_retry(&path) {
+        Ok(()) => Ok(()),
+        Err(_) if !path.exists() => Ok(()),
+        Err(error) => Err(format!(
+            "清除切换事务日志失败（{}）：{error}；下次启动可能误报存在未完成切换",
+            path.display()
+        )),
     }
 }
 
@@ -1148,14 +1157,43 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
     // **P0-05**：`with_store` 只有真正保存成功才返回 Ok，此刻才允许清日志。
     // 保存失败时保留日志（下次启动会提示存在未完成事务），并如实回报。
     match result {
-        Ok(done) => {
-            clear_switch_journal();
+        Ok(mut done) => {
+            if let Err(error) = clear_switch_journal() {
+                done.warnings.push(error);
+            }
             Ok(done)
         }
-        Err(error) => Err(format!(
-            "{error}；切换未完成，事务日志已保留，下次启动会提示按备份恢复"
-        )),
+        Err(error) => {
+            // **P0-E**：账号库保存失败时，**在本次调用里**就尝试把实际账号材料
+            // 回滚到备份状态。原实现只保留日志并提示「下次启动按备份恢复」，
+            // 于是失败后的一段时间里，磁盘上的凭据/隔离目录已经是 B，而账号库
+            // 仍是 A——用户此时启动 Claude Code 会登进一个"未登记"的账号。
+            //
+            // 回滚是 best-effort：失败时如实告知，并保留日志与备份。
+            let rolled_back = rollback_account_material_after_failed_switch();
+            Err(match rolled_back {
+                Ok(backup_id) => format!(
+                    "{error}；切换未完成，已自动把账号材料回滚到切换前状态（备份 {backup_id}）"
+                ),
+                Err(rollback_error) => format!(
+                    "{error}；切换未完成，且账号材料回滚失败（{rollback_error}）。                     事务日志与备份均已保留，请在「备份与恢复」里手动恢复"
+                ),
+            })
+        }
     }
+}
+
+/// **P0-E**：切号保存失败后，把账号材料回滚到备份状态。
+///
+/// 用事务日志里记录的备份 id（就是切换前刚建的那份），避免回滚到更早的备份。
+fn rollback_account_material_after_failed_switch() -> Result<String, String> {
+    let journal =
+        read_switch_journal().ok_or_else(|| "找不到切换事务日志，无法确定回滚目标".to_string())?;
+    let backup_id = journal
+        .backup_id
+        .ok_or_else(|| "事务日志没有记录备份 id".to_string())?;
+    restore_backup_blocking(backup_id.clone())?;
+    Ok(backup_id)
 }
 
 // ───────────────────────── Clash ─────────────────────────
@@ -3253,6 +3291,12 @@ pub fn run() {
     // 出口门禁断网自愈：上次进程崩溃/被杀留下的断网现场在这里恢复。
     // fail-closed：宁可多恢复一次，也不能让用户以为「还断着」却没人接管。
     for message in egate_netcut::heal() {
+        log_error(&message);
+    }
+    // **P0-B**：恢复中断的完整迁移。必须**早于** Desktop 切换恢复——
+    // 迁移会整体替换 `desktop-accounts`，先跑 Desktop 恢复会拿旧账本去操作
+    // 已被替换的目录。
+    for message in export::recover_full_migration() {
         log_error(&message);
     }
     // **P0-08**：恢复中断的 Desktop 切换（崩溃残留）。

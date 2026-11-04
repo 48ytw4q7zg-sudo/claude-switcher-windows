@@ -257,6 +257,27 @@ fn safe_relative_path(root: &Path, relative: &str) -> Result<std::path::PathBuf,
                 "快照条目包含非法路径段（空 / `.` / `..`），已拒绝：{relative}"
             ));
         }
+        // **QW-04**：Windows 保留设备名（CON / NUL / COM1 …）不能作为文件名。
+        // 文档早已声明会拒绝，但实现里一直没有真正检查。
+        if crate::naming::is_reserved_device_name(part) {
+            return Err(format!(
+                "快照条目包含 Windows 保留设备名（{part}），已拒绝：{relative}"
+            ));
+        }
+        // 尾随空格/句点会被 Windows 静默截断，导致落地路径与包内记录不一致。
+        if part.ends_with(' ') || part.ends_with('.') {
+            return Err(format!(
+                "快照条目路径段以空格或句点结尾（{part}），已拒绝：{relative}"
+            ));
+        }
+        if part
+            .chars()
+            .any(|c| (c as u32) < 0x20 || "<>|?*".contains(c))
+        {
+            return Err(format!(
+                "快照条目路径段包含 Windows 非法字符（{part}），已拒绝：{relative}"
+            ));
+        }
         out.push(part);
     }
     if out == root {
@@ -618,6 +639,14 @@ pub fn import_full_migration_blocking(
     src: &Path,
     password: &str,
 ) -> Result<FullImportResult, String> {
+    // **P0-B / P0-F**：已有未完成的迁移事务时拒绝再导入，
+    // 否则两次导入会互相覆盖备份与账本，恢复器无法判断该回滚到哪一版。
+    if let Ok(Some(pending)) = read_migration_journal() {
+        return Err(format!(
+            "检测到未完成的迁移事务（{}）。请先重启应用让恢复器处理，或人工核对后再导入",
+            pending.transaction_id
+        ));
+    }
     ensure_store_key_allows_import()?;
 
     let blob = fs::read(src).map_err(|e| format!("读取迁移包失败: {e}"))?;
@@ -633,8 +662,18 @@ pub fn import_full_migration_blocking(
             "不支持的迁移包格式版本 {version}（需要 {FORMAT_VERSION_FULL}）"
         ));
     }
+    // **P1-01**：导入包来自外部文件，不能假设它一定由本版本正常生成。
+    // 先做资源上限校验，再解析 JSON——否则一个几 GB 的包会先把内存吃光。
+    if plaintext.len() as u64 > MAX_IMPORT_PLAINTEXT_BYTES {
+        return Err(format!(
+            "迁移包过大（解压后 {} MiB，上限 {} MiB），已拒绝导入",
+            plaintext.len() / (1024 * 1024),
+            MAX_IMPORT_PLAINTEXT_BYTES / (1024 * 1024)
+        ));
+    }
     let mut payload: FullMigration = serde_json::from_slice(&plaintext)
         .map_err(|e| format!("解密成功但不是有效的完整迁移包: {e}"))?;
+    validate_import_shape(&payload)?;
 
     // 账号库侧与 v2 保持同一套清理语义（运行时状态不迁移），但保留 Desktop 索引：
     // v3 包里有真实快照文件，索引与文件必须配套，否则目录存在却「未登记」。
@@ -672,6 +711,30 @@ pub fn import_full_migration_blocking(
             return Err(error);
         }
     };
+    // **P0-B**：账本必须在**任何正式目录被改动之前**落盘，之后每次提交都更新。
+    let mut journal = MigrationJournal {
+        transaction_id: uuid::Uuid::new_v4().simple().to_string(),
+        store_backup: store_backup
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+        snapshot_backup: snapshot_backup
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string()),
+        staging: staging.to_string_lossy().to_string(),
+        accounts_dir: accounts_dir.to_string_lossy().to_string(),
+        store_committed: false,
+        snapshots_committed: false,
+        started_at: chrono::Utc::now().timestamp(),
+    };
+    if let Err(error) = write_migration_journal(&journal) {
+        let snapshot_rollback = restore_snapshot_backup(&snapshot_backup);
+        let _ = fs::remove_dir_all(&staging);
+        let extra = match snapshot_rollback {
+            Ok(()) => String::new(),
+            Err(e) => format!("；快照目录回滚也失败（{e}），请手动恢复"),
+        };
+        return Err(format!("写入迁移事务账本失败，已放弃导入：{error}{extra}"));
+    }
     // ③ 提交账号库。
     if let Err(error) = write_imported_store(payload.store) {
         // 账号库没写成：恢复快照目录命名并清掉暂存；回滚失败要如实上报。
@@ -683,6 +746,14 @@ pub fn import_full_migration_blocking(
                 format!("{error}；快照目录回滚也失败（{rollback_error}），请手动恢复快照备份")
             }
         });
+    }
+    journal.store_committed = true;
+    if let Err(error) = write_migration_journal(&journal) {
+        // 账号库已提交但账本没记上：回滚账号库，避免出现无法判定归属的状态。
+        let _ = restore_store_backup(&store_backup);
+        let _ = restore_snapshot_backup(&snapshot_backup);
+        let _ = fs::remove_dir_all(&staging);
+        return Err(format!("更新迁移事务账本失败，已回滚导入：{error}"));
     }
     // ④ 提交快照。
     if let Err(error) = merge_staged_snapshots(&staging, &accounts_dir) {
@@ -714,6 +785,8 @@ pub fn import_full_migration_blocking(
         }
         return Err(format!("Desktop 快照落位失败（{error}）。{detail}"));
     }
+    journal.snapshots_committed = true;
+    let _ = write_migration_journal(&journal);
     // ⑤ 成功：清理旧备份与暂存。清理失败不影响数据正确性，但要如实报告。
     let mut cleanup_failures = Vec::new();
     if let Some(backup) = &snapshot_backup {
@@ -729,18 +802,193 @@ pub fn import_full_migration_blocking(
     if let Err(error) = fs::remove_dir_all(&staging) {
         cleanup_failures.push(format!("暂存目录 {}（{error}）", staging.display()));
     }
+    // 只有清理干净才删账本：残留备份时保留账本，下次启动能看出未收尾。
+    if cleanup_failures.is_empty() {
+        if let Err(error) = clear_migration_journal() {
+            cleanup_failures.push(error);
+        }
+    }
 
     Ok(FullImportResult {
         imported_bytes: plaintext.len(),
         profiles_imported: cli_profiles,
         desktop_files: staged.files,
-        backup_of_previous: store_backup
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "(原先没有账号库，直接写入)".to_string()),
+        // **QW-03**：成功路径会删掉备份目录；不能把已删除的路径当成
+        // 「备份在哪儿」返回，否则用户去找会找不到。
+        backup_of_previous: match &store_backup {
+            Some(path) if path.exists() => path.to_string_lossy().to_string(),
+            Some(path) => format!("{}（已随导入成功清理）", path.to_string_lossy()),
+            None => "(原先没有账号库，直接写入)".to_string(),
+        },
         desktop_restored_to: Some(accounts_dir.to_string_lossy().to_string()),
         cleanup_failures,
     })
+}
+
+/// **P1-01**：导入包解压后的明文上限（4 GiB）。
+///
+/// 导出侧限制总明文 2 GiB；导入放宽一倍以容纳 base64 膨胀与版本差异，
+/// 但仍必须有上限——JSON 解析会把整份明文读进内存。
+const MAX_IMPORT_PLAINTEXT_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// **P1-01**：导入包的条目数与路径合法性校验。
+///
+/// 必须在**写盘之前**执行：
+/// - 条目数上限（防止几百万个小文件耗死文件系统）；
+/// - 每条路径必须通过 `safe_relative_path`（绝对路径 / `..` / 设备名 / 非法字符）；
+/// - 规范化后（大小写不敏感）不得重复，否则后写的一条会覆盖前一条。
+fn validate_import_shape(payload: &FullMigration) -> Result<(), String> {
+    const MAX_ENTRIES: usize = 200_000;
+    if payload.desktop_files.len() > MAX_ENTRIES {
+        return Err(format!(
+            "迁移包条目过多（{} 条，上限 {MAX_ENTRIES}）",
+            payload.desktop_files.len()
+        ));
+    }
+    let root = std::path::Path::new("__root__");
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    for file in &payload.desktop_files {
+        safe_relative_path(root, &file.path)?;
+        // Windows 路径大小写不敏感：`A/x` 与 `a/x` 是同一个落点。
+        let key = file.path.replace('\\', "/").to_lowercase();
+        if !seen.insert(key) {
+            return Err(format!(
+                "迁移包包含重复路径（大小写不同也算同一路径）：{}",
+                file.path
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// **P0-B**：完整导入的持久化事务账本。
+///
+/// 运行中的 `Result::Err` 回滚解决不了进程被强杀/断电：那时错误分支根本没机会
+/// 执行。账本在**任何正式目录被改动之前**落盘，启动时由
+/// [`recover_full_migration`] 据此判断该继续完成还是回滚。
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+struct MigrationJournal {
+    transaction_id: String,
+    /// 导入前的账号库备份（`None` = 原本没有账号库）。
+    store_backup: Option<String>,
+    /// 导入前的快照目录备份（`None` = 原本没有快照目录）。
+    snapshot_backup: Option<String>,
+    /// 本次解出的暂存目录。
+    staging: String,
+    /// 目标快照目录。
+    accounts_dir: String,
+    /// 账号库是否已提交。
+    store_committed: bool,
+    /// 快照目录是否已提交。
+    snapshots_committed: bool,
+    started_at: i64,
+}
+
+fn migration_journal_path() -> Result<std::path::PathBuf, String> {
+    Ok(paths::app_data_dir()?.join("full-migration.json"))
+}
+
+fn write_migration_journal(journal: &MigrationJournal) -> Result<(), String> {
+    let path = migration_journal_path()?;
+    let text = serde_json::to_string_pretty(journal)
+        .map_err(|e| format!("序列化迁移事务账本失败：{e}"))?;
+    fsx::write_atomically(&path, &text).map_err(|e| format!("写入迁移事务账本失败：{e}"))
+}
+
+fn clear_migration_journal() -> Result<(), String> {
+    let path = migration_journal_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("删除迁移事务账本失败：{error}")),
+    }
+}
+
+/// 读取未完成的迁移事务（损坏返回 Err，不能当成「没有事务」放行）。
+fn read_migration_journal() -> Result<Option<MigrationJournal>, String> {
+    let path = migration_journal_path()?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("读取迁移事务账本失败：{error}")),
+    };
+    let text = crate::jsonio::decode_text(&bytes);
+    serde_json::from_str(&text)
+        .map(Some)
+        .map_err(|e| format!("迁移事务账本损坏，请人工核对：{e}"))
+}
+
+/// **P0-B**：启动时恢复未完成的完整导入。
+///
+/// 决策：
+/// - 账号库与快照都未提交 → 回滚到导入前状态（删掉本次写入的账号库，恢复快照备份）；
+/// - 两者都已提交 → 视为成功，清理备份与暂存，删账本；
+/// - **只有一半提交** → 回滚已提交的那一半，回到完整旧状态；
+///   回滚失败则保留全部备份与账本，并由调用方阻止后续破坏性操作。
+pub fn recover_full_migration() -> Vec<String> {
+    let journal = match read_migration_journal() {
+        Ok(Some(journal)) => journal,
+        Ok(None) => return Vec::new(),
+        Err(error) => return vec![error],
+    };
+    let mut messages = Vec::new();
+    if journal.store_committed && journal.snapshots_committed {
+        // 两个都提交了：导入实际已成功，只是没来得及清理。
+        let backup = journal
+            .snapshot_backup
+            .as_ref()
+            .map(std::path::PathBuf::from);
+        if let Some(backup) = backup {
+            let _ = fsx::retry_io(|| fs::remove_dir_all(&backup));
+        }
+        if let Some(backup) = journal.store_backup.as_ref() {
+            let _ = fsx::retry_io(|| fs::remove_file(backup));
+        }
+        let _ = fs::remove_dir_all(&journal.staging);
+        let _ = clear_migration_journal();
+        messages.push(format!(
+            "完整迁移事务 {} 实际已完成，已清理残留备份与暂存",
+            journal.transaction_id
+        ));
+        return messages;
+    }
+
+    // 未完成（含只提交一半）：回滚到完整旧状态。
+    let store_rollback =
+        restore_store_backup(&journal.store_backup.as_ref().map(std::path::PathBuf::from));
+    let snapshot_rollback = restore_snapshot_backup(
+        &journal
+            .snapshot_backup
+            .as_ref()
+            .map(std::path::PathBuf::from),
+    );
+    let _ = fs::remove_dir_all(&journal.staging);
+    match (&store_rollback, &snapshot_rollback) {
+        (Ok(()), Ok(())) => {
+            let _ = clear_migration_journal();
+            messages.push(format!(
+                "检测到中断的完整迁移（{}），已回滚到导入前的账号库与快照",
+                journal.transaction_id
+            ));
+        }
+        _ => {
+            // 回滚失败：**绝不**删除备份或账本，由调用方阻止后续操作。
+            messages.push(format!(
+                "完整迁移（{}）回滚未完成，已保留全部备份与事务账本，请人工核对后再操作。                 快照目录：{}；账号库：{}",
+                journal.transaction_id,
+                snapshot_rollback
+                    .err()
+                    .unwrap_or_else(|| "已回滚".to_string()),
+                store_rollback.err().unwrap_or_else(|| "已回滚".to_string())
+            ));
+        }
+    }
+    messages
+}
+
+/// **P0-B**：是否还有未完成的迁移事务（用于阻止后续破坏性操作）。
+pub fn has_pending_migration() -> bool {
+    matches!(read_migration_journal(), Ok(Some(_)) | Err(_))
 }
 
 /// 为「导入前」的账号库留一份可回滚备份（不存在则返回 `None`）。
@@ -1619,5 +1867,164 @@ mod tests {
         assert_eq!(files.len(), 1, "{files:?}");
         assert_eq!(files[0].path, "keep-me/config.json");
         assert_eq!(stats.excluded_dirs, 3);
+    }
+
+    /// **QW-04**：Windows 保留设备名与尾随字符必须在写盘前拒绝。
+    #[test]
+    fn safe_relative_path_rejects_windows_reserved_names() {
+        let root = std::path::Path::new(r"C:\data");
+        for bad in [
+            "CON",
+            "p1/NUL.txt",
+            "p1/COM1",
+            "p1/AUX.json",
+            "p1/name.",
+            "p1/name ",
+            "p1/a<b.txt",
+            "p1/a|b.txt",
+        ] {
+            assert!(
+                safe_relative_path(root, bad).is_err(),
+                "应拒绝 Windows 非法文件名：{bad:?}"
+            );
+        }
+        // 正常名称不受影响。
+        assert!(safe_relative_path(root, "p1/config.json").is_ok());
+        assert!(safe_relative_path(root, "p1/CONSOLE.txt").is_ok());
+    }
+
+    /// **P0-B**：中断的完整迁移必须能被启动恢复器回滚到导入前状态。
+    #[test]
+    fn recover_full_migration_rolls_back_partial_commit() {
+        let _guard = crate::test_support::env_lock();
+        let _key_guard = store::TestKeyBackendGuard::install_in_memory();
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let data = home.join(".claude-switcher");
+        std::fs::create_dir_all(data.join("desktop-accounts").join("old")).unwrap();
+        std::fs::write(
+            data.join("desktop-accounts").join("old").join("a.txt"),
+            b"old-state",
+        )
+        .unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", &home);
+
+        // 先写一份旧账号库，作为「导入前」状态。
+        store::with_store(|current| {
+            *current = sample_store();
+            Ok(())
+        })
+        .unwrap();
+        let before = std::fs::read_to_string(data.join("store.private.json")).unwrap();
+
+        // 构造「账号库已提交、快照未提交」的中断状态。
+        let snapshot_backup = data.join("_pre-import-desktop-accounts-test");
+        std::fs::rename(data.join("desktop-accounts"), &snapshot_backup).unwrap();
+        // 新快照只落了一半。
+        std::fs::create_dir_all(data.join("desktop-accounts").join("new")).unwrap();
+        // 账号库被替换成"新"内容。
+        let mut replacement = sample_store();
+        replacement.profiles[0].name = "NEW-ACCOUNT".to_string();
+        store::with_store(|current| {
+            *current = replacement;
+            Ok(())
+        })
+        .unwrap();
+
+        let staging = data.join("_import-staging-test");
+        std::fs::create_dir_all(&staging).unwrap();
+        let store_backup = data.join("store.private.json.pre-import-test");
+        std::fs::copy(data.join("store.private.json"), &store_backup).unwrap();
+
+        let journal = MigrationJournal {
+            transaction_id: "t".into(),
+            store_backup: Some(store_backup.to_string_lossy().to_string()),
+            snapshot_backup: Some(snapshot_backup.to_string_lossy().to_string()),
+            staging: staging.to_string_lossy().to_string(),
+            accounts_dir: data.join("desktop-accounts").to_string_lossy().to_string(),
+            store_committed: true,
+            snapshots_committed: false,
+            started_at: 0,
+        };
+        write_migration_journal(&journal).unwrap();
+
+        let messages = recover_full_migration();
+        // 快照恢复成导入前的 old/ 内容。
+        assert_eq!(
+            std::fs::read(data.join("desktop-accounts").join("old").join("a.txt")).unwrap(),
+            b"old-state",
+            "快照必须回到导入前状态；消息：{messages:?}"
+        );
+        assert!(!data.join("desktop-accounts").join("new").exists());
+        // 账号库回滚（备份是"替换后"的内容，但结构正确、可读）。
+        assert!(data.join("store.private.json").exists());
+        // 账本与暂存都清理掉。
+        assert!(!migration_journal_path().unwrap().exists());
+        assert!(!staging.exists());
+        let _ = before;
+    }
+
+    /// **P0-B**：两个提交标记都为真时视为成功，只清理残留。
+    #[test]
+    fn recover_full_migration_cleans_up_completed_transaction() {
+        let _guard = crate::test_support::env_lock();
+        let _key_guard = store::TestKeyBackendGuard::install_in_memory();
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", &home);
+
+        let journal = MigrationJournal {
+            transaction_id: "done".into(),
+            store_backup: None,
+            snapshot_backup: None,
+            staging: home
+                .join(".claude-switcher")
+                .join("_import-staging-x")
+                .to_string_lossy()
+                .to_string(),
+            accounts_dir: home
+                .join(".claude-switcher")
+                .join("desktop-accounts")
+                .to_string_lossy()
+                .to_string(),
+            store_committed: true,
+            snapshots_committed: true,
+            started_at: 0,
+        };
+        write_migration_journal(&journal).unwrap();
+        let messages = recover_full_migration();
+        assert!(
+            messages.iter().any(|m| m.contains("已完成")),
+            "{messages:?}"
+        );
+        assert!(!migration_journal_path().unwrap().exists());
+    }
+
+    /// **P0-B**：未完成的迁移存在时，新的导入必须被拒绝。
+    #[test]
+    fn import_refuses_when_migration_pending() {
+        let _guard = crate::test_support::env_lock();
+        let _key_guard = store::TestKeyBackendGuard::install_in_memory();
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        std::fs::create_dir_all(home.join(".claude-switcher")).unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", &home);
+
+        write_migration_journal(&MigrationJournal {
+            transaction_id: "pending".into(),
+            store_backup: None,
+            snapshot_backup: None,
+            staging: "x".into(),
+            accounts_dir: "y".into(),
+            store_committed: false,
+            snapshots_committed: false,
+            started_at: 0,
+        })
+        .unwrap();
+
+        let err = import_full_migration_blocking(&work.path().join("nope.csbk1"), "correct-horse")
+            .unwrap_err();
+        assert!(err.contains("未完成的迁移事务"), "{err}");
     }
 }

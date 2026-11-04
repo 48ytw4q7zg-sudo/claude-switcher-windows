@@ -981,4 +981,34 @@ mod tests {
         assert!(g.enabled && g.threshold_reached && !g.already_tripped);
         // 部分保护优先于已熔断的判断由 decide() 覆盖（见 decide 测试）。
     }
+
+    /// **P0-08 / P0-G**：手动保持意图三态——只有「明确没有」才允许自动解除。
+    #[test]
+    fn manual_hold_state_is_tri_state() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+
+        // 初始：没有意图文件 → None。
+        assert_eq!(manual_hold_state(), ManualHold::None);
+        assert!(!is_manual_hold(), "明确没有手动保持时不应判为保持");
+
+        // 写入后 → Held。
+        mark_manual_hold().unwrap();
+        assert_eq!(manual_hold_state(), ManualHold::Held);
+        assert!(is_manual_hold());
+
+        // 清除后 → None。
+        clear_manual_hold().unwrap();
+        assert_eq!(manual_hold_state(), ManualHold::None);
+
+        // 损坏文件 → Unknown（保守：视为保持，不允许自动解除）。
+        let path = isolation_intent_file().unwrap();
+        std::fs::write(&path, b"{not json").unwrap();
+        assert_eq!(manual_hold_state(), ManualHold::Unknown);
+        assert!(
+            is_manual_hold(),
+            "Unknown 必须按「保持」对待，否则会静默推翻用户意图"
+        );
+    }
 }

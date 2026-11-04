@@ -478,19 +478,18 @@ fn parse_rule_verification_expected(json: &str, expected: &[ExpectedRule]) -> Ru
             unknown_names.push(format!("{name}（{dir} {exe}）"));
             continue;
         }
-        match seen.get(name) {
-            // 同名重复结果：只要有一条不 ok 就按失败记（保守）。
-            Some((prev_ok, _)) => {
-                if !ok {
-                    seen.insert(name, (false, reason));
-                } else if !prev_ok {
-                    // 保持失败状态。
-                }
-            }
-            None => {
-                seen.insert(name, (ok, reason));
-            }
+        // **QW-01**：同名结果**重复出现**本身就是异常（脚本应每条预期规则
+        // 只返回一行）。若允许重复，两条 ok 就能凑出 verified=2，
+        // 掩盖另一条规则根本没被检查的事实。这里直接判查询失败。
+        if seen.contains_key(name) {
+            return RuleVerification {
+                query_ok: false,
+                expected: expected_count,
+                verified: 0,
+                failed: vec![format!("核验结果中规则名重复出现：{name}")],
+            };
         }
+        seen.insert(name, (ok, reason));
     }
     let mut verified = 0u32;
     let mut failed = Vec::new();
@@ -814,6 +813,25 @@ pub fn prune_stale_rule_targets() -> Result<u32, String> {
 /// **P0-04**：删除应用隔离规则并回查确认真的消失。
 pub fn release_all_verified() -> Result<ReleaseReport, String> {
     let guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::ReleaseIsolation)?;
+    // **P0-G**：拿到锁之后**重新核验**手动保持意图。
+    //
+    // 监控循环是在拿锁**之前**算出 `Recover` 决策的；等待锁期间用户可能刚点了
+    // 「保持隔离」。原实现在锁内不再检查，于是旧决策会覆盖新意图。
+    // `Unknown`（意图文件损坏/不可读）同样拒绝解除——宁可不解除，也不能
+    // 静默推翻用户的明确要求。
+    match crate::egate_monitor::manual_hold_state() {
+        crate::egate_monitor::ManualHold::None => {}
+        crate::egate_monitor::ManualHold::Held => {
+            return Err(
+                "检测到用户手动保持的隔离，已放弃本次自动解除（仅手动解除可清除）".to_string(),
+            )
+        }
+        crate::egate_monitor::ManualHold::Unknown => {
+            return Err(
+                "无法确认手动隔离意图（意图文件损坏或不可读），已放弃本次自动解除".to_string(),
+            )
+        }
+    }
     release_all_verified_locked(&guard)
 }
 
@@ -985,7 +1003,9 @@ mod tests {
         ])
         .to_string();
         let dup = parse_rule_verification_expected(&dup_json, &expected);
-        assert_eq!(dup.verified, 1, "同名重复只能算一次");
+        // **QW-01**：重复出现 = 核验异常（不是「只算一次」）。
+        assert!(!dup.query_ok, "同名重复必须判为查询失败：{dup:?}");
+        assert_eq!(dup.verified, 0);
 
         // 缺少结果条目 → 该条按失败记。
         let missing = parse_rule_verification_expected("[]", &expected);

@@ -166,6 +166,12 @@ pub fn cut(mode: CutMode) -> (bool, String) {
     if mode == CutMode::Off {
         return (true, "档位为「不断网」，未执行断网".to_string());
     }
+    // **P0-I**：能力门控必须在**修改任何系统状态之前**。
+    // 注意：这里只拦「新增断网事务」，不影响对已有 netcut.json 的恢复——
+    // 恢复路径不经过本函数的这个分支。
+    if let CutCapability::Unavailable(reason) = global_cut_capability(mode) {
+        return (false, format!("该断网档位当前不可用：{reason}"));
+    }
     // **P0-02**：断网必须独占系统操作权。
     let guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::NetworkCut) {
         Ok(guard) => guard,
@@ -495,6 +501,33 @@ fn rule_exists(name: &str) -> Result<bool, String> {
     }
 }
 
+/// **P0-I**：全局断网能力门控。
+///
+/// ClaudeGuard v3.10 契约要求：没有独立于主程序的恢复执行器并自检通过之前，
+/// 不应新增高风险的全局断网动作。`nics` 档位会**禁用物理网卡**，一旦主程序
+/// 无法启动或崩溃，用户会失去网络且没有可靠的自助恢复手段。
+///
+/// 当前实现只有「启动自愈」与 `--egate-restore`（都需要主程序跑起来），
+/// 因此按契约把 `nics` 标为不可用；`firewall` 档位不受影响。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CutCapability {
+    /// 可用。
+    Ready,
+    /// 暂不可用（附原因）。
+    Unavailable(String),
+}
+
+/// 查询某个断网档位当前是否允许执行。
+pub fn global_cut_capability(mode: CutMode) -> CutCapability {
+    match mode {
+        CutMode::Nics => CutCapability::Unavailable(
+            "禁用物理网卡后无法由本工具自身恢复网络，当前缺少独立于主程序的恢复执行器。             请改用「防火墙全局阻断」档位；已存在的断网账本仍可正常恢复"
+                .to_string(),
+        ),
+        _ => CutCapability::Ready,
+    }
+}
+
 /// 启动自愈：若存在断网现场就恢复（进程崩溃/被杀后由下次启动调用）。
 pub fn heal() -> Vec<String> {
     match load_state() {
@@ -564,37 +597,65 @@ pub enum RuleState {
 
 /// 查询规则并**核验属性**（严格解析，任何非预期输出都报错）。
 fn query_cut_rule() -> Result<RuleState, String> {
-    // **P0-07**：不能只看「找到的第一条同名规则」。
+    // **P0-07 / P0-C / P0-D**：三件事必须同时成立才算「规则真的在阻断」。
     //
-    // 1. 同名规则可能有多条（重复创建/组策略残留）——必须**全部**属性正确；
-    // 2. 只有出现在 `ActiveStore`（当前生效策略）里才算真的阻断生效；
-    // 3. 数据面（`Get-NetFirewallProfile`）若整体关闭，规则存在也不生效；
-    // 4. 查询本身失败（权限、服务停止）返回 **Unknown**，绝不返回 Present。
+    // P0-C（实测确认）：`Get-NetFirewallRule -ErrorAction Stop` 在**没有匹配对象**
+    // 时不会返回空数组，而是**抛异常**（「找不到任何 DisplayName 属性等于 … 的
+    // MSFT_NetFirewallRule 对象」）。原实现把异常一律吞成 `unknown`，导致
+    // **首次断网**被误判为「状态未知」而拒绝创建规则。必须先用
+    // `-ErrorAction SilentlyContinue` 枚举来区分「真的没有」与「查询失败」。
+    //
+    // P0-D：`$anyOn` 只要有一档配置文件开启就算通过，而当前活动的网络连接
+    // 可能属于**关闭的那一档**。改为按当前活动连接的网络类别逐项核对。
     let script = format!(
-        "$ErrorActionPreference='Stop'
-         $name = {name}
-         try {{
-           $rules = @(Get-NetFirewallRule -DisplayName $name -PolicyStore PersistentStore -ErrorAction Stop)
-           if ($rules.Count -eq 0) {{ 'absent'; exit 0 }}
-           foreach ($r in $rules) {{
-             if ($r.Enabled -ne 'True' -or $r.Direction -ne 'Outbound' -or $r.Action -ne 'Block') {{ 'wrong'; exit 0 }}
-           }}
-           # 生效策略里必须也能看到同名且启用+阻断的规则。
-           $active = @(Get-NetFirewallRule -DisplayName $name -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
-           $activeOk = $false
-           foreach ($a in $active) {{
-             if ($a.Enabled -eq 'True' -and $a.Action -eq 'Block') {{ $activeOk = $true }}
-           }}
-           if (-not $activeOk) {{ 'unknown'; exit 0 }}
-           # 防火墙配置档整体关闭时规则不生效。
-           $profiles = @(Get-NetFirewallProfile -ErrorAction SilentlyContinue)
-           if ($profiles.Count -gt 0) {{
-             $anyOn = $false
-             foreach ($p in $profiles) {{ if ($p.Enabled -eq 'True') {{ $anyOn = $true }} }}
-             if (-not $anyOn) {{ 'unknown'; exit 0 }}
-           }}
-           'present'
-         }} catch {{ 'unknown' }}",
+        r#"$ErrorActionPreference='Stop'
+$name = {name}
+try {{
+  # ① 用 SilentlyContinue 枚举：无匹配 = 真正不存在，不抛异常。
+  $rules = @(Get-NetFirewallRule -DisplayName $name -PolicyStore PersistentStore -ErrorAction SilentlyContinue)
+  if ($rules.Count -eq 0) {{ 'absent'; exit 0 }}
+  foreach ($r in $rules) {{
+    if ($r.Enabled -ne 'True' -or $r.Direction -ne 'Outbound' -or $r.Action -ne 'Block') {{ 'wrong'; exit 0 }}
+  }}
+
+  # ② 必须在当前生效策略里也能看到（防止组策略覆盖）。
+  $active = @(Get-NetFirewallRule -DisplayName $name -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+  $activeOk = $false
+  foreach ($a in $active) {{
+    if ($a.Enabled -eq 'True' -and $a.Action -eq 'Block') {{ $activeOk = $true }}
+  }}
+  if (-not $activeOk) {{ 'unknown'; exit 0 }}
+
+  # ③ 当前**活动网络**所属的防火墙配置档必须开启。
+  #    Get-NetFirewallProfile 查询失败 → unknown（不能当成「已开」）。
+  $profiles = @(Get-NetFirewallProfile -ErrorAction SilentlyContinue)
+  if ($profiles.Count -eq 0) {{ 'unknown'; exit 0 }}
+  $statusMap = @{{}}
+  foreach ($p in $profiles) {{ $statusMap[[string]$p.Name] = ($p.Enabled -eq 'True') }}
+
+  $connections = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)
+  if ($connections.Count -eq 0) {{
+    # 没有活动连接（例如已断网成功）：没有流量可放行，规则即可视为生效；
+    # 但仍要求至少一档配置开启，否则规则本身无从生效。
+    $anyOn = $false
+    foreach ($v in $statusMap.Values) {{ if ($v) {{ $anyOn = $true }} }}
+    if (-not $anyOn) {{ 'unknown'; exit 0 }}
+    'present'
+    exit 0
+  }}
+  foreach ($c in $connections) {{
+    $cat = [string]$c.NetworkCategory   # DomainAuthenticated / Private / Public
+    $key = switch ($cat) {{
+      'DomainAuthenticated' {{ 'Domain' }}
+      'Private' {{ 'Private' }}
+      'Public' {{ 'Public' }}
+      default {{ '' }}
+    }}
+    if ($key -eq '' -or -not $statusMap.ContainsKey($key)) {{ 'unknown'; exit 0 }}
+    if (-not $statusMap[$key]) {{ 'unknown'; exit 0 }}
+  }}
+  'present'
+}} catch {{ 'unknown' }}"#,
         name = ps_quote(CUT_RULE)
     );
     let out = crate::platform::imp::run_powershell(&script)
@@ -705,31 +766,58 @@ fn enable_nics_by_guid(snapshots: &[AdapterSnapshot]) -> (Vec<String>, Vec<Strin
         if snap.guid.trim().is_empty() {
             continue;
         }
+        // **P0-J**：`Get-NetAdapter` / `Enable-NetAdapter` **没有** `-InterfaceGuid`
+        // 参数（实测报「找不到与参数名称匹配的参数」）。`InterfaceGuid` 只是
+        // 网卡对象的属性，必须枚举后按属性精确匹配，再用 `-InputObject` 启用。
+        //
+        // 这条路径曾在 v0.6.8 因参数不存在而必然失败——断网后网卡无法恢复，
+        // 是系统可用性级别的缺陷。下面的脚本已在本机 PowerShell 上验证语法。
         let script = format!(
             "$ErrorActionPreference='Stop'
              $guid = {guid}
-             $adapter = Get-NetAdapter -InterfaceGuid $guid -ErrorAction SilentlyContinue
-             if (-not $adapter) {{ 'missing' }} else {{
-               if ($adapter.AdminStatus -ne 'Up') {{
-                 Enable-NetAdapter -InterfaceGuid $guid -Confirm:$false -ErrorAction Stop
+             try {{
+               $matches = @(Get-NetAdapter -IncludeHidden -ErrorAction Stop | Where-Object {{ [string]$_.InterfaceGuid -eq $guid }})
+               if ($matches.Count -eq 0) {{ 'missing' }}
+               elseif ($matches.Count -gt 1) {{ 'ambiguous' }}
+               else {{
+                 $adapter = $matches[0]
+                 if ($adapter.AdminStatus -ne 'Up') {{
+                   Enable-NetAdapter -InputObject $adapter -Confirm:$false -ErrorAction Stop
+                 }}
+                 $after = @(Get-NetAdapter -IncludeHidden -ErrorAction SilentlyContinue | Where-Object {{ [string]$_.InterfaceGuid -eq $guid }})
+                 if ($after.Count -eq 1 -and $after[0].AdminStatus -eq 'Up') {{ 'ok' }} else {{ 'failed' }}
                }}
-               $after = Get-NetAdapter -InterfaceGuid $guid -ErrorAction SilentlyContinue
-               if ($after -and $after.AdminStatus -eq 'Up') {{ 'ok' }} else {{ 'failed' }}
-             }}",
+             }} catch {{ 'error: ' + $_.Exception.Message }}",
             guid = ps_quote(&snap.guid)
         );
         match crate::platform::imp::run_powershell(&script) {
-            Ok(out) => match out.trim().to_ascii_lowercase().as_str() {
-                "ok" => restored.push(snap.guid.clone()),
-                "missing" => failures.push(format!(
-                    "网卡 {}（GUID {}）已不存在，无法恢复；账本保留待人工处理",
-                    snap.name, snap.guid
-                )),
-                other => failures.push(format!(
-                    "网卡 {}（GUID {}）启用后状态仍非 Up（{other}）",
-                    snap.name, snap.guid
-                )),
-            },
+            Ok(out) => {
+                let out = out.trim();
+                let lower = out.to_ascii_lowercase();
+                if lower == "ok" {
+                    restored.push(snap.guid.clone());
+                } else if lower == "missing" {
+                    failures.push(format!(
+                        "网卡 {}（GUID {}）已不存在，无法恢复；账本保留待人工处理",
+                        snap.name, snap.guid
+                    ));
+                } else if lower == "ambiguous" {
+                    failures.push(format!(
+                        "网卡 {}（GUID {}）匹配到多块设备，拒绝猜测启用",
+                        snap.name, snap.guid
+                    ));
+                } else if let Some(detail) = out.strip_prefix("error: ") {
+                    failures.push(format!(
+                        "网卡 {}（GUID {}）恢复失败：{detail}",
+                        snap.name, snap.guid
+                    ));
+                } else {
+                    failures.push(format!(
+                        "网卡 {}（GUID {}）启用后状态仍非 Up（{out}）",
+                        snap.name, snap.guid
+                    ));
+                }
+            }
             Err(error) => failures.push(format!(
                 "网卡 {}（GUID {}）恢复失败：{error}",
                 snap.name, snap.guid
@@ -805,6 +893,21 @@ mod tests {
     fn cut_rule_name_is_product_scoped() {
         // 恢复与自愈都按这个名字找规则，改名会留下删不掉的残留。
         assert_eq!(CUT_RULE, "ClaudeSwitcher Egate Cut All");
+    }
+
+    /// **P0-I**：`nics` 档位必须被能力门控拦下（没有独立恢复执行器），
+    /// 而 `firewall` 档位不受影响。
+    #[test]
+    fn nics_mode_is_gated_but_firewall_is_not() {
+        assert!(matches!(
+            global_cut_capability(CutMode::Nics),
+            CutCapability::Unavailable(_)
+        ));
+        assert_eq!(
+            global_cut_capability(CutMode::Firewall),
+            CutCapability::Ready
+        );
+        assert_eq!(global_cut_capability(CutMode::Off), CutCapability::Ready);
     }
 }
 

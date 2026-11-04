@@ -1337,6 +1337,9 @@ pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String>
         "$ErrorActionPreference='SilentlyContinue'
          $killed = New-Object System.Collections.ArrayList
          $cliMarkers = @('\\node_modules\\', '\\npm\\', '\\nvm\\', '\\fnm\\', '\\volta\\', '\\.bun\\', '\\.deno\\')
+         # **P1-02**：受管桌面 GUI 的安装特征（用户级 / 系统级 / MSIX）。
+         # 只有落在这些目录里的同名进程才允许结束；其余按「身份未确认」跳过。
+         $guiPaths = @('\\anthropicclaude\\', '\\programs\\claude\\', '\\program files\\claude', '\\windowsapps\\')
          foreach ($p in @(Get-Process -Name {names} -ErrorAction SilentlyContinue)) {{
            $path = $p.Path
            $pname = $p.ProcessName
@@ -1355,6 +1358,17 @@ pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String>
            }}
            if (-not $path) {{
              [void]$killed.Add(\"$desc（已跳过：无法读取映像路径，不盲目结束）\")
+             continue
+           }}
+           # **P1-02**：只结束能确认属于受管 GUI 安装的进程。
+           # 非典型路径下的原生 CLI 与这里无法区分，按「身份未确认」跳过。
+           $lowerPath = $path.ToLowerInvariant()
+           $guiHint = $false
+           foreach ($h in $guiPaths) {{
+             if ($lowerPath.Contains($h)) {{ $guiHint = $true }}
+           }}
+           if (-not $guiHint) {{
+             [void]$killed.Add(\"$desc（已跳过：不在受管 GUI 安装路径内，身份未确认）\")
              continue
            }}
            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue

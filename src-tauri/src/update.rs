@@ -252,11 +252,21 @@ pub fn compute_sha256(bytes: &[u8]) -> String {
 /// 2. 处于隔离状态（本产品防火墙规则仍在）；
 /// 3. 隔离状态无法确认（查询失败）——同样不能安装。
 fn ensure_no_protection_transaction() -> Result<(), String> {
-    if let Ok(Some(_)) = crate::egate_netcut::load_state() {
-        return Err(
-            "系统当前处于全局断网状态（存在断网账本）。请先执行「恢复网络」再更新，             否则更新会打断恢复流程"
-                .to_string(),
-        );
+    // **P1-04**：三态显式匹配。原实现 `if let Ok(Some(_))` 会让 `Err`
+    // （账本损坏/不可读）直接放行——恰恰是最需要拦的情况。
+    match crate::egate_netcut::load_state() {
+        Ok(None) => {}
+        Ok(Some(_)) => {
+            return Err(
+                "系统当前处于全局断网状态（存在断网账本）。请先执行「恢复网络」再更新，                 否则更新会打断恢复流程"
+                    .to_string(),
+            )
+        }
+        Err(error) => {
+            return Err(format!(
+                "无法读取断网账本（{error}），无法确认系统是否处于断网状态。                 为避免更新打断恢复流程，本次更新已中止"
+            ))
+        }
     }
     if crate::egate_monitor::is_tripped() || crate::egate_monitor::is_partial() {
         return Err("系统当前处于应用隔离状态。请先解除隔离并确认出口正常后再更新。".to_string());
@@ -307,9 +317,15 @@ pub fn download_and_install_blocking(
         return Err("SHA256 校验失败，已拒绝安装".to_string());
     }
 
+    // **P1-04**：下载可能耗时数分钟，期间状态可能变化——启动安装器**之前**
+    // 必须再核验一次，并在持有系统操作锁的情况下启动，避免与恢复流程并发。
+    let guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::FullRestore)
+        .map_err(|e| format!("无法获取系统维护权（{e}），已取消安装以免打断保护流程"))?;
+    ensure_no_protection_transaction()?;
     crate::platform::imp::silent_command(&local_path.to_string_lossy())
         .spawn()
         .map_err(|e| format!("启动安装包失败：{e}"))?;
+    drop(guard);
 
     Ok(UpdateInstallResult {
         downloaded: true,
