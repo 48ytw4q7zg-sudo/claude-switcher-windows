@@ -360,19 +360,52 @@ mod tests {
 
     #[test]
     fn skipped_round_marks_targets_unverified_not_fail() {
-        // 未接入时 enforce=true：目标应判 Unverified（不熔断），且本轮未探测。
+        // 未接入时 enforce=true：目标应判 Unverified（不判 Fail），且本轮未探测。
         let mut streaks = std::collections::BTreeMap::new();
         let report = run_round(&[target("a", true)], &mut streaks, true, 2);
         // 真实注册表读取结果不可控，只断言不变量：
-        // 跳过的目标绝不能累计失败计数。
         if !report.probed {
             assert!(
                 report.targets.iter().all(|t| t.verdict != Verdict::Fail),
                 "未探测的目标不得判 Fail"
             );
             assert!(report.skipped_reason.is_some());
-            assert!(streaks.is_empty(), "未接入时不得累计熔断计数：{streaks:?}");
-            assert!(!report.should_trip, "未探测时不得达到熔断条件");
+            // P0-05：目标失败计数仍必须为空（跳过 ≠ 目标失败）。
+            assert!(
+                !streaks.keys().any(|k| k == "a"),
+                "跳过的目标不得累计失败计数：{streaks:?}"
+            );
+            // 但接入路径会独立累计（这是 P0-05 的有意行为）。
+            if report.access_streak > 0 {
+                assert!(
+                    streaks.contains_key("access:uncovered"),
+                    "接入未覆盖应记录独立计数：{streaks:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn access_uncovered_triggers_trip_independently_of_targets() {
+        // P0-05 核心语义：接入路径连续未覆盖达到阈值时，即使所有目标都是
+        // Unverified（没有实际探测），也必须触发熔断判定。
+        let mut streaks = std::collections::BTreeMap::new();
+        let targets = vec![target("a", true)];
+        let mut last = None;
+        // 模拟连续多轮 Uncovered（通过真实接入判定驱动）。
+        for _ in 0..3 {
+            let report = run_round(&targets, &mut streaks, true, 2);
+            if report.probed {
+                // 本机实际接入了代理：本测试不适用，跳过。
+                return;
+            }
+            last = Some(report);
+        }
+        let report = last.expect("至少跑一轮");
+        assert!(report.access_streak >= 1, "未接入时必须累计接入计数");
+        if report.access_streak >= 2 {
+            assert!(report.access_trip, "接入连续未覆盖达到阈值应触发");
+            assert!(report.should_trip, "access_trip 必须并入 should_trip");
         }
     }
 }
