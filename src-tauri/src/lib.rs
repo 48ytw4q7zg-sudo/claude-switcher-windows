@@ -3185,6 +3185,10 @@ pub fn run() {
     for message in egate_netcut::heal() {
         log_error(&message);
     }
+    // **P0-08**：恢复中断的 Desktop 切换（崩溃残留）。
+    for message in desktop::heal_desktop_switch() {
+        log_error(&message);
+    }
     // **P0-06**：先从真实系统状态重建熔断状态（进程重启后内存归零，
     // 但防火墙规则仍在）。
     egate_monitor::rebuild_trip_state_from_system();

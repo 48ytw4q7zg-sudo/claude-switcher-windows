@@ -21,6 +21,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::Utc;
+use serde::{Deserialize, Serialize};
 use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 use uuid::Uuid;
 
@@ -523,6 +524,25 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
         backup_path: std::cell::RefCell::new(None),
         original_existed: std::cell::Cell::new(false),
     };
+    // **P0-08**：切换前写入持久化账本（崩溃后可恢复）。
+    let from_id = store::load_store()
+        .ok()
+        .and_then(|s| s.current_desktop_profile_id.clone());
+    let tx_id = Uuid::new_v4().simple().to_string();
+    let ledger = DesktopSwitchLedger {
+        transaction_id: tx_id.clone(),
+        from_id,
+        to_id: id.to_string(),
+        backup_path: None,
+        original_existed: live.is_dir(),
+        live_dir: live.to_string_lossy().to_string(),
+        phase: "prepared".to_string(),
+        started_at: chrono::Utc::now().timestamp(),
+    };
+    if let Err(error) = write_switch_ledger(&ledger) {
+        return Err(format!("写入 Desktop 切换账本失败，已放弃切换：{error}"));
+    }
+
     let mut switched = false;
     let result = store::with_store(|store| {
         let outcome = switch_desktop_profile_in(
@@ -542,8 +562,25 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
         outcome
     });
 
+    // 更新账本：记录精确备份路径与阶段。
+    let mut final_ledger = ledger.clone();
+    final_ledger.backup_path = transaction
+        .backup_path
+        .borrow()
+        .as_ref()
+        .map(|p| p.to_string_lossy().to_string());
+    final_ledger.phase = if switched {
+        "committed".to_string()
+    } else {
+        "prepared".to_string()
+    };
+
     match result {
-        Ok(warnings) => Ok(warnings),
+        Ok(warnings) => {
+            let _ = write_switch_ledger(&final_ledger);
+            clear_switch_ledger();
+            Ok(warnings)
+        }
         Err(error) => {
             // 若是保存账号库失败且文件已切换 → 回滚活目录，恢复一致状态。
             if switched {
@@ -581,18 +618,139 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
                     });
                 }
             }
+            let _ = write_switch_ledger(&final_ledger);
             Err(error)
         }
     }
 }
 
 /// **P0-NEW-03**：Desktop 切换事务上下文（记录本次切换的精确备份）。
+///
+/// **P0-08**：同时写入持久化账本，供程序崩溃后恢复。
 struct DesktopTransaction {
     target_id: String,
     /// 本次切换创建的原活目录备份（精确路径，不靠扫描猜测）。
     backup_path: std::cell::RefCell<Option<std::path::PathBuf>>,
     /// 切换前活目录是否存在。
     original_existed: std::cell::Cell<bool>,
+}
+
+/// **P0-08**：Desktop 切换事务账本（落盘，崩溃后恢复用）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DesktopSwitchLedger {
+    /// 事务 ID。
+    transaction_id: String,
+    /// 原始账号 ID（切换前）。
+    from_id: Option<String>,
+    /// 目标账号 ID。
+    to_id: String,
+    /// 本次备份路径（精确）。
+    backup_path: Option<String>,
+    /// 切换前活目录是否存在。
+    original_existed: bool,
+    /// 活目录路径。
+    live_dir: String,
+    /// 阶段：prepared / files_switched / committed。
+    phase: String,
+    /// 开始时间（unix 秒）。
+    started_at: i64,
+}
+
+fn desktop_switch_ledger_path() -> Result<std::path::PathBuf, String> {
+    Ok(crate::paths::app_data_dir()?.join("desktop-switch.json"))
+}
+
+fn write_switch_ledger(ledger: &DesktopSwitchLedger) -> Result<(), String> {
+    let path = desktop_switch_ledger_path()?;
+    let text =
+        serde_json::to_string_pretty(ledger).map_err(|e| format!("序列化切换账本失败：{e}"))?;
+    fsx::write_atomically(&path, &text).map_err(|e| format!("写入切换账本失败：{e}"))
+}
+
+fn clear_switch_ledger() {
+    if let Ok(path) = desktop_switch_ledger_path() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+/// **P0-08**：启动时检查未完成的 Desktop 切换并恢复一致状态。
+///
+/// 返回需要展示给用户的说明（无残留时为空）。
+pub fn heal_desktop_switch() -> Vec<String> {
+    let Ok(path) = desktop_switch_ledger_path() else {
+        return Vec::new();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return Vec::new();
+    };
+    let text = crate::jsonio::decode_text(&bytes);
+    let ledger: DesktopSwitchLedger = match serde_json::from_str(&text) {
+        Ok(ledger) => ledger,
+        Err(error) => {
+            return vec![format!(
+                "Desktop 切换账本损坏（{error}），已保留原文件请人工检查"
+            )];
+        }
+    };
+
+    let mut messages = Vec::new();
+    match ledger.phase.as_str() {
+        "committed" => {
+            // 已提交但未清理账本：正常清理。
+            clear_switch_ledger();
+        }
+        "files_switched" | "prepared" => {
+            // 文件可能已切换但账号库未提交 → 用精确备份回滚。
+            let live = std::path::PathBuf::from(&ledger.live_dir);
+            match &ledger.backup_path {
+                Some(backup) => {
+                    let backup = std::path::PathBuf::from(backup);
+                    if !backup.is_dir() {
+                        messages.push(format!(
+                            "Desktop 切换中断，备份缺失（{}），请人工核对活目录归属",
+                            backup.display()
+                        ));
+                    } else {
+                        let rollback = (|| -> Result<(), String> {
+                            if live.exists() || links::path_is_link(&live) {
+                                fsx::retry_io(|| fs::remove_dir_all(&live))
+                                    .map_err(|e| format!("清理活目录失败：{e}"))?;
+                            }
+                            copy_dir_recursive(&backup, &live)
+                                .map(|_| ())
+                                .map_err(|e| format!("还原活目录失败：{e}"))
+                        })();
+                        match rollback {
+                            Ok(()) => {
+                                messages.push(format!(
+                                    "检测到中断的 Desktop 切换（→ {}），已回滚到切换前状态",
+                                    ledger.to_id
+                                ));
+                                clear_switch_ledger();
+                            }
+                            Err(error) => messages.push(format!(
+                                "Desktop 切换中断且回滚失败（{error}），备份保留在 {}",
+                                backup.display()
+                            )),
+                        }
+                    }
+                }
+                None => {
+                    // 原本无活目录：清理半成品。
+                    if live.exists() {
+                        let _ = fsx::retry_io(|| fs::remove_dir_all(&live));
+                    }
+                    messages.push(format!(
+                        "检测到中断的 Desktop 切换（→ {}，原本无活目录），已清理",
+                        ledger.to_id
+                    ));
+                    clear_switch_ledger();
+                }
+            }
+        }
+        other => messages.push(format!("Desktop 切换账本阶段未知：{other}")),
+    }
+    messages
 }
 
 /// [`switch_desktop_profile`] 的可注入版本：`kill`/`running`/`copy` 均可替换，
