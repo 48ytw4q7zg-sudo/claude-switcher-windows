@@ -172,6 +172,8 @@ interface FullExportResult {
   bytes: number;
   desktop_files: number;
   skipped_links: number;
+  /** 被排除的中间目录数（.live-backup 等事务残留）。 */
+  excluded_dirs?: number;
 }
 
 /** P1-02：完整迁移包导入结果。 */
@@ -181,6 +183,8 @@ interface FullImportResult {
   desktop_files: number;
   backup_of_previous: string;
   desktop_restored_to?: string | null;
+  /** 成功后清理备份/暂存时的失败项（数据已正确，仅残留文件）。 */
+  cleanup_failures?: string[];
 }
 
 interface SessionIsolationStatus {
@@ -905,9 +909,13 @@ function App() {
       setExportPassword('');
       const links =
         result.skipped_links > 0
-          ? `；跳过 ${result.skipped_links} 个链接/超大文件（不会跨机还原）`
+          ? `；跳过 ${result.skipped_links} 个链接（不会跨机还原）`
           : '';
-      return `已加密导出完整迁移包（${(result.bytes / 1024).toFixed(1)} 千字节，含 ${result.desktop_files} 个 Desktop 快照文件${links}）→ ${result.path}`;
+      const excluded =
+        (result.excluded_dirs ?? 0) > 0
+          ? `；已排除 ${result.excluded_dirs} 个事务中间目录`
+          : '';
+      return `已加密导出完整迁移包（${(result.bytes / 1024).toFixed(1)} 千字节，含 ${result.desktop_files} 个 Desktop 快照文件${links}${excluded}）→ ${result.path}`;
     });
 
   /** P1-02：导入完整迁移包（账号库 + Claude Desktop 快照，事务性落位）。 */
@@ -1087,7 +1095,14 @@ function App() {
                 title: '退出 Claude 账号切换器',
                 detail: '账号快照与备份都会保留，下次打开可继续使用。',
                 confirmLabel: '退出',
-                onConfirm: () => invoke('quit_app_cmd'),
+                // P0-12：退出前会先恢复隔离/断网；恢复失败则不退出并说明原因。
+                onConfirm: async () => {
+                  try {
+                    await invoke('quit_app_cmd');
+                  } catch (error) {
+                    window.alert(String(error));
+                  }
+                },
               })
             }
             disabled={!!busy}

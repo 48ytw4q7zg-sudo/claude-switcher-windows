@@ -86,6 +86,8 @@ pub struct FullExportResult {
     pub desktop_files: usize,
     /// 跳过的链接数（链接不进包，避免跨机指向错误位置）。
     pub skipped_links: usize,
+    /// 被排除的中间目录数（`.live-backup` 等事务残留）。
+    pub excluded_dirs: usize,
 }
 
 /// **P1-02**：Desktop 快照导入结果。
@@ -97,6 +99,9 @@ pub struct FullImportResult {
     pub backup_of_previous: String,
     /// 恢复的 Desktop 快照目录。
     pub desktop_restored_to: Option<String>,
+    /// **QW-05**：成功后清理备份/暂存时的失败项（数据已正确，仅残留文件）。
+    #[serde(default)]
+    pub cleanup_failures: Vec<String>,
 }
 
 /// **P1-02**：Desktop 快照打包统计（不含文件内容，便于单测）。
@@ -105,7 +110,18 @@ pub struct SnapshotPackStats {
     pub files: usize,
     pub bytes: u64,
     pub skipped_links: usize,
+    /// 被排除的中间目录数（`.live-backup` / `_*` 事务残留）。
+    pub excluded_dirs: usize,
 }
+
+/// 迁移包**总明文**上限（2 GiB）。
+///
+/// 打包时全部文件都会进内存（再 base64 膨胀 4/3），超过这个量级几乎必然
+/// 说明 `desktop-accounts` 下混进了不该打包的东西。
+const MAX_SNAPSHOT_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// 不参与打包的目录名（切换/导入事务产生的中间目录）。
+const EXCLUDED_SNAPSHOT_DIR_NAMES: &[&str] = &[".live-backup", "_pre-import-desktop-accounts"];
 
 /// 单个快照文件的体积上限（256 MiB）。
 ///
@@ -152,6 +168,15 @@ fn collect_snapshot_files(root: &Path) -> Result<(Vec<SnapshotFile>, SnapshotPac
                 .metadata()
                 .map_err(|e| format!("读取快照文件属性失败 {}: {e}", path.display()))?;
             if meta.is_dir() {
+                // **P1-01**：只打包受管理的 Desktop 账号快照目录。
+                // `.live-backup` 是切换过程中的活目录备份，`_pre-import-*` /
+                // `_import-staging-*` 是导入事务残留——它们都不是账号快照，
+                // 打进迁移包只会把历史垃圾搬到新机器。
+                let name = entry.file_name().to_string_lossy().to_string();
+                if EXCLUDED_SNAPSHOT_DIR_NAMES.contains(&name.as_str()) || name.starts_with('_') {
+                    stats.excluded_dirs += 1;
+                    continue;
+                }
                 stack.push(path);
                 continue;
             }
@@ -159,8 +184,20 @@ fn collect_snapshot_files(root: &Path) -> Result<(Vec<SnapshotFile>, SnapshotPac
                 continue;
             }
             if meta.len() > MAX_SNAPSHOT_FILE_BYTES {
-                stats.skipped_links += 1;
-                continue;
+                // **P1-01**：超限不能在"完整导出"里静默跳过——那会生成一个
+                // 看似成功、实际缺数据的包。明确失败，让用户先处理该文件。
+                return Err(format!(
+                    "快照文件超出单文件上限（{} MiB）：{}。                     完整导出要求包含全部账号数据，请先清理该文件或用「加密导出」只备份账号库",
+                    MAX_SNAPSHOT_FILE_BYTES / (1024 * 1024),
+                    path.display()
+                ));
+            }
+            // **P1-01**：总明文大小上限，避免把内存吃光。
+            if stats.bytes + meta.len() > MAX_SNAPSHOT_TOTAL_BYTES {
+                return Err(format!(
+                    "Desktop 快照总大小超过上限（{} MiB），已中止导出以免内存耗尽；                     请确认 desktop-accounts 下没有异常大文件",
+                    MAX_SNAPSHOT_TOTAL_BYTES / (1024 * 1024)
+                ));
             }
             let relative = path
                 .strip_prefix(root)
@@ -358,11 +395,17 @@ pub fn export_full_migration_blocking(
     if password.chars().count() < MIN_PASSWORD_LEN {
         return Err(format!("口令至少 {MIN_PASSWORD_LEN} 位"));
     }
-    // 账号库与快照必须在同一视图下取：先 load_store（它会解密凭据），
-    // 再读磁盘快照。两者之间没有切换动作，因此内容一致。
-    let store_data = store::load_store()?;
+    // **P0-04**：账号库与快照必须在**同一把锁**下读取。
+    //
+    // 原实现是「先 load_store()，再遍历 desktop-accounts」——两步之间若另一个
+    // 进程正在切换/捕获 Desktop 快照，就会导出混合两代数据的包，而加密与
+    // 哈希校验全部通过，没人能发现。现在整个读取过程在 `with_store_read`
+    // 的排他锁内完成（与切换/捕获/导入使用同一把锁）。
     let accounts_dir = paths::app_data_dir()?.join("desktop-accounts");
-    let (desktop_files, stats) = collect_snapshot_files(&accounts_dir)?;
+    let (store_data, desktop_files, stats) = store::with_store_read(|store_data| {
+        let (files, stats) = collect_snapshot_files(&accounts_dir)?;
+        Ok((store_data.clone(), files, stats))
+    })?;
 
     let payload = FullMigration {
         store: store_data,
@@ -381,6 +424,7 @@ pub fn export_full_migration_blocking(
         bytes: blob.len(),
         desktop_files: stats.files,
         skipped_links: stats.skipped_links,
+        excluded_dirs: stats.excluded_dirs,
     })
 }
 
@@ -580,8 +624,7 @@ pub fn import_full_migration_blocking(
     let (plaintext, version) = decrypt_blob(&blob, password)?;
     if version == FORMAT_VERSION {
         return Err(
-            "这是旧版账号快照（格式 v2），**不包含** Claude Desktop 快照。\
-             请改用「导入账号快照」；若需要迁移 Desktop，请在源机用新版重新导出。"
+            "这是旧版账号快照（格式 v2），**不包含** Claude Desktop 快照。             请改用「导入账号快照」；若需要迁移 Desktop，请在源机用新版重新导出。"
                 .to_string(),
         );
     }
@@ -599,11 +642,17 @@ pub fn import_full_migration_blocking(
     payload.store.current_desktop_profile_id = None;
     let cli_profiles = payload.store.profiles.len();
 
-    let accounts_dir = paths::app_data_dir()?.join("desktop-accounts");
     let data_root = paths::app_data_dir()?;
-    // 暂存目录放在**同一分区**（app_data_dir 下），这样最后的并入是 rename
+    let accounts_dir = data_root.join("desktop-accounts");
+    // 暂存目录放在**同一分区**（app_data_dir 下），这样最后并入是 rename
     // 而不是跨卷复制。名字以下划线开头，不参与账号枚举。
     let staging = data_root.join(format!("_import-staging-{}", uuid::Uuid::new_v4().simple()));
+    // **P1-01**：即使迁移包不含任何 Desktop 快照，也必须创建（空）暂存目录。
+    // 原实现在文件清单为空时不会建目录，而 `merge_staged_snapshots()` 会去读它，
+    // 于是一个合法但无快照的 v3 包会在账号库已被替换后才导入失败。
+    if let Err(error) = fs::create_dir_all(&staging) {
+        return Err(format!("创建导入暂存目录失败：{error}"));
+    }
     let staged = match stage_snapshot_files(&payload.desktop_files, &staging) {
         Ok(stats) => stats,
         Err(error) => {
@@ -613,46 +662,136 @@ pub fn import_full_migration_blocking(
         }
     };
 
-    // 备份现有快照目录（原子重命名到同级 `_pre-import-*`）。
-    let snapshot_backup = backup_existing_snapshots(&data_root)?;
-    let (backup_label, _) = match replace_store_with_backup(payload.store) {
-        Ok(result) => result,
+    // ① 先给旧账号库留一份**可回滚**的备份（与快照备份同属本次事务）。
+    let store_backup = backup_current_store_for_import()?;
+    // ② 备份现有快照目录（原子重命名到同级 `_pre-import-*`）。
+    let snapshot_backup = match backup_existing_snapshots(&data_root) {
+        Ok(backup) => backup,
         Err(error) => {
-            // 账号库没换成：恢复快照目录命名并清掉暂存。
-            restore_snapshot_backup(&snapshot_backup);
             let _ = fs::remove_dir_all(&staging);
             return Err(error);
         }
     };
-
-    // 提交快照：把暂存目录里的内容并入正式位置。
-    let restore_error = merge_staged_snapshots(&staging, &accounts_dir).err();
-    if let Some(error) = restore_error {
-        // 快照落位失败 → 回滚快照目录；账号库已提交，需要用户知道这个不一致。
-        restore_snapshot_backup(&snapshot_backup);
+    // ③ 提交账号库。
+    if let Err(error) = write_imported_store(payload.store) {
+        // 账号库没写成：恢复快照目录命名并清掉暂存；回滚失败要如实上报。
+        let snapshot_rollback = restore_snapshot_backup(&snapshot_backup);
         let _ = fs::remove_dir_all(&staging);
-        return Err(format!(
-            "Desktop 快照落位失败（{error}）。账号库已导入，但快照目录已回滚到导入前状态\
-             （{}）；原账号库备份在 {}。请核对后重试导入。",
-            snapshot_backup
-                .as_ref()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|| "（原本没有快照目录）".to_string()),
-            backup_label
-        ));
+        return Err(match snapshot_rollback {
+            Ok(()) => error,
+            Err(rollback_error) => {
+                format!("{error}；快照目录回滚也失败（{rollback_error}），请手动恢复快照备份")
+            }
+        });
     }
-    // 成功：删掉旧快照备份与暂存目录（备份已无用途）。
+    // ④ 提交快照。
+    if let Err(error) = merge_staged_snapshots(&staging, &accounts_dir) {
+        // **P0-03**：快照落位失败必须**同时**回滚账号库与快照目录，
+        // 否则会留下「新账号库 + 旧快照」的混合状态（v0.6.7 原实现只回滚快照）。
+        let snapshot_rollback = restore_snapshot_backup(&snapshot_backup);
+        let store_rollback = restore_store_backup(&store_backup);
+        let _ = fs::remove_dir_all(&staging);
+        let mut detail = String::new();
+        match (&snapshot_rollback, &store_rollback) {
+            (Ok(()), Ok(())) => {
+                detail.push_str("已回滚到导入前的完整状态（账号库与快照目录）");
+            }
+            _ => {
+                detail.push_str("回滚未完全成功，已保留备份与暂存现场：");
+                if let Err(e) = &snapshot_rollback {
+                    detail.push_str(&format!(" 快照目录：{e}；"));
+                }
+                if let Err(e) = &store_rollback {
+                    detail.push_str(&format!(" 账号库：{e}；"));
+                }
+                if let Some(backup) = &snapshot_backup {
+                    detail.push_str(&format!(" 快照备份：{}；", backup.display()));
+                }
+                if let Some(backup) = &store_backup {
+                    detail.push_str(&format!(" 账号库备份：{}；", backup.display()));
+                }
+            }
+        }
+        return Err(format!("Desktop 快照落位失败（{error}）。{detail}"));
+    }
+    // ⑤ 成功：清理旧备份与暂存。清理失败不影响数据正确性，但要如实报告。
+    let mut cleanup_failures = Vec::new();
     if let Some(backup) = &snapshot_backup {
-        let _ = fs::remove_dir_all(backup);
+        if let Err(error) = fsx::retry_io(|| fs::remove_dir_all(backup)) {
+            cleanup_failures.push(format!("快照备份 {}（{error}）", backup.display()));
+        }
     }
-    let _ = fs::remove_dir_all(&staging);
+    if let Some(backup) = &store_backup {
+        if let Err(error) = fsx::retry_io(|| fs::remove_file(backup)) {
+            cleanup_failures.push(format!("账号库备份 {}（{error}）", backup.display()));
+        }
+    }
+    if let Err(error) = fs::remove_dir_all(&staging) {
+        cleanup_failures.push(format!("暂存目录 {}（{error}）", staging.display()));
+    }
 
     Ok(FullImportResult {
         imported_bytes: plaintext.len(),
         profiles_imported: cli_profiles,
         desktop_files: staged.files,
-        backup_of_previous: backup_label,
+        backup_of_previous: store_backup
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "(原先没有账号库，直接写入)".to_string()),
         desktop_restored_to: Some(accounts_dir.to_string_lossy().to_string()),
+        cleanup_failures,
+    })
+}
+
+/// 为「导入前」的账号库留一份可回滚备份（不存在则返回 `None`）。
+///
+/// 与 [`replace_store_with_backup`] 的区别：这里**只备份不写入**，
+/// 让调用方在两份数据都落位成功后再决定是否清理。
+fn backup_current_store_for_import() -> Result<Option<std::path::PathBuf>, String> {
+    let store_path = paths::store_path()?;
+    if !store_path.exists() {
+        return Ok(None);
+    }
+    let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S-%3f");
+    let backup_path = store_path.with_file_name(format!("store.private.json.pre-import-{stamp}"));
+    fs::copy(&store_path, &backup_path).map_err(|e| format!("备份现有账号库失败: {e}"))?;
+    Ok(Some(backup_path))
+}
+
+/// **P0-03**：把账号库回滚到导入前的备份。
+///
+/// 没有备份（原本就没有账号库）时，把当前账号库删掉即回到「不存在」状态；
+/// 删除失败要如实返回 Err，不能假装回滚成功。
+fn restore_store_backup(backup: &Option<std::path::PathBuf>) -> Result<(), String> {
+    let store_path = paths::store_path()?;
+    match backup {
+        Some(backup) => {
+            if !backup.exists() {
+                return Err(format!(
+                    "账号库备份已丢失（{}），无法回滚",
+                    backup.display()
+                ));
+            }
+            fsx::retry_io(|| fs::copy(backup, &store_path))
+                .map(|_| ())
+                .map_err(|e| format!("还原账号库失败：{e}"))
+        }
+        None => {
+            // 导入前没有账号库：回滚 = 删除本次写入的。
+            match std::fs::remove_file(&store_path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("删除本次导入的账号库失败：{error}")),
+            }
+        }
+    }
+}
+
+/// 把导入的账号库写入本地（走 `with_store` 互斥；凭据由本机主密钥重新加密）。
+fn write_imported_store(incoming: store::Store) -> Result<(), String> {
+    store::with_store(|current| {
+        *current = incoming;
+        Ok(())
     })
 }
 
@@ -678,15 +817,27 @@ fn backup_existing_snapshots(data_root: &Path) -> Result<Option<std::path::PathB
 }
 
 /// 把 [`backup_existing_snapshots`] 的备份改回原名（回滚用，best-effort）。
-fn restore_snapshot_backup(backup: &Option<std::path::PathBuf>) {
-    let Some(backup) = backup else { return };
-    let Some(root) = backup.parent() else { return };
+fn restore_snapshot_backup(backup: &Option<std::path::PathBuf>) -> Result<(), String> {
+    // 原本没有快照目录：回滚 = 确保目标位置不存在（删除本次写入的部分内容）。
+    let Some(backup) = backup else {
+        let accounts = paths::app_data_dir()?.join("desktop-accounts");
+        if accounts.exists() {
+            return fsx::retry_io(|| fs::remove_dir_all(&accounts))
+                .map_err(|e| format!("清理本次写入的快照目录失败：{e}"));
+        }
+        return Ok(());
+    };
+    let root = backup
+        .parent()
+        .ok_or_else(|| format!("快照备份路径异常：{}", backup.display()))?;
     let accounts = root.join("desktop-accounts");
     // 目标可能已被部分写入：先清掉不完整的目录，再改名回去。
     if accounts.exists() {
-        let _ = fsx::retry_io(|| fs::remove_dir_all(&accounts));
+        fsx::retry_io(|| fs::remove_dir_all(&accounts))
+            .map_err(|e| format!("清理不完整的快照目录失败：{e}"))?;
     }
-    let _ = fsx::rename_with_retry(backup, &accounts);
+    fsx::rename_with_retry(backup, &accounts)
+        .map_err(|e| format!("恢复快照备份失败（{}）：{e}", backup.display()))
 }
 
 /// 把暂存目录里的快照并入正式位置（逐项重命名，冲突时以包内内容为准）。
@@ -1414,5 +1565,59 @@ mod tests {
             .filter(|name| name.starts_with("_import-staging-"))
             .collect();
         assert!(staging.is_empty(), "成功后不应残留暂存目录：{staging:?}");
+    }
+
+    /// **P0-03**：空 Desktop 快照的 v3 包必须能正常导入（不能因暂存目录
+    /// 未被创建而在账号库替换后失败）。
+    #[test]
+    fn full_import_accepts_package_without_desktop_files() {
+        let _guard = crate::test_support::env_lock();
+        let _key_guard = store::TestKeyBackendGuard::install_in_memory();
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        std::fs::create_dir_all(home.join(".claude-switcher")).unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", &home);
+
+        let migration = FullMigration {
+            store: sample_store(),
+            desktop_files: Vec::new(),
+            exported_at: 1,
+        };
+        let plaintext = serde_json::to_vec(&migration).unwrap();
+        let blob = encrypt_blob(&plaintext, "correct-horse", FORMAT_VERSION_FULL).unwrap();
+        let src = work.path().join("pkg.csbk1");
+        std::fs::write(&src, blob).unwrap();
+
+        let result = import_full_migration_blocking(&src, "correct-horse")
+            .expect("无 Desktop 快照的合法包应能导入");
+        assert_eq!(result.desktop_files, 0);
+        assert_eq!(result.profiles_imported, 1);
+        // 凭据已由本机主密钥重新封装。
+        let raw = std::fs::read_to_string(home.join(".claude-switcher").join("store.private.json"))
+            .unwrap();
+        assert!(raw.contains(store::ENC_PREFIX));
+    }
+
+    /// **P0-04**：导出必须排除切换/导入事务目录，不把历史垃圾搬进迁移包。
+    #[test]
+    fn export_excludes_transaction_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("desktop-accounts");
+        std::fs::create_dir_all(root.join("keep-me")).unwrap();
+        std::fs::write(root.join("keep-me").join("config.json"), b"{}").unwrap();
+        // 这些都不该进包。
+        for junk in [
+            ".live-backup",
+            "_import-staging-abc",
+            "_pre-import-desktop-accounts-1",
+        ] {
+            std::fs::create_dir_all(root.join(junk)).unwrap();
+            std::fs::write(root.join(junk).join("junk.bin"), b"junk").unwrap();
+        }
+
+        let (files, stats) = collect_snapshot_files(&root).unwrap();
+        assert_eq!(files.len(), 1, "{files:?}");
+        assert_eq!(files[0].path, "keep-me/config.json");
+        assert_eq!(stats.excluded_dirs, 3);
     }
 }

@@ -1318,10 +1318,12 @@ pub fn kill_processes_by_names(names: &[&str]) -> Result<Vec<String>, String> {
 /// 规则（保守优先，宁可不杀）：
 /// 1. 路径含 `\node_modules\`、`\npm\`、`\nvm\`、`\fnm\`、`\volta\` → 跳过（CLI）；
 /// 2. 进程名是 `node` / `bun` / `deno` → 跳过（CLI 宿主）；
-/// 3. 其余命中的同名进程才结束。
+/// 3. **读不到映像路径的进程一律跳过**——无法证明它是桌面 GUI 时强行结束
+///    可能误杀用户终端里的 CLI（提权进程、跨会话进程常读不到 `Path`）；
+/// 4. 其余命中的同名进程才结束。
 ///
 /// 返回值与 [`kill_processes_by_names`] 一致（被结束进程的描述），
-/// 额外把跳过的 CLI 进程也追加为 `"<desc>（CLI，已跳过）"` 便于用户核对。
+/// 额外把跳过的进程追加为 `"<desc>（已跳过：<原因>）"`，便于用户核对为什么没杀。
 pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String> {
     if names.is_empty() {
         return Ok(Vec::new());
@@ -1338,6 +1340,7 @@ pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String>
          foreach ($p in @(Get-Process -Name {names} -ErrorAction SilentlyContinue)) {{
            $path = $p.Path
            $pname = $p.ProcessName
+           $desc = \"$pname (PID $($p.Id))\"
            $isCli = $false
            if ($pname -in @('node','bun','deno','npm','npx')) {{ $isCli = $true }}
            if ($path) {{
@@ -1346,9 +1349,12 @@ pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String>
                if ($lower.Contains($m)) {{ $isCli = $true }}
              }}
            }}
-           $desc = \"$pname (PID $($p.Id))\"
            if ($isCli) {{
-             [void]$killed.Add(\"$desc（CLI，已跳过：只提醒不查杀）\")
+             [void]$killed.Add(\"$desc（已跳过：CLI 宿主，只提醒不查杀）\")
+             continue
+           }}
+           if (-not $path) {{
+             [void]$killed.Add(\"$desc（已跳过：无法读取映像路径，不盲目结束）\")
              continue
            }}
            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue

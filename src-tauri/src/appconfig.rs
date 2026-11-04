@@ -182,12 +182,25 @@ fn load_from_migrated(path: &std::path::Path) -> Result<AppConfig, String> {
     let config = load_from(path)?;
     let (migrated, changed) = migrate(config)?;
     if changed {
-        // 迁移前备份原始文件（时间戳后缀，不覆盖）。
-        let backup = path.with_extension(format!(
-            "json.bak-{}",
-            chrono::Utc::now().format("%Y%m%d%H%M%S")
-        ));
-        std::fs::copy(path, &backup).map_err(|e| format!("迁移前备份配置失败：{e}"))?;
+        // 迁移前备份原始文件。
+        //
+        // **QW-02**：同一秒内多次迁移会撞名（原实现只精确到秒），
+        // 第二次的 `copy` 会覆盖第一次的备份——而第一次备份可能才是
+        // 真正的原始版本。这里加毫秒 + 唯一后缀，并保证**绝不覆盖**已存在文件。
+        let stamp = chrono::Utc::now().format("%Y%m%d%H%M%S-%3f");
+        let unique = uuid::Uuid::new_v4().simple().to_string();
+        let backup = path.with_extension(format!("json.bak-{stamp}-{}", &unique[..8]));
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut dest = options
+            .open(&backup)
+            .map_err(|e| format!("创建迁移备份文件失败（{}）：{e}", backup.display()))?;
+        {
+            let mut source =
+                std::fs::File::open(path).map_err(|e| format!("读取迁移前配置失败：{e}"))?;
+            std::io::copy(&mut source, &mut dest)
+                .map_err(|e| format!("迁移前备份配置失败：{e}"))?;
+        }
         // 只在迁移成功后写入新版本。
         let text = serde_json::to_string_pretty(&migrated)
             .map_err(|e| format!("序列化迁移后配置失败：{e}"))?;

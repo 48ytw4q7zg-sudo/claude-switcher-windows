@@ -171,16 +171,20 @@ struct SwitchJournal {
     started_at: DateTime<Utc>,
 }
 
-fn write_switch_journal(journal: &SwitchJournal) {
-    let Ok(path) = paths::switch_journal_path() else {
-        return;
-    };
-    if let Ok(text) = serde_json::to_string_pretty(journal) {
-        // 写日志失败不能阻断切换本身（记日志是旁路）。
-        let _ = fsx::write_atomically(&path, &text);
-    }
+/// **P0-05**：切换事务日志必须**先落盘**才允许动账号材料。
+///
+/// 原实现是 best-effort：写失败被吞掉，而后续凭据/隔离目录已经改了，
+/// 崩溃或保存失败时没有任何恢复线索。现在返回 `Result`，写不进去就中止切换
+/// （此刻还没动数据，是无损放弃点）。
+fn write_switch_journal(journal: &SwitchJournal) -> Result<(), String> {
+    let path = paths::switch_journal_path()?;
+    let text = serde_json::to_string_pretty(journal)
+        .map_err(|e| format!("序列化切换事务日志失败：{e}"))?;
+    fsx::write_atomically(&path, &text)
+        .map_err(|e| format!("写入切换事务日志失败，已中止切换（未改动任何账号数据）：{e}"))
 }
 
+/// 清除切换事务日志（**只能在账号库真正保存成功之后调用**，见 P0-05）。
 fn clear_switch_journal() {
     if let Ok(path) = paths::switch_journal_path() {
         let _ = fsx::remove_file_with_retry(&path);
@@ -971,7 +975,7 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
     // H-2：整个切换是一次账号库事务，读—改—写全程持 with_store 锁。
     // 内部调用（preflight/backup/reconcile/clash/accounts/isolation/keep）均不获取
     // STORE_LOCK，无重入死锁；只读路径（read_lightweight/load_store）不持锁。
-    store::with_store(|store_data| {
+    let result = store::with_store(|store_data| {
         if !store_data.profiles.iter().any(|p| p.id == id) {
             return Err("找不到这个账号快照".to_string());
         }
@@ -997,7 +1001,7 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
             step: "backup-created".to_string(),
             backup_id: Some(backup.id.clone()),
             started_at: Utc::now(),
-        });
+        })?;
         // 跨身份保留：切换前把 keep-in-workspace.txt 列出的相对路径收进暂存（默认关闭）。
         // 与上游一致：暂存失败（含上次还原残留的唯一副本）直接中止切换，不覆盖。
         let keep_base = credentials::claude_dir()?;
@@ -1124,8 +1128,11 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
         store_data.profiles[idx].last_switched_at = Some(Utc::now());
         store_data.profiles[idx].updated_at = Utc::now();
         // with_store 在闭包返回 Ok 后统一 save，这里不再显式 save。
-        // 事务正常完成：清掉切换日志（残留日志 = 上次切换中断的信号）。
-        clear_switch_journal();
+        //
+        // **P0-05**：绝不能在这里清日志——此刻账号库**还没保存**。
+        // 原实现在闭包里就清掉，一旦 `save_store()` 失败，就成了
+        // 「材料已切换、账号库仍是旧账号、恢复线索也没了」。清除动作
+        // 移到 with_store 返回 Ok 之后（见 switch_profile_blocking）。
 
         Ok(SwitchResult {
             switched_to: profile.name,
@@ -1136,7 +1143,19 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
             ),
             warnings,
         })
-    })
+    });
+
+    // **P0-05**：`with_store` 只有真正保存成功才返回 Ok，此刻才允许清日志。
+    // 保存失败时保留日志（下次启动会提示存在未完成事务），并如实回报。
+    match result {
+        Ok(done) => {
+            clear_switch_journal();
+            Ok(done)
+        }
+        Err(error) => Err(format!(
+            "{error}；切换未完成，事务日志已保留，下次启动会提示按备份恢复"
+        )),
+    }
 }
 
 // ───────────────────────── Clash ─────────────────────────
@@ -1868,9 +1887,13 @@ fn show_main_window_cmd(app: tauri::AppHandle) {
     tray::show_main_window(&app);
 }
 
+/// 主窗口「退出」按钮：**P0-12** 走安全退出（先恢复系统状态，失败则不退出）。
+///
+/// 与托盘退出共用同一入口，避免两条路径行为不一致——只修托盘会让
+/// 用户从窗口退出时照样把防火墙规则留在系统上。
 #[tauri::command]
-fn quit_app_cmd(app: tauri::AppHandle) {
-    tray::quit_app(&app);
+async fn quit_app_cmd(app: tauri::AppHandle) -> Result<(), String> {
+    blocking(move || tray::request_safe_exit(&app)).await
 }
 
 /// 关闭主窗口 = 隐藏到托盘（真正的退出走托盘右键菜单）。
@@ -3026,10 +3049,19 @@ async fn egate_trip_now() -> Result<egate_trip::TripReport, String> {
         } else {
             config.egate_guarded_agents.clone()
         };
+        // **P0-08**：手动触发的隔离属于用户意图，必须在**施加隔离之前**
+        // 先把意图落盘。原实现是 trip() 返回后才写，且失败被忽略——
+        // 用户以为锁住了，自动恢复却按「没有手动保持」解除。
+        // 写意图失败则拒绝执行本次手动隔离（不制造无法保持的隔离状态）。
+        egate_monitor::mark_manual_hold()
+            .map_err(|e| format!("{e}；本次手动隔离已取消（否则自动恢复可能擅自解除它）"))?;
         let result = egate_trip::trip(&agents);
-        // **P0-07**：手动触发的隔离属于用户意图，自动恢复不得解除它。
-        if result.any_isolated {
-            egate_monitor::mark_manual_hold();
+        if !result.any_isolated && !result.all_isolated {
+            // 没有任何隔离实际生效：回滚意图，避免留下「手动保持」但系统上
+            // 根本没有隔离的矛盾状态。
+            if let Err(error) = egate_monitor::clear_manual_hold() {
+                log_error(&format!("清理未生效的手动隔离意图失败：{error}"));
+            }
         }
         Ok(result)
     })
@@ -3049,8 +3081,11 @@ async fn egate_release_now() -> Result<u32, String> {
                 report.failures.join("；")
             ));
         }
-        // **P0-07**：手动解除隔离时清除 ManualHold 意图。
-        egate_monitor::clear_manual_hold();
+        // **P0-07 / P0-08**：手动解除隔离时清除 ManualHold 意图。
+        // 清除失败必须报错：意图还在，下一次自动恢复仍会拒绝解除，
+        // 用户会以为「已经解除了」而实际没有。
+        egate_monitor::clear_manual_hold()
+            .map_err(|e| format!("隔离规则已清除，但{e}；请重试解除，否则自动恢复不会解除"))?;
         egate_monitor::clear_tripped();
         Ok(report.requested)
     })

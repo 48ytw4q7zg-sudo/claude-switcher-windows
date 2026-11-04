@@ -601,6 +601,26 @@ fn header_has_item(after: &[&str]) -> bool {
 /// - 原本不存在且未改动 → 无需处理（返回 Ok(false)）
 /// - 原本不存在但被创建 → 删除
 /// - 原本存在且有改动 → 写回原始内容
+///
+/// **P0-11**：回滚失败必须上报，不能 `let _ = ...` 吞掉。
+///
+/// 原实现多个错误分支用 `let _ = restore_merge(...)`：Merge.yaml 没恢复成功
+/// 也被当成「已回滚」，用户下次启动会看到一份半改过的配置，而且没有任何提示。
+///
+/// 返回给调用方拼进错误信息的说明文本（成功时为空串）。
+fn rollback_merge_or_report(
+    merge_path: &std::path::Path,
+    merge_original: Option<&str>,
+    merge_changed: bool,
+) -> String {
+    match restore_merge(merge_path, merge_original, merge_changed) {
+        Ok(_) => String::new(),
+        Err(error) => format!(
+            "；但 Merge.yaml 回滚失败（{error}），该文件可能仍处于半修改状态，             请用备份手动恢复后再重试"
+        ),
+    }
+}
+
 fn restore_merge(
     path: &std::path::Path,
     original: Option<&str>,
@@ -805,10 +825,11 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
         || group.contains('\n')
         || FORBIDDEN_GROUPS.contains(&group_trimmed.to_uppercase().as_str())
     {
-        let _ = restore_merge(&merge_path, merge_original.as_deref(), merge_changed);
-        return Err(
-            "代理组名为空、含逗号/换行或为内置策略名，请先在设置中选择 Clash 代理组".to_string(),
-        );
+        let rollback =
+            rollback_merge_or_report(&merge_path, merge_original.as_deref(), merge_changed);
+        return Err(format!(
+            "代理组名为空、含逗号/换行或为内置策略名，请先在设置中选择 Clash 代理组{rollback}"
+        ));
     }
     let policy = WebRtcPolicy::parse(app.webrtc_policy.as_deref());
     report
@@ -822,8 +843,9 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
     let new_text = match upsert_managed_block(&old, &block) {
         Ok(text) => text,
         Err(error) => {
-            let _ = restore_merge(&merge_path, merge_original.as_deref(), merge_changed);
-            return Err(error);
+            let rollback =
+                rollback_merge_or_report(&merge_path, merge_original.as_deref(), merge_changed);
+            return Err(format!("{error}{rollback}"));
         }
     };
 
@@ -833,16 +855,18 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
         let backup = if existed {
             let backup = backup_path_for(&script_path);
             if let Err(error) = std::fs::copy(&script_path, &backup) {
-                let _ = restore_merge(&merge_path, merge_original.as_deref(), merge_changed);
-                return Err(format!("备份 Script.js 失败: {error}"));
+                let rollback =
+                    rollback_merge_or_report(&merge_path, merge_original.as_deref(), merge_changed);
+                return Err(format!("备份 Script.js 失败: {error}{rollback}"));
             }
             Some(backup)
         } else {
             None
         };
         if let Err(error) = fsx::write_atomically(&script_path, &new_text) {
-            let _ = restore_merge(&merge_path, merge_original.as_deref(), merge_changed);
-            return Err(format!("写入 Script.js 失败: {error}"));
+            let rollback =
+                rollback_merge_or_report(&merge_path, merge_original.as_deref(), merge_changed);
+            return Err(format!("写入 Script.js 失败: {error}{rollback}"));
         }
         report.script_changed = true;
         report.script_backup = backup.as_ref().map(|b| b.to_string_lossy().to_string());

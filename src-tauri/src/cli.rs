@@ -148,10 +148,17 @@ fn run_egate_status() -> i32 {
         })),
         "network_cut_error": cut_error,
     });
+    // **QW-01**：状态无法确认时用专门的退出码，便于脚本/急救流程判断。
+    // 0 = 全部已知；3 = 有无法确认的项（规则查询失败或断网账本损坏）。
+    let unknown = rules.is_none() || cut_error.is_some();
     match serde_json::to_string_pretty(&status) {
         Ok(json) => {
             println!("{json}");
-            0
+            if unknown {
+                3
+            } else {
+                0
+            }
         }
         Err(error) => {
             eprintln!("序列化保护状态失败: {error}");

@@ -175,8 +175,53 @@ pub fn show_main_window(app: &AppHandle) {
     }
 }
 
-pub fn quit_app(app: &AppHandle) {
-    app.exit(0);
+/// **P0-12**：安全退出——先恢复系统状态并核验，成功后才真正退出。
+///
+/// 原实现直接 `app.exit(0)`：若退出时正处于应用隔离或全局断网状态，
+/// 防火墙规则会留在系统上，而用户以为"关掉工具就没事了"。
+///
+/// 顺序（与 ClaudeGuard v3.10 契约一致）：
+/// 1. `restore_all()` 内部先提交「停止保护」意图，再恢复网络与隔离；
+/// 2. 只有 `complete` 才退出；任何一项失败都**保持应用可用**，
+///    把未恢复的资源与急救命令显示出来，让用户还能手动处理。
+///
+/// 注意：这只是**正常退出**的路径，不能替代崩溃恢复（启动自愈 + `--egate-restore`）。
+pub fn request_safe_exit(app: &AppHandle) -> Result<(), String> {
+    let report = crate::egate_netcut::restore_all();
+    if report.complete {
+        app.exit(0);
+        return Ok(());
+    }
+    Err(format!(
+        "退出前恢复未完成，应用保持运行以免留下无法自动清理的系统状态。
+         未恢复的资源：{}
+         原因：{}
+         可在终端执行 `ClaudeSwitcher.exe --egate-restore` 单独执行急救恢复。",
+        if report.pending_resources.is_empty() {
+            "（未列出）".to_string()
+        } else {
+            report.pending_resources.join("、")
+        },
+        if report.failures.is_empty() {
+            report.note.clone()
+        } else {
+            report.failures.join("；")
+        }
+    ))
+}
+
+/// 安全退出被中止时提示用户（对话框 + 日志都已写过，不重复弹）。
+///
+/// **P0-12**：这里**不**强制退出。恢复失败时应用保持可用，用户才能
+/// 重试恢复或手动排查——强行退出等于把系统留在半保护状态。
+fn show_exit_blocked_notice(app: &AppHandle, error: &str) {
+    use tauri_plugin_notification::NotificationExt;
+    let _ = app
+        .notification()
+        .builder()
+        .title("退出已中止：系统保护未恢复")
+        .body(error)
+        .show();
 }
 
 /// 托盘菜单账号项 id 前缀，后接 profile id；点击即一键切换到该账号。
@@ -401,7 +446,13 @@ pub fn install_tray_handlers(app: &mut tauri::App) -> Result<(), String> {
                     let _ = refresh_tray_status(&handle);
                 });
             }
-            "tray-quit" => quit_app(app),
+            // **P0-12**：走安全退出（先恢复系统状态，失败则不退出）。
+            "tray-quit" => {
+                if let Err(error) = request_safe_exit(app) {
+                    crate::log_error(&format!("安全退出被中止：{error}"));
+                    show_exit_blocked_notice(app, &error);
+                }
+            }
             _ => {}
         }
     });

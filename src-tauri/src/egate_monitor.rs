@@ -268,38 +268,84 @@ struct ManualHoldState {
     since: u64,
 }
 
+/// **P0-08**：手动保持隔离的三态。
+///
+/// `Unknown`（账本损坏/不可读）**不等于**「没有手动保持」——自动恢复遇到
+/// `Unknown` 必须放弃解除，否则用户的明确要求会被静默推翻。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ManualHold {
+    /// 用户明确要求保持隔离。
+    Held,
+    /// 明确没有手动保持。
+    None,
+    /// 无法确认（读取失败或账本损坏）。
+    Unknown,
+}
+
 /// 用户手动执行隔离：写入 ManualHold 意图，自动恢复不得解除它。
-pub fn mark_manual_hold() {
+///
+/// **P0-08**：返回 `Result`。写不进去时调用方**不得**声称「手动保持成功」——
+/// 原实现吞掉写盘错误，用户以为锁住了，自动恢复却按「没有手动保持」解除。
+pub fn mark_manual_hold() -> Result<(), String> {
+    let path = isolation_intent_file().map_err(|e| format!("无法定位手动隔离意图文件：{e}"))?;
     let state = ManualHoldState {
         manual_hold: true,
         since: now_secs(),
     };
-    if let Ok(path) = isolation_intent_file() {
-        if let Ok(text) = serde_json::to_string_pretty(&state) {
-            let _ = crate::fsx::write_atomically(&path, &text);
+    let text =
+        serde_json::to_string_pretty(&state).map_err(|e| format!("序列化手动隔离意图失败：{e}"))?;
+    crate::fsx::write_atomically(&path, &text)
+        .map_err(|e| format!("写入手动隔离意图失败（自动恢复仍可能解除隔离）：{e}"))
+}
+
+/// 用户手动解除隔离：清除 ManualHold 意图。
+///
+/// **P0-08**：返回 `Result`——删除失败时意图仍然存在，下一次自动恢复
+/// 会继续拒绝解除，必须让用户知道。
+pub fn clear_manual_hold() -> Result<(), String> {
+    let path = isolation_intent_file().map_err(|e| format!("无法定位手动隔离意图文件：{e}"))?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("清除手动隔离意图失败：{error}")),
+    }
+}
+
+/// 读取手动保持隔离的当前状态（三态，见 [`ManualHold`]）。
+pub fn manual_hold_state() -> ManualHold {
+    let Ok(path) = isolation_intent_file() else {
+        return ManualHold::Unknown;
+    };
+    if !path.exists() {
+        return ManualHold::None;
+    }
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            crate::log_error(&format!(
+                "手动隔离意图无法读取（{error}），按「无法确认」处理：不会自动解除现有隔离"
+            ));
+            return ManualHold::Unknown;
+        }
+    };
+    let text = crate::jsonio::decode_text(&bytes);
+    match serde_json::from_str::<ManualHoldState>(&text) {
+        Ok(state) if state.manual_hold => ManualHold::Held,
+        Ok(_) => ManualHold::None,
+        Err(error) => {
+            crate::log_error(&format!(
+                "手动隔离意图文件损坏（{error}），按「无法确认」处理：不会自动解除现有隔离"
+            ));
+            ManualHold::Unknown
         }
     }
 }
 
-/// 用户手动解除隔离：清除 ManualHold 意图。
-pub fn clear_manual_hold() {
-    if let Ok(path) = isolation_intent_file() {
-        let _ = std::fs::remove_file(path);
-    }
-}
-
-/// 当前是否有用户手动保持的隔离（读取失败按 false——见 P0-NEW-04 的意图检查）。
+/// 兼容旧调用：是否有用户手动保持的隔离。
+///
+/// 只有**明确没有**才算 false；`Unknown` 也算 true（保守：不允许自动解除）。
 pub fn is_manual_hold() -> bool {
-    let Ok(path) = isolation_intent_file() else {
-        return false;
-    };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return false;
-    };
-    let text = crate::jsonio::decode_text(&bytes);
-    serde_json::from_str::<ManualHoldState>(&text)
-        .map(|state| state.manual_hold)
-        .unwrap_or(false)
+    !matches!(manual_hold_state(), ManualHold::None)
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

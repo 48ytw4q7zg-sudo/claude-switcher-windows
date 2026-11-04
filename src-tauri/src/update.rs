@@ -245,10 +245,40 @@ pub fn compute_sha256(bytes: &[u8]) -> String {
 }
 
 /// 下载 + 校验 + 安装更新（完整流程）。
+/// **P1-04**：更新前置检查——存在未完成的保护/恢复状态时拒绝安装。
+///
+/// 三类拦截：
+/// 1. 断网账本存在（网络被规则挡着，安装包可能根本下载不了，恢复逻辑也会被打断）；
+/// 2. 处于隔离状态（本产品防火墙规则仍在）；
+/// 3. 隔离状态无法确认（查询失败）——同样不能安装。
+fn ensure_no_protection_transaction() -> Result<(), String> {
+    if let Ok(Some(_)) = crate::egate_netcut::load_state() {
+        return Err(
+            "系统当前处于全局断网状态（存在断网账本）。请先执行「恢复网络」再更新，             否则更新会打断恢复流程"
+                .to_string(),
+        );
+    }
+    if crate::egate_monitor::is_tripped() || crate::egate_monitor::is_partial() {
+        return Err("系统当前处于应用隔离状态。请先解除隔离并确认出口正常后再更新。".to_string());
+    }
+    if crate::egate_monitor::is_trip_state_unknown() {
+        return Err(
+            "无法确认当前隔离状态（防火墙查询失败）。为避免更新打断恢复流程，             请先打开保护面板核对后再更新"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
 pub fn download_and_install_blocking(
     version: &str,
     sha256: &str,
 ) -> Result<UpdateInstallResult, String> {
+    // **P1-04**：更新前先确认没有正在进行的保护/恢复事务。
+    //
+    // 安装会替换正在运行的程序；若此刻系统处于隔离/断网/未知状态，
+    // 新版启动时看到的是「半恢复」现场，比不更新更危险。
+    ensure_no_protection_transaction()?;
     let asset_name = format!("ClaudeSwitcher_{version}_x64-setup.exe");
     let url = format!(
         "https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/download/v{version}/{asset_name}"

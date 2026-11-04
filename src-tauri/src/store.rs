@@ -787,6 +787,26 @@ pub fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<
     }
 }
 
+/// **P0-04**：在一个**持锁的一致视图**里读取账号库并执行闭包，**不写回**。
+///
+/// 用途：导出迁移包时必须同时看到「账号库」和「desktop-accounts 快照目录」的
+/// 同一时刻状态。原来的做法是先 `load_store()` 再遍历目录——两步之间如果有
+/// 另一个进程正在切换/捕获 Desktop 快照，就会导出一个混合了两代数据的包，
+/// 而且加密校验完全通过（没人能发现）。
+///
+/// 锁顺序与 [`with_store`] 完全一致（跨进程锁 → 进程内 Mutex），因此导出
+/// 期间任何会改账号库或快照的操作（切换/捕获/导入）都会被挡在门外。
+/// 闭包内**禁止**调用任何获取 STORE_LOCK 的函数（会自死锁）。
+pub fn with_store_read<T>(f: impl FnOnce(&Store) -> Result<T, String>) -> Result<T, String> {
+    let _reentry = ReentryGuard::enter()?;
+    let _process_lock = CrossProcessLock::acquire()?;
+    let _guard = STORE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let store_data = load_store()?;
+    f(&store_data)
+}
+
 /// 只读轻量元数据（H-9）：托盘菜单 / CLI / 状态只需要 id / 名称 / uuid / email。
 #[derive(Debug, Clone)]
 pub struct LightProfile {

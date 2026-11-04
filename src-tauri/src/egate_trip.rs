@@ -97,12 +97,17 @@ pub fn rule_name_for_exe(agent: &str, direction: &str, exe: &str) -> String {
     format!("{} {suffix}", rule_name(agent, direction))
 }
 
-/// 结束一个应用的全部进程（按进程名）。返回被结束的进程描述。
+/// 结束一个应用的全部进程（按进程名 + 映像路径判定 GUI/CLI）。
+///
+/// **P0-09**：不能只用 `kill_processes_by_names`。Windows 的进程名匹配
+/// 大小写不敏感，`Claude` 与 `claude` 会同时命中桌面版与 Claude Code 原生 CLI。
+/// 这里复用 `kill_desktop_app_processes`（按映像路径排除 node/npm/nvm 等 CLI 宿主），
+/// 与旧保镖采用同一套策略。
 pub fn kill_agent_processes(agent: &str) -> Result<Vec<String>, String> {
     let Some((_, exe_names)) = agent_spec(agent) else {
         return Ok(Vec::new());
     };
-    crate::platform::imp::kill_processes_by_names(exe_names)
+    crate::platform::imp::kill_desktop_app_processes(exe_names)
 }
 
 /// 枚举当前运行的被守护应用进程（pid → 应用 id）。
@@ -218,10 +223,25 @@ pub fn resolve_agent_exe_candidates(agent: &str) -> Vec<ExeCandidate> {
              }}\n\
            }}\n\
          }}\n\
-         # 3) MSIX 包安装位置\n\
-         foreach ($pkg in @(Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue)) {{\n\
-           if ($pkg.InstallLocation) {{ [void]$found.Add(@{{ path = $pkg.InstallLocation; source = 'msix' }}) }}\n\
-         }}\n\
+         # 3) MSIX 包：InstallLocation 是**目录**不是 exe。
+         #    从包清单 AppxManifest.xml 的 Application Executable 取真实可执行文件，
+         #    拼成完整路径并确认是文件；取不到就跳过，绝不把目录当 exe。
+         foreach ($pkg in @(Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue)) {{
+           if (-not $pkg.InstallLocation) {{ continue }}
+           $manifest = Join-Path $pkg.InstallLocation 'AppxManifest.xml'
+           if (-not (Test-Path -LiteralPath $manifest)) {{ continue }}
+           try {{
+             [xml]$doc = Get-Content -LiteralPath $manifest -ErrorAction Stop
+             foreach ($app in @($doc.Package.Applications.Application)) {{
+               $rel = $app.Executable
+               if (-not $rel) {{ continue }}
+               $full = Join-Path $pkg.InstallLocation $rel
+               if (Test-Path -LiteralPath $full -PathType Leaf) {{
+                 [void]$found.Add(@{{ path = $full; source = 'msix' }})
+               }}
+             }}
+           }} catch {{ }}
+         }}
          ConvertTo-Json -InputObject @($found) -Compress",
         names = names,
         exe_files = exe_files
@@ -284,11 +304,52 @@ struct RuleVerification {
     failed: Vec<String>,
 }
 
+/// 一条**预期存在的规则**：名称、方向、程序路径三者绑定。
+///
+/// **P0-01**：创建与核验必须共用同一份预期清单。原实现创建用
+/// `rule_name_for_exe()`（带路径哈希后缀），核验却在 PowerShell 里重新拼
+/// `"{prefix} {agent} {Out|In}"`（无后缀）——新建的规则永远核验不到，
+/// `coverage_complete` 恒为 false。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExpectedRule {
+    pub name: String,
+    /// `"Out"` / `"In"`（用于失败说明）。
+    pub dir: String,
+    /// 期望的 `Direction` 值：`Outbound` / `Inbound`。
+    pub direction: &'static str,
+    pub exe: String,
+}
+
+/// 为「应用 × 每个 exe × 每个方向」生成完整的预期规则集合。
+///
+/// 这是**唯一**的规则标识来源：创建与核验都调用它，不允许任何一方自行拼接。
+pub fn expected_rules(agent: &str, exes: &[String]) -> Vec<ExpectedRule> {
+    let mut out = Vec::with_capacity(exes.len() * 2);
+    for exe in exes {
+        out.push(ExpectedRule {
+            name: rule_name_for_exe(agent, "Out", exe),
+            dir: "Out".to_string(),
+            direction: "Outbound",
+            exe: exe.clone(),
+        });
+        out.push(ExpectedRule {
+            name: rule_name_for_exe(agent, "In", exe),
+            dir: "In".to_string(),
+            direction: "Inbound",
+            exe: exe.clone(),
+        });
+    }
+    out
+}
+
 /// 查询某个应用在**全部已解析路径**上的规则是否完整生效。
 ///
 /// **P0-08**：期望集合从 `exe × 2 方向` 扩展为
 /// `每一条候选 exe × 出站/入站`。多路径（用户级 + 系统级 + MSIX 共存）时
 /// 只覆盖其中一份等于没隔离——另一份照样能联网。
+///
+/// **P0-01**：预期清单由 [`expected_rules`] 生成后**整体传给 PowerShell**，
+/// 脚本只用传入的名称查询，绝不自行拼接。
 ///
 /// 核验的每条规则必须同时满足：
 /// 1. 存在且启用（`Enabled=True`）；
@@ -298,7 +359,9 @@ struct RuleVerification {
 ///    能看到它。只查配置对象（`PersistentStore`）不等于证明阻断已生效：
 ///    组策略可能覆盖或禁用本地规则。
 fn count_rules_for(agent: &str, exes: &[String]) -> RuleVerification {
-    if exes.is_empty() {
+    let expected_rules = expected_rules(agent, exes);
+    let expected = expected_rules.len() as u32;
+    if expected_rules.is_empty() {
         return RuleVerification {
             query_ok: true,
             expected: 0,
@@ -306,61 +369,58 @@ fn count_rules_for(agent: &str, exes: &[String]) -> RuleVerification {
             failed: vec!["没有可核验的可执行文件路径".to_string()],
         };
     }
-    let exe_list = exes
+    // 把「名称 + 方向 + 程序」打包成 JSON 传入脚本：脚本不拼接规则名。
+    let spec = expected_rules
         .iter()
-        .map(|e| ps_quote(e))
-        .collect::<Vec<_>>()
-        .join(",");
+        .map(|rule| {
+            serde_json::json!({
+                "name": rule.name,
+                "dir": rule.dir,
+                "direction": rule.direction,
+                "exe": rule.exe,
+            })
+        })
+        .collect::<Vec<_>>();
+    let spec_json = serde_json::to_string(&spec).unwrap_or_else(|_| "[]".to_string());
     let script = format!(
-        "$ErrorActionPreference='Stop'
-         $agent = {agent}
-         $exes = @({exe_list})
-         $dirs = @(
-           @{{ dir = 'Out'; suffix = 'Out'; expect = 'Outbound' }},
-           @{{ dir = 'In';  suffix = 'In';  expect = 'Inbound' }}
-         )
-         $results = New-Object System.Collections.ArrayList
-         foreach ($exe in $exes) {{
-           foreach ($d in $dirs) {{
-             $name = \"{prefix} $agent $($d.suffix)\"
-             $ok = $false
-             $reason = ''
-             try {{
-               $r = Get-NetFirewallRule -DisplayName $name -PolicyStore PersistentStore -ErrorAction Stop | Select-Object -First 1
-               if (-not $r) {{ $reason = '规则不存在' }}
-               else {{
-                 $f = $r | Get-NetFirewallApplicationFilter
-                 if ($r.Enabled -ne 'True') {{ $reason = '规则未启用' }}
-                 elseif ($r.Action -ne 'Block') {{ $reason = '动作不是阻断' }}
-                 elseif ($r.Direction -ne $d.expect) {{ $reason = '方向不符' }}
-                 elseif (-not $f.Program) {{ $reason = '规则未绑定程序' }}
-                 elseif ($f.Program -ine $exe) {{ $reason = '程序路径不匹配' }}
-                 else {{
-                   # 再确认该规则在**当前生效策略**（ActiveStore）里也存在。
-                   $active = @(Get-NetFirewallRule -DisplayName $name -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
-                   if ($active.Count -eq 0) {{ $reason = '未进入当前生效策略（可能被组策略覆盖）' }}
-                   else {{
-                     $ar = $active | Select-Object -First 1
-                     if ($ar.Enabled -ne 'True' -or $ar.Action -ne 'Block') {{
-                       $reason = '生效策略中的规则属性不符'
-                     }} else {{ $ok = $true }}
-                   }}
-                 }}
-               }}
-             }} catch {{ $reason = '规则不存在' }}
-             [void]$results.Add(@{{ exe = $exe; dir = $d.dir; ok = $ok; reason = $reason }})
-           }}
-         }}
+        "$ErrorActionPreference='Stop'\n\
+         $json = {spec} \n\
+         $specs = $json | ConvertFrom-Json\n\
+         $results = New-Object System.Collections.ArrayList\n\
+         foreach ($s in $specs) {{\n\
+           $ok = $false\n\
+           $reason = ''\n\
+           try {{\n\
+             $r = Get-NetFirewallRule -DisplayName $s.name -PolicyStore PersistentStore -ErrorAction Stop | Select-Object -First 1\n\
+             if (-not $r) {{ $reason = '规则不存在' }}\n\
+             else {{\n\
+               $f = $r | Get-NetFirewallApplicationFilter\n\
+               if ($r.Enabled -ne 'True') {{ $reason = '规则未启用' }}\n\
+               elseif ($r.Action -ne 'Block') {{ $reason = '动作不是阻断' }}\n\
+               elseif ($r.Direction -ne $s.direction) {{ $reason = '方向不符' }}\n\
+               elseif (-not $f.Program) {{ $reason = '规则未绑定程序' }}\n\
+               elseif ($f.Program -ine $s.exe) {{ $reason = '程序路径不匹配' }}\n\
+               else {{\n\
+                 $active = @(Get-NetFirewallRule -DisplayName $s.name -PolicyStore ActiveStore -ErrorAction SilentlyContinue)\n\
+                 if ($active.Count -eq 0) {{ $reason = '未进入当前生效策略（可能被组策略覆盖）' }}\n\
+                 else {{\n\
+                   $ar = $active | Select-Object -First 1\n\
+                   if ($ar.Enabled -ne 'True' -or $ar.Action -ne 'Block') {{ $reason = '生效策略中的规则属性不符' }}\n\
+                   else {{ $ok = $true }}\n\
+                 }}\n\
+               }}\n\
+             }}\n\
+           }} catch {{ $reason = '规则不存在' }}\n\
+           [void]$results.Add(@{{ name = $s.name; dir = $s.dir; exe = $s.exe; ok = $ok; reason = $reason }})\n\
+         }}\n\
          ConvertTo-Json -InputObject @($results) -Compress",
-        agent = ps_quote(agent),
-        exe_list = exe_list,
-        prefix = RULE_PREFIX
+        spec = ps_quote(&spec_json)
     );
     match crate::platform::imp::run_powershell(&script) {
-        Ok(json) => parse_rule_verification(&json, exes.len() as u32 * 2),
+        Ok(json) => parse_rule_verification_expected(&json, &expected_rules),
         Err(_) => RuleVerification {
             query_ok: false,
-            expected: exes.len() as u32 * 2,
+            expected,
             verified: 0,
             failed: vec!["规则查询失败（无法确认隔离是否生效）".to_string()],
         },
@@ -368,13 +428,14 @@ fn count_rules_for(agent: &str, exes: &[String]) -> RuleVerification {
 }
 
 /// 解析规则核验 JSON（严格：无法解析即 `query_ok=false`，绝不当作通过）。
-fn parse_rule_verification(json: &str, expected: u32) -> RuleVerification {
+fn parse_rule_verification_expected(json: &str, expected: &[ExpectedRule]) -> RuleVerification {
+    let expected_count = expected.len() as u32;
     let value: serde_json::Value = match serde_json::from_str(json.trim()) {
         Ok(value) => value,
         Err(_) => {
             return RuleVerification {
                 query_ok: false,
-                expected,
+                expected: expected_count,
                 verified: 0,
                 failed: vec!["规则查询结果无法解析".to_string()],
             }
@@ -386,33 +447,76 @@ fn parse_rule_verification(json: &str, expected: u32) -> RuleVerification {
         _ => {
             return RuleVerification {
                 query_ok: false,
-                expected,
+                expected: expected_count,
                 verified: 0,
                 failed: vec!["规则查询结果格式异常".to_string()],
             }
         }
     };
-    let mut verified = 0u32;
-    let mut failed = Vec::new();
-    for item in items {
-        let exe = item.get("exe").and_then(|v| v.as_str()).unwrap_or("?");
+    // **QW-03**：结果必须与预期集合**逐项按名称匹配**。
+    //
+    // 原实现只统计 `ok=true` 的条数：脚本若返回重复条目（或返回了不属于预期
+    // 集合的名称），条数照样能凑够 expected，于是「数量对上了」被当成完整覆盖。
+    // 现在按规则名建立映射，每个预期名称恰好计一次；未出现、重复出现或
+    // 名称不属于预期集合，都不计入 verified。
+    let mut seen: std::collections::BTreeMap<&str, (bool, String)> =
+        std::collections::BTreeMap::new();
+    let mut unknown_names: Vec<String> = Vec::new();
+    for item in &items {
+        let name = item.get("name").and_then(|v| v.as_str()).unwrap_or("");
         let dir = item.get("dir").and_then(|v| v.as_str()).unwrap_or("?");
+        let exe = item.get("exe").and_then(|v| v.as_str()).unwrap_or("?");
         // `ok` 必须是明确的布尔值：缺字段一律按失败处理（不能 filter_map 丢掉）。
         let ok = item.get("ok").and_then(|v| v.as_bool()).unwrap_or(false);
-        if ok {
-            verified += 1;
-        } else {
-            let reason = item
-                .get("reason")
-                .and_then(|v| v.as_str())
-                .filter(|s| !s.is_empty())
-                .unwrap_or("原因未知");
-            failed.push(format!("{dir} {exe}：{reason}"));
+        let reason = item
+            .get("reason")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("原因未知")
+            .to_string();
+        if !expected.iter().any(|rule| rule.name == name) {
+            unknown_names.push(format!("{name}（{dir} {exe}）"));
+            continue;
         }
+        match seen.get(name) {
+            // 同名重复结果：只要有一条不 ok 就按失败记（保守）。
+            Some((prev_ok, _)) => {
+                if !ok {
+                    seen.insert(name, (false, reason));
+                } else if !prev_ok {
+                    // 保持失败状态。
+                }
+            }
+            None => {
+                seen.insert(name, (ok, reason));
+            }
+        }
+    }
+    let mut verified = 0u32;
+    let mut failed = Vec::new();
+    for rule in expected {
+        match seen.get(rule.name.as_str()) {
+            Some((true, _)) => verified += 1,
+            Some((false, reason)) => failed.push(format!("{} {}：{reason}", rule.dir, rule.exe)),
+            None => failed.push(format!("{} {}：核验结果中缺少该规则", rule.dir, rule.exe)),
+        }
+    }
+    if !unknown_names.is_empty() {
+        // 脚本返回了不属于预期集合的规则：说明名称拼接或查询范围有问题，
+        // 不能当作查询成功。
+        return RuleVerification {
+            query_ok: false,
+            expected: expected_count,
+            verified,
+            failed: vec![format!(
+                "核验结果包含非预期规则：{}",
+                unknown_names.join("、")
+            )],
+        };
     }
     RuleVerification {
         query_ok: true,
-        expected,
+        expected: expected_count,
         verified,
         failed,
     }
@@ -481,26 +585,27 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
     //
     // 规则名带上路径的稳定哈希后缀：同一应用多路径共存时，每条规则对应一个
     // 具体程序，既不会互相覆盖，也能在升级后按旧路径精确清理。
-    for exe in &exes {
-        for (direction, label) in [("out", "Out"), ("in", "In")] {
-            let name = rule_name_for_exe(agent, label, exe);
-            let script = format!(
-                "$ErrorActionPreference='Stop'\n\
-                 $existing = Get-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue\n\
-                 if (-not $existing) {{\n\
-                   New-NetFirewallRule -DisplayName {} -Direction {} -Action Block -Program {} -Enabled True | Out-Null\n\
-                 }}",
-                ps_quote(&name),
-                ps_quote(&name),
-                if direction == "out" { "Outbound" } else { "Inbound" },
-                ps_quote(exe)
-            );
-            match crate::platform::imp::run_powershell(&script) {
-                Ok(_) => report.rules_added += 1,
-                Err(error) => report
-                    .note
-                    .push_str(&format!("添加 {exe} 的{label}站规则失败（{error}）；")),
-            }
+    // **P0-01**：规则名来自 [`expected_rules`]——与核验使用的是**同一份**清单。
+    // 任何一方自行拼接名称都会让新建的规则永远核验不到。
+    for rule in expected_rules(agent, &exes) {
+        let script = format!(
+            "$ErrorActionPreference='Stop'\n\
+             $existing = Get-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue\n\
+             if (-not $existing) {{\n\
+               New-NetFirewallRule -DisplayName {} -Direction {} -Action Block -Program {} -Enabled True | Out-Null\n\
+             }}",
+            ps_quote(&rule.name),
+            ps_quote(&rule.name),
+            rule.direction,
+            ps_quote(&rule.exe)
+        );
+        match crate::platform::imp::run_powershell(&script) {
+            Ok(_) => report.rules_added += 1,
+            Err(error) => report.note.push_str(&format!(
+                "添加 {} 的{}站规则失败（{error}）；",
+                rule.exe,
+                if rule.dir == "Out" { "出" } else { "入" }
+            )),
         }
     }
 
@@ -818,42 +923,78 @@ mod tests {
         // 规则名仍落在可被 `rule_count()` 通配统计的前缀下。
         assert!(a.starts_with(RULE_PREFIX), "{a}");
     }
-
-    /// **P0-08**：核验解析必须严格——缺 `ok` 字段、非数组/对象都算查询失败，
-    /// 不能因为 `filter_map` 而静默当成「全部通过」。
+    /// **P0-01 / QW-03**：核验解析必须与**预期规则集合**逐项按名称匹配。
+    ///
+    /// 关键回归：预期清单来自 `expected_rules()`（带路径哈希后缀），
+    /// 若解析端还在按另一个名字匹配，新建的规则永远核验不到。
     #[test]
-    fn rule_verification_parser_is_strict() {
-        // 正常：2 条通过。
-        let ok = parse_rule_verification(
-            r#"[{"exe":"C:\\a.exe","dir":"Out","ok":true,"reason":""},{"exe":"C:\\a.exe","dir":"In","ok":true,"reason":""}]"#,
-            2,
+    fn rule_verification_matches_expected_names() {
+        let exes = vec![r"C:.exe".to_string()];
+        let expected = expected_rules("claude", &exes);
+        assert_eq!(expected.len(), 2);
+        let out_name = &expected[0].name;
+        let in_name = &expected[1].name;
+        // 规则名必须包含路径哈希后缀（与旧格式区分）。
+        assert!(
+            out_name.starts_with("ClaudeSwitcher AppIsolation claude Out "),
+            "{out_name}"
         );
+
+        // 正常：两条都通过。
+        let ok_json = serde_json::json!([
+            {"name": out_name, "dir": "Out", "exe": exes[0], "ok": true, "reason": ""},
+            {"name": in_name,  "dir": "In",  "exe": exes[0], "ok": true, "reason": ""},
+        ])
+        .to_string();
+        let ok = parse_rule_verification_expected(&ok_json, &expected);
         assert!(ok.query_ok);
         assert_eq!(ok.verified, 2);
         assert!(ok.failed.is_empty());
 
-        // 一条失败：原因必须被保留。
-        let partial = parse_rule_verification(
-            r#"[{"exe":"C:\\a.exe","dir":"Out","ok":true},{"exe":"C:\\a.exe","dir":"In","ok":false,"reason":"未进入当前生效策略（可能被组策略覆盖）"}]"#,
-            2,
-        );
+        // 一条失败：原因必须保留。
+        let partial_json = serde_json::json!([
+            {"name": out_name, "dir": "Out", "exe": exes[0], "ok": true},
+            {"name": in_name,  "dir": "In",  "exe": exes[0], "ok": false,
+             "reason": "未进入当前生效策略（可能被组策略覆盖）"},
+        ])
+        .to_string();
+        let partial = parse_rule_verification_expected(&partial_json, &expected);
         assert!(partial.query_ok);
         assert_eq!(partial.verified, 1);
-        assert_eq!(partial.failed.len(), 1);
         assert!(
             partial.failed[0].contains("生效策略"),
             "{:?}",
             partial.failed
         );
 
-        // 缺少 ok 字段：不能当成通过。
-        let missing = parse_rule_verification(r#"[{"exe":"C:\\a.exe","dir":"Out"}]"#, 1);
+        // **P0-01 回归**：脚本返回**旧格式名字**（无后缀）→ 视为非预期规则，
+        // 查询失败；绝不能因为「条数凑够」而判为完整覆盖。
+        let legacy_json = serde_json::json!([
+            {"name": "ClaudeSwitcher AppIsolation claude Out", "dir": "Out", "exe": exes[0], "ok": true},
+            {"name": "ClaudeSwitcher AppIsolation claude In",  "dir": "In",  "exe": exes[0], "ok": true},
+        ])
+        .to_string();
+        let legacy = parse_rule_verification_expected(&legacy_json, &expected);
+        assert!(!legacy.query_ok, "旧格式名字必须被判为查询失败");
+        assert_eq!(legacy.verified, 0);
+
+        // **QW-03**：重复结果不能凑数。
+        let dup_json = serde_json::json!([
+            {"name": out_name, "dir": "Out", "exe": exes[0], "ok": true},
+            {"name": out_name, "dir": "Out", "exe": exes[0], "ok": true},
+        ])
+        .to_string();
+        let dup = parse_rule_verification_expected(&dup_json, &expected);
+        assert_eq!(dup.verified, 1, "同名重复只能算一次");
+
+        // 缺少结果条目 → 该条按失败记。
+        let missing = parse_rule_verification_expected("[]", &expected);
         assert_eq!(missing.verified, 0);
-        assert_eq!(missing.failed.len(), 1);
+        assert_eq!(missing.failed.len(), 2);
 
         // 非预期形状：查询失败（不是「零失败」）。
-        assert!(!parse_rule_verification("not json", 2).query_ok);
-        assert!(!parse_rule_verification("123", 2).query_ok);
+        assert!(!parse_rule_verification_expected("not json", &expected).query_ok);
+        assert!(!parse_rule_verification_expected("123", &expected).query_ok);
     }
 
     /// 候选路径解析：去重、忽略空路径、保留来源。

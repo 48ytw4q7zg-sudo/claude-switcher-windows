@@ -231,15 +231,30 @@ pub fn guard_tick() -> GuardTick {
     // 但只接受**明确有效**的代理地址：Unsupported（socks/PAC/坏端口）与
     // 缺地址都不能算「可用」，否则开着代理却仍判正常会放行不安全流量。
     let system_proxy_mode = crate::egate_check::read_proxy_evidence();
-    let use_system_proxy = system_proxy_mode.enable
-        && matches!(
-            crate::egate_access::parse_proxy_server(system_proxy_mode.server.as_deref()),
-            crate::egate_access::ProxyParse::Http(_)
-        );
+    // **P0-13**：语法有效还不够，代理端口必须真的能连上。
+    // 三个状态分开：地址有效 → 本地端口可连 → 出口已验证（最后一项由门禁负责）。
+    let proxy_addr =
+        match crate::egate_access::parse_proxy_server(system_proxy_mode.server.as_deref()) {
+            crate::egate_access::ProxyParse::Http(addr) if system_proxy_mode.enable => {
+                // 回环地址才做端口探测；外部代理地址探测会变成对第三方的连接尝试。
+                if crate::egate_access::is_loopback_host(&addr) {
+                    let reachable = crate::egate_access::proxy_port_reachable(&addr);
+                    Some((addr, reachable))
+                } else {
+                    Some((addr, true))
+                }
+            }
+            _ => None,
+        };
+    let use_system_proxy = proxy_addr.is_some();
+    let proxy_usable = proxy_addr
+        .as_ref()
+        .map(|(_, reachable)| *reachable)
+        .unwrap_or(false);
 
     let alive_now = if use_system_proxy {
-        // 系统代理已开启：客户端在线即视为接入正常（TUN 不强制）。
-        client_up
+        // 系统代理已开启：客户端在线 **且代理端口可连** 才算接入正常（TUN 不强制）。
+        client_up && proxy_usable
     } else {
         // TUN 模式：客户端 + TUN 都必须在线。
         tun_up && client_up
@@ -248,7 +263,7 @@ pub fn guard_tick() -> GuardTick {
     let prev_offline = OFFLINE.swap(!alive_now, Ordering::SeqCst);
     let (alive, log_offline, should_kill) = if use_system_proxy {
         // 系统代理模式下 TUN 缺失不算离线。
-        tick_decision(true, client_up, prev_offline)
+        tick_decision(true, client_up && proxy_usable, prev_offline)
     } else {
         tick_decision(tun_up, client_up, prev_offline)
     };

@@ -218,6 +218,37 @@ pub fn plan_route(path: &AccessPath) -> ProbeRoute {
     }
 }
 
+/// 是否为回环地址（`127.0.0.1` / `localhost` / `[::1]`）。
+///
+/// 只有回环代理才适合做端口探测：对外部主机做 TCP connect 等于主动探测第三方。
+pub fn is_loopback_host(addr: &str) -> bool {
+    let host = match addr.rsplit_once(':') {
+        Some((host, _)) => host.trim_matches(|c| c == '[' || c == ']'),
+        None => addr,
+    };
+    let host = host.to_ascii_lowercase();
+    host == "localhost" || host == "::1" || host.starts_with("127.") || host == "0.0.0.0"
+}
+
+/// **P0-13**：探测本地代理端口是否真的可连接。
+///
+/// 「内核进程存在」不等于「代理在监听」：Clash 崩溃重启中、端口被改、
+/// 或被别的程序占用时，进程还在但代理不可用。保镖若只看进程名，
+/// 就会把这种状态判成「接入正常」而放行。
+///
+/// 只做**一次** TCP connect（超时 300ms），不做 HTTP 请求——真实出口是否
+/// 经过代理仍由门禁的显式代理探测决定，不能把"端口通"当成"出口已验证"。
+pub fn proxy_port_reachable(addr: &str) -> bool {
+    use std::net::{TcpStream, ToSocketAddrs};
+    let Ok(mut addrs) = addr.to_socket_addrs() else {
+        return false;
+    };
+    let Some(socket) = addrs.next() else {
+        return false;
+    };
+    TcpStream::connect_timeout(&socket, std::time::Duration::from_millis(300)).is_ok()
+}
+
 /// `ProxyServer` 解析结果。
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ProxyParse {
@@ -633,5 +664,50 @@ mod tests {
         assert!(bypass_hits_host("claude.ai", "claude.ai"));
         assert!(bypass_hits_host("*.claude.ai", "api.claude.ai"));
         assert!(!bypass_hits_host("claude.ai", "notclaude.ai"));
+    }
+
+    // ── P0-13：本地代理端口探测 ──
+
+    #[test]
+    fn loopback_host_detection() {
+        for addr in [
+            "127.0.0.1:7890",
+            "127.1.2.3:1080",
+            "localhost:8080",
+            "[::1]:7890",
+        ] {
+            assert!(is_loopback_host(addr), "{addr} 应判定为回环");
+        }
+        for addr in ["10.0.0.5:7890", "192.168.1.1:80", "proxy.example.com:8080"] {
+            assert!(!is_loopback_host(addr), "{addr} 不应判定为回环");
+        }
+    }
+
+    /// 关闭的端口必须判为不可达；这直接决定保镖会不会误判「代理可用」。
+    ///
+    /// 用一个**必然连不上**的地址：`192.0.2.0/24` 是 RFC 5737 保留的文档网段，
+    /// 不会有主机响应；300ms 超时后必须返回 false。
+    #[test]
+    fn unreachable_endpoint_is_not_reachable() {
+        // 先占一个端口再释放，得到本机上一个确定没有监听者的端口号。
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let closed = listener.local_addr().unwrap().to_string();
+        drop(listener);
+        assert!(
+            !proxy_port_reachable(&closed),
+            "本机已关闭的端口必须判为不可达（否则保镖会把断开的代理当成可用）"
+        );
+        // 非法输入也不能 panic，只能返回 false。
+        assert!(!proxy_port_reachable(""));
+        assert!(!proxy_port_reachable("127.0.0.1"));
+    }
+
+    /// 本机实际监听的端口必须判为可达。
+    #[test]
+    fn listening_port_is_reachable() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        assert!(proxy_port_reachable(&addr), "{addr} 在监听，应判为可达");
+        drop(listener);
     }
 }

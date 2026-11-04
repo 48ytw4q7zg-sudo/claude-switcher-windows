@@ -361,15 +361,38 @@ pub(crate) fn restore_locked(_guard: &crate::egate_lock::OperationGuard) -> (boo
 
     // 顺序：先恢复网卡、最后删规则——恢复过程中网络始终被规则挡着。
     if let Some(state) = &state {
-        // P0-03：以**完整计划**为准恢复（覆盖「执行成功但进度没写」的情形）。
-        let adapters = state.adapters_to_restore().to_vec();
-        if !adapters.is_empty() {
-            // 启用网卡并核验。
-            if let Err(error) = enable_nics(&adapters) {
-                failures.push(format!("启用网卡失败：{error}"));
+        // **P0-06**：优先按 `adapter_snapshots` 里的 **GUID** 恢复。
+        //
+        // - 只恢复「本次事务确实禁用过」且「原始管理状态为 Up」的设备；
+        // - GUID 找不到时保留账本并报出具体设备，不拿同名设备顶替；
+        // - 只有**旧账本**（没有 GUID）才回退到名称路径。
+        let snapshots: Vec<AdapterSnapshot> = state
+            .adapter_snapshots
+            .iter()
+            .filter(|snap| !snap.guid.trim().is_empty() && snap.admin_up)
+            .cloned()
+            .collect();
+        let (restored_guids, guid_failures) = enable_nics_by_guid(&snapshots);
+        failures.extend(guid_failures);
+        let _ = restored_guids;
+
+        // 兼容路径：旧账本只有名称，或计划里有快照没覆盖到的名称。
+        let legacy_names: Vec<String> = state
+            .adapters_to_restore()
+            .iter()
+            .filter(|name| {
+                !state
+                    .adapter_snapshots
+                    .iter()
+                    .any(|snap| &snap.name == *name && !snap.guid.trim().is_empty())
+            })
+            .cloned()
+            .collect();
+        if !legacy_names.is_empty() {
+            if let Err(error) = enable_nics(&legacy_names) {
+                failures.push(format!("按名称启用网卡失败（旧账本兼容路径）：{error}"));
             } else {
-                // 回查：确认网卡确实已 Up（驱动加载可能延迟）。
-                match verify_nics_up(&adapters) {
+                match verify_nics_up(&legacy_names) {
                     Ok(gone) if !gone.is_empty() => {
                         failures.push(format!("网卡未能恢复（可能驱动延迟）：{}", gone.join("、")));
                     }
@@ -503,6 +526,15 @@ fn ensure_firewall_cut_rule() -> Result<(), String> {
             remove_cut_rule()?;
         }
         RuleState::Absent => {}
+        // **P0-07**：无法确认时**不重建也不宣称成功**。
+        // 盲目重建可能在组策略覆盖下反复失败，甚至与用户安全策略冲突。
+        RuleState::Unknown => {
+            return Err(
+                "阻断规则状态无法确认（不在当前生效策略内、防火墙配置关闭或查询失败）；\
+                 为避免误报「已断网」，本次断网视为未完成"
+                    .to_string(),
+            )
+        }
     }
     let script = format!(
         "$ErrorActionPreference='Stop'\n\
@@ -519,18 +551,51 @@ fn ensure_firewall_cut_rule() -> Result<(), String> {
 /// 规则核验三态：存在且正确 / 不存在 / 存在但属性不符。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RuleState {
+    /// 规则存在、属性正确，且在当前生效策略下确实阻断。
     Present,
+    /// 明确不存在。
     Absent,
+    /// 存在但属性不符（可安全删除重建）。
     WrongAttributes,
+    /// **P0-07**：无法确认（不在 ActiveStore / 防火墙配置关闭 / 查询失败）。
+    /// 这种情况**不得**报告成功，也**不得**盲目删除规则。
+    Unknown,
 }
 
 /// 查询规则并**核验属性**（严格解析，任何非预期输出都报错）。
 fn query_cut_rule() -> Result<RuleState, String> {
+    // **P0-07**：不能只看「找到的第一条同名规则」。
+    //
+    // 1. 同名规则可能有多条（重复创建/组策略残留）——必须**全部**属性正确；
+    // 2. 只有出现在 `ActiveStore`（当前生效策略）里才算真的阻断生效；
+    // 3. 数据面（`Get-NetFirewallProfile`）若整体关闭，规则存在也不生效；
+    // 4. 查询本身失败（权限、服务停止）返回 **Unknown**，绝不返回 Present。
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'\n\
-         $r = @(Get-NetFirewallRule -DisplayName {}) | Select-Object -First 1\n\
-         if (-not $r) {{ 'absent' }} elseif ($r.Enabled -eq 'True' -and $r.Direction -eq 'Outbound' -and $r.Action -eq 'Block') {{ 'present' }} else {{ 'wrong' }}",
-        ps_quote(CUT_RULE)
+        "$ErrorActionPreference='Stop'
+         $name = {name}
+         try {{
+           $rules = @(Get-NetFirewallRule -DisplayName $name -PolicyStore PersistentStore -ErrorAction Stop)
+           if ($rules.Count -eq 0) {{ 'absent'; exit 0 }}
+           foreach ($r in $rules) {{
+             if ($r.Enabled -ne 'True' -or $r.Direction -ne 'Outbound' -or $r.Action -ne 'Block') {{ 'wrong'; exit 0 }}
+           }}
+           # 生效策略里必须也能看到同名且启用+阻断的规则。
+           $active = @(Get-NetFirewallRule -DisplayName $name -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
+           $activeOk = $false
+           foreach ($a in $active) {{
+             if ($a.Enabled -eq 'True' -and $a.Action -eq 'Block') {{ $activeOk = $true }}
+           }}
+           if (-not $activeOk) {{ 'unknown'; exit 0 }}
+           # 防火墙配置档整体关闭时规则不生效。
+           $profiles = @(Get-NetFirewallProfile -ErrorAction SilentlyContinue)
+           if ($profiles.Count -gt 0) {{
+             $anyOn = $false
+             foreach ($p in $profiles) {{ if ($p.Enabled -eq 'True') {{ $anyOn = $true }} }}
+             if (-not $anyOn) {{ 'unknown'; exit 0 }}
+           }}
+           'present'
+         }} catch {{ 'unknown' }}",
+        name = ps_quote(CUT_RULE)
     );
     let out = crate::platform::imp::run_powershell(&script)
         .map_err(|e| format!("查询阻断规则失败：{e}"))?;
@@ -538,6 +603,7 @@ fn query_cut_rule() -> Result<RuleState, String> {
         "present" => Ok(RuleState::Present),
         "absent" => Ok(RuleState::Absent),
         "wrong" => Ok(RuleState::WrongAttributes),
+        "unknown" => Ok(RuleState::Unknown),
         other => Err(format!("阻断规则查询输出无法解析：{other:?}")),
     }
 }
@@ -623,6 +689,54 @@ fn enable_nics(nics: &[String]) -> Result<(), String> {
          }}"
     );
     crate::platform::imp::run_powershell(&script).map(|_| ())
+}
+
+/// **P0-06**：按**稳定身份**（InterfaceGuid）恢复网卡，找不到就明确报错。
+///
+/// 原实现只按显示名称 Enable：网卡在断网后改名（驱动更新、用户重命名、
+/// 多语言系统切换）就找不到设备，而恢复流程会静默跳过那一块。
+///
+/// 返回 `(已恢复的 GUID, 失败说明)`。**绝不**用同名设备替代——名称可能已被
+/// 另一块网卡占用，误启用会改变用户的网络拓扑。
+fn enable_nics_by_guid(snapshots: &[AdapterSnapshot]) -> (Vec<String>, Vec<String>) {
+    let mut restored = Vec::new();
+    let mut failures = Vec::new();
+    for snap in snapshots {
+        if snap.guid.trim().is_empty() {
+            continue;
+        }
+        let script = format!(
+            "$ErrorActionPreference='Stop'
+             $guid = {guid}
+             $adapter = Get-NetAdapter -InterfaceGuid $guid -ErrorAction SilentlyContinue
+             if (-not $adapter) {{ 'missing' }} else {{
+               if ($adapter.AdminStatus -ne 'Up') {{
+                 Enable-NetAdapter -InterfaceGuid $guid -Confirm:$false -ErrorAction Stop
+               }}
+               $after = Get-NetAdapter -InterfaceGuid $guid -ErrorAction SilentlyContinue
+               if ($after -and $after.AdminStatus -eq 'Up') {{ 'ok' }} else {{ 'failed' }}
+             }}",
+            guid = ps_quote(&snap.guid)
+        );
+        match crate::platform::imp::run_powershell(&script) {
+            Ok(out) => match out.trim().to_ascii_lowercase().as_str() {
+                "ok" => restored.push(snap.guid.clone()),
+                "missing" => failures.push(format!(
+                    "网卡 {}（GUID {}）已不存在，无法恢复；账本保留待人工处理",
+                    snap.name, snap.guid
+                )),
+                other => failures.push(format!(
+                    "网卡 {}（GUID {}）启用后状态仍非 Up（{other}）",
+                    snap.name, snap.guid
+                )),
+            },
+            Err(error) => failures.push(format!(
+                "网卡 {}（GUID {}）恢复失败：{error}",
+                snap.name, snap.guid
+            )),
+        }
+    }
+    (restored, failures)
 }
 
 /// PowerShell 单引号转义。
