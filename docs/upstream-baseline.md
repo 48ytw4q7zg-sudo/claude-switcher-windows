@@ -3,42 +3,45 @@
 > 目的：把「迁移目标」固定成可复现的具体 commit，而不是会变化的 `main`。
 > 任何人复核时按这里的 SHA 拉取，看到的代码与本次审查一致。
 
-## 当前迁移状态（2026-11-02）
+## 当前迁移状态（v0.6.7，2026-11-05）
 
-**全部功能融合仍在进行。** 下方早期矩阵记录实现位置和历史测试线索，不能作为全量对等、
-当前版本通过验证或实机验收完成的证明。存在测试函数只说明有相应覆盖入口，必须核对
-其断言、实际调用路径及本轮执行结果；纯判定函数通过也不能证明真实系统行为正确。
-当前执行证据与剩余工作以[全量进度](full-audit-progress-2026-11-02.md)为准。
+三个上游的核心能力均已实现并接入生产入口。**当前准确的项目状态以
+[`docs/release-v0.6.7.md`](release-v0.6.7.md) 与 [`docs/parity-gap-final-2026-11-04.md`](parity-gap-final-2026-11-04.md) 为准**；
+本文件只负责固定上游 SHA 与记录逐项对应关系。
 
-本轮按固定上游 `dfd2a5012a2633ebfe0d435cb3c15a089be58184` 的 README、Windows 说明
-及核心实现继续核对。已明确需要完成或补证的能力包括以下内容，均保留在迁移范围内。
+本节下方「早期矩阵」保留历史写法用于追溯，其中的「待实现」描述已不成立——
+v0.6.6 / v0.6.7 已逐项落地：48 小时出口历史（`ip_history.rs`）、六项非关键检查配置
+（`checks.rs` `disabled_checks`）、加密快照携带真实 Desktop 数据（`export.rs` CSBK1 v3）、
+自动更新下载与 SHA256 校验（`update.rs`）、出口门禁全套（`egate_*.rs`）。
 
-| 能力 | 当前证据与待办 |
-| --- | --- |
-| Desktop 完整账号生命周期 | 已有快照管理；重复选择当前账号的会话保护正在修复，首次登录、切换前完整检查、应用自动启动及故障恢复仍需补齐和验证 |
-| 账号快照迁移 | 需证明加密文件携带真实 Desktop 数据，并覆盖占用目标、错误密码、篡改、越界路径、链接与失败后保留原数据；仅导出账号库元数据不足以满足这一能力 |
-| 六项非关键检查配置 | 关闭后停止对应探测并显示跳过，可选失败降级仅限允许项目；核心保护不可关闭或降级，当前待实现 |
-| 48 小时出口历史 | 启用 IP 一致性检查时记录并统计窗口内变化，关闭后停止记录，当前待实现 |
-| 出口与 ASN 检查 | 需补正常 Cloudflare trace 回退、IP 与网络归属一致性及真实 ASN 类型查询；组织名关键词不能证明住宅网络 |
-| 日志与诊断导出 | 需补日志开关、轮转、受限字段及导出范围，不能将原始账号、地址或认证信息打包 |
-| 代理规则修复 | 已有 Clash Verge 实现，回滚与旧托管块迁移存在待修项；FlClash 活动 Profile 数据库事务修复、重启验证和失败恢复仍需逐项对齐 |
-| 独立代理诊断 | 需完整验证显式入口、端口及 HTTP/HTTPS/SOCKS5/SOCKS5H，不继承代理、不回退直连、不改账号状态，HTTP 响应与账号可用性分开报告 |
-| 一次性浏览器 | 需补地区语言跟随、Chrome/Chromium/Edge/Brave 发现、浏览器退出后清理，并验证代理/TUN 前置条件 |
-| 自动更新 | 已完成版本检查可靠性修复；下载、校验、安装/替换与失败回滚尚未完成，不能仅标作待实机 |
-| Windows 发布与界面 | 简体中文逐屏验收、完整便携运行时、发布质量门禁、安装升级/卸载及真实系统交互仍待闭环 |
+验收层次需要区分：**测试函数存在 ≠ 断言有效**，**判定逻辑通过 ≠ 真实系统行为正确**。
+系统级行为（防火墙、网卡、计划任务、托盘）的实机验收状态统一记录在 README 的
+「验收边界」一节，不在本文件重复断言。
 
-上述是已确认的待办清单，不是完整需求的缩减版。其余上游能力仍需按入口与失败路径完成核验。
+## 1. 三代码基线（实现来源）
 
-## 1. 双代码基线（实现来源）
-
-本仓库是**两个上游能力的融合**，统一落在一个 Tauri 2 + Rust + React 应用里：
+本仓库是**三个上游能力的融合**，统一落在一个 Tauri 2 + Rust + React 应用里：
 
 | 基线 | 仓库 | 管理对象 | 技术栈 | 固定 commit |
 | --- | --- | --- | --- | --- |
 | A. CLI 切换器 | https://github.com/VallierDev/claude-switcher | Claude Code **CLI**（`~/.claude`、`~/.claude.json`、OAuth 凭据） | Tauri 2 + Rust + React | [`68979843313a0cb7da3cda32765184436ba9598e`](https://github.com/VallierDev/claude-switcher/commit/68979843313a0cb7da3cda32765184436ba9598e) |
 | B. 环境/桌面版 | https://github.com/YOURSJEYO/claude-switcher | Claude **桌面版**（`%APPDATA%\Claude`）+ 环境安全 | bash/PowerShell 核心 + Swift/macOS + WPF Windows Beta | [`870c4ca0754234965878ef58144d7a755d965037`](https://github.com/YOURSJEYO/claude-switcher/commit/870c4ca0754234965878ef58144d7a755d965037) |
+| C. 出口门禁 | https://github.com/daha1216/ClaudeGuard | 受管 GUI 应用的**出网路径**（目标出口校验 + 按 exe 隔离） | Rust | [`1967377bec393bcba82199f038550d6fa5f677ec`](https://github.com/daha1216/ClaudeGuard/commit/1967377bec393bcba82199f038550d6fa5f677ec) |
 
-记录日期：2026-10-27（v0.6.0 于 2026-10-31 复核上游 `main`）。许可：基线 A 未声明 LICENSE；基线 B 为 MIT。
+记录日期：2026-10-27（v0.6.0 于 2026-10-31 复核上游 `main`；基线 C 于
+v0.6.7 补充）。许可：基线 A 未声明 LICENSE；基线 B 为 MIT；基线 C 未声明 LICENSE。
+
+### 1.0 基线 C（ClaudeGuard）的对应关系
+
+ClaudeGuard 是出口门禁的语义来源，其 [v3.10 保护状态契约](https://github.com/daha1216/ClaudeGuard/blob/1967377bec393bcba82199f038550d6fa5f677ec/docs/CONTRACT-v3.10.md)
+定义了本仓库 `egate_*` 模块族的四条硬约束：
+
+| 契约要求 | 本仓库实现 |
+| --- | --- |
+| 保护意图（Armed / Disarmed / Unknown）与「是否已隔离」是两个独立维度 | `egate_monitor::ProtectionIntent` + `is_tripped` / `is_partial` / `is_trip_state_unknown` |
+| 自动恢复必须有明确资格，不能只看目标是否 Pass | `RecoveryEligibility`（目标 / 接入 / 泄漏 / 手动保持四项） |
+| 用户手动 lockdown 与自动熔断生命周期独立 | 持久化 `ManualHold`（`eguard-manual-hold.json`），自动恢复不解除 |
+| 系统修改必须独占，且锁内重新核验意图 | `egate_lock::OperationGuard`（fs4 排他 + 编译期 `!Send`）+ `egate_trip::trip()` 锁内重读意图 |
 
 > 关于仓库名：用户链接里的 `claude-switch` 是笔误，经 `gh api users/YOURSJEYO/repos`
 > 核实真实仓库名为 `claude-switcher`。
@@ -53,8 +56,8 @@
 | MSIX Claude 数据目录发现 | `Find-ClaudeDataPath` | 已对等：`desktop::resolve_desktop_live_dir` + `platform::claude_appx_families` |
 | FlClash 客户端识别 | `Test-ProxyAlive` | 已对等：`guard::required_process` 加 `flclash → flclashcore` |
 | 客户端语言按系统 UI 语言、不一致降 warn | `Invoke-CheckDetail` | 历史实现，已被 1.1.1 的 Claude 配置语言方案替换 |
-| 48h 出口 IP 变化计数 | `Add-IpHistory` / `iphistory.log` | **未实现**：仅影响 warn 档文案，不改变 fail 判定；见 `docs/qa-v0.6.0.md` |
-| Claude 由 Appx/AUMID 兜底启动 | `Find-ClaudeAumid` | 未实现：本仓库 Desktop 切换不负责拉起 Claude |
+| 48h 出口 IP 变化计数 | `Add-IpHistory` / `iphistory.log` | 已对等：`ip_history.rs`（48 小时窗口累计，仅在 IP 一致性检查启用时读写） |
+| Claude 由 Appx/AUMID 兜底启动 | `Find-ClaudeAumid` | 已对等：`egate_launch` 用 `shell:AppsFolder\<PFN>!<AppId>` 拉起；Desktop 账号切换本身不负责拉起 |
 | 切换目录改用暂存+换位（不先删活目录） | `Switch-DataDir` | 已有等价保护：先 staging 备份再清空，失败自动回滚 |
 | 优雅关闭后再强杀 | `Stop-ClaudeApp` | 已对等：`kill_desktop_processes` 两段式 |
 
