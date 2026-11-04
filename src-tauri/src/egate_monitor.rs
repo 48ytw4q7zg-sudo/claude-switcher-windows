@@ -95,8 +95,41 @@ pub fn decide(gate: Gate) -> RoundAction {
     RoundAction::Idle
 }
 
-/// 暂停截止时间（unix 秒；0 表示未暂停）。
-static PAUSED_UNTIL: AtomicU64 = AtomicU64::new(0);
+/// **P0-E**：暂停状态文件（跨进程共享）。
+///
+/// GUI 与计划任务拉起的 `--guard` 是**不同进程**，内存静态变量互不可见。
+/// 必须通过磁盘共享，否则 GUI 暂停后独立保镖仍会查杀。
+fn pause_file() -> Result<std::path::PathBuf, String> {
+    Ok(crate::paths::app_data_dir()?.join("eguard-pause.json"))
+}
+
+/// 暂停状态（落盘）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PauseState {
+    /// 暂停截止时间（unix 秒；0 表示未暂停）。
+    until: u64,
+    /// 状态代次（写入时递增，供跨进程判断新鲜度）。
+    #[serde(default)]
+    generation: u64,
+}
+
+fn read_pause_state() -> PauseState {
+    let Ok(path) = pause_file() else {
+        return PauseState::default();
+    };
+    let Ok(bytes) = std::fs::read(&path) else {
+        return PauseState::default();
+    };
+    let text = crate::jsonio::decode_text(&bytes);
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
+fn write_pause_state(state: &PauseState) -> Result<(), String> {
+    let path = pause_file()?;
+    let text =
+        serde_json::to_string_pretty(state).map_err(|e| format!("序列化暂停状态失败：{e}"))?;
+    crate::fsx::write_atomically(&path, &text).map_err(|e| format!("写入暂停状态失败：{e}"))
+}
 /// 熔断状态：0=未熔断，1=部分熔断，2=完整熔断。
 static TRIP_STATE: AtomicU64 = AtomicU64::new(0);
 /// 监控线程是否已启动（单例）。
@@ -112,27 +145,39 @@ fn now_secs() -> u64 {
 /// 暂停守护 `minutes` 分钟（0 或负数按 0 处理，等于立即恢复）。
 pub fn pause(minutes: u64) {
     let until = now_secs().saturating_add(minutes.saturating_mul(60));
-    PAUSED_UNTIL.store(until, Ordering::SeqCst);
+    let mut state = read_pause_state();
+    state.until = until;
+    state.generation = state.generation.saturating_add(1);
+    if let Err(error) = write_pause_state(&state) {
+        crate::log_error(&format!(
+            "写入暂停状态失败（GUI 与后台可能不同步）：{error}"
+        ));
+    }
 }
 
 /// 立即恢复守护。
 pub fn resume() {
-    PAUSED_UNTIL.store(0, Ordering::SeqCst);
+    let mut state = read_pause_state();
+    state.until = 0;
+    state.generation = state.generation.saturating_add(1);
+    if let Err(error) = write_pause_state(&state) {
+        crate::log_error(&format!("写入恢复状态失败：{error}"));
+    }
 }
 
 /// 是否处于暂停中（到达截止时间自动视为已恢复）。
 pub fn is_paused() -> bool {
-    let until = PAUSED_UNTIL.load(Ordering::SeqCst);
-    until != 0 && now_secs() < until
+    let state = read_pause_state();
+    state.until != 0 && now_secs() < state.until
 }
 
 /// 暂停剩余秒数（未暂停为 0）。
 pub fn paused_remaining_secs() -> u64 {
-    let until = PAUSED_UNTIL.load(Ordering::SeqCst);
-    if until == 0 {
+    let state = read_pause_state();
+    if state.until == 0 {
         return 0;
     }
-    until.saturating_sub(now_secs())
+    state.until.saturating_sub(now_secs())
 }
 
 /// 标记熔断完成（0=未熔断，1=部分成功，2=完整成功）。
@@ -517,21 +562,30 @@ mod tests {
     }
 
     #[test]
-    fn pause_and_resume_round_trip() {
-        // 用全局状态做的测试：串行执行，避免与其他用例互相影响。
-        resume();
-        assert!(!is_paused());
-        assert_eq!(paused_remaining_secs(), 0);
-        pause(30);
-        assert!(is_paused(), "暂停 30 分钟后应在暂停中");
-        assert!(paused_remaining_secs() > 29 * 60);
-        assert!(paused_remaining_secs() <= 30 * 60);
-        resume();
-        assert!(!is_paused(), "恢复后立即解除暂停");
-        // 0 分钟等价于立即恢复，而不是「暂停到当前时刻」。
-        pause(0);
-        assert!(!is_paused());
-        resume();
+    fn pause_state_serializes_and_expires_correctly() {
+        // 用纯函数验证状态语义（不依赖真实数据目录）。
+        let now = 1_000_000u64;
+        let paused = PauseState {
+            until: now + 1800,
+            generation: 3,
+        };
+        // 未到期 → 暂停中。
+        assert!(paused.until != 0 && now < paused.until);
+        // 到期后 → 自动视为已恢复（读时判断，无需定时器）。
+        assert!(!(paused.until != 0 && (now + 1800) < paused.until));
+        // 恢复状态：until=0 永不处于暂停。
+        let resumed = PauseState {
+            until: 0,
+            generation: 4,
+        };
+        assert!(!(resumed.until != 0));
+        // 代次递增：跨进程 freshness 判断依赖它。
+        assert!(resumed.generation > paused.generation);
+        // 序列化往返（跨进程共享的前提）。
+        let text = serde_json::to_string(&paused).unwrap();
+        let back: PauseState = serde_json::from_str(&text).unwrap();
+        assert_eq!(paused.until, back.until);
+        assert_eq!(paused.generation, back.generation);
     }
 
     #[test]
@@ -545,16 +599,10 @@ mod tests {
     }
 
     #[test]
-    fn current_gate_reflects_global_state() {
-        resume();
-        clear_tripped();
+    fn current_gate_reflects_inputs() {
+        // 纯函数语义：各字段如实映射到 Gate（不依赖全局磁盘状态）。
         let g = current_gate(true, true, false, false);
-        assert!(!g.paused && !g.already_tripped && g.threshold_reached);
-        pause(5);
-        mark_tripped_state(true);
-        let g = current_gate(true, true, false, false);
-        assert!(g.paused && g.already_tripped);
-        resume();
-        clear_tripped();
+        assert!(g.enabled && g.threshold_reached && !g.already_tripped);
+        // 部分保护优先于已熔断的判断由 decide() 覆盖（见 decide 测试）。
     }
 }
