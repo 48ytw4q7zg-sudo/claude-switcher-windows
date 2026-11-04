@@ -596,6 +596,35 @@ fn header_has_item(after: &[&str]) -> bool {
 }
 
 /// 备份文件名：`<原名>.bak.<纳秒>`（与上游 `.bak.<时间戳>` 语义一致）。
+/// **P0-06**：恢复 Merge.yaml 到事务前状态。
+///
+/// - 原本不存在且未改动 → 无需处理（返回 Ok(false)）
+/// - 原本不存在但被创建 → 删除
+/// - 原本存在且有改动 → 写回原始内容
+fn restore_merge(
+    path: &std::path::Path,
+    original: Option<&str>,
+    changed: bool,
+) -> Result<bool, String> {
+    if !changed {
+        return Ok(false);
+    }
+    match original {
+        Some(text) => {
+            fsx::write_atomically(path, text).map_err(|e| format!("恢复 Merge.yaml 失败：{e}"))?;
+            Ok(true)
+        }
+        None => {
+            // 原本不存在：删除本次创建的文件。
+            match fsx::remove_file_with_retry(path) {
+                Ok(()) => Ok(true),
+                Err(_e) if !path.exists() => Ok(true),
+                Err(e) => Err(format!("删除新建 Merge.yaml 失败：{e}")),
+            }
+        }
+    }
+}
+
 fn backup_path_for(path: &Path) -> PathBuf {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -699,6 +728,19 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
         return Ok(report);
     }
 
+    // **P0-06**：Clash 双文件统一事务——记录两个文件的原始状态，任何失败
+    // 都要恢复**两个**文件，而不只是 Script.js。
+    let merge_existed = merge_path.exists();
+    let merge_original = if merge_existed {
+        Some(
+            jsonio::read_text_lossy_bom(&merge_path)
+                .map_err(|e| format!("读取 Merge.yaml 失败（未做任何修改）：{e}"))?,
+        )
+    } else {
+        None
+    };
+    let mut merge_changed = false;
+
     // —— 1. 所有模式都先清理历史 Merge.yaml 遗留（global/direct 也需要）——
     if merge_path.exists() {
         let raw = jsonio::read_text_lossy_bom(&merge_path)?;
@@ -715,6 +757,7 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
                         .map_err(|e| format!("写入 Merge.yaml 失败: {e}"))?;
                 }
                 report.merge_changed = true;
+                merge_changed = true;
                 report.merge_backup = Some(backup.to_string_lossy().to_string());
                 report.messages.push(format!(
                     "已清理历史遗留 Merge 规则并备份: {}",
@@ -815,11 +858,23 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
         };
         match rollback {
             Ok(()) => {
+                // **P0-06**：同时恢复 Merge.yaml（若有改动），保证双文件一致。
+                let merge_note =
+                    match restore_merge(&merge_path, merge_original.as_deref(), merge_changed) {
+                        Ok(true) => " 与 Merge.yaml".to_string(),
+                        Ok(false) => String::new(),
+                        Err(e) => {
+                            // 回滚失败必须如实报告，不能宣称已完整回滚。
+                            report.messages.push(format!(
+                            "Merge.yaml 回滚失败（{e}）：原内容已保留在内存，请手动恢复或使用备份"
+                        ));
+                            "（Merge.yaml 回滚失败）".to_string()
+                        }
+                    };
                 restart_clash_verge(&mut report);
-                report.messages.push(
-                    "置顶规则 FAIL: 验证失败，已回滚 Script.js，请确认 Clash Verge 已启用全局扩展脚本"
-                        .to_string(),
-                );
+                report.messages.push(format!(
+                    "置顶规则 FAIL: 验证失败，已回滚 Script.js{merge_note}，请确认 Clash Verge 已启用全局扩展脚本"
+                ));
             }
             Err(error) => {
                 // 回滚失败：保留备份路径供用户手动恢复，明确报告未回滚。
