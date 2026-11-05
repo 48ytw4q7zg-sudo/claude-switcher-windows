@@ -631,14 +631,15 @@ try {{
     $af = $a | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
     $pf = $a | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
     $adf = $a | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
-    $progAny = (-not $af) -or (-not $af.Program) -or $af.Program -eq 'Any'
-    $portAny = (-not $pf) -or (
+    # **P0-B**：过滤器查询失败不能当成「没有限制」——那会把未知判成全局。
+    if (-not $af -or -not $pf -or -not $adf) {{ 'unknown'; exit 0 }}
+    $progAny = (-not $af.Program) -or $af.Program -eq 'Any'
+    $portAny = (
                  ((-not $pf.Protocol) -or $pf.Protocol -eq 'Any') -and
                  ((-not $pf.LocalPort) -or $pf.LocalPort -eq 'Any') -and
                  ((-not $pf.RemotePort) -or $pf.RemotePort -eq 'Any')
                )
-    $addrAny = (-not $adf) -or
-               (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and
+    $addrAny = (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and
                 ((-not $adf.RemoteAddress) -or $adf.RemoteAddress -eq 'Any'))
     # Profile 必须覆盖「所有」配置档：只对 Domain 生效的规则挡不住 Public 流量。
     $profileAll = ([string]$a.Profile).ToLowerInvariant() -eq 'any'

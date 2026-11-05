@@ -404,27 +404,32 @@ fn count_rules_for(agent: &str, exes: &[String]) -> RuleVerification {
                  $active = @(Get-NetFirewallRule -DisplayName $s.name -PolicyStore ActiveStore -ErrorAction SilentlyContinue)\n\
                  if ($active.Count -eq 0) {{ $reason = '未进入当前生效策略（可能被组策略覆盖）' }}\n\
                  else {{\n\
-                   $ar = $active | Select-Object -First 1\n\
+                   $ar = $active | Select-Object -First 1
                    $af = $ar | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
-                   if ($ar.Enabled -ne 'True' -or $ar.Action -ne 'Block') {{ $reason = '生效策略中的规则属性不符' }}
-                   elseif ($ar.Direction -ne $s.direction -or -not $af.Program -or $af.Program -ine $s.exe) {{ $reason = '生效策略的方向或程序过滤条件不符' }}
-                   # **P0-05**：端口/地址过滤器若被限定，就不再覆盖该程序的全部出站流量。
                    $pf = $ar | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
                    $adf = $ar | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
-                   $portAny = (-not $pf) -or (
+                   $portAny = $pf -and (
                      (((-not $pf.Protocol) -or $pf.Protocol -eq 'Any') -and
                       ((-not $pf.LocalPort) -or $pf.LocalPort -eq 'Any') -and
                       ((-not $pf.RemotePort) -or $pf.RemotePort -eq 'Any'))
                    )
-                   $addrAny = (-not $adf) -or (
+                   $addrAny = $adf -and (
                      (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and
                       ((-not $adf.RemoteAddress) -or $adf.RemoteAddress -eq 'Any'))
                    )
                    $profileAll = ([string]$ar.Profile).ToLowerInvariant() -eq 'any'
-                   if (-not $portAny) {{ $reason = '生效策略限定了端口范围，未覆盖全部流量' }}
+                   # **P0-B**：单条条件链，任何一项不符都不得落到 $ok = $true。
+                   # 原实现把端口/地址/Profile 检查写成独立链，前半段（动作/方向/
+                   # 程序）已经判错时，只要后半段通过仍会把 $ok 置真。
+                   if ($ar.Enabled -ne 'True') {{ $reason = '生效策略中的规则未启用' }}
+                   elseif ($ar.Action -ne 'Block') {{ $reason = '生效策略中的动作不是阻断' }}
+                   elseif ($ar.Direction -ne $s.direction) {{ $reason = '生效策略中的方向不符' }}
+                   elseif (-not $af -or -not $af.Program -or $af.Program -ine $s.exe) {{ $reason = '生效策略的程序过滤条件不符' }}
+                   elseif (-not $pf -or -not $adf) {{ $reason = '生效策略的过滤器查询不完整' }}
+                   elseif (-not $portAny) {{ $reason = '生效策略限定了端口范围，未覆盖全部流量' }}
                    elseif (-not $addrAny) {{ $reason = '生效策略限定了地址范围，未覆盖全部流量' }}
                    elseif (-not $profileAll) {{ $reason = '生效策略只对部分网络配置档生效' }}
-                   else {{ $ok = $true }}\n\
+                   else {{ $ok = $true }}
                  }}\n\
                }}\n\
              }}\n\
@@ -555,6 +560,14 @@ fn ps_quote(value: &str) -> String {
 /// 解析不到任何路径时只结束进程，并**如实**说明「未加防火墙规则」，
 /// 绝不谎称已隔离。
 pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport {
+    quarantine_agent_with(agent, exe_path, true)
+}
+
+/// `kill=false` 时只建立出站隔离规则、**不结束进程**。
+///
+/// **P0-C**：未接入兜底封锁只应「挡住出站」，不该在用户刚发现代理没开时
+/// 就把正在用的 Claude Desktop 杀掉——那是普通熔断（目标失败达阈值）的语义。
+pub fn quarantine_agent_with(agent: &str, exe_path: Option<&str>, kill: bool) -> QuarantineReport {
     let mut report = QuarantineReport {
         agent: agent.to_string(),
         rules_added: 0,
@@ -582,9 +595,11 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
     };
     if exes.is_empty() {
         // 没有路径：仍然结束进程（至少阻止当前实例），但必须说明隔离未完成。
-        match kill_agent_processes(agent) {
-            Ok(killed) => report.killed = killed,
-            Err(error) => report.note.push_str(&format!("结束进程失败（{error}）；")),
+        if kill {
+            match kill_agent_processes(agent) {
+                Ok(killed) => report.killed = killed,
+                Err(error) => report.note.push_str(&format!("结束进程失败（{error}）；")),
+            }
         }
         report.note.push_str(
             "未找到可执行文件路径（应用可能未安装或从未运行），无法建立防火墙隔离；保护未完成",
@@ -593,9 +608,11 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
     }
 
     // 2. 再结束进程（失败不阻断后续隔离：进程可能已退出）。
-    match kill_agent_processes(agent) {
-        Ok(killed) => report.killed = killed,
-        Err(error) => report.note.push_str(&format!("结束进程失败（{error}）；")),
+    if kill {
+        match kill_agent_processes(agent) {
+            Ok(killed) => report.killed = killed,
+            Err(error) => report.note.push_str(&format!("结束进程失败（{error}）；")),
+        }
     }
 
     // 3. 为**每个路径**建立出/入站阻断规则。
@@ -687,6 +704,59 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
     }
     report
 }
+/// **P0-C**：未接入兜底封锁——只建出站隔离，**不结束进程**。
+///
+/// 与 [`trip`] 共用同一套规则建立与核验逻辑（不新增第二套防火墙实现），
+/// 但不杀进程：用户只是暂时没开代理，不应被直接踢下线。
+pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
+    if guarded_agents.is_empty() {
+        return TripReport {
+            agents: Vec::new(),
+            any_isolated: false,
+            all_isolated: false,
+            failures: Vec::new(),
+            note: "没有配置的守护对象，未执行任何操作".to_string(),
+        };
+    }
+    let guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::Isolate) {
+        Ok(guard) => guard,
+        Err(error) => {
+            return TripReport {
+                agents: Vec::new(),
+                any_isolated: false,
+                all_isolated: false,
+                failures: vec![format!("无法获取系统操作锁：{error}")],
+                note: format!("兜底封锁未执行（{error}）"),
+            };
+        }
+    };
+    let _keep = &guard;
+    let mut agents = Vec::new();
+    let mut failures = Vec::new();
+    for id in guarded_agents {
+        let report = quarantine_agent_with(id, None, false);
+        if !report.verified {
+            failures.push(format!("{}：{}", report.agent, report.note.trim()));
+        }
+        agents.push(report);
+    }
+    let any_isolated = agents.iter().any(|agent| agent.verified);
+    let all_isolated = agents.iter().all(|agent| agent.coverage_complete);
+    TripReport {
+        note: if all_isolated {
+            "未接入兜底封锁：全部守护对象出站规则已生效".to_string()
+        } else if any_isolated {
+            "未接入兜底封锁：部分生效（见失败说明）".to_string()
+        } else {
+            "未能确认任何兜底规则生效".to_string()
+        },
+        agents,
+        any_isolated,
+        all_isolated,
+        failures,
+    }
+}
+
 /// 执行一次熔断：对配置里所有守护对象结束进程并隔离。
 ///
 /// 与上游一致：**只处理 GUI 应用**；CLI 宿主不在守护列表里，避免误伤终端。
@@ -1154,5 +1224,53 @@ mod tests {
         assert_ne!(ReleaseReason::Emergency, ReleaseReason::Automatic);
 
         crate::egate_monitor::clear_manual_hold().unwrap();
+    }
+
+    /// **P0-B 回归**：把核验脚本的条件链单独抽出来在真实 PowerShell 里跑，
+    /// 确认「前半段属性错误、后半段全部通过」不会被判成功。
+    ///
+    /// 这是上一版真实存在的缺陷：端口/地址/Profile 检查曾是一条独立链，
+    /// 末尾的 `else { $ok = $true }` 会覆盖前面的方向/程序判定。
+    #[test]
+    fn verification_chain_rejects_earlier_mismatch() {
+        let script = r#"
+$s = @{ direction='Outbound'; exe='C:\a.exe' }
+function Check($ar, $af, $pf, $adf) {
+  $ok = $false; $reason = ''
+  $portAny = (((-not $pf.Protocol) -or $pf.Protocol -eq 'Any') -and ((-not $pf.LocalPort) -or $pf.LocalPort -eq 'Any') -and ((-not $pf.RemotePort) -or $pf.RemotePort -eq 'Any'))
+  $addrAny = (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and ((-not $adf.RemoteAddress) -or $adf.RemoteAddress -eq 'Any'))
+  $profileAll = ([string]$ar.Profile).ToLowerInvariant() -eq 'any'
+  if ($ar.Enabled -ne 'True') { $reason = 'not-enabled' }
+  elseif ($ar.Action -ne 'Block') { $reason = 'bad-action' }
+  elseif ($ar.Direction -ne $s.direction) { $reason = 'bad-direction' }
+  elseif (-not $af -or -not $af.Program -or $af.Program -ine $s.exe) { $reason = 'bad-program' }
+  elseif (-not $pf -or -not $adf) { $reason = 'filters-missing' }
+  elseif (-not $portAny) { $reason = 'port-limited' }
+  elseif (-not $addrAny) { $reason = 'addr-limited' }
+  elseif (-not $profileAll) { $reason = 'profile-limited' }
+  else { $ok = $true }
+  return "$ok|$reason"
+}
+$anyPf = [pscustomobject]@{ Protocol='Any'; LocalPort='Any'; RemotePort='Any' }
+$anyAdf = [pscustomobject]@{ LocalAddress='Any'; RemoteAddress='Any' }
+$goodAf = [pscustomobject]@{ Program='C:\a.exe' }
+$cases = @(
+  @{ n='all-good';           a=[pscustomobject]@{Enabled='True';Action='Block';Direction='Outbound';Profile='Any'} },
+  @{ n='bad-action';         a=[pscustomobject]@{Enabled='True';Action='Allow';Direction='Outbound';Profile='Any'} },
+  @{ n='bad-direction';      a=[pscustomobject]@{Enabled='True';Action='Block';Direction='Inbound';Profile='Any'} },
+  @{ n='domain-only';        a=[pscustomobject]@{Enabled='True';Action='Block';Direction='Outbound';Profile='Domain'} }
+)
+foreach ($c in $cases) { Write-Output ($c.n + '=' + (Check $c.a $goodAf $anyPf $anyAdf)) }
+"#;
+        let out = crate::platform::imp::run_powershell(script).unwrap_or_default();
+        let out = out.trim();
+        // 非 Windows / 无 PowerShell 的构建机上只校验脚本能生成（不误报失败）。
+        if out.is_empty() {
+            return;
+        }
+        assert!(out.contains("all-good=True|"), "{out}");
+        assert!(out.contains("bad-action=False|bad-action"), "{out}");
+        assert!(out.contains("bad-direction=False|bad-direction"), "{out}");
+        assert!(out.contains("domain-only=False|profile-limited"), "{out}");
     }
 }

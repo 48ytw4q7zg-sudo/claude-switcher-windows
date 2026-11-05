@@ -3291,6 +3291,12 @@ pub fn run() {
     let cli_command = cli::parse(&args);
 
     // 只读 CLI 子命令：附加控制台执行后直接退出，不初始化 GUI、不写账号库。
+    // **P0-E**：卸载/急救恢复必须在 GUI 初始化之前完成——
+    // 卸载时主界面可能根本起不来，恢复不能依赖窗口与托盘。
+    if let Some(cmd @ cli::CliCommand::ExitRestore) = &cli_command {
+        let code = cli::run_readonly(cmd);
+        std::process::exit(code);
+    }
     if let Some(cmd @ (cli::CliCommand::List | cli::CliCommand::Status)) = &cli_command {
         let code = cli::run_readonly(cmd);
         std::process::exit(code);
@@ -3352,6 +3358,10 @@ pub fn run() {
                 log_error(&format!("Clash 双文件崩溃恢复未完成：{error}"));
             }
             for message in desktop::heal_desktop_switch() {
+                log_error(&message);
+            }
+            // **P0-D**：恢复中断的快照删除（改名后崩、存库前崩都可能）。
+            for message in desktop::heal_desktop_delete() {
                 log_error(&message);
             }
             egate_monitor::rebuild_trip_state_from_system();

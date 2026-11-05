@@ -175,7 +175,17 @@ fn collect_snapshot_files(root: &Path) -> Result<(Vec<SnapshotFile>, SnapshotPac
                 // `_import-staging-*` 是导入事务残留——它们都不是账号快照，
                 // 打进迁移包只会把历史垃圾搬到新机器。
                 let name = entry.file_name().to_string_lossy().to_string();
-                if EXCLUDED_SNAPSHOT_DIR_NAMES.contains(&name.as_str()) || name.starts_with('_') {
+                // **QW-02**：排除全部事务残留目录，而不只是 `.live-backup`。
+                //
+                // Desktop 回存会留下 `<id>.old` / `<id>.new`，删除会留下
+                // `.<id>.delete-pending-*`。这些不是已登记的账号快照，
+                // 打进迁移包等于把半成品数据搬到新机器。
+                if EXCLUDED_SNAPSHOT_DIR_NAMES.contains(&name.as_str())
+                    || name.starts_with('_')
+                    || name.ends_with(".old")
+                    || name.ends_with(".new")
+                    || name.contains(".delete-pending-")
+                {
                     stats.excluded_dirs += 1;
                     continue;
                 }
@@ -1078,6 +1088,8 @@ pub fn import_full_migration_blocking(
                 format!("快照提交标记失败：{e}"),
             )
         })?;
+        // **QW-01**：清理失败要如实列出，并保留账本让下次启动重试，
+        // 不能一律忽略后仍然返回「全部完成」。
         let mut cleanup_failures = Vec::new();
         // 只在备份确实存在时才尝试删除（原本没有快照目录/账号库时不算失败）。
         if snapshots_existed && snapshot_backup.exists() {

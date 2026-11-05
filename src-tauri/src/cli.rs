@@ -22,6 +22,8 @@ pub enum CliCommand {
     EgateCheck,
     /// 出口门禁：急救——恢复网络并解除全部隔离。
     EgateRestore,
+    /// **P0-E**：仅供卸载程序调用——静默恢复全部系统状态，退出码即结果。
+    ExitRestore,
     /// 出口门禁：真实保护状态。
     EgateStatus,
     /// 出口门禁：发送一条测试通知，后接类别。
@@ -48,6 +50,9 @@ pub fn parse(args: &[String]) -> Option<CliCommand> {
             // 出口门禁：脚本化入口（批处理 / 前置流水线）。
             "--egate-check" => return Some(CliCommand::EgateCheck),
             "--egate-restore" => return Some(CliCommand::EgateRestore),
+            // **P0-E**：卸载钩子专用。与 --egate-restore 同一条恢复协议，
+            // 但输出更严格（无控制台时也要给出可机器判断的退出码）。
+            "--exit-restore" => return Some(CliCommand::ExitRestore),
             "--egate-status" => return Some(CliCommand::EgateStatus),
             "--egate-notify-test" => {
                 let kind = iter.next().cloned().unwrap_or_default();
@@ -67,6 +72,7 @@ pub fn run_readonly(cmd: &CliCommand) -> i32 {
         CliCommand::Status => print_status(),
         CliCommand::EgateCheck => run_egate_check(),
         CliCommand::EgateRestore => run_egate_restore(),
+        CliCommand::ExitRestore => run_egate_restore(),
         CliCommand::EgateStatus => run_egate_status(),
         // 写路径/需要 GUI 上下文的命令不应走这里；保守返回参数错误码。
         CliCommand::Switch(_) | CliCommand::SwitchId(_) | CliCommand::EgateNotifyTest(_) => 2,
@@ -363,6 +369,7 @@ pub fn run_console(args: &[String]) -> i32 {
         Some(CliCommand::SwitchId(id)) => run_switch_id_first_instance(&id),
         Some(CliCommand::EgateCheck) => run_readonly(&CliCommand::EgateCheck),
         Some(CliCommand::EgateRestore) => run_readonly(&CliCommand::EgateRestore),
+        Some(CliCommand::ExitRestore) => run_readonly(&CliCommand::ExitRestore),
         Some(CliCommand::EgateStatus) => run_readonly(&CliCommand::EgateStatus),
         // 通知测试需要 GUI 的 AppHandle，走主程序而非 CLI 进程。
         Some(CliCommand::EgateNotifyTest(_)) => {

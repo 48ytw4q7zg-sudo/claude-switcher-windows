@@ -704,31 +704,58 @@ fn run_uncovered_lockdown(
     if agents.is_empty() {
         return;
     }
-    // 已经处于兜底锁状态时不重复施加（避免每轮都去动防火墙）。
-    if uncovered_lock_active() {
-        return;
-    }
-    let trip = crate::egate_trip::trip(&agents);
-    if trip.any_isolated {
+    // **P0-C**：先写意图**再**动防火墙——崩溃时至少有「我打算锁」的记录。
+    if !uncovered_lock_active() {
         if let Err(error) = mark_uncovered_lock() {
             crate::log_error(&format!(
-                "未接入兜底封锁已施加，但意图落盘失败（{error}）：重启后可能无法识别这批规则"
+                "未接入兜底封锁：意图落盘失败（{error}），本轮不施加规则以免无法归属"
             ));
+            return;
         }
-        crate::log_error(&format!(
-            "未接入代理链路：已立即建立应用级兜底封锁（{}）",
-            trip.note
-        ));
-    } else {
-        crate::log_error(&format!(
-            "未接入代理链路，但兜底封锁未能建立（Degraded）：{}",
+    }
+    // **P0-C**：每轮都重新核验并补齐，不能因「意图文件存在」就跳过。
+    let trip = crate::egate_trip::enforce_uncovered_outbound(&agents);
+    if trip.all_isolated {
+        if !uncovered_lock_ready() {
+            let _ = mark_uncovered_ready();
+        }
+        return;
+    }
+    // 部分生效或完全失败：保持 Degraded，下一轮继续补齐。
+    // 从「全部生效」退回「部分生效」：清掉 ready 标记，状态回到 Degraded。
+    clear_uncovered_ready();
+    crate::log_error(&format!(
+        "未接入兜底封锁未完整生效（Degraded）：{}；下一轮将继续补齐",
+        if trip.failures.is_empty() {
             report
                 .targets
                 .iter()
                 .map(|t| t.name.as_str())
                 .collect::<Vec<_>>()
                 .join("、")
-        ));
+        } else {
+            trip.failures.join("；")
+        }
+    ));
+}
+
+/// **P0-C**：接入恢复后独立解除兜底封锁，不依赖普通熔断的 `TRIP_STATE`。
+///
+/// 只删除本产品拥有的规则并核验；核验通过才清意图文件。
+fn release_uncovered_lock() {
+    if !uncovered_lock_active() {
+        return;
+    }
+    match crate::egate_trip::release_verified(crate::egate_trip::ReleaseReason::Automatic) {
+        Ok(report) if report.verified => {
+            clear_uncovered_lock();
+            crate::log_error("接入已恢复：未接入兜底封锁已解除");
+        }
+        Ok(report) => crate::log_error(&format!(
+            "接入已恢复，但兜底规则未能全部清除（剩余 {} 条），保留意图待重试",
+            report.remaining
+        )),
+        Err(error) => crate::log_error(&format!("解除兜底封锁失败：{error}")),
     }
 }
 
@@ -749,8 +776,30 @@ fn mark_uncovered_lock() -> Result<(), String> {
     crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
 }
 
+fn uncovered_lock_ready_file() -> Result<std::path::PathBuf, String> {
+    Ok(crate::paths::app_data_dir()?.join("eguard-uncovered-lock-ready.json"))
+}
+
+fn uncovered_lock_ready() -> bool {
+    uncovered_lock_ready_file()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+fn mark_uncovered_ready() -> Result<(), String> {
+    let path = uncovered_lock_ready_file()?;
+    crate::fsx::write_atomically(&path, "{}").map_err(|e| e.to_string())
+}
+
+fn clear_uncovered_ready() {
+    if let Ok(path) = uncovered_lock_ready_file() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// 接入恢复后清除兜底锁记录（规则由自动恢复统一解除）。
 pub fn clear_uncovered_lock() {
+    clear_uncovered_ready();
     if let Ok(path) = uncovered_lock_file() {
         let _ = std::fs::remove_file(path);
     }
@@ -816,6 +865,12 @@ fn run_monitor_round(
         run_uncovered_lockdown(config, &report);
     }
 
+    // **P0-C**：先按「接入是否恢复」独立处理兜底锁——它不参与 TRIP_STATE，
+    // 因此不能等 decide() 的 Recover 分支（那里要求 already_tripped）。
+    if report.access.path != "uncovered" {
+        release_uncovered_lock();
+    }
+
     match decide(gate) {
         RoundAction::Trip => {
             // P0-02：若另一进程正在修改系统保护资源，本轮跳过（下轮再试），
@@ -877,8 +932,6 @@ fn run_monitor_round(
         RoundAction::Recover => {
             // P0-07：出口已恢复，自动解除隔离。
             // **P0-NEW-02**：只有核验通过才清除熔断状态。
-            // 接入已恢复：兜底锁不再需要，规则由下面的统一解除处理。
-            clear_uncovered_lock();
             match crate::egate_trip::release_verified(crate::egate_trip::ReleaseReason::Automatic) {
                 Ok(report) if report.verified => {
                     let removed = report.requested;
@@ -1100,5 +1153,41 @@ mod tests {
             is_manual_hold(),
             "Unknown 必须按「保持」对待，否则会静默推翻用户意图"
         );
+    }
+
+    /// **P0-C**：兜底锁的意图/就绪两个状态互不混淆。
+    #[test]
+    fn uncovered_lock_state_files_are_independent() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        assert!(!uncovered_lock_active());
+        assert!(!uncovered_lock_ready());
+
+        // 只写意图：表示「打算锁」，但规则未必全部生效。
+        mark_uncovered_lock().unwrap();
+        assert!(uncovered_lock_active());
+        assert!(!uncovered_lock_ready());
+
+        // 规则全部生效后才标记 ready。
+        mark_uncovered_ready().unwrap();
+        assert!(uncovered_lock_ready());
+
+        // 清除时两者一起走。
+        clear_uncovered_lock();
+        assert!(!uncovered_lock_active());
+        assert!(!uncovered_lock_ready());
+    }
+
+    /// **P0-C**：兜底封锁只建规则，不结束进程。
+    #[test]
+    fn uncovered_enforcement_does_not_kill_processes() {
+        // 无守护对象时是安全空操作；有对象时也不应调用进程结束路径。
+        let report = crate::egate_trip::enforce_uncovered_outbound(&[]);
+        assert!(report.agents.is_empty());
+        assert!(!report.any_isolated);
+        assert!(report.note.contains("没有配置"));
     }
 }

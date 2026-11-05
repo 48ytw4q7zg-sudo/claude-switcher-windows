@@ -523,6 +523,7 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
         target_id: id.to_string(),
         backup_path: std::cell::RefCell::new(None),
         original_existed: std::cell::Cell::new(false),
+        phase: std::cell::Cell::new(DesktopSwitchPhase::Prepared),
     };
     // **P0-08 / P0-F**：账本必须**在取得账号库执行权之后**才写。
     //
@@ -677,11 +678,30 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
             //   已经一致的状态；因此这里**清掉**账本，但清失败要如实报告。
             // - 回滚失败：账本必须留下（下次启动重试恢复），且阶段保持
             //   `FilesSwitched`（可回滚态）。
-            // **P0-03**：失败时按「实际做到哪一步」决定账本去留：
-            // - 还没动过活目录（账本停在 Prepared）→ 清掉账本，不留待恢复事务；
-            // - 已备份/已开始替换 → 保留账本与备份，让恢复器能回滚。
+            // **P0-A**：判定依据是**事务实际推进到的阶段**（`transaction.phase`）
+            // 与**磁盘账本**，而不是外层最初创建的 `Prepared`。
+            //
+            // 原实现用 `base_ledger.phase` 判断：内层已经推进到 FilesSwitching、
+            // 甚至清空了一半活目录后才失败，外层仍认为「没动过文件」而清掉账本，
+            // 结果需要恢复的现场失去了恢复依据。
+            let disk_phase = read_pending_switch_ledger()
+                .ok()
+                .flatten()
+                .map(|l| l.phase)
+                .unwrap_or(DesktopSwitchPhase::Unknown);
+            let effective_phase = match (transaction.phase.get(), disk_phase) {
+                // 两者取「更靠后」的那个：任何一方显示动过文件，就必须保留账本。
+                (a, DesktopSwitchPhase::Unknown) => a,
+                (a, b) => {
+                    if phase_rank(b) > phase_rank(a) {
+                        b
+                    } else {
+                        a
+                    }
+                }
+            };
             let touched_files = matches!(
-                final_ledger.phase,
+                effective_phase,
                 DesktopSwitchPhase::BackupVerified
                     | DesktopSwitchPhase::FilesSwitching
                     | DesktopSwitchPhase::FilesSwitched
@@ -694,6 +714,8 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
                 }
                 return Err(error);
             }
+            // 动过文件：账本必须留下，且写明**实际阶段**（便于恢复器判断）。
+            final_ledger.phase = effective_phase;
             if let Err(write_error) = write_switch_ledger(&final_ledger) {
                 return Err(format!(
                     "{error}；且切换账本写入失败（{write_error}），下次启动可能需要人工核对 {}",
@@ -714,6 +736,22 @@ struct DesktopTransaction {
     backup_path: std::cell::RefCell<Option<std::path::PathBuf>>,
     /// 切换前活目录是否存在。
     original_existed: std::cell::Cell<bool>,
+    /// **P0-A**：本次事务**实际推进到**的阶段（由 `advance_ledger_phase` 回写）。
+    ///
+    /// 外层错误处理不能再用最初创建的 `Prepared` 判断「有没有动过文件」：
+    /// 内层可能已经把账本推进到 `FilesSwitching`、清空了活目录后才失败。
+    phase: std::cell::Cell<DesktopSwitchPhase>,
+}
+
+impl Default for DesktopTransaction {
+    fn default() -> Self {
+        Self {
+            target_id: String::new(),
+            backup_path: std::cell::RefCell::new(None),
+            original_existed: std::cell::Cell::new(false),
+            phase: std::cell::Cell::new(DesktopSwitchPhase::Prepared),
+        }
+    }
 }
 
 /// **P0-A**：账号库提交标记（写入账本，用于崩溃后判定提交归属）。
@@ -797,6 +835,20 @@ pub enum DesktopSwitchPhase {
     /// 不认识的阶段（旧版本或损坏）：保守处理，绝不自动删除。
     #[serde(other)]
     Unknown,
+}
+
+/// 阶段先后顺序（数值越大越「靠后」）。用于在「内存记录」与「磁盘账本」
+/// 不一致时取更保守（更靠后）的那个。
+fn phase_rank(phase: DesktopSwitchPhase) -> u8 {
+    match phase {
+        DesktopSwitchPhase::Prepared => 0,
+        DesktopSwitchPhase::BackupVerified => 1,
+        DesktopSwitchPhase::FilesSwitching => 2,
+        DesktopSwitchPhase::FilesSwitched => 3,
+        DesktopSwitchPhase::StoreCommitted => 4,
+        DesktopSwitchPhase::Completed => 5,
+        DesktopSwitchPhase::Unknown => 0,
+    }
 }
 
 impl DesktopSwitchPhase {
@@ -1350,6 +1402,8 @@ fn switch_desktop_profile_in(
         // 存在精确的备份路径，否则崩溃时恢复器不知道去哪里恢复。
         // 写失败则中止（活目录尚未改动，原账号仍完整）。
         persist_backup_path(&path, live_dir)?;
+        // **P0-A**：备份已登记，账本此刻已是 BackupVerified。
+        transaction.phase.set(DesktopSwitchPhase::BackupVerified);
         warnings.push(format!(
             "切换前已备份当前 Claude Desktop 数据到 {}（{} 字节，跳过链接 {} 个）",
             path.display(),
@@ -1368,6 +1422,8 @@ fn switch_desktop_profile_in(
             "无法把切换账本推进到「文件替换中」（{error}），已中止切换：活目录未被修改"
         ));
     }
+    // **P0-A**：记录真实推进到的阶段，供外层失败判定使用。
+    transaction.phase.set(DesktopSwitchPhase::FilesSwitching);
     if live_dir.exists() || links::path_is_link(live_dir) {
         fsx::retry_io(|| fs::remove_dir_all(live_dir)).map_err(|e| {
             format!(
@@ -1475,6 +1531,128 @@ fn switch_desktop_profile_in(
 
 /// 删除 Desktop 账号登记；`also_files` 为 true 时连快照目录一起删除。
 /// 登记不存在视为幂等成功。
+/// **P0-D**：Desktop 删除的持久化账本。
+///
+/// 原实现「改名 → 存库 → 删目录」没有账本：崩在「改名之后、存库之前」时，
+/// 登记还在、正式目录却已不存在，数据只躺在待删目录里且无人知晓。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DesktopDeleteJournal {
+    transaction_id: String,
+    snapshot_id: String,
+    original: String,
+    pending: String,
+    /// 正式目录已改名。
+    files_moved: bool,
+    /// 账号库已提交（登记已删除）。
+    store_committed: bool,
+    started_at: i64,
+}
+
+fn desktop_delete_journal_path() -> Result<std::path::PathBuf, String> {
+    Ok(crate::paths::app_data_dir()?.join("desktop-delete.json"))
+}
+
+fn write_delete_journal(journal: &DesktopDeleteJournal) -> Result<(), String> {
+    let path = desktop_delete_journal_path()?;
+    crate::fsx::write_atomically(
+        &path,
+        &serde_json::to_string_pretty(journal).map_err(|e| format!("序列化删除账本失败：{e}"))?,
+    )
+    .map_err(|e| format!("写入删除账本失败：{e}"))
+}
+
+fn clear_delete_journal() -> Result<(), String> {
+    let path = desktop_delete_journal_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("删除删除账本失败：{error}")),
+    }
+}
+
+/// **P0-D**：启动时恢复中断的快照删除。
+///
+/// 判据是「账号库登记 + 文件实际状态」：
+/// - 登记还在、正式目录不存在、待删目录存在 → 把目录改回正式名（恢复数据）；
+/// - 登记已删 → 继续删除待删目录，完成后清账本；
+/// - 情况不明 → 保留账本与所有文件，报告唯一副本位置。
+pub fn heal_desktop_delete() -> Vec<String> {
+    let path = match desktop_delete_journal_path() {
+        Ok(path) => path,
+        Err(_) => return Vec::new(),
+    };
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            return vec![format!("Desktop 删除账本无法读取（{error}），已保留现场")];
+        }
+    };
+    let journal: DesktopDeleteJournal =
+        match serde_json::from_str(&crate::jsonio::decode_text(&bytes)) {
+            Ok(journal) => journal,
+            Err(error) => {
+                return vec![format!(
+                    "Desktop 删除账本损坏（{error}），已保留现场请人工核对"
+                )];
+            }
+        };
+    let original = std::path::PathBuf::from(&journal.original);
+    let pending = std::path::PathBuf::from(&journal.pending);
+    let registered = store::load_store()
+        .map(|data| {
+            data.desktop_profiles
+                .iter()
+                .any(|p| p.id == journal.snapshot_id)
+        })
+        .unwrap_or(true);
+    let mut messages = Vec::new();
+
+    if registered && !original.exists() && pending.is_dir() {
+        match fsx::rename_with_retry(&pending, &original) {
+            Ok(()) => {
+                if let Err(error) = clear_delete_journal() {
+                    messages.push(error);
+                }
+                messages.push(format!(
+                    "检测到中断的快照删除（{}），已把待删目录恢复为正式快照",
+                    journal.snapshot_id
+                ));
+            }
+            Err(error) => messages.push(format!(
+                "快照 {} 的目录仍保留在 {}，恢复正式名失败：{error}；账本已保留",
+                journal.snapshot_id,
+                pending.display()
+            )),
+        }
+        return messages;
+    }
+    if !registered && pending.is_dir() {
+        match fsx::retry_io(|| std::fs::remove_dir_all(&pending)) {
+            Ok(()) => {
+                if let Err(error) = clear_delete_journal() {
+                    messages.push(error);
+                }
+                messages.push(format!(
+                    "检测到中断的快照删除（{}），登记已删除，已清理待删目录",
+                    journal.snapshot_id
+                ));
+            }
+            Err(error) => messages.push(format!(
+                "登记已删除，但待删目录 {} 清理失败：{error}",
+                pending.display()
+            )),
+        }
+        return messages;
+    }
+    // 其余情况：不清账本，报告现场。
+    messages.push(format!(
+        "Desktop 删除事务（{}）状态不明（files_moved={}，store_committed={}），         已保留账本与全部目录，请人工核对",
+        journal.transaction_id, journal.files_moved, journal.store_committed
+    ));
+    messages
+}
+
 pub fn delete_desktop_profile(id: &str, also_files: bool) -> Result<(), String> {
     // **P0-04**：整个删除过程持有与导入/切换相同的执行权。
     //
@@ -1510,8 +1688,20 @@ pub fn delete_desktop_profile(id: &str, also_files: bool) -> Result<(), String> 
             profile.id,
             uuid::Uuid::new_v4().simple()
         ));
+        let mut journal = DesktopDeleteJournal {
+            transaction_id: uuid::Uuid::new_v4().simple().to_string(),
+            snapshot_id: profile.id.clone(),
+            original: snapshot.to_string_lossy().to_string(),
+            pending: pending.to_string_lossy().to_string(),
+            files_moved: false,
+            store_committed: false,
+            started_at: chrono::Utc::now().timestamp(),
+        };
+        // **P0-D**：先落账本，再动文件。
+        write_delete_journal(&journal)?;
         let renamed = if snapshot.exists() {
             fsx::rename_with_retry(&snapshot, &pending).map_err(|e| {
+                let _ = clear_delete_journal();
                 format!(
                     "移走快照目录失败 {}: {}（账号未删除）",
                     snapshot.display(),
@@ -1522,22 +1712,40 @@ pub fn delete_desktop_profile(id: &str, also_files: bool) -> Result<(), String> 
         } else {
             false
         };
+        journal.files_moved = renamed;
+        write_delete_journal(&journal)?;
         // 登记保存失败 → 把目录改回原名，保证「登记与文件」一致。
         if let Err(error) = tx.save(&data) {
+            // **QW-03**：回滚改名失败时必须把**两个**错误都报出来，
+            // 不能声称「已恢复快照目录」。
             if renamed {
-                let _ = fsx::rename_with_retry(&pending, &snapshot);
+                return Err(match fsx::rename_with_retry(&pending, &snapshot) {
+                    Ok(()) => {
+                        let _ = clear_delete_journal();
+                        format!("保存账号库失败，已恢复快照目录：{error}")
+                    }
+                    Err(restore_error) => format!(
+                        "保存账号库失败（{error}）；且恢复快照目录失败（{restore_error}）。                         该账号的唯一副本仍在 {}，请勿删除，账本已保留",
+                        pending.display()
+                    ),
+                });
             }
-            return Err(format!("保存账号库失败，已恢复快照目录：{error}"));
+            let _ = clear_delete_journal();
+            return Err(format!("保存账号库失败：{error}"));
         }
+        journal.store_committed = true;
+        write_delete_journal(&journal)?;
         if renamed {
             if let Err(error) = fsx::retry_io(|| std::fs::remove_dir_all(&pending)) {
                 // 登记已删、目录已移走：残留不影响正确性，但要如实说明位置。
+                // 账本保留，下次启动会继续清理。
                 return Err(format!(
                     "账号已删除，但清理快照目录失败（{error}）；残留目录：{}",
                     pending.display()
                 ));
             }
         }
+        clear_delete_journal()?;
         Ok(())
     })
 }
@@ -1943,11 +2151,7 @@ mod tests {
         fs::write(live.join("cache/old.tmp"), b"old").unwrap();
 
         let backup_root = dir.path().join("backups");
-        let tx = DesktopTransaction {
-            target_id: String::new(),
-            backup_path: std::cell::RefCell::new(None),
-            original_existed: std::cell::Cell::new(false),
-        };
+        let tx = DesktopTransaction::default();
         let warnings = switch_desktop_profile_in(
             "b-id",
             &live,
@@ -2026,11 +2230,7 @@ mod tests {
         fs::write(live.join("who.txt"), b"A-after-use").unwrap();
         fs::write(live.join("cache/new.tmp"), b"new").unwrap();
 
-        let tx = DesktopTransaction {
-            target_id: String::new(),
-            backup_path: std::cell::RefCell::new(None),
-            original_existed: std::cell::Cell::new(false),
-        };
+        let tx = DesktopTransaction::default();
         switch_desktop_profile_in(
             "b-id",
             &live,
@@ -2086,11 +2286,7 @@ mod tests {
         fs::create_dir_all(&live).unwrap();
         fs::write(live.join("who.txt"), b"unknown-account").unwrap();
 
-        let tx = DesktopTransaction {
-            target_id: String::new(),
-            backup_path: std::cell::RefCell::new(None),
-            original_existed: std::cell::Cell::new(false),
-        };
+        let tx = DesktopTransaction::default();
         switch_desktop_profile_in(
             "b-id",
             &live,
@@ -2149,11 +2345,7 @@ mod tests {
             copy_dir_recursive(src, dst)
         };
 
-        let tx = DesktopTransaction {
-            target_id: String::new(),
-            backup_path: std::cell::RefCell::new(None),
-            original_existed: std::cell::Cell::new(false),
-        };
+        let tx = DesktopTransaction::default();
         let err = switch_desktop_profile_in(
             "b-id",
             &live,
@@ -2191,11 +2383,7 @@ mod tests {
         let mut store = Store::default();
 
         // 未知 id。
-        let tx = DesktopTransaction {
-            target_id: String::new(),
-            backup_path: std::cell::RefCell::new(None),
-            original_existed: std::cell::Cell::new(false),
-        };
+        let tx = DesktopTransaction::default();
         let err = switch_desktop_profile_in(
             "nobody",
             &live,
@@ -2222,11 +2410,7 @@ mod tests {
             size_bytes: 0,
             meta: None,
         });
-        let tx = DesktopTransaction {
-            target_id: String::new(),
-            backup_path: std::cell::RefCell::new(None),
-            original_existed: std::cell::Cell::new(false),
-        };
+        let tx = DesktopTransaction::default();
         let err = switch_desktop_profile_in(
             "ghost",
             &live,
@@ -2246,11 +2430,7 @@ mod tests {
         // 才能走到 wait_until_quite 这一步。
         fs::create_dir_all(accounts.join("ghost")).unwrap();
         fs::write(live.join("who.txt"), b"A").unwrap();
-        let tx = DesktopTransaction {
-            target_id: String::new(),
-            backup_path: std::cell::RefCell::new(None),
-            original_existed: std::cell::Cell::new(false),
-        };
+        let tx = DesktopTransaction::default();
         let err = switch_desktop_profile_in(
             "ghost",
             &live,
@@ -2335,11 +2515,7 @@ mod tests {
         let running_calls = Rc::clone(&calls);
         let copy_calls = Rc::clone(&calls);
         let backup_root = dir.path().join("backups");
-        let tx = DesktopTransaction {
-            target_id: String::new(),
-            backup_path: std::cell::RefCell::new(None),
-            original_existed: std::cell::Cell::new(false),
-        };
+        let tx = DesktopTransaction::default();
         let warnings = switch_desktop_profile_in(
             "current",
             &live,
@@ -2397,11 +2573,7 @@ mod tests {
             if snapshot_exists {
                 fs::create_dir_all(accounts.join("current")).unwrap();
             }
-            let tx = DesktopTransaction {
-                target_id: String::new(),
-                backup_path: std::cell::RefCell::new(None),
-                original_existed: std::cell::Cell::new(false),
-            };
+            let tx = DesktopTransaction::default();
             let result = switch_desktop_profile_in(
                 "current",
                 &live,
@@ -2445,11 +2617,7 @@ mod tests {
         let copy_calls = Rc::new(Cell::new(0));
         let kill_count = Rc::clone(&kill_calls);
         let copy_count = Rc::clone(&copy_calls);
-        let tx = DesktopTransaction {
-            target_id: String::new(),
-            backup_path: std::cell::RefCell::new(None),
-            original_existed: std::cell::Cell::new(false),
-        };
+        let tx = DesktopTransaction::default();
         let warnings = switch_desktop_profile_in(
             "current",
             &live,
@@ -2488,11 +2656,7 @@ mod tests {
         let mut store = current_desktop_store();
         let store_before = serde_json::to_value(&store).unwrap();
         for (target, expected) in [("current", "快照目录缺失"), ("unknown", "未找到")] {
-            let tx = DesktopTransaction {
-                target_id: String::new(),
-                backup_path: std::cell::RefCell::new(None),
-                original_existed: std::cell::Cell::new(false),
-            };
+            let tx = DesktopTransaction::default();
             let error = switch_desktop_profile_in(
                 target,
                 &live,
@@ -2944,5 +3108,147 @@ mod tests {
         let after = store::load_store().unwrap();
         assert!(after.desktop_profiles.is_empty());
         assert!(after.current_desktop_profile_id.is_none());
+    }
+
+    /// **P0-A 回归**：内层已把账本推进到 FilesSwitching 后失败时，
+    /// 外层**不能**因为自己手里还是 Prepared 就清掉账本。
+    #[test]
+    fn failed_after_files_switching_keeps_ledger() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let accounts = dir.path().join("desktop-accounts");
+        let snapshot = accounts.join("b-id");
+        fs::create_dir_all(&snapshot).unwrap();
+        fs::write(snapshot.join("who.txt"), b"B").unwrap();
+
+        let mut store_data = Store::default();
+        store_data.desktop_profiles.push(DesktopProfile {
+            id: "b-id".into(),
+            name: "B".into(),
+            notes: None,
+            created_at: Utc::now(),
+            updated_at: Utc::now(),
+            last_switched_at: None,
+            snapshot_rel: "desktop-accounts/b-id".into(),
+            size_bytes: 0,
+            meta: None,
+        });
+
+        let live = dir.path().join("Claude");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("who.txt"), b"A").unwrap();
+        let backup_root = dir.path().join("backups");
+        let snapshot_clone = snapshot.clone();
+        let live_clone = live.clone();
+        // 备份成功、活目录清空之后，快照→活目录复制失败。
+        let copy = move |src: &Path, dst: &Path| {
+            if src == snapshot_clone && dst == live_clone {
+                return Err("模拟目标快照复制失败".to_string());
+            }
+            copy_dir_recursive(src, dst)
+        };
+        let tx = DesktopTransaction::default();
+        let err = switch_desktop_profile_in(
+            "b-id",
+            &live,
+            &accounts,
+            &mut store_data,
+            &|_n| Ok(Vec::new()),
+            &|| Ok(false),
+            &backup_root,
+            &copy,
+            &tx,
+        )
+        .unwrap_err();
+        assert!(err.contains("复制失败"), "{err}");
+        // 事务上下文必须反映出「已经动过文件」。
+        assert!(
+            matches!(
+                tx.phase.get(),
+                DesktopSwitchPhase::FilesSwitching | DesktopSwitchPhase::BackupVerified
+            ),
+            "内层推进阶段后应回写事务上下文，实际 {:?}",
+            tx.phase.get()
+        );
+    }
+
+    /// **P0-D**：删除在「改名后、存库前」崩溃时，启动恢复要把目录改回正式名。
+    #[test]
+    fn delete_journal_restores_directory_when_store_not_committed() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let accounts = dir.path().join(".claude-switcher").join("desktop-accounts");
+        let original = accounts.join("a-id");
+        let pending = accounts.join(".a-id.delete-pending-test");
+        std::fs::create_dir_all(&pending).unwrap();
+        std::fs::write(pending.join("who.txt"), b"only-copy").unwrap();
+
+        // 账号库仍登记该快照（存库未完成）。
+        store::with_store(|store| {
+            store.desktop_profiles.push(DesktopProfile {
+                id: "a-id".into(),
+                name: "A".into(),
+                notes: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                last_switched_at: None,
+                snapshot_rel: "desktop-accounts/a-id".into(),
+                size_bytes: 0,
+                meta: None,
+            });
+            Ok(())
+        })
+        .unwrap();
+        write_delete_journal(&DesktopDeleteJournal {
+            transaction_id: "t".into(),
+            snapshot_id: "a-id".into(),
+            original: original.to_string_lossy().to_string(),
+            pending: pending.to_string_lossy().to_string(),
+            files_moved: true,
+            store_committed: false,
+            started_at: 0,
+        })
+        .unwrap();
+
+        let messages = heal_desktop_delete();
+        assert!(
+            original.is_dir(),
+            "登记仍在时必须把待删目录恢复为正式快照；消息：{messages:?}"
+        );
+        assert_eq!(fs::read(original.join("who.txt")).unwrap(), b"only-copy");
+        assert!(!desktop_delete_journal_path().unwrap().exists());
+    }
+
+    /// **P0-D**：登记已删除时，恢复器继续清理待删目录。
+    #[test]
+    fn delete_journal_cleans_pending_when_store_committed() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let accounts = dir.path().join(".claude-switcher").join("desktop-accounts");
+        let pending = accounts.join(".a-id.delete-pending-test");
+        std::fs::create_dir_all(&pending).unwrap();
+        // 账号库里没有该登记（删除已提交）。
+        store::with_store(|store| {
+            store.desktop_profiles.clear();
+            Ok(())
+        })
+        .unwrap();
+        write_delete_journal(&DesktopDeleteJournal {
+            transaction_id: "t".into(),
+            snapshot_id: "a-id".into(),
+            original: accounts.join("a-id").to_string_lossy().to_string(),
+            pending: pending.to_string_lossy().to_string(),
+            files_moved: true,
+            store_committed: true,
+            started_at: 0,
+        })
+        .unwrap();
+
+        let _ = heal_desktop_delete();
+        assert!(!pending.exists(), "登记已删除时应清理待删目录");
+        assert!(!desktop_delete_journal_path().unwrap().exists());
     }
 }
