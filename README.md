@@ -40,8 +40,8 @@
 | 项 | 状态 |
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
-| 安装包 | **[Release v0.6.11](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases)**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计 |
-| SHA256 | 每个 Release 附 `SHA256SUMS.txt`；校验：`Get-FileHash .\<文件名> -Algorithm SHA256` 后与其比对。本版发布后此处补上已核验的具体值 |
+| 安装包 | **[Release v0.6.11](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.6.11)**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计 |
+| SHA256 | `0.6.11_x64-setup.exe` `2b4823e76b57d8d854fa13d218a8ee85252e720c49ac2d95053085c32fc6f903`<br>`0.6.11_x64_zh-CN.msi` `8383cd0112432129967e85e7bf36f4d5f392ae78fdad1d5b1f9b6e703d368adc`<br>`ClaudeSwitcher-portable.zip` `efb6372c6a9ddc15bc24402a37cdcb82265431d253c62cea3b2285581e925600`<br>校验：`Get-FileHash .\<文件名> -Algorithm SHA256`，与 Release 的 `SHA256SUMS.txt` 比对 |
 | 开发分支验证 | 11 月 5 日（v0.6.11）：完整 Rust 回归 **630 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。第十二轮修项见 [v0.6.11 发布说明](docs/release-v0.6.11.md)，上一轮见 [v0.6.10](docs/release-v0.6.10.md) |
 | 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；逐项状态与剩余差异见[功能对等记录](docs/upstream-baseline.md)与[对等核对](docs/parity-gap-final-2026-11-04.md) |
 | 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |
