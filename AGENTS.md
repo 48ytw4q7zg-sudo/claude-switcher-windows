@@ -271,6 +271,13 @@ async fn xxx() -> Result<T, String> {
 - **v0.7.2 已验证**：`AppIsolation`/`UncoveredLock`/旧版 `Egate ... Out` 三类规则共存时
   `cs.exe --exit-restore` 退出码 0 且规则清零；无残留时幂等返回 0。未验证：非管理员拒绝路径、
   组策略持有规则、进程中断/输出截断注入、真实 TUN 路由证据。
+- **v0.7.6 已验证**：`tests/windows-integration/02/03/04` 在管理员实机通过；
+  `scripts/check-security-regressions.ps1` 36/36 组通过（CI 与发布共用同一脚本）。
+  新增：规则修复事务化（先建后删）、ready 属性级核验、自动解除复核 ProxyOverride、
+  WinINet 通配符语义、内置目标锚点锁定、配置丢失识别、High 权限任务路径校验、
+  手动检查与后台熔断计数隔离、监控间隔 clamp 修正。
+  **未验证**：真实 TUN 环境、IPv6 旁路实机复现、环境修改恢复账本、
+  非管理员路径、ActiveStore 不一致、并发与进程中断注入、NSIS 回归。
 - **v0.7.5 已验证**：`tests/windows-integration/02/03/04` 在管理员实机通过
   （三类规则清零 + 真实断网账本/意图/ready 收敛 + 账本损坏时拒绝并保留证据）。
   新增：严格 OAuth 三态策略（零直连断言）、熔断完成状态按应处理集合计算、

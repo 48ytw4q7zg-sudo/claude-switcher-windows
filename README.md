@@ -39,10 +39,10 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 源码 | `main` 分支（本仓库），当前版本 **v0.7.5**（安全与状态机修订）。版本号跳过 v0.7.4，用于区分「已发布的 v0.7.3」与本地中间态 |
-| 安装包 | **[Release v0.7.5](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.7.5)**，由 `.github/workflows/windows-build.yml` 在打 `v0.7.5` tag 时构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停） |
-| SHA256 | `ClaudeSwitcher_0.7.5_x64-setup.exe` `7515f615c0542e56d818e4e922bfe356fc2196e4d498a501e39e0eec2526b697`<br>`ClaudeSwitcher-portable.zip` `fd1ff32dfade80beadc273450834c8466d5aece2e61e6b7ed6d9d0077f7b4487`<br>（已用 `sha256sum -c SHA256SUMS.txt` 与独立重算双重核对）<br>校验：`Get-FileHash .\<文件名> -Algorithm SHA256`，或 `gh attestation verify <文件> -R 48ytw4q7zg-sudo/claude-switcher-windows` 验证来源证明（已验通过） |
-| 开发分支验证 | 11 月 6 日（v0.7.5）：完整 Rust 回归 **690 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。<br>**真实系统验证（管理员，本机）**：<br>① `02-firewall-isolation.ps1`：三类规则 4 条 → `--exit-restore` → 退出码 **0**、规则 **4 → 0**；重复执行幂等。<br>② `03-restore-ledger.ps1`：**真实构造的断网账本** + 阻断规则 + 兜底意图 + ready → 全部清除、退出码 0。<br>③ `04-corrupt-ledger.ps1`：账本损坏时退出码 **1**、规则与账本均保留（不猜、不删）。<br>本轮修项见 [v0.7.5 发布说明](docs/release-v0.7.5.md) |
+| 源码 | `main` 分支（本仓库），当前版本 **v0.7.6**（安全边界与事务收口） |
+| 安装包 | **v0.7.6**：源码就绪，安装包由 `.github/workflows/windows-build.yml` 在打 `v0.7.6` tag 时构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停）。最近一个已发布版本是 [v0.7.5](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.7.5) |
+| SHA256 | v0.7.6 安装包尚未构建，因此**没有可核对的哈希**（不写占位值）。构建后以 Release 里的 `SHA256SUMS.txt` 为准，本地校验：`Get-FileHash .\<文件名> -Algorithm SHA256`，或 `gh attestation verify <文件> -R 48ytw4q7zg-sudo/claude-switcher-windows` 验证来源证明 |
+| 开发分支验证 | 11 月 6 日（v0.7.6）：完整 Rust 回归 **700 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过；`scripts/check-security-regressions.ps1` **36/36 组**安全回归通过（CI 与发布共用同一份脚本）。<br>**真实系统验证（管理员，本机）**：<br>① `02-firewall-isolation.ps1`：三类规则 4 条 → `--exit-restore` → 退出码 0、规则 4 → 0，幂等。<br>② `03-restore-ledger.ps1`：真实断网账本 + 阻断规则 + 兜底意图 + ready → 全部清除。<br>③ `04-corrupt-ledger.ps1`：账本损坏时退出码 1、规则与账本均保留。<br>本轮修项见 [v0.7.6 发布说明](docs/release-v0.7.6.md) |
 | 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；逐项状态与剩余差异见[功能对等记录](docs/upstream-baseline.md)与[对等核对](docs/parity-gap-final-2026-11-04.md) |
 | 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
@@ -328,6 +328,9 @@ ClaudeSwitcher-portable.zip                                       # 便携版
 | **自动更新全流程** | 下载 + SHA256 校验已实现；`installed: false` 如实表示「安装向导已启动」而非已安装。安装后的版本替换与回滚需实机验收。<br>**v0.7.2 明确的边界**：发布清单**没有签名根**，因此 SHA256 的来源仍由「调用方传入」决定——这不足以证明制品来自本项目的发布者。在具备可信签名链之前，自动下载+运行安装包**不应被视为完整的可信更新路径**；用户在更新提示中看到的官方 Release 页面才是可信来源 |
 | **P1-13 严格防泄漏模式** | 新增 `strict_leak_protection`（默认关）：开启后接入路径未知或 TUN 路由未证明时也会封锁受管应用出站（不杀进程、不全局断网）。**未实机验证**完整触发链 |
 | **P1-02 管理员 helper** | 仍未实现受限特权 helper（架构级）；`is_elevated` 与界面权限提示已有 |
+| **P1-06 环境修改恢复账本** | 时区/IPv6/Culture 修改已统一走系统操作锁；**原状态快照与资源级恢复账本仍未建立**，且需可回滚 VM 验收 |
+| **P0-01 特权计划任务** | 已缓解：拒绝在用户可写目录注册 Highest 任务（真实探针判定）。**受限特权 helper 仍未实现** |
+| **P1-12 企业策略代理来源** | 未实现：当前只读 HKCU 代理设置，组策略/HKLM 强制代理未覆盖 |
 | **加密快照跨机导入** | 单元测试已覆盖「源机导出 → 另一 USERPROFILE 导入 → 账号库与 Desktop 快照同时恢复」；真实两台机器间的迁移仍需实机执行（DPAPI 系统凭据不在包内，Desktop 可能需重新登录） |
 | **托盘一键切换**（动态菜单、点击切换、系统通知、菜单重建） | 未完成完整实机验收 |
 | **按终端并行多账号**（wt/cmd 拉起、独立配置目录、共享 skills） | 未实机验证 |

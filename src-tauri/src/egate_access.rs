@@ -210,12 +210,20 @@ pub fn verdict(
             if bypass_all(evidence.overrides.as_deref()) {
                 // 全部绕过代理 = 应用直连，与未接入同义。
                 AccessPath::Uncovered
-            } else if let Some(entry) = bypass_risk(evidence.overrides.as_deref(), hosts) {
-                AccessPath::Unknown {
-                    reason: format!("代理绕过列表含 {entry}，被监控流量可能直连"),
-                }
             } else {
-                AccessPath::SystemProxy { addr }
+                match bypass_verdict(evidence.overrides.as_deref(), hosts) {
+                    // **P0-09 / L-10**：明确绕过风险 -> 不能当成「代理已覆盖」。
+                    BypassVerdict::Risk(entry) => AccessPath::Unknown {
+                        reason: format!("代理绕过列表含 {entry}，被监控流量可能绕过代理直连"),
+                    },
+                    // **L-10**：看不懂的绕过语法不得当成无风险。
+                    BypassVerdict::Unknown(detail) => AccessPath::Unknown {
+                        reason: format!(
+                            "代理绕过列表含无法识别的条目（{detail}），无法确认受监控域名是否被绕过"
+                        ),
+                    },
+                    BypassVerdict::NoRisk => AccessPath::SystemProxy { addr },
+                }
             }
         }
         ProxyParse::Unsupported(why) => AccessPath::Unknown {
@@ -483,48 +491,81 @@ fn check_addr(addr: String) -> ProxyParse {
     }
 }
 
-/// 拆分绕过列表条目。
-pub fn bypass_entries(raw: Option<&str>) -> Vec<String> {
-    raw.map(|raw| {
-        raw.split(';')
-            .map(|entry| entry.trim().to_string())
-            .filter(|entry| !entry.is_empty())
-            .collect()
-    })
-    .unwrap_or_default()
+/// **P0-09（v0.7.6）**：`ProxyOverride` 条目的语义分类。
+///
+/// v0.7.5 的 `entry_domain()` 只做 `trim_start_matches('*')` 再按域名后缀
+/// 匹配，于是 `*claude*` 变成 `claude*`（尾部 `*` 残留）→ 永不命中
+/// `claude.ai`。而 Windows WinINet **确实支持** `*int*` / `*claude*` 这类
+/// 中间通配，会让匹配域名绕过代理直连——门禁却判为「代理已覆盖」。
+///
+/// 现在按 Windows 认可的语法分类，不认得的一律 `Unrecognized`
+/// （**不得**默认判为无风险）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BypassEntry {
+    /// `*`：全部绕过代理。
+    MatchAll,
+    /// `<local>`：内网主机名（无点号）绕过。
+    Local,
+    /// `<-loopback>`：显式声明回环**不**绕过（本身不是绕过规则）。
+    NoLoopback,
+    /// 含 `*` 的通配模式：`*claude*` / `*.claude.ai` / `claude.*`。
+    Wildcard(String),
+    /// 字面域名：按 Windows 语义匹配域名本身与子域。
+    Literal(String),
+    /// IP 字面量 / IP 段 / CIDR：只对**指向裸 IP** 的连接生效。
+    IpRange(String),
+    /// 无法理解的语法 → 调用方必须按「无法确认」处理。
+    Unrecognized(String),
 }
 
-/// 是否「全部绕过」（`*` 或空列表都意味着没有代理）。
-pub fn bypass_all(raw: Option<&str>) -> bool {
-    match raw.map(str::trim) {
-        None => false,
-        Some("") => false,
-        Some(list) => bypass_entries(Some(list)).iter().any(|e| e == "*"),
-    }
+/// 解析 `ProxyOverride` 的原始串（分号分隔）。
+fn parse_bypass_entries(raw: Option<&str>) -> Vec<BypassEntry> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    raw.split(';')
+        .map(str::trim)
+        .filter(|entry| !entry.is_empty())
+        .map(classify_bypass_entry)
+        .collect()
 }
 
-/// 去掉通配前缀，取出条目里的域名部分（`*.claude.ai`、`*claude.ai` → `claude.ai`）。
-fn entry_domain(entry: &str) -> String {
-    entry
-        .trim()
-        .trim_start_matches('*')
-        .trim_start_matches('.')
-        .to_string()
-}
-
-/// 条目是否只覆盖本机 / 私网 / 链路本地——这类地址不可能让公网流量直连。
-pub fn bypass_local_entry(entry: &str) -> bool {
-    let e = entry.trim().to_ascii_lowercase();
-    match e.as_str() {
-        "<local>" | "localhost" | "localhost.*" | "*.localhost" | "*.local" | "[::1]" | "::1" => {
-            return true
+/// 单条绕过条目的分类（**P0-09**：宁可标 Unrecognized，也不乐观放行）。
+fn classify_bypass_entry(entry: &str) -> BypassEntry {
+    let trimmed = entry.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    match lower.as_str() {
+        "*" => return BypassEntry::MatchAll,
+        "<local>" | "localhost" | "localhost.*" | "*.localhost" | "*.local" => {
+            return BypassEntry::Local
         }
+        "<-loopback>" => return BypassEntry::NoLoopback,
+        "[::1]" | "::1" => return BypassEntry::Local,
         _ => {}
     }
-    let Some(prefix) = e.strip_suffix(".*") else {
-        return false;
-    };
-    let octets: Vec<u8> = prefix
+    // 私网 / 回环 IP 段：`10.*`、`127.*`、`192.168.*`、`172.16.*` 这类
+    // 在 Windows 里等价于「内网不绕过」，对按主机名的连接不构成绕过。
+    if is_local_ip_range(&lower) {
+        return BypassEntry::Local;
+    }
+    // IP 字面量 / 段 / CIDR：只对裸 IP URL 生效。
+    if looks_like_ip_range(&lower) {
+        return BypassEntry::IpRange(lower);
+    }
+    if trimmed.contains('*') {
+        return BypassEntry::Wildcard(lower);
+    }
+    // 字面域名：必须是合法的标签序列，否则归入 Unrecognized。
+    if is_domain_like(&lower) {
+        return BypassEntry::Literal(lower);
+    }
+    BypassEntry::Unrecognized(trimmed.to_string())
+}
+
+/// 该条目是否是「内网/回环」语义（对公网主机名不构成绕过）。
+fn is_local_ip_range(entry: &str) -> bool {
+    let e = entry.trim().trim_end_matches(".*");
+    let octets: Vec<u8> = e
         .split('.')
         .map(|v| v.parse::<u8>().ok())
         .collect::<Option<Vec<_>>>()
@@ -537,35 +578,156 @@ pub fn bypass_local_entry(entry: &str) -> bool {
     }
 }
 
-/// 绕过条目是否会命中给定主机名（`*` 由 `bypass_all` 单独处理）。
-pub fn bypass_hits_host(entry: &str, host: &str) -> bool {
-    let domain = entry_domain(entry);
-    if domain.is_empty() {
-        return true;
+/// 形如 IP 字面量 / `a.b.*` / `a.b.c.d/nn` / IPv6 的条目。
+fn looks_like_ip_range(entry: &str) -> bool {
+    let head = entry.split('/').next().unwrap_or(entry);
+    if head.contains(':') {
+        // IPv6 字面量（含 `::` 缩写与方括号）。
+        return head.len() >= 2
+            && head.chars().all(|c| {
+                c.is_ascii_hexdigit() || c == ':' || c == '.' || c == '[' || c == ']' || c == '*'
+            });
     }
-    let host = host.trim().to_ascii_lowercase();
-    host == domain || host.ends_with(&format!(".{domain}"))
+    let parts: Vec<&str> = head.split('.').collect();
+    if parts.is_empty() || parts.len() > 4 {
+        return false;
+    }
+    parts
+        .iter()
+        .all(|part| *part == "*" || part.parse::<u8>().is_ok())
 }
 
-/// 绕过列表里是否存在会让被监控流量直连的条目；返回该条目。
-pub fn bypass_risk(raw: Option<&str>, hosts: &[String]) -> Option<String> {
-    for entry in bypass_entries(raw) {
-        if entry == "*" || bypass_local_entry(&entry) {
+/// 是否是合法的域名标签序列（字母/数字/连字符，至少一个点）。
+fn is_domain_like(entry: &str) -> bool {
+    let e = entry.trim_matches('.').to_ascii_lowercase();
+    if e.is_empty() || !e.contains('.') {
+        return false;
+    }
+    e.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+/// **P0-09**：Windows `*` 通配语义——`*` 匹配任意长度任意字符，
+/// 其余字符大小写不敏感地字面匹配（不是正则）。
+fn glob_matches(pattern: &str, text: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let t: Vec<char> = text.chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    // 标准无回溯爆炸的通配匹配（`star` 记录最近一个 `*` 的位置）。
+    let (mut star, mut mark) = (usize::MAX, 0usize);
+    while ti < t.len() {
+        if pi < p.len() && p[pi] == t[ti] {
+            pi += 1;
+            ti += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = pi;
+            pi += 1;
+            mark = ti;
+        } else if star != usize::MAX {
+            pi = star + 1;
+            mark += 1;
+            ti = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
+}
+
+/// 通配条目是否可能绕过该主机（含它的子域）。
+///
+/// 对 `*.claude.ai` 条目要能命中 `claude.ai` 本身——受管应用连的可能是
+/// `api.claude.ai`，那一条会被 WinINet 绕过。保守地认为「可能绕过」即算命中。
+fn wildcard_covers_host(pattern: &str, host: &str) -> bool {
+    if glob_matches(pattern, host) {
+        return true;
+    }
+    glob_matches(pattern, &format!("any.{host}"))
+}
+
+/// 单条条目是否绕过该主机名。
+fn bypass_entry_hits(entry: &BypassEntry, host: &str) -> bool {
+    let host = host.trim().to_ascii_lowercase();
+    match entry {
+        BypassEntry::MatchAll => true,
+        BypassEntry::NoLoopback => false,
+        // `<local>` 只绕过**无点号**的内网名字；带点的公网域名不受影响。
+        BypassEntry::Local => !host.contains('.'),
+        BypassEntry::Wildcard(pattern) => wildcard_covers_host(pattern, &host),
+        BypassEntry::Literal(domain) => host == *domain || host.ends_with(&format!(".{domain}")),
+        // IP 条目只对「指向裸 IP」的连接生效；按主机名的连接不受影响。
+        BypassEntry::IpRange(_) => looks_like_ip_range(&host),
+        // 不认得的语法：`bypass_verdict` 会把它转成 Unknown，不落入 NoRisk。
+        BypassEntry::Unrecognized(_) => false,
+    }
+}
+
+/// **P0-09**：绕过判定的三态结论。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BypassVerdict {
+    /// 确认没有绕过风险。
+    NoRisk,
+    /// 发现会让受监控主机绕过代理的条目。
+    Risk(String),
+    /// 存在无法理解的绕过语法 → **不得**当成 NoRisk。
+    Unknown(String),
+}
+
+/// 判定整条绕过列表对受监控主机的风险（**P0-09 / L-10**）。
+fn bypass_verdict(raw: Option<&str>, hosts: &[String]) -> BypassVerdict {
+    let entries = parse_bypass_entries(raw);
+    if entries.contains(&BypassEntry::MatchAll) {
+        return BypassVerdict::Risk("*".to_string());
+    }
+    let mut unrecognized: Vec<String> = Vec::new();
+    for entry in entries {
+        if let BypassEntry::Unrecognized(raw_text) = &entry {
+            unrecognized.push(raw_text.clone());
             continue;
         }
-        if hosts.iter().any(|h| bypass_hits_host(&entry, h)) {
-            return Some(entry);
+        let label = match &entry {
+            BypassEntry::Literal(d) => d.clone(),
+            BypassEntry::Wildcard(p) => p.clone(),
+            BypassEntry::Local => "<local>".to_string(),
+            BypassEntry::IpRange(r) => r.clone(),
+            BypassEntry::MatchAll => "*".to_string(),
+            BypassEntry::NoLoopback => "<-loopback>".to_string(),
+            BypassEntry::Unrecognized(u) => u.clone(),
+        };
+        if hosts.iter().any(|h| bypass_entry_hits(&entry, h)) {
+            return BypassVerdict::Risk(label);
         }
         if SENSITIVE_SUFFIXES
             .iter()
-            .any(|suffix| bypass_hits_host(&entry, suffix))
+            .any(|suffix| bypass_entry_hits(&entry, suffix))
         {
-            return Some(entry);
+            return BypassVerdict::Risk(label);
         }
     }
-    None
+    if !unrecognized.is_empty() {
+        return BypassVerdict::Unknown(unrecognized.join("；"));
+    }
+    BypassVerdict::NoRisk
 }
 
+/// 整条列表是否「全部绕过」。
+fn bypass_all(raw: Option<&str>) -> bool {
+    parse_bypass_entries(raw).contains(&BypassEntry::MatchAll)
+}
+
+/// 兼容旧签名的单条命中判定（测试/诊断用）。
+#[allow(dead_code)]
+pub fn bypass_hits_host(entry: &str, host: &str) -> bool {
+    bypass_entry_hits(&classify_bypass_entry(entry), host)
+}
 /// 从探测地址里取主机名（小写）。
 pub fn host_of(url: &str) -> Option<String> {
     let rest = url.trim();
@@ -803,6 +965,122 @@ mod tests {
     }
 
     // ── 路由 ──
+
+    /// **P0-09（v0.7.6）**：Windows `ProxyOverride` 通配符语义表。
+    ///
+    /// 回归点：v0.7.5 的 `entry_domain()` 只剥前导 `*`，于是 `*claude*` 变成
+    /// `claude*`（尾部 `*` 残留）→ 永不命中 `claude.ai`，门禁把「代理被绕过」
+    /// 判成「代理已覆盖」。WinINet 确实支持 `*int*` 这类中间通配。
+    #[test]
+    fn proxy_override_wildcards_follow_windows_semantics() {
+        // 中间通配：必须命中（这是本次回归的核心）。
+        assert!(bypass_hits_host("*claude*", "claude.ai"));
+        assert!(bypass_hits_host("*claude*", "api.claude.ai"));
+        assert!(bypass_hits_host("*chatgpt*", "chatgpt.com"));
+        // 后缀通配。
+        assert!(bypass_hits_host("claude.*", "claude.ai"));
+        // 前缀通配：`*.claude.ai` 对 `claude.ai` 本身也算「可能绕过」
+        // （应用连的是 api.claude.ai，那条会被绕过）。
+        assert!(bypass_hits_host("*.claude.ai", "claude.ai"));
+        assert!(bypass_hits_host("*.claude.ai", "api.claude.ai"));
+        // 字面域名 + 子域。
+        assert!(bypass_hits_host("claude.ai", "claude.ai"));
+        assert!(bypass_hits_host("claude.ai", "api.claude.ai"));
+        // 不得误伤真正无关的域名。
+        //
+        // 注意：星号 claude 星号 在 WinINet 语义下**也**匹配 notclaude.invalid
+        // （它含有 claude 子串），那是正确行为，不是误判。
+        assert!(!bypass_hits_host("*claude*", "example.invalid"));
+        assert!(!bypass_hits_host("claude.*", "example.invalid"));
+        assert!(!bypass_hits_host("claude.ai", "notclaude.ai"));
+        // `*` 全部绕过。
+        assert!(bypass_hits_host("*", "anything.example"));
+    }
+
+    /// **P0-09 / L-10**：绕过判定必须是三态，未知语法不得当无风险。
+    #[test]
+    fn bypass_verdict_is_three_state_and_conservative() {
+        let claude = vec!["claude.ai".to_string()];
+        let chatgpt = vec!["chatgpt.com".to_string()];
+
+        // 明确风险。
+        assert_eq!(
+            bypass_verdict(Some("*claude*"), &claude),
+            BypassVerdict::Risk("*claude*".to_string())
+        );
+        assert_eq!(
+            bypass_verdict(Some("claude.*"), &claude),
+            BypassVerdict::Risk("claude.*".to_string())
+        );
+        assert_eq!(
+            bypass_verdict(Some("*chatgpt*"), &chatgpt),
+            BypassVerdict::Risk("*chatgpt*".to_string())
+        );
+        // 全部绕过。
+        assert_eq!(
+            bypass_verdict(Some("*"), &claude),
+            BypassVerdict::Risk("*".to_string())
+        );
+
+        // 无风险：无关域名、`<local>` 对公网域名、空列表。
+        assert_eq!(
+            bypass_verdict(Some("example.com"), &claude),
+            BypassVerdict::NoRisk
+        );
+        assert_eq!(
+            bypass_verdict(Some("<local>"), &claude),
+            BypassVerdict::NoRisk
+        );
+        assert_eq!(bypass_verdict(Some(""), &claude), BypassVerdict::NoRisk);
+        assert_eq!(bypass_verdict(None, &claude), BypassVerdict::NoRisk);
+        // 内网 IP 段对公网域名不构成绕过。
+        assert_eq!(
+            bypass_verdict(Some("10.*;192.168.*"), &claude),
+            BypassVerdict::NoRisk
+        );
+
+        // **L-10**：看不懂的语法必须是 Unknown，绝不判为 NoRisk。
+        assert!(matches!(
+            bypass_verdict(Some("!!weird!!"), &claude),
+            BypassVerdict::Unknown(_)
+        ));
+        // 未知语法即使同时有明确风险，也要报风险（更严重的优先）。
+        assert!(matches!(
+            bypass_verdict(Some("!!weird!!;*claude*"), &claude),
+            BypassVerdict::Risk(_)
+        ));
+    }
+
+    /// **P0-09**：`verdict()` 必须把绕过风险映射成「无法确认」，
+    /// 而不是 SystemProxy（= 认为代理已覆盖）。
+    #[test]
+    fn verdict_rejects_system_proxy_when_bypass_risks_monitored_host() {
+        let evidence = ProxyEvidence {
+            enable: true,
+            server: Some("127.0.0.1:7890".to_string()),
+            autoconfig: None,
+            overrides: Some("*claude*".to_string()),
+            complete: true,
+            error: None,
+        };
+        let hosts = vec!["claude.ai".to_string()];
+        assert!(
+            verdict(&evidence, None, &hosts).is_unknown(),
+            "代理绕过列表含 *claude* 时不得判为已覆盖"
+        );
+
+        let clean = ProxyEvidence {
+            overrides: Some("example.com".to_string()),
+            ..evidence.clone()
+        };
+        assert!(
+            matches!(
+                verdict(&clean, None, &hosts),
+                AccessPath::SystemProxy { .. }
+            ),
+            "无关绕过条目不应影响判定"
+        );
+    }
 
     #[test]
     fn route_follows_access_path() {

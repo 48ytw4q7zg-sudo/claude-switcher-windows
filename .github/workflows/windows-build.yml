@@ -81,6 +81,13 @@ jobs:
           cargo clippy --all-targets -- -D warnings
           cargo test --lib
 
+      # **P2-02（v0.7.6）**：安全回归场景由**同一份脚本**执行，CI 与 tag 发布共用。
+      #
+      # 上一轮两套门禁分叉过：CI 因为陈旧测试名失败，发布构建却绿了（它跑的是
+      # 无过滤的 cargo test --lib）。现在只有一个来源，测试改名/删除时两边同时报警。
+      - name: Security regression scenarios
+        shell: pwsh
+        run: ./scripts/check-security-regressions.ps1
       - name: Quality gate (Frontend)
         run: |
           npx tsc --noEmit

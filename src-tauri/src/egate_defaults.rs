@@ -131,6 +131,20 @@ pub fn check_builtin_protection(targets: &[EgateTarget]) -> Vec<String> {
             if expected.anchor_url != target.anchor_url.trim() {
                 errors.push(format!("内置目标「{}」的探测地址不能修改", expected.name));
             }
+            // **P0-07（v0.7.6）**：锚点类型同样不可改。
+            //
+            // `evaluate()` 对 `Reachability` 直接按「能不能连上」判 Pass，
+            // 完全不看出口 IP/地区；而 `unready_targets()` 又会跳过
+            // Reachability 目标的白名单校验。两者叠加的结果是：
+            // 把 Claude/Codex 改成 Reachability 就能把整套出口白名单
+            // 绕过去——网站能访问就等于「安全」。
+            if expected.anchor_kind != target.anchor_kind {
+                errors.push(format!(
+                    "内置目标「{}」的锚点类型不能修改（需保持「{}」），否则会绕过出口白名单校验",
+                    expected.name,
+                    expected.anchor_kind.label()
+                ));
+            }
         }
     }
     errors
@@ -238,6 +252,41 @@ mod tests {
             "2001:db8::1".to_string(),
         ]);
         assert_eq!(ips, vec!["1.2.3.4".to_string(), "2001:db8::1".to_string()]);
+    }
+
+    /// **P0-07（v0.7.6）**：内置目标不得被降级成「仅可达性」。
+    ///
+    /// 回归点：`check_builtin_protection()` 原来只保护 `anchor_url`。
+    /// 把 Claude 改成 `Reachability` 后，`evaluate()` 只看「能不能连上」
+    /// 就判 Pass，`unready_targets()` 又跳过白名单校验——整套出口白名单
+    /// 被绕过去。
+    #[test]
+    fn builtin_claude_cannot_be_downgraded_to_reachability() {
+        let mut targets = builtin_targets();
+        let claude = targets.iter_mut().find(|t| t.id == "claude").unwrap();
+        claude.anchor_kind = AnchorKind::Reachability;
+
+        assert!(
+            !check_builtin_protection(&targets).is_empty(),
+            "把内置目标改成仅可达性必须被拒绝"
+        );
+    }
+
+    /// **P0-07**：反向改动同样禁止（把本就 Reachability 的目标改成 Trace），
+    /// 且探测地址保护仍然有效。
+    #[test]
+    fn builtin_anchor_kind_is_pinned_in_both_directions() {
+        let mut targets = builtin_targets();
+        let antigravity = targets.iter_mut().find(|t| t.id == "antigravity").unwrap();
+        antigravity.anchor_kind = AnchorKind::Trace;
+        assert!(!check_builtin_protection(&targets).is_empty());
+
+        let mut t2 = builtin_targets();
+        let codex = t2.iter_mut().find(|t| t.id == "codex").unwrap();
+        codex.anchor_url = "https://evil.invalid/trace".to_string();
+        assert!(!check_builtin_protection(&t2).is_empty());
+
+        assert!(check_builtin_protection(&builtin_targets()).is_empty());
     }
 
     #[test]

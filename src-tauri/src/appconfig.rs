@@ -337,12 +337,61 @@ pub fn load_checked() -> ConfigLoad {
         Err(error) => return ConfigLoad::Corrupt(format!("无法定位配置文件：{error}")),
     };
     if !path.exists() {
-        return ConfigLoad::Fresh;
+        // **P0-02（v0.7.6）**：「文件不在」有两种完全不同的含义。
+        //
+        // - 真正的首次安装：从没写过配置 → Fresh，允许进配置向导；
+        // - **已有用户的配置丢了**（被同步工具清空、误删、路径异常）→
+        //   绝不能当成「尚未配置」。默认配置的 `egate_enabled = false`，
+        //   于是已经开了严格保护的用户会被静默降级成「允许普通直连」。
+        return match is_initialized() {
+            true => ConfigLoad::Corrupt(
+                "应用配置文件已丢失（此前已初始化过）。为避免按默认值关闭保护，                 本次拒绝回退；请从备份恢复 appconfig.json 后重试".to_string(),
+            ),
+            false => ConfigLoad::Fresh,
+        };
     }
     match load_from_migrated(&path) {
-        Ok(config) => ConfigLoad::Ok(Box::new(config)),
+        Ok(config) => {
+            // 成功读到配置 = 这是一个已初始化的安装，补写初始化标记
+            // （老版本升级过来时不会有标记文件）。
+            let _ = mark_initialized();
+            ConfigLoad::Ok(Box::new(config))
+        }
         Err(error) => ConfigLoad::Corrupt(error),
     }
+}
+
+/// **P0-02**：初始化标记——把「首次安装」与「配置丢失」区分开。
+///
+/// 这是一个**独立于 appconfig.json** 的小文件：它的存在只表示
+/// 「这台机器上本产品已经被配置过」，不承载任何设置。这样即使配置被
+/// 误删/清空，我们仍然知道那不是全新安装。
+fn initialized_marker_path() -> Result<std::path::PathBuf, String> {
+    Ok(config_path()?.with_file_name("config-initialized.json"))
+}
+
+/// 标记为「已初始化」（幂等）。
+fn mark_initialized() -> Result<(), String> {
+    let path = initialized_marker_path()?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败：{e}"))?;
+    }
+    let body = serde_json::json!({ "since": now_unix_secs() }).to_string();
+    fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
+}
+
+/// 是否已初始化过（标记文件存在即算）。
+fn is_initialized() -> bool {
+    initialized_marker_path()
+        .map(|p| p.exists())
+        .unwrap_or(false)
+}
+
+fn now_unix_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 /// 在跨进程排他锁内完成读取、修改和原子保存。
@@ -377,8 +426,19 @@ pub fn try_update(
         .open(path.with_extension("lock"))
         .map_err(|error| format!("打开配置锁失败：{error}"))?;
     fs4::FileExt::lock(&lock).map_err(|error| format!("获取配置锁失败：{error}"))?;
+    // **P0-02**：已初始化但配置文件丢了 → **拒绝写入**。
+    //
+    // 不这么做的话，任何一次 `update()` 都会用默认值悄悄重建配置，
+    // 等于替用户「主动关闭」了保护，并覆盖掉仅存的线索。
+    if !path.exists() && is_initialized() {
+        return Err(
+            "应用配置文件已丢失（此前已初始化过）。已拒绝用默认值重建配置，             以免覆盖丢失前的保护设置；请先从备份恢复 appconfig.json"
+                .to_string(),
+        );
+    }
     // **P1-02**：写入路径也走迁移——避免旧程序把高版本配置覆盖成旧结构。
     let mut config = load_from_migrated(&path)?;
+    let _ = mark_initialized();
     let before = config.clone();
     f(&mut config);
     // **P0-04 / P1-12**：只有**安全相关字段**变了才推进门禁代次。
@@ -407,6 +467,59 @@ mod revision_tests {
     /// 回归点：`update()` 原来无条件递增。`checks.rs` 每次环境检查都会写
     /// `last_egress_ip`，于是「看一眼出口 IP」就把正在进行的门禁探测判成过期
     /// ——探测作废、响应变慢、状态反复重算，用户却什么都没改。
+    /// **P0-02（v0.7.6）**：已初始化后配置文件丢失，绝不能当成首次安装。
+    ///
+    /// 回归点：`load_checked()` 原来只看 `path.exists()`，于是被误删/同步
+    /// 清空的配置会返回 `Fresh` → 默认 `egate_enabled = false` →
+    /// 已开严格保护的用户被静默降级成「允许普通直连」。
+    #[test]
+    fn lost_config_after_initialization_is_not_treated_as_fresh() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        // ① 真正的首次安装：Fresh，且允许写入配置。
+        assert!(
+            matches!(load_checked(), ConfigLoad::Fresh),
+            "未初始化且无配置时应当是 Fresh"
+        );
+        // ② 写一次配置 → 建立初始化标记。
+        update(|c| c.egate_enabled = true).unwrap();
+        assert!(is_initialized(), "写入配置后必须留下初始化标记");
+        assert!(matches!(load_checked(), ConfigLoad::Ok(_)));
+
+        // ③ 配置文件被删：必须报「配置丢失」，绝不能回退成 Fresh。
+        let path = config_path().unwrap();
+        std::fs::remove_file(&path).unwrap();
+        match load_checked() {
+            ConfigLoad::Corrupt(reason) => {
+                assert!(reason.contains("丢失"), "原因应说明配置丢失：{reason}");
+            }
+            other => panic!("配置丢失后不得返回 {other:?}"),
+        }
+        assert!(
+            !matches!(load_checked(), ConfigLoad::Fresh),
+            "已有用户的配置丢失不得被当成首次安装"
+        );
+
+        // ④ 同样不允许用默认值悄悄重建配置（覆盖掉仅存的线索）。
+        let error = update(|c| c.egate_enabled = false).unwrap_err();
+        assert!(error.contains("拒绝"), "{error}");
+    }
+
+    /// **P0-02**：从未初始化过的机器，配置缺失仍是 Fresh（允许进向导）。
+    #[test]
+    fn genuine_first_install_is_still_fresh() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        assert!(matches!(load_checked(), ConfigLoad::Fresh));
+        assert!(!is_initialized());
+    }
+
     #[test]
     fn revision_bumps_only_for_security_relevant_changes() {
         let _env = crate::test_support::env_lock();

@@ -1154,19 +1154,38 @@ fn run_ps(script: &str) -> Result<String, String> {
 
 /// 全部网卡（含虚拟网卡）。
 pub fn list_adapters() -> Result<Vec<AdapterInfo>, String> {
-    let script = "\
-$ips = Get-NetIPAddress -AddressFamily IPv4,IPv6 -ErrorAction SilentlyContinue
-@(Get-NetAdapter -ErrorAction SilentlyContinue | ForEach-Object {
+    // **P1-01（v0.7.6）**：底层也必须严格。
+    //
+    // `detect_tun_adapter_strict()` 只在 Rust 接口上加了 `Result`，但如果
+    // 这里的 PowerShell 仍用 `SilentlyContinue`，「权限被拒 / 服务停止 /
+    // RPC 失败」都会变成空集合 -> `Ok([])`。调用链于是：
+    //   网卡查询失败 -> Ok([]) -> 判「没有 TUN」-> current_access()=Uncovered
+    //   -> 施加兜底封锁 -> 累计到阈值后熔断。
+    // 也就是说「读不到网卡」被当成了「确认未接入代理」。
+    //
+    // 现在：`Get-NetAdapter` 用 `-ErrorAction Stop`，任何异常都让整条调用
+    // 返回 `Err`，由调用方按 `Unknown` 处理。IP 地址查询失败只影响
+    // ipv4/ipv6 字段（`ips_ok=false`），不影响「网卡是否存在」这一事实。
+    let script = r#"$ErrorActionPreference='Stop'
+$ips = @()
+$ipOk = $true
+try { $ips = @(Get-NetIPAddress -AddressFamily IPv4,IPv6 -ErrorAction Stop) }
+catch { $ipOk = $false }
+# Adapter enumeration failure must throw: that is "cannot read", not "no adapters".
+$adapters = @(Get-NetAdapter -ErrorAction Stop)
+$rows = @($adapters | ForEach-Object {
     $idx = $_.ifIndex
     [PSCustomObject]@{
         name = $_.Name
         description = $_.InterfaceDescription
         status = $_.Status.ToString()
         if_index = [uint32]$idx
+        ips_ok = $ipOk
         ipv4 = @($ips | Where-Object { $_.InterfaceIndex -eq $idx -and $_.AddressFamily -eq 'IPv4' } | Select-Object -ExpandProperty IPAddress)
         ipv6 = @($ips | Where-Object { $_.InterfaceIndex -eq $idx -and $_.AddressFamily -eq 'IPv6' } | Select-Object -ExpandProperty IPAddress)
     }
-}) | ConvertTo-Json -Depth 3";
+})
+ConvertTo-Json -InputObject @($rows) -Depth 3 -Compress"#;
     let json = run_ps(script)?;
     parse_adapters(&json)
 }
@@ -1455,6 +1474,21 @@ pub fn set_culture_and_location(culture: &str, geo_id: u32) -> Result<(), String
 /// 注册「登录时触发」的计划任务（AtLogOn，Interactive 登录类型无需存密码）。
 /// highest=true 时以最高权限运行（RunLevel=Highest，注册需管理员）。
 pub fn register_logon_task(name: &str, exe: &str, args: &str, highest: bool) -> Result<(), String> {
+    // **P0-01（v0.7.6）**：`RunLevel Highest` 的任务会以最高完整性运行。
+    // 如果它引用的 EXE 落在**普通进程可写**的目录里，任何低/中完整性进程
+    // 都能替换那个文件，下一次登录就以高权限执行非预期代码——本地提权。
+    //
+    // 这是架构性问题的**缓解**（完整方案需要独立的、只接受固定命令的
+    // 特权 helper，见 docs/release-v0.7.6.md）。在那之前：
+    // **拒绝在用户可写路径下创建 Highest 任务**，即使这会让某些需要
+    // 管理员权限的功能暂时不可用。安全边界不能为了功能而放宽。
+    if highest {
+        if let Err(reason) = assert_task_target_not_user_writable(exe) {
+            return Err(format!(
+                "拒绝注册最高权限计划任务「{name}」：{reason}。                 请把本程序安装到管理员控制的目录（如 Program Files）后重试"
+            ));
+        }
+    }
     let run_level = if highest { "Highest" } else { "Limited" };
     let script = format!(
         "$ErrorActionPreference='Stop'\n\
@@ -1470,6 +1504,54 @@ pub fn register_logon_task(name: &str, exe: &str, args: &str, highest: bool) -> 
     );
     run_ps(&script)?;
     Ok(())
+}
+
+/// **P0-01**：断言计划任务目标所在目录**不被当前用户写入**。
+///
+/// 用真实探针判定（尝试在该目录建一个随机命名的文件），不靠路径名猜测：
+/// 用户完全可以把程序放进 `C:\Program Files` 下一个自己拥有写权限的子目录。
+/// 探针文件用完即删；任何一步失败都按「无法证明安全」处理。
+fn assert_task_target_not_user_writable(exe: &str) -> Result<(), String> {
+    use rand::Rng;
+    let path = std::path::Path::new(exe);
+    if !path.is_file() {
+        return Err(format!("目标程序不存在：{exe}"));
+    }
+    let dir = path
+        .parent()
+        .ok_or_else(|| "无法确定目标程序所在目录".to_string())?;
+    // 已知的用户可写根：命中即直接拒绝（比探针更快、更明确）。
+    const USER_WRITABLE_ROOTS: &[&str] = &[
+        r"\\appdata\roaming",
+        r"\\appdata\local",
+        r"\\appdata\locallow",
+        r"\\downloads",
+        r"\\desktop",
+        r"\\documents",
+        r"\\temp\",
+        r"\\users\public",
+    ];
+    let lower = dir
+        .to_string_lossy()
+        .to_ascii_lowercase()
+        .replace('/', "\\");
+    if let Some(root) = USER_WRITABLE_ROOTS
+        .iter()
+        .find(|root| lower.contains(*root))
+    {
+        return Err(format!("目标位于用户可写目录（{root}）"));
+    }
+    // 真实探针：能否在该目录创建并删除一个文件。
+    let suffix: u64 = rand::thread_rng().gen();
+    let probe = dir.join(format!(".cs-task-probe-{suffix:016x}.tmp"));
+    match std::fs::File::create(&probe) {
+        Ok(handle) => {
+            drop(handle);
+            let _ = std::fs::remove_file(&probe);
+            Err("目标目录对当前用户可写，可能被替换为非预期程序".to_string())
+        }
+        Err(_) => Ok(()),
+    }
 }
 
 /// 删除计划任务（不存在视为成功）。
@@ -1816,24 +1898,7 @@ pub fn classify_managed_gui_paths(paths: Vec<String>) -> (Vec<String>, Vec<Strin
     (confirmed, rejected)
 }
 
-pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String> {
-    if names.is_empty() {
-        return Ok(Vec::new());
-    }
-    let name_list = names
-        .iter()
-        .map(|n| ps_single_quote(n))
-        .collect::<Vec<_>>()
-        .join(",");
-    // **P1-07 / P1-12（v0.7.3）**：两处语义修正。
-    //
-    // 1. 路径特征必须与 `managed_gui_identity()` **逐字一致**：原来脚本里的
-    //    `$guiPaths` 只有 Claude 的目录，ChatGPT / Antigravity 会被判「身份
-    //    未确认」而跳过——规则建了、进程没杀，用户以为已经隔离。
-    // 2. `Stop-Process -ErrorAction SilentlyContinue` 后无条件 `$killed.Add`
-    //    会在权限不足时**谎报成功**。现在逐个 PID 结束、收集异常，并在
-    //    结束后按 PID + 启动时间复核进程是否真的消失（防止 PID 复用误判）。
-    let template = r#"$ProgressPreference='SilentlyContinue'
+const KILL_SCRIPT: &str = r#"$ProgressPreference='SilentlyContinue'
 $ErrorActionPreference='SilentlyContinue'
 $killed = New-Object System.Collections.ArrayList
 $skipped = New-Object System.Collections.ArrayList
@@ -1910,19 +1975,81 @@ foreach ($p in @(Get-Process -Name __NAMES__ -ErrorAction SilentlyContinue)) {
   [void]$killed.Add($desc)
 }
 ConvertTo-Json -InputObject @([pscustomobject]@{ killed = @($killed); skipped = @($skipped) })"#;
+
+pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String> {
+    if names.is_empty() {
+        return Ok(Vec::new());
+    }
+    let name_list = names
+        .iter()
+        .map(|n| ps_single_quote(n))
+        .collect::<Vec<_>>()
+        .join(",");
+    // **P1-07 / P1-12（v0.7.3）**：两处语义修正。
+    //
+    // 1. 路径特征必须与 `managed_gui_identity()` **逐字一致**：原来脚本里的
+    //    `$guiPaths` 只有 Claude 的目录，ChatGPT / Antigravity 会被判「身份
+    //    未确认」而跳过——规则建了、进程没杀，用户以为已经隔离。
+    // 2. `Stop-Process -ErrorAction SilentlyContinue` 后无条件 `$killed.Add`
+    //    会在权限不足时**谎报成功**。现在逐个 PID 结束、收集异常，并在
+    //    结束后按 PID + 启动时间复核进程是否真的消失（防止 PID 复用误判）。
+    let template = KILL_SCRIPT;
+
     let script = template.replace("__NAMES__", &name_list);
     let json = run_ps(&script)?;
-    parse_kill_result(&json)
+    parse_kill_outcome(&json).map(|outcome| outcome.killed)
+}
+
+/// **L-01**：结构化版本——`killed` / `skipped` / `failed` 分开返回。
+pub fn kill_desktop_app_processes_ex(names: &[&str]) -> Result<KillOutcome, String> {
+    if names.is_empty() {
+        return Ok(KillOutcome::default());
+    }
+    let name_list = names
+        .iter()
+        .map(|n| ps_single_quote(n))
+        .collect::<Vec<_>>()
+        .join(",");
+    // 与 `kill_desktop_app_processes` 共用同一段脚本。
+    let template = KILL_SCRIPT;
+    let script = template.replace("__NAMES__", &name_list);
+    let json = run_ps(&script)?;
+    parse_kill_outcome(&json)
 }
 
 /// 解析「结束 + 跳过」两段结果（**P1-12**）。
 ///
 /// 返回值只包含**确认已经退出**的进程；跳过/失败的原因并入同一列表，
 /// 用「（…）」标注，保持既有调用方（托盘提示、账本）不改结构。
-fn parse_kill_result(json: &str) -> Result<Vec<String>, String> {
+/// **L-01（v0.7.6）**：进程结束的三类结果，必须分开。
+///
+/// v0.7.5 把 `killed` 与 `skipped` 合并成一个 `Vec<String>` 返回，
+/// 于是调用方 `summarize_trip` 用 `!killed.is_empty()` 判断「有系统副作用」
+/// 时，把「跳过的进程」也算成了「真的杀掉了」——一次全是跳过的巡检
+/// 会被记成 `Partial`，界面显示凭空出现的部分隔离。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct KillOutcome {
+    /// 确认已退出的进程。
+    pub killed: Vec<String>,
+    /// 被跳过的进程（CLI 宿主 / 身份未确认 / 权限不足）。
+    pub skipped: Vec<String>,
+    /// 结束命令已执行但未能确认退出的进程。
+    pub failed: Vec<String>,
+}
+
+#[allow(dead_code)]
+impl KillOutcome {
+    /// 是否产生了**真实**副作用（只有 killed 算）。
+    pub fn has_side_effects(&self) -> bool {
+        !self.killed.is_empty()
+    }
+}
+
+/// 结构化解析（**L-01**：killed / skipped / failed 分开）。
+fn parse_kill_outcome(json: &str) -> Result<KillOutcome, String> {
     let trimmed = json.trim();
     if trimmed.is_empty() {
-        return Ok(Vec::new());
+        return Ok(KillOutcome::default());
     }
     let value: serde_json::Value = serde_json::from_str(trimmed)
         .map_err(|e| format!("进程结束结果解析失败: {e}; 原文: {trimmed}"))?;
@@ -1941,9 +2068,11 @@ fn parse_kill_result(json: &str) -> Result<Vec<String>, String> {
             _ => Vec::new(),
         }
     };
-    let mut out = collect("killed");
-    out.extend(collect("skipped"));
-    Ok(out)
+    Ok(KillOutcome {
+        killed: collect("killed"),
+        skipped: collect("skipped"),
+        failed: collect("failed"),
+    })
 }
 
 fn parse_killed(json: &str) -> Result<Vec<String>, String> {
@@ -2355,6 +2484,30 @@ mod tests {
         assert_eq!(confirmed.len(), 1);
         assert!(confirmed[0].ends_with(r"Program Files\Claude\Claude.exe"));
         assert_eq!(rejected.len(), 2, "CLI 与未知路径都必须被拒");
+    }
+
+    /// **L-01（v0.7.6）**：`killed` / `skipped` / `failed` 必须分开，
+    /// 跳过的进程不得算成真实查杀副作用。
+    #[test]
+    fn kill_outcome_keeps_skipped_out_of_side_effects() {
+        let mixed = r#"[{"killed":["Claude (PID 1)"],"skipped":["claude (PID 2)（CLI 宿主，只提醒不查杀）"] }]"#;
+        let outcome = parse_kill_outcome(mixed).unwrap();
+        assert_eq!(outcome.killed.len(), 1);
+        assert_eq!(outcome.skipped.len(), 1);
+        assert!(outcome.has_side_effects());
+
+        // 全是跳过 -> 没有真实副作用。
+        let all_skipped =
+            r#"[{"killed":[],"skipped":["claude (PID 2)（CLI 宿主，只提醒不查杀）"] }]"#;
+        let outcome = parse_kill_outcome(all_skipped).unwrap();
+        assert!(outcome.killed.is_empty());
+        assert!(!outcome.has_side_effects(), "跳过的进程不得算成查杀副作用");
+
+        // 失败也要单独归类。
+        let with_failed = r#"[{"killed":[],"skipped":["a (PID 3)（结束命令已执行，但进程仍存在）"],"failed":[]}]"#;
+        let outcome = parse_kill_outcome(with_failed).unwrap();
+        assert!(outcome.skipped.iter().any(|x| x.contains("仍存在")));
+        assert!(!outcome.has_side_effects());
     }
 
     #[test]

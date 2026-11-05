@@ -220,7 +220,34 @@ pub fn guard_tick() -> GuardTick {
         };
     }
 
-    let cfg = appconfig::load();
+    // **P1-08（v0.7.6）**：保镖必须用严格读取。
+    //
+    // `appconfig::load()` 在读取失败/配置丢失时返回**默认配置**，而默认的
+    // `proxy_mode` 是 `clash-verge`。保护意图仍是 Armed 的情况下，保镖会拿
+    // 这份编造出来的模式去判「客户端是否在线」并执行查杀——把用户正常的
+    // 桌面程序当异常给结束了。
+    let cfg = match appconfig::load_checked() {
+        appconfig::ConfigLoad::Ok(config) => *config,
+        appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+        // 配置损坏 / 已初始化配置丢失：本轮不查杀、不改时区，保留既有防火墙保护。
+        appconfig::ConfigLoad::Corrupt(error) => {
+            append_log(
+                "bodyguard.log",
+                &format!(
+                    "{} 无法读取保护配置（{}），本轮跳过查杀与时区校正（Degraded）",
+                    now_timestamp(),
+                    error
+                ),
+            );
+            return GuardTick {
+                alive: true,
+                tun_up: false,
+                client_up: false,
+                tun_detail: format!("无法确认（配置损坏：{error}）"),
+                killed: Vec::new(),
+            };
+        }
+    };
     let mode = cfg
         .proxy_mode
         .clone()
@@ -276,6 +303,34 @@ pub fn guard_tick() -> GuardTick {
         tun_up && client_up
     };
 
+    // **P1-02（v0.7.6）**：证据不可信时**不推进**离线状态。
+    //
+    // v0.7.5 先 `OFFLINE.swap(!alive_now)` 再判断「网卡读不出来就跳过」——
+    // 但状态已经被改过了，与注释里「读取失败时保持上一轮离线状态」相反。
+    // 一次查询失败会污染防抖历史，让下一轮更容易误判离线。
+    if adapters_unreadable.is_some() {
+        if let Some(error) = &adapters_unreadable {
+            append_log(
+                "bodyguard.log",
+                &format!(
+                    "{} 网卡信息读取失败，本轮跳过离线判定({})：{error}",
+                    now_timestamp(),
+                    if use_system_proxy {
+                        "系统代理"
+                    } else {
+                        "TUN"
+                    }
+                ),
+            );
+        }
+        return GuardTick {
+            alive: true,
+            tun_up: false,
+            client_up,
+            tun_detail: "无法确认（网卡信息读取失败）".to_string(),
+            killed: Vec::new(),
+        };
+    }
     let prev_offline = OFFLINE.swap(!alive_now, Ordering::SeqCst);
     let decision = if use_system_proxy {
         // 系统代理模式下 TUN 缺失不算离线。

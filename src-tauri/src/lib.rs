@@ -2519,6 +2519,18 @@ pub struct RegionLockReport {
 /// set-region：按当前出口重锁国家 / 时区 / 区域格式；`apply=true` 时立即改系统时区与区域。
 #[tauri::command]
 async fn lock_region(apply: bool) -> Result<RegionLockReport, String> {
+    // **P1-07（v0.7.6）**：改时区 / Culture / Home Location 必须持系统操作锁，
+    // 与保镖时区看门狗、急救恢复互斥，避免互相覆盖。只读查询不取锁。
+    if apply {
+        let _guard = match egate_lock::acquire(egate_lock::SystemOperation::TimezoneWrite) {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Err(format!(
+                    "另一个环境修改正在进行（{error}），本次地区锁定未执行"
+                ))
+            }
+        };
+    }
     blocking(move || {
         let info = egress::detect_egress_blocking()?;
         // 产品约束：只允许新加坡/日本/美国。先按实时出口推导计划，再用共享的
@@ -2690,9 +2702,32 @@ fn egate_save_targets(targets: Vec<egate::EgateTarget>) -> Result<(), String> {
             target
         })
         .collect();
-    appconfig::update(|config| {
+    // **P1-05（v0.7.6）**：门禁已开启时，保存目标也必须过布防就绪校验。
+    //
+    // 原来只校验目标结构与内置保护，然后直接写盘。于是门禁开着的用户
+    // 可以保存一组没有白名单的新目标，UI 显示「保存成功」，下一轮巡检
+    // 立刻进入失败/未验证——错误要等到后台熔断才暴露。
+    //
+    // 与 `egate_update_settings` 一样走 `try_update`，校验与写盘在同一把
+    // 配置锁内完成。
+    let mut mutate = |config: &mut appconfig::AppConfig| {
         config.egate_targets = normalized.clone();
-    })?;
+    };
+    let validate = |config: &appconfig::AppConfig| -> Result<(), String> {
+        if !config.egate_enabled {
+            return Ok(());
+        }
+        // 对**即将保存的那份目标**校验（不再读一次配置，避免竞态）。
+        let unready = unready_targets(&config.egate_targets);
+        if unready.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "门禁已开启，以下目标缺少期望出口（IP 或地区），保存后会被判定为失败并触发熔断：{}。             请先补齐白名单，或先停用门禁",
+            unready.join("、")
+        ))
+    };
+    appconfig::try_update(&mut mutate, &validate)?;
     Ok(())
 }
 
@@ -2816,7 +2851,11 @@ fn egate_update_settings(
     let mut mutate = |config: &mut appconfig::AppConfig| {
         config.egate_enabled = enabled;
         config.egate_trip_threshold = trip_threshold;
-        config.egate_interval_secs = egate_check::clamp_timeout(interval_secs);
+        // **P1-04（v0.7.6）**：监控间隔必须用 clamp_interval（5..=3600 秒）。
+        //
+        // 这里曾误用 clamp_timeout（单目标探测超时，1..=30 秒）——
+        // 用户保存 600 秒会被压成 30 秒，巡检频率被悄悄放大 20 倍。
+        config.egate_interval_secs = egate_monitor::clamp_interval(interval_secs);
         config.egate_enforce_access = enforce_access;
         config.egate_leak_trip = leak_trip;
         // 首次开启门禁时若还没选守护对象，回落到内置默认（claude/chatgpt/antigravity），
@@ -2885,12 +2924,18 @@ async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
             config.egate_targets.clone()
         };
         // 防抖计数必须跨轮保留；锁中毒按空计数恢复（宁可多熔断一次也不卡死）。
-        let mut streaks = egate_streaks()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // **P1-03（v0.7.6）**：手动检查/启动检查用**临时计数器**。
+        //
+        // 共用 `egate_streaks()` 会让「用户点十次检查」把后台巡检的连续失败
+        // 数抬到 10，于是后台第一次真失败就直接达到阈值熔断——用户的手动
+        // 操作变成了触发查杀的开关。
+        //
+        // 后台 `run_monitor_round` 才是唯一拥有防抖计数的一方。
+        let mut staged = std::collections::BTreeMap::new();
+        let streaks = &mut staged;
         Ok(egate_check::run_round(
             &targets,
-            &mut streaks,
+            streaks,
             config.egate_enforce_access,
             config.egate_trip_threshold,
         ))
@@ -2992,16 +3037,21 @@ async fn egate_launch_check() -> Result<egate_launch::LaunchDecision, String> {
         } else {
             config.egate_targets.clone()
         };
-        let mut streaks = egate_streaks()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // **P1-03（v0.7.6）**：手动检查/启动检查用**临时计数器**。
+        //
+        // 共用 `egate_streaks()` 会让「用户点十次检查」把后台巡检的连续失败
+        // 数抬到 10，于是后台第一次真失败就直接达到阈值熔断——用户的手动
+        // 操作变成了触发查杀的开关。
+        //
+        // 后台 `run_monitor_round` 才是唯一拥有防抖计数的一方。
+        let mut staged = std::collections::BTreeMap::new();
+        let streaks = &mut staged;
         let report = egate_check::run_round(
             &targets,
-            &mut streaks,
+            streaks,
             config.egate_enforce_access,
             config.egate_trip_threshold,
         );
-        drop(streaks);
         let gate = egate_launch::gate_from_round(
             &report,
             config.egate_enabled,
@@ -3040,16 +3090,21 @@ async fn egate_launch_claude() -> Result<serde_json::Value, String> {
         } else {
             config.egate_targets.clone()
         };
-        let mut streaks = egate_streaks()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // **P1-03（v0.7.6）**：手动检查/启动检查用**临时计数器**。
+        //
+        // 共用 `egate_streaks()` 会让「用户点十次检查」把后台巡检的连续失败
+        // 数抬到 10，于是后台第一次真失败就直接达到阈值熔断——用户的手动
+        // 操作变成了触发查杀的开关。
+        //
+        // 后台 `run_monitor_round` 才是唯一拥有防抖计数的一方。
+        let mut staged = std::collections::BTreeMap::new();
+        let streaks = &mut staged;
         let report = egate_check::run_round(
             &targets,
-            &mut streaks,
+            streaks,
             config.egate_enforce_access,
             config.egate_trip_threshold,
         );
-        drop(streaks);
         let gate = egate_launch::gate_from_round(
             &report,
             config.egate_enabled,
@@ -3108,7 +3163,16 @@ fn egate_rearm() -> Result<serde_json::Value, String> {
 /// `unknown=true` 表示防火墙查询失败或本进程还没查过——界面应显示
 /// 「无法确认」，不能把 `tripped=false` 当成「确认未隔离」。
 #[tauri::command]
-fn egate_monitor_status() -> serde_json::Value {
+async fn egate_monitor_status() -> serde_json::Value {
+    // **L-02（v0.7.6）**：这条命令会跑真实防火墙查询（`uncovered_lock_snapshot`
+    // 要对账规则库存）与 `is_elevated()`。放在同步命令里会**卡住 WebView 主线程**，
+    // 界面表现为点一下设置就转圈。挪到 `blocking` 里异步执行。
+    blocking(|| Ok(egate_monitor_status_inner()))
+        .await
+        .unwrap_or_else(|error| serde_json::json!({ "error": error }))
+}
+
+fn egate_monitor_status_inner() -> serde_json::Value {
     let unknown = egate_monitor::is_trip_state_unknown();
     let uncovered = egate_monitor::uncovered_lock_snapshot();
     serde_json::json!({
@@ -3295,7 +3359,18 @@ async fn egate_quarantine_count() -> Result<Option<u32>, String> {
 
 /// 出口门禁：当前接入路径（只读注册表与网卡，不探测）。
 #[tauri::command]
-fn egate_access_status() -> egate_access::AccessInfo {
+async fn egate_access_status() -> egate_access::AccessInfo {
+    // **L-03（v0.7.6）**：接入判定要枚举网卡 + 读注册表，同样是阻塞调用。
+    blocking(|| Ok(egate_access_status_inner()))
+        .await
+        .unwrap_or(egate_access::AccessInfo {
+            path: "unknown".to_string(),
+            note: "状态读取失败".to_string(),
+            tun_proven: false,
+        })
+}
+
+fn egate_access_status_inner() -> egate_access::AccessInfo {
     let config = appconfig::load();
     let targets = if config.egate_targets.is_empty() {
         egate_defaults::builtin_targets()
@@ -3720,6 +3795,50 @@ mod arm_readiness_tests {
         assert!(builtins
             .iter()
             .any(|t| t.anchor_kind != egate::AnchorKind::Reachability));
+    }
+
+    /// **P1-04（v0.7.6）**：监控间隔必须用 clamp_interval（5..=3600），
+    /// 不能用 clamp_timeout（1..=30）。
+    ///
+    /// 回归点：调用点误用了 `egate_check::clamp_timeout`，于是用户保存
+    /// 600 秒会被压成 30 秒——巡检频率被悄悄放大 20 倍，还毫无提示。
+    #[test]
+    fn monitor_interval_is_clamped_to_monitor_range_not_probe_timeout() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        // 保存 600 秒必须回读 600 秒（旧实现会变成 30）。
+        egate_update_settings(false, 2, 600, true, false).unwrap();
+        match appconfig::load_checked() {
+            appconfig::ConfigLoad::Ok(config) => {
+                assert_eq!(
+                    config.egate_interval_secs, 600,
+                    "600 秒不得被 clamp_timeout 压成 30"
+                );
+            }
+            other => panic!("配置应可读：{other:?}"),
+        }
+
+        // 表驱动：监控间隔的合法区间是 5..=3600。
+        for (input, expected) in [
+            (5u64, 5u64),
+            (15, 15),
+            (30, 30),
+            (120, 120),
+            (600, 600),
+            (3600, 3600),
+            (99999, 3600),
+        ] {
+            assert_eq!(
+                egate_monitor::clamp_interval(input),
+                expected,
+                "clamp_interval({input}) 应为 {expected}"
+            );
+        }
+        // 对照：探测超时的上限是 30——这正是当初被误用的函数。
+        assert_eq!(egate_check::clamp_timeout(600), 30);
     }
 
     /// 只有可达性锚点可以不带白名单——它本来就不看出口 IP/地区。

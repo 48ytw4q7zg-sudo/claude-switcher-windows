@@ -42,6 +42,8 @@ pub struct QuarantineReport {
     /// ready 记录用它做「按预期规则名」的对账：被外部删掉的规则能让界面
     /// 立刻从「已核验」降级，而不是等 15 分钟 TTL。
     pub expected_rule_names: Vec<String>,
+    /// **P0-04**：本次应建立的完整规则规格（名称 + 方向 + 程序路径）。
+    pub expected_rules: Vec<RuleSpec>,
     /// **P2-04**：受管应用的安装状态。
     ///
     /// 界面据此区分「没装这个应用（不适用）」「查不出安装状态（保护未知）」
@@ -190,6 +192,22 @@ fn agent_spec(id: &str) -> Option<(&'static str, &'static [&'static str])> {
     }
 }
 
+/// **P0-08（v0.7.6）**：每个受管应用的 MSIX 包身份匹配条件。
+///
+/// v0.7.5 的 MSIX 查询硬编码 `Get-AppxPackage -Name 'Claude'`：
+/// ChatGPT / Antigravity 的 MSIX 安装永远查不到，于是「只有 MSIX 记录、
+/// 没有运行进程也没注册表路径」的应用被错判成 `NotInstalled`，
+/// 跳过了预先建立的防火墙隔离规则。
+fn msix_package_names(id: &str) -> &'static [&'static str] {
+    match id {
+        "claude" => &["Claude"],
+        "chatgpt" => &["ChatGPT", "OpenAI"],
+        "antigravity" => &["Antigravity", "Google"],
+        // 未知 id：返回空集（调用方按「无法确认」处理，不判未安装）。
+        _ => &[],
+    }
+}
+
 /// 解析应用 id 是否可被本模块守护（未知 id 忽略，不报错）。
 pub fn is_guarded_agent(id: &str) -> bool {
     agent_spec(id).is_some()
@@ -261,7 +279,25 @@ pub fn kill_agent_processes(agent: &str) -> Result<Vec<String>, String> {
     let Some((_, exe_names)) = agent_spec(agent) else {
         return Ok(Vec::new());
     };
-    crate::platform::imp::kill_desktop_app_processes(exe_names)
+    // **L-01（v0.7.6）**：用结构化结果——`skipped` 不得算成真实查杀。
+    //
+    // v0.7.5 把 killed 与 skipped 合并返回，于是 `summarize_trip` 的
+    // `side_effects = !killed.is_empty()` 会把「跳过的进程」当成「杀了」，
+    // 一次全是跳过的巡检被记成 Partial，界面凭空出现部分隔离。
+    let outcome = crate::platform::imp::kill_desktop_app_processes_ex(exe_names)?;
+    if !outcome.skipped.is_empty() {
+        crate::log_error(&format!(
+            "{agent}：以下进程未被结束（身份未确认或权限不足）：{}",
+            outcome.skipped.join("、")
+        ));
+    }
+    if !outcome.failed.is_empty() {
+        crate::log_error(&format!(
+            "{agent}：以下进程结束命令已执行但未能确认退出：{}",
+            outcome.failed.join("、")
+        ));
+    }
+    Ok(outcome.killed)
 }
 
 /// 枚举当前运行的被守护应用进程（pid → 应用 id）。
@@ -386,6 +422,12 @@ pub fn resolve_agent_installation(agent: &str) -> InstallationLookup {
         .map(|n| ps_quote(&format!("{n}.exe")))
         .collect::<Vec<_>>()
         .join(",");
+    // **P0-08**：MSIX 包身份按应用筛选，不能硬编码 Claude。
+    let msix_names = msix_package_names(agent)
+        .iter()
+        .map(|n| ps_quote(n))
+        .collect::<Vec<_>>()
+        .join(",");
     // **P1-05（v0.7.5）**：逐来源记录「成功 / 明确为空 / 查询失败」。
     //
     // v0.7.3 的脚本通篇 `-ErrorAction SilentlyContinue`，于是「注册表拒绝访问」
@@ -475,7 +517,14 @@ foreach ($root in $unRoots) {{
 
 # 4) MSIX 包：InstallLocation 是目录，需从 AppxManifest.xml 取真实 exe。
 try {{
-  $pkgs = @(Get-AppxPackage -Name 'Claude' -ErrorAction Stop)
+  # **P0-08**：按本应用的包身份筛选，不能硬编码 'Claude'。
+  $msixNames = @({msix})
+  $pkgs = @()
+  foreach ($n in $msixNames) {{
+    $pkgs += @(Get-AppxPackage -Name $n -ErrorAction Stop)
+    $pkgs += @(Get-AppxPackage -Name ($n + '*') -ErrorAction Stop)
+  }}
+  $pkgs = @($pkgs | Sort-Object -Property PackageFullName -Unique)
 }} catch {{
   [void]$errors.Add("MSIX 包枚举失败：" + $_.Exception.Message)
   $pkgs = @()
@@ -501,7 +550,8 @@ foreach ($pkg in $pkgs) {{
 
 ConvertTo-Json @{{ found = @($found); errors = @($errors) }} -Compress -Depth 4"#,
         names = names,
-        exe_files = exe_files
+        exe_files = exe_files,
+        msix = msix_names
     );
     // **P2-01**：查询失败不能等同于「未安装」。
     let json = match crate::platform::imp::run_powershell(&script) {
@@ -599,11 +649,11 @@ fn parse_exe_candidates(json: &str) -> Vec<ExeCandidate> {
     out
 }
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct RuleVerification {
-    query_ok: bool,
-    expected: u32,
-    verified: u32,
-    failed: Vec<String>,
+pub(crate) struct RuleVerification {
+    pub(crate) query_ok: bool,
+    pub(crate) expected: u32,
+    pub(crate) verified: u32,
+    pub(crate) failed: Vec<String>,
 }
 
 /// 一条**预期存在的规则**：名称、方向、程序路径三者绑定。
@@ -695,6 +745,60 @@ fn count_rules_for_reason(
     outbound_only: bool,
 ) -> RuleVerification {
     let expected_rules = expected_rules_for(reason, agent, exes, outbound_only);
+    verify_expected_rules_impl(&expected_rules)
+}
+
+/// **P0-04（v0.7.6）**：规则规格的可序列化镜像（供 ready 记录持久化）。
+///
+/// `ExpectedRule` 的 `direction` 是 `&'static str`，不能直接反序列化；
+/// ready 文件需要把规格写下来、下次读回来做属性级核验，因此单独用一份
+/// 全所有权的结构。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RuleSpec {
+    pub name: String,
+    pub dir: String,
+    pub direction: String,
+    pub exe: String,
+}
+
+impl From<&ExpectedRule> for RuleSpec {
+    fn from(rule: &ExpectedRule) -> Self {
+        RuleSpec {
+            name: rule.name.clone(),
+            dir: rule.dir.clone(),
+            direction: rule.direction.to_string(),
+            exe: rule.exe.clone(),
+        }
+    }
+}
+
+impl From<&RuleSpec> for ExpectedRule {
+    fn from(spec: &RuleSpec) -> Self {
+        ExpectedRule {
+            name: spec.name.clone(),
+            dir: spec.dir.clone(),
+            direction: match spec.direction.as_str() {
+                "Inbound" => "Inbound",
+                _ => "Outbound",
+            },
+            exe: spec.exe.clone(),
+        }
+    }
+}
+
+/// 按可序列化规格做完整核验（属性 + ActiveStore）。
+pub(crate) fn verify_rule_specs(specs: &[RuleSpec]) -> RuleVerification {
+    let expected_rules: Vec<ExpectedRule> = specs.iter().map(ExpectedRule::from).collect();
+    verify_expected_rules_impl(&expected_rules)
+}
+
+/// **P0-04（v0.7.6）**：按**规则规格**做完整核验（属性 + ActiveStore）。
+///
+/// 与 `count_rules_for_reason` 共用同一套 PowerShell 判据——ready 对账
+/// 必须核对「规则确实是 Block/已启用/绑定正确程序/方向正确/进入生效策略」，
+/// 而不是只看规则名还在不在。外部程序把规则改成 Allow 后，名字与数量都
+/// 不变，仅凭存在性检查会误报「已核验」。
+fn verify_expected_rules_impl(expected_rules: &[ExpectedRule]) -> RuleVerification {
     let expected = expected_rules.len() as u32;
     if expected_rules.is_empty() {
         return RuleVerification {
@@ -768,14 +872,19 @@ fn count_rules_for_reason(
                  }}\n\
                }}\n\
              }}\n\
-           }} catch {{ $reason = '规则不存在' }}\n\
+           }} catch {{
+             # **L-04（v0.7.6）**：区分「规则确实不存在」与「查询本身失败」。
+             # 原来一律记成规则缺失，于是 RPC 失败、权限被拒、服务停止
+             # 都被显示成「规则缺失」，误导用户去补规则而不是修权限。
+             $reason = 'query-failed: ' + $_.Exception.Message
+           }}\n\
            [void]$results.Add(@{{ name = $s.name; dir = $s.dir; exe = $s.exe; ok = $ok; reason = $reason }})\n\
          }}\n\
          ConvertTo-Json -InputObject @($results) -Compress",
         spec = ps_quote(&spec_json)
     );
     match crate::platform::imp::run_powershell(&script) {
-        Ok(json) => parse_rule_verification_expected(&json, &expected_rules),
+        Ok(json) => parse_rule_verification_expected(&json, expected_rules),
         Err(_) => RuleVerification {
             query_ok: false,
             expected,
@@ -925,6 +1034,7 @@ pub fn quarantine_agent_for(
         killed: Vec::new(),
         verified: false,
         expected_rule_names: Vec::new(),
+        expected_rules: Vec::new(),
         installation: ApplicationInstallation::Installed,
         note: String::new(),
     };
@@ -1036,44 +1146,111 @@ pub fn quarantine_agent_for(
     // **P1-07**：先把「应该有哪些规则」记下来，供 ready 对账使用。
     let expected = expected_rules_for(reason, agent, &exes, outbound_only);
     report.expected_rule_names = expected.iter().map(|r| r.name.clone()).collect();
+    report.expected_rules = expected.iter().map(RuleSpec::from).collect();
     for rule in expected {
-        // **P0-NEW-01**：创建路径上的 `SilentlyContinue` 会把「权限不足
-        // （未以管理员运行）」吞成一次「成功」，随后回查才发现不完整，
-        // 用户看到的是含糊的「覆盖不完整」。这里全部改 `Stop`，
-        // 让错误消息直接带出真正原因（拒绝访问）。
+        // **P0-03（v0.7.6）**：规则修复必须是「先建新、验证、再删旧」的事务。
+        //
+        // v0.7.5 的顺序是 `Remove-NetFirewallRule` 然后 `New-NetFirewallRule`：
+        // 一旦新建失败（权限不足、RPC 抖动），旧规则已经被删掉，
+        // 受保护程序就暴露在未阻断状态——恰恰是这次修复要防的事。
+        //
+        // 现在的顺序：
+        // 1. 严格查询旧规则；查询失败 -> 什么都不做，报 Unknown；
+        // 2. 建一条**临时名**的新规则；
+        // 3. 对临时规则做完整属性核验（含 ActiveStore）；
+        // 4. 核验通过后才删旧实例；
+        // 5. 最后把临时名改成正式名。
+        //
+        // 新建失败 / 核验不过 -> 删掉临时规则、**保留旧规则**，报告失败。
+        let temp_name = format!("{} ::pending", rule.name);
         let script = format!(
             "$ProgressPreference='SilentlyContinue'
 $ErrorActionPreference='Stop'
-# 无语句级 exit/return：两者都会跳过执行结果哨兵。
+# 无语句级 exit/return/continue：三者都会跳过执行结果哨兵。
 $name = {name}
+$temp = {temp}
 $wantDirection = {direction}
 $wantProgram = {program}
-$existing = @(Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)
+$escapedName = [WildcardPattern]::Escape($name)
+$escapedTemp = [WildcardPattern]::Escape($temp)
+
+function Get-ByName([string]$n, [string]$escaped) {{
+  @(Get-NetFirewallRule -DisplayName ($escaped + '*') -ErrorAction Stop |
+    Where-Object {{ $_.DisplayName -eq $n }})
+}}
+
+# 1) 严格查询旧规则。查询失败直接抛（外层包装判 Unknown），绝不删任何东西。
+$existing = Get-ByName $name $escapedName
 $healthy = $false
 foreach ($r in $existing) {{
-  $f = $r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+  $f = $r | Get-NetFirewallApplicationFilter -ErrorAction Stop
   if ($r.Enabled -eq 'True' -and $r.Action -eq 'Block' -and
       $r.Direction -eq $wantDirection -and $f.Program -and $f.Program -ieq $wantProgram) {{
     $healthy = $true
   }}
 }}
+$result = 'existing'
 if (-not $healthy) {{
-  if ($existing.Count -gt 0) {{ $existing | Remove-NetFirewallRule -ErrorAction Stop }}
-  New-NetFirewallRule -DisplayName $name -Direction $wantDirection -Action Block -Program $wantProgram -Enabled True -ErrorAction Stop | Out-Null
-  'created'
-}} else {{
-  'existing'
-}}",
+  $stale = Get-ByName $temp $escapedTemp
+  if ($stale.Count -gt 0) {{ $stale | Remove-NetFirewallRule -ErrorAction Stop }}
+  $created = $false
+  try {{
+    New-NetFirewallRule -DisplayName $temp -Direction $wantDirection -Action Block `
+      -Program $wantProgram -Enabled True -ErrorAction Stop | Out-Null
+    $created = $true
+  }} catch {{
+    $result = 'create-failed: ' + $_.Exception.Message
+  }}
+  if ($created) {{
+    $ok = $false
+    try {{
+      foreach ($r in (Get-ByName $temp $escapedTemp)) {{
+        if ($r.Enabled -ne 'True' -or $r.Action -ne 'Block' -or $r.Direction -ne $wantDirection) {{ continue }}
+        $af = $r | Get-NetFirewallApplicationFilter -ErrorAction Stop
+        if (-not $af -or -not $af.Program -or $af.Program -ine $wantProgram) {{ continue }}
+        $pf = $r | Get-NetFirewallPortFilter -ErrorAction Stop
+        $adf = $r | Get-NetFirewallAddressFilter -ErrorAction Stop
+        $portAny = $pf -and (((-not $pf.Protocol) -or $pf.Protocol -eq 'Any') -and
+                   ((-not $pf.LocalPort) -or $pf.LocalPort -eq 'Any') -and
+                   ((-not $pf.RemotePort) -or $pf.RemotePort -eq 'Any'))
+        $addrAny = $adf -and (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and
+                   ((-not $adf.RemoteAddress) -or $adf.RemoteAddress -eq 'Any'))
+        $profileAll = ([string]$r.Profile).ToLowerInvariant() -eq 'any'
+        if ($portAny -and $addrAny -and $profileAll) {{
+          $active = @(Get-NetFirewallRule -DisplayName ($escapedTemp + '*') -PolicyStore ActiveStore -ErrorAction Stop |
+                      Where-Object {{ $_.DisplayName -eq $temp }})
+          if ($active.Count -gt 0) {{ $ok = $true }}
+        }}
+      }}
+    }} catch {{ $ok = $false }}
+    if ($ok) {{
+      if ($existing.Count -gt 0) {{ $existing | Remove-NetFirewallRule -ErrorAction Stop }}
+      (Get-ByName $temp $escapedTemp) | Set-NetFirewallRule -NewDisplayName $name -ErrorAction Stop
+      $result = 'created'
+    }} else {{
+      $stale = Get-ByName $temp $escapedTemp
+      if ($stale.Count -gt 0) {{ $stale | Remove-NetFirewallRule -ErrorAction Stop }}
+      $result = 'unverified'
+    }}
+  }}
+}}
+$result",
             name = ps_quote(&rule.name),
+            temp = ps_quote(&temp_name),
             direction = rule.direction,
             program = ps_quote(&rule.exe)
         );
-        // **L-14（v0.7.3）**：只有**真正新建**的规则才计入 `rules_added`。
-        // 原来无论规则是否已存在都会 +1，于是「重复隔离」的报告里
-        // 「新增 N 条」与实际动作不符，用户无法判断这次到底改了什么。
         match crate::platform::imp::run_powershell(&script) {
-            Ok(out) if out.trim() == "existing" => {}
-            Ok(_) => report.rules_added += 1,
+            Ok(out) => match out.trim() {
+                "existing" => {}
+                "created" => report.rules_added += 1,
+                // **P0-03**：新建失败 / 核验不过时保留旧规则，如实报告。
+                other => report.note.push_str(&format!(
+                    "修复 {} 的{}站规则未完成（{other}），已保留旧规则；",
+                    rule.exe,
+                    if rule.dir == "Out" { "出" } else { "入" }
+                )),
+            },
             Err(error) => report.note.push_str(&format!(
                 "添加 {} 的{}站规则失败（{error}）；",
                 rule.exe,
@@ -1081,7 +1258,6 @@ if (-not $healthy) {{
             )),
         }
     }
-
     // 4. 回查：规则写入返回成功不等于当前策略下真的生效。
     let mut verification = count_rules_for_reason(reason, agent, &exes, outbound_only);
     if verification.query_ok && verification.verified > 0 {
@@ -1737,7 +1913,41 @@ pub fn release_uncovered_with_evidence(
     }
     let guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::ReleaseIsolation)?;
     check_uncovered_release_eligible(expected_revision)?;
-    release_isolation_reason_locked(&guard, IsolationReason::Uncovered)
+    // **P0-06（v0.7.6）**：规则删除与意图/ready 清理必须在**同一段持锁事务**里。
+    //
+    // 原来是「删规则（锁内）→ 返回 → 锁释放 → 另一处清意图」。中间的间隙里
+    // 另一个保护流程可能重建了意图或规则，随后被旧流程误删意图文件——
+    // 结果是「实际有封锁规则却没有归属意图」。
+    //
+    // 现在：删规则 → 回查零残留 → **在锁内**清理意图/ready，且只删
+    // `txn` 与本次一致的记录（别人新建的意图不会被误删）。
+    let txn = crate::egate_monitor::uncovered_lock_txn();
+    let report = release_isolation_reason_locked(&guard, IsolationReason::Uncovered)?;
+    if report.fully_cleared() {
+        match &txn {
+            Some(txn) => crate::egate_monitor::clear_uncovered_lock_if_txn(txn)?,
+            None => crate::egate_monitor::clear_uncovered_lock()?,
+        }
+    }
+    Ok(report)
+}
+
+/// **P0-05（v0.7.6）**：当前受监控目标的主机名（用于绕过列表复核）。
+///
+/// 自动解除前必须拿到**最新**配置里的域名——用旧报告里的域名会在
+/// 用户改了目标之后放行不该放行的路径。
+fn current_target_hosts() -> Vec<String> {
+    let config = match crate::appconfig::load_checked() {
+        crate::appconfig::ConfigLoad::Ok(config) => *config,
+        crate::appconfig::ConfigLoad::Fresh => crate::appconfig::AppConfig::default(),
+        crate::appconfig::ConfigLoad::Corrupt(_) => return Vec::new(),
+    };
+    let targets = if config.egate_targets.is_empty() {
+        crate::egate_defaults::builtin_targets()
+    } else {
+        config.egate_targets
+    };
+    crate::egate_check::monitored_hosts(&targets)
 }
 
 /// **P0-03**：兜底自动解除的持锁资格复核（纯检查，不做任何删除）。
@@ -1821,6 +2031,20 @@ fn access_still_safe_for_unlock() -> Result<(), String> {
                 {
                     return Err(format!(
                         "系统代理端口 {addr} 已不可连，接入不再安全，已放弃自动解除兜底封锁"
+                    ));
+                }
+                // **P0-05（v0.7.6）**：重新复核**完整的**接入判定，
+                // 包括 `ProxyOverride` 绕过列表与 PAC。
+                //
+                // 只看「代理开关开着 + 端口能连」不够：等待锁期间别的程序
+                // 改了绕过列表，让受监控域名直连，代理照样开着、端口照样通，
+                // 但受管应用已经不走它了。那正是兜底封锁要防的场景。
+                let hosts = current_target_hosts();
+                let path = crate::egate_check::current_access(&hosts);
+                if !matches!(path, crate::egate_access::AccessPath::SystemProxy { .. }) {
+                    return Err(format!(
+                        "接入路径已不再安全（{}），已放弃自动解除兜底封锁",
+                        path.note()
                     ));
                 }
                 return Ok(());

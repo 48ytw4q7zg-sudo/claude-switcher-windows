@@ -1130,7 +1130,9 @@ pub fn restore_all() -> RecoveryReport {
     }
 
     // 4. 还原环境账本。
-    let env_ok = match crate::egate_env::restore() {
+    // **P1-07**： 已持 FullRestore 锁，环境还原走无锁版本，
+    // 否则会与自己争同一把锁（自我死锁）。
+    let env_ok = match crate::egate_env::restore_locked(&guard) {
         Ok(_) => true,
         Err(error) => {
             failures.push(format!("环境账本：{error}"));

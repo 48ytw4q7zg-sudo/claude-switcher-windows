@@ -820,7 +820,14 @@ fn run_uncovered_lockdown(
         for agent in &trip.agents {
             rule_names.extend(agent.expected_rule_names.iter().cloned());
         }
-        if let Err(error) = mark_uncovered_ready(&agents, rules, rule_names) {
+        // **P0-04**：把完整规则规格一起记下，供下次做属性级核验。
+        let mut specs: Vec<crate::egate_trip::RuleSpec> = Vec::new();
+        for agent in &trip.agents {
+            for spec in &agent.expected_rules {
+                specs.push(spec.clone());
+            }
+        }
+        if let Err(error) = mark_uncovered_ready(&agents, rules, rule_names, specs) {
             crate::log_error(&format!(
                 "兜底封锁已生效，但核验记录写入失败（{error}）：界面将显示为「未核验」"
             ));
@@ -858,14 +865,10 @@ fn release_uncovered_lock(expected_revision: Option<u64>) {
     // `release_isolation_reason`——它在锁内只做「按来源删除」，不复核
     // 保护意图/暂停/代次/接入路径。于是「检查通过 → 等锁 → 删规则」之间
     // 代理断了、用户暂停了，仍会被过期结论解除保护。
+    // **P0-06**：意图/ready 的清理已并入 `release_uncovered_with_evidence`
+    // 的持锁事务里，这里不再单独清（那会产生事务间隙）。
     match crate::egate_trip::release_uncovered_with_evidence(expected_revision) {
-        Ok(report) if report.verified => {
-            if let Err(error) = clear_uncovered_lock() {
-                crate::log_error(&format!(
-                    "兜底规则已解除，但意图文件未能删除（{error}）：状态将显示为待处理"
-                ));
-                return;
-            }
+        Ok(report) if report.fully_cleared() => {
             crate::log_error("接入已恢复：未接入兜底封锁已解除");
         }
         Ok(report) => crate::log_error(&format!(
@@ -990,8 +993,38 @@ pub(crate) fn uncovered_lock_active() -> bool {
 /// 但用户需要知道自己是被哪一种触发的——后者是主动的安全选择，不是故障。
 fn mark_uncovered_lock_with_reason(reason: &str) -> Result<(), String> {
     let path = uncovered_lock_file()?;
-    let body = serde_json::json!({ "since": now_secs(), "reason": reason }).to_string();
+    // **P0-06**：给这份意图一个唯一事务号。清理时只删「txn 相符」的记录，
+    // 这样另一个流程在间隙里重建的意图不会被误删。
+    let body = serde_json::json!({
+        "since": now_secs(),
+        "reason": reason,
+        "txn": format!("{}-{}", now_secs(), std::process::id()),
+    })
+    .to_string();
     crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
+}
+
+/// 读取当前兜底意图的事务号（旧记录没有该字段时返回 None）。
+pub fn uncovered_lock_txn() -> Option<String> {
+    uncovered_lock_file()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| v.get("txn").and_then(|r| r.as_str()).map(str::to_string))
+}
+
+/// **P0-06**：仅当事务号仍与 `expected` 一致时才清理意图 + ready。
+///
+/// 这是「删规则 → 清意图」事务的后半段，必须在持锁状态下调用。
+/// 事务号不一致说明别的流程已经重新建立了意图，此时**不得**删除。
+pub fn clear_uncovered_lock_if_txn(expected: &str) -> Result<(), String> {
+    match uncovered_lock_txn() {
+        Some(current) if current != expected => Err(format!(
+            "兜底意图已被别的流程更新（txn {current} != {expected}），本次未清理以免误删新意图"
+        )),
+        // 旧记录没有 txn：退化为「按存在性清理」，但如实说明。
+        _ => clear_uncovered_lock(),
+    }
 }
 
 /// 读取兜底意图的触发原因（用于界面说明；旧文件没有该字段时返回 `uncovered`）。
@@ -1032,6 +1065,12 @@ struct UncoveredReady {
     /// 只比条数会漏掉「兜底规则被删一条、旧版遗留恰好留一条」这种巧合。
     #[serde(default)]
     rule_names: Vec<String>,
+    /// **P0-04**：核验时的**完整规则规格**（名称 + 方向 + 程序路径）。
+    ///
+    /// 只存名称不够：外部程序把规则改成 `Allow` 或换掉程序路径后，
+    /// 名称与数量都不变，仅凭存在性检查会误报「已核验」。
+    #[serde(default)]
+    specs: Vec<crate::egate_trip::RuleSpec>,
 }
 
 const UNCOVERED_READY_TTL_SECS: u64 = 15 * 60;
@@ -1117,14 +1156,36 @@ fn uncovered_ready_state() -> UncoveredReadyState {
             )
         }
     }
-    // **P1-07**：再按**预期规则名**逐条对账——条数对了不代表规则是对的那几条，
-    // 更不代表它们还启用、程序路径正确、当前配置档下生效。
-    if !ready.rule_names.is_empty() {
+    // **P0-04（v0.7.6）**：按**完整规格**核验，不只是看名字还在不在。
+    //
+    // 外部程序把规则改成 `Allow`、换掉程序路径、或它根本没进 ActiveStore 时，
+    // 名称与条数都不变——仅凭存在性检查会把「已经不阻断了」显示成「已核验」。
+    if !ready.specs.is_empty() {
+        let verification = crate::egate_trip::verify_rule_specs(&ready.specs);
+        if !verification.query_ok {
+            return UncoveredReadyState::Stale(
+                "无法查询兜底规则的实际属性，核验结果不能作为当前状态".to_string(),
+            );
+        }
+        if verification.verified < verification.expected {
+            let detail = if verification.failed.is_empty() {
+                format!(
+                    "{} 条规则未生效",
+                    verification.expected - verification.verified
+                )
+            } else {
+                verification.failed.join("；")
+            };
+            return UncoveredReadyState::Stale(format!("部分兜底规则已失效或属性被改动：{detail}"));
+        }
+    } else if !ready.rule_names.is_empty() {
+        // 旧版记录只有名称没有规格：至少确认名称仍在，但**不能**声称
+        // 属性已核验——留待下一轮补齐后再写完整规格。
         match crate::platform::imp::firewall_rules_all_present(&ready.rule_names) {
             crate::platform::imp::RuleLookup::Present => {}
             crate::platform::imp::RuleLookup::Absent => {
                 return UncoveredReadyState::Stale(
-                    "部分兜底规则已被外部删除或禁用，覆盖不再完整".to_string(),
+                    "部分兜底规则已被外部删除，覆盖不再完整".to_string(),
                 );
             }
             crate::platform::imp::RuleLookup::Unknown => {
@@ -1133,6 +1194,9 @@ fn uncovered_ready_state() -> UncoveredReadyState {
                 );
             }
         }
+    } else {
+        // **L-06**：既无规格也无名称的记录不能当作「已核验」。
+        return UncoveredReadyState::Stale("核验记录缺少规则明细，需重新核验".to_string());
     }
     UncoveredReadyState::Valid
 }
@@ -1142,6 +1206,7 @@ fn mark_uncovered_ready(
     agents: &[String],
     rules: u32,
     rule_names: Vec<String>,
+    specs: Vec<crate::egate_trip::RuleSpec>,
 ) -> Result<(), String> {
     let path = uncovered_lock_ready_file()?;
     let revision = match crate::appconfig::load_checked() {
@@ -1158,6 +1223,7 @@ fn mark_uncovered_ready(
         rules,
         agents,
         rule_names,
+        specs,
     };
     let body = serde_json::to_string(&ready).map_err(|e| e.to_string())?;
     crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
@@ -1758,15 +1824,21 @@ mod tests {
             .map(|id| id.to_string())
             .collect();
         // **P1-07**：记录里声称 2 条规则，但系统上一条都没有 → 必须判失效。
-        mark_uncovered_ready(&defaults, 2, Vec::new()).unwrap();
+        mark_uncovered_ready(&defaults, 2, Vec::new(), Vec::new()).unwrap();
         assert!(matches!(
             uncovered_ready_state(),
             UncoveredReadyState::Stale(_)
         ));
 
-        // 记录 0 条规则 → 与当前库存一致，视为有效。
-        mark_uncovered_ready(&defaults, 0, Vec::new()).unwrap();
-        assert!(uncovered_lock_ready());
+        // 记录 0 条规则 + 无规格 -> **不是**有效（P0-04：没有属性级核验
+        // 就不能说「已核验」）。完整 Valid 路径需要真实防火墙规则，
+        // 由 tests/windows-integration/03-restore-ledger.ps1 覆盖。
+        mark_uncovered_ready(&defaults, 0, Vec::new(), Vec::new()).unwrap();
+        assert!(matches!(
+            uncovered_ready_state(),
+            UncoveredReadyState::Stale(_)
+        ));
+        assert!(!uncovered_lock_ready(), "无规则规格的记录不得显示已核验");
 
         // **L-13**：配置代次一变就失效。
         crate::appconfig::update(|config| {
@@ -1779,7 +1851,7 @@ mod tests {
         ));
 
         // **P1-07**：受管应用清单变化同样立刻失效。
-        mark_uncovered_ready(&["claude".to_string()], 0, Vec::new()).unwrap();
+        mark_uncovered_ready(&["claude".to_string()], 0, Vec::new(), Vec::new()).unwrap();
         assert!(matches!(
             uncovered_ready_state(),
             UncoveredReadyState::Stale(_)
@@ -1790,6 +1862,7 @@ mod tests {
             &defaults,
             0,
             vec!["ClaudeSwitcher UncoveredLock ghost Out".into()],
+            Vec::new(),
         )
         .unwrap();
         assert!(matches!(
@@ -1801,6 +1874,48 @@ mod tests {
         clear_uncovered_lock().unwrap();
         assert!(!uncovered_lock_active());
         assert!(!uncovered_lock_ready());
+    }
+
+    /// **P0-04（v0.7.6）**：ready 记录缺少规则明细时不得算「已核验」。
+    ///
+    /// 回归点：v0.7.5 只核对规则名存在性。外部程序把规则改成 `Allow`
+    /// 或换掉程序路径后，名称与条数都不变，界面仍显示「已核验」。
+    /// 现在必须有完整规格并逐条核验属性；旧版只有名称的记录也降级为
+    /// 「需重新核验」而不是当成完整核验。
+    #[test]
+    fn ready_without_rule_specs_is_never_valid() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        let defaults: Vec<String> = crate::egate_defaults::DEFAULT_GUARDED_AGENTS
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        // 既有规则名、也有条数，但**没有规格** -> 必须判失效（L-06）。
+        mark_uncovered_ready(&defaults, 0, vec!["some-rule".into()], Vec::new()).unwrap();
+        assert!(
+            matches!(uncovered_ready_state(), UncoveredReadyState::Stale(_)),
+            "缺少规则明细的记录不能算已核验"
+        );
+
+        // 有规格但规则在系统上不存在 -> 同样失效（属性级核验）。
+        let spec = crate::egate_trip::RuleSpec {
+            name: "ClaudeSwitcher UncoveredLock definitely-missing Out".into(),
+            dir: "Out".into(),
+            direction: "Outbound".into(),
+            exe: r"C:\Windows\System32
+otepad.exe"
+                .into(),
+        };
+        mark_uncovered_ready(&defaults, 1, vec![spec.name.clone()], vec![spec]).unwrap();
+        assert!(
+            matches!(uncovered_ready_state(), UncoveredReadyState::Stale(_)),
+            "属性核验不通过时不得显示已核验"
+        );
+
+        clear_uncovered_lock().unwrap();
     }
 
     /// **P1-07**：旧版遗留规则**不能**用来顶替兜底规则的对账数量。

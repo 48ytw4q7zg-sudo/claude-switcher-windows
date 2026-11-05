@@ -176,6 +176,20 @@ fn now_secs() -> u64 {
 ///
 /// 返回账本记录；无法确定目标时区时返回 `Err`（不给模糊建议）。
 pub fn align_timezone(egress_country: &str, city: &str) -> Result<AppliedEnv, String> {
+    // **P1-07**：改时区必须与看门狗/急救恢复共用同一把锁。
+    let _guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::TimezoneWrite)?;
+    align_timezone_locked(egress_country, city)
+}
+
+/// **P1-07**：已持锁版本。
+pub(crate) fn align_timezone_locked(
+    egress_country: &str,
+    city: &str,
+) -> Result<AppliedEnv, String> {
+    align_timezone_inner(egress_country, city)
+}
+
+fn align_timezone_inner(egress_country: &str, city: &str) -> Result<AppliedEnv, String> {
     let target = crate::region::country_default_windows_tz(egress_country);
     if target.is_empty() {
         return Err(format!(
@@ -224,6 +238,23 @@ pub fn align_timezone(egress_country: &str, city: &str) -> Result<AppliedEnv, St
 
 /// 按账本还原到改动前的状态（幂等：没有账本时返回 Ok）。
 pub fn restore() -> Result<String, String> {
+    // **P1-07（v0.7.6）**：所有改系统环境的入口统一走系统操作锁。
+    //
+    // 原来只有时区看门狗用 `SystemOperation::TimezoneWrite`，而手动地区锁定、
+    // 环境对齐/还原都没取锁——三者同时执行会互相覆盖，最后结果取决于
+    // 谁后写，而不是「最后一次合法事务」。
+    //
+    // 已持锁的调用方（`restore_all`）请用 `restore_locked`，否则会自我死锁。
+    let guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::TimezoneWrite)?;
+    restore_locked(&guard)
+}
+
+/// **P1-07**：已持锁版本（内部**不再**申请锁，避免自我死锁）。
+pub(crate) fn restore_locked(_guard: &crate::egate_lock::OperationGuard) -> Result<String, String> {
+    restore_inner()
+}
+
+fn restore_inner() -> Result<String, String> {
     // **P0-11**：账本损坏必须报错，不能假装「没有改动」。
     let record = match load()? {
         Some(record) => record,
