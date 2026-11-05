@@ -187,6 +187,9 @@ pub struct Store {
     /// F-5：当前生效的供应商账号 id；为 None 表示当前走 OAuth 账号。
     #[serde(default)]
     pub current_provider_id: Option<String>,
+    /// Desktop 切换已提交事务 ID；必须与切换目标在同一次原子保存中写入。
+    #[serde(default)]
+    pub last_desktop_transaction_id: Option<String>,
 }
 
 impl Default for Store {
@@ -200,6 +203,7 @@ impl Default for Store {
             current_desktop_profile_id: None,
             provider_profiles: Vec::new(),
             current_provider_id: None,
+            last_desktop_transaction_id: None,
         }
     }
 }
@@ -763,6 +767,42 @@ impl CrossProcessLock {
         fs4::FileExt::lock(&file).map_err(|e| format!("获取账号库跨进程锁失败: {e}"))?;
         Ok(CrossProcessLock(file))
     }
+}
+
+/// Desktop 快照/账号库的统一跨进程执行权。
+///
+/// 与 with_store 使用同一个 store.lock，保证导出、导入、Desktop 捕获/切换/删除
+/// 互斥；闭包内只能调用本模块的 `*_locked` 方法，不能嵌套 with_store。
+pub struct StoreTransactionGuard {
+    _reentry: ReentryGuard,
+    _process: CrossProcessLock,
+    _thread: std::sync::MutexGuard<'static, ()>,
+}
+
+impl StoreTransactionGuard {
+    pub fn load(&self) -> Result<Store, String> {
+        load_store()
+    }
+
+    pub fn save(&self, store: &Store) -> Result<(), String> {
+        save_store(store)
+    }
+}
+
+pub fn with_store_transaction<T>(
+    f: impl FnOnce(&StoreTransactionGuard) -> Result<T, String>,
+) -> Result<T, String> {
+    let reentry = ReentryGuard::enter()?;
+    let process = CrossProcessLock::acquire()?;
+    let thread = STORE_LOCK
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = StoreTransactionGuard {
+        _reentry: reentry,
+        _process: process,
+        _thread: thread,
+    };
+    f(&guard)
 }
 
 /// 在账号库互斥保护下执行一次「读—改—写」（H-2 / J-1 / J-2）。

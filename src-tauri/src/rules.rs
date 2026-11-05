@@ -22,6 +22,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::appconfig;
@@ -602,6 +603,80 @@ fn header_has_item(after: &[&str]) -> bool {
 /// - 原本不存在但被创建 → 删除
 /// - 原本存在且有改动 → 写回原始内容
 ///
+/// Clash 双文件崩溃事务：原始内容在修改前落盘，启动/下次修复先恢复。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RulesTransaction {
+    transaction_id: String,
+    merge_path: String,
+    script_path: String,
+    merge_original: Option<String>,
+    script_original: Option<String>,
+    merge_committed: bool,
+    script_committed: bool,
+    kernel_verified: bool,
+}
+
+fn rules_transaction_path() -> Result<std::path::PathBuf, String> {
+    Ok(crate::paths::app_data_dir()?.join("rules-transaction.json"))
+}
+
+fn write_rules_transaction(tx: &RulesTransaction) -> Result<(), String> {
+    let path = rules_transaction_path()?;
+    crate::fsx::write_atomically(
+        &path,
+        &serde_json::to_string_pretty(tx).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| format!("写入 Clash 事务账本失败：{e}"))
+}
+
+fn clear_rules_transaction() -> Result<(), String> {
+    let path = rules_transaction_path()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("删除 Clash 事务账本失败：{e}")),
+    }
+}
+
+/// 崩溃恢复只按本事务精确备份恢复，不扫描其他目录。
+pub fn heal_rules_transaction() -> Result<(), String> {
+    let path = rules_transaction_path()?;
+    let raw = match std::fs::read(&path) {
+        Ok(raw) => raw,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("读取 Clash 事务账本失败：{e}")),
+    };
+    let tx: RulesTransaction = serde_json::from_str(&crate::jsonio::decode_text(&raw))
+        .map_err(|e| format!("Clash 事务账本损坏，已保留现场：{e}"))?;
+    if tx.kernel_verified {
+        clear_rules_transaction()?;
+        return Ok(());
+    }
+    let mut errors = Vec::new();
+    for (path, original) in [
+        (PathBuf::from(&tx.merge_path), tx.merge_original.as_deref()),
+        (
+            PathBuf::from(&tx.script_path),
+            tx.script_original.as_deref(),
+        ),
+    ] {
+        let result = match original {
+            Some(text) => crate::fsx::write_atomically(&path, text)
+                .map_err(|e| format!("恢复 {} 失败：{e}", path.display())),
+            None if path.exists() => crate::fsx::remove_file_with_retry(&path)
+                .map_err(|e| format!("删除本次创建的 {} 失败：{e}", path.display())),
+            None => Ok(()),
+        };
+        if let Err(error) = result {
+            errors.push(error);
+        }
+    }
+    if !errors.is_empty() {
+        return Err(format!("{}；事务账本已保留待重试", errors.join("；")));
+    }
+    clear_rules_transaction()
+}
+
 /// **P0-11**：回滚失败必须上报，不能 `let _ = ...` 吞掉。
 ///
 /// 原实现多个错误分支用 `let _ = restore_merge(...)`：Merge.yaml 没恢复成功
@@ -759,6 +834,19 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
     } else {
         None
     };
+    heal_rules_transaction()?;
+    let mut tx = RulesTransaction {
+        transaction_id: uuid::Uuid::new_v4().simple().to_string(),
+        merge_path: merge_path.to_string_lossy().to_string(),
+        script_path: script_path.to_string_lossy().to_string(),
+        merge_original: merge_original.clone(),
+        script_original: script_existed.then(|| script_old.clone()),
+        merge_committed: false,
+        script_committed: false,
+        kernel_verified: false,
+    };
+    // 在任一文件被改写之前，两个原始快照必须已落盘。
+    write_rules_transaction(&tx)?;
     let mut merge_changed = false;
 
     // —— 1. 所有模式都先清理历史 Merge.yaml 遗留（global/direct 也需要）——
@@ -778,6 +866,8 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
                 }
                 report.merge_changed = true;
                 merge_changed = true;
+                tx.merge_committed = true;
+                write_rules_transaction(&tx)?;
                 report.merge_backup = Some(backup.to_string_lossy().to_string());
                 report.messages.push(format!(
                     "已清理历史遗留 Merge 规则并备份: {}",
@@ -869,6 +959,8 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
             return Err(format!("写入 Script.js 失败: {error}{rollback}"));
         }
         report.script_changed = true;
+        tx.script_committed = true;
+        write_rules_transaction(&tx)?;
         report.script_backup = backup.as_ref().map(|b| b.to_string_lossy().to_string());
         report.messages.push(match &report.script_backup {
             Some(backup) => format!("已写入 Script.js 规则并备份: {backup}"),
@@ -880,6 +972,9 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
     restart_clash_verge(&mut report);
     report.kernel_verified = wait_kernel_verified(group_trimmed, policy, 40);
     if report.kernel_verified {
+        tx.kernel_verified = true;
+        write_rules_transaction(&tx)?;
+        clear_rules_transaction()?;
         report.messages.push("置顶规则 ✓".to_string());
     } else if report.script_changed {
         report
@@ -907,6 +1002,7 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
                         }
                     };
                 restart_clash_verge(&mut report);
+                clear_rules_transaction()?;
                 report.messages.push(format!(
                     "置顶规则 FAIL: 验证失败，已回滚 Script.js{merge_note}，请确认 Clash Verge 已启用全局扩展脚本"
                 ));
@@ -934,6 +1030,7 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
                 .push("内核未加载规则；已恢复本次对 Merge.yaml 的修改".to_string());
         }
         restart_clash_verge(&mut report);
+        clear_rules_transaction()?;
     } else {
         // 块本就在文件里（未改动），但内核没加载——只告警，不回滚。
         report

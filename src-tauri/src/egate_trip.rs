@@ -405,7 +405,9 @@ fn count_rules_for(agent: &str, exes: &[String]) -> RuleVerification {
                  if ($active.Count -eq 0) {{ $reason = '未进入当前生效策略（可能被组策略覆盖）' }}\n\
                  else {{\n\
                    $ar = $active | Select-Object -First 1\n\
-                   if ($ar.Enabled -ne 'True' -or $ar.Action -ne 'Block') {{ $reason = '生效策略中的规则属性不符' }}\n\
+                   $af = $ar | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+                   if ($ar.Enabled -ne 'True' -or $ar.Action -ne 'Block') {{ $reason = '生效策略中的规则属性不符' }}
+                   elseif ($ar.Direction -ne $s.direction -or -not $af.Program -or $af.Program -ine $s.exe) {{ $reason = '生效策略的方向或程序过滤条件不符' }}
                    else {{ $ok = $true }}\n\
                  }}\n\
                }}\n\
@@ -609,7 +611,25 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
     }
 
     // 4. 回查：规则写入返回成功不等于当前策略下真的生效。
-    let verification = count_rules_for(agent, &exes);
+    let mut verification = count_rules_for(agent, &exes);
+    if verification.query_ok && verification.verified > 0 {
+        // 规则对象存在仍不代表当前活动网络受防火墙过滤。
+        match crate::platform::imp::effective_firewall_enabled() {
+            Some(true) => {}
+            Some(false) => {
+                verification.verified = 0;
+                verification
+                    .failed
+                    .push("当前活动网络的防火墙已关闭".to_string());
+            }
+            None => {
+                verification.query_ok = false;
+                verification
+                    .failed
+                    .push("无法读取当前生效的防火墙配置".to_string());
+            }
+        }
+    }
     report.query_ok = verification.query_ok;
     report.rules_expected = verification.expected;
     report.rules_verified = verification.verified;
@@ -810,35 +830,60 @@ pub fn prune_stale_rule_targets() -> Result<u32, String> {
     Ok(value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32)
 }
 
-/// **P0-04**：删除应用隔离规则并回查确认真的消失。
+/// 解除隔离的来源，决定是否检查手动保持意图。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReleaseReason {
+    Automatic,
+    UserRequested,
+    Emergency,
+}
+
 pub fn release_all_verified() -> Result<ReleaseReport, String> {
+    release_verified(ReleaseReason::Automatic)
+}
+
+/// 自动恢复、用户手动解除和紧急恢复共用核验删除逻辑，但只有自动恢复受手动保持拦截。
+pub fn release_verified(reason: ReleaseReason) -> Result<ReleaseReport, String> {
     let guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::ReleaseIsolation)?;
-    // **P0-G**：拿到锁之后**重新核验**手动保持意图。
-    //
-    // 监控循环是在拿锁**之前**算出 `Recover` 决策的；等待锁期间用户可能刚点了
-    // 「保持隔离」。原实现在锁内不再检查，于是旧决策会覆盖新意图。
-    // `Unknown`（意图文件损坏/不可读）同样拒绝解除——宁可不解除，也不能
-    // 静默推翻用户的明确要求。
-    match crate::egate_monitor::manual_hold_state() {
-        crate::egate_monitor::ManualHold::None => {}
-        crate::egate_monitor::ManualHold::Held => {
-            return Err(
-                "检测到用户手动保持的隔离，已放弃本次自动解除（仅手动解除可清除）".to_string(),
-            )
-        }
-        crate::egate_monitor::ManualHold::Unknown => {
-            return Err(
-                "无法确认手动隔离意图（意图文件损坏或不可读），已放弃本次自动解除".to_string(),
-            )
+    if reason == ReleaseReason::Automatic {
+        match crate::egate_monitor::manual_hold_state() {
+            crate::egate_monitor::ManualHold::None => {}
+            crate::egate_monitor::ManualHold::Held => {
+                return Err(
+                    "检测到用户手动保持的隔离，已放弃本次自动解除（仅手动解除可清除）".to_string(),
+                );
+            }
+            crate::egate_monitor::ManualHold::Unknown => {
+                return Err(
+                    "无法确认手动隔离意图（意图文件损坏或不可读），已放弃本次自动解除".to_string(),
+                );
+            }
         }
     }
-    release_all_verified_locked(&guard)
+    release_verified_locked(&guard, reason)
+}
+
+/// 已持锁的解除实现：只有自动来源检查手动保持意图。
+pub(crate) fn release_verified_locked(
+    guard: &crate::egate_lock::OperationGuard,
+    reason: ReleaseReason,
+) -> Result<ReleaseReport, String> {
+    if reason == ReleaseReason::Automatic {
+        match crate::egate_monitor::manual_hold_state() {
+            crate::egate_monitor::ManualHold::Held | crate::egate_monitor::ManualHold::Unknown => {
+                return Err("手动保持隔离生效中，已放弃本次自动解除".to_string())
+            }
+            crate::egate_monitor::ManualHold::None => {}
+        }
+    }
+    release_all_verified_locked(guard)
 }
 
 /// **P0-01**：已持锁版本的解除隔离——内部**不再申请锁**。
 pub(crate) fn release_all_verified_locked(
     _guard: &crate::egate_lock::OperationGuard,
 ) -> Result<ReleaseReport, String> {
+    // 该入口用于已经持锁的紧急恢复（Emergency），不再检查手动保持。
     // P0-C：先尝试清理旧版残留（升级兼容），失败不阻断主流程。
     let legacy = cleanup_legacy_rules().unwrap_or(0);
     let script = format!(
@@ -1068,5 +1113,34 @@ mod tests {
         assert!(!report.any_isolated);
         assert!(report.agents.is_empty());
         assert_eq!(report.failures.len(), 0, "没有守护对象不算失败");
+    }
+
+    /// 三个解除来源共用执行入口，只有自动恢复受手动保持拦截。
+    #[test]
+    fn release_reason_policy_separates_automatic_and_manual() {
+        assert_ne!(ReleaseReason::UserRequested, ReleaseReason::Automatic);
+        assert_ne!(ReleaseReason::Emergency, ReleaseReason::Automatic);
+        assert_ne!(ReleaseReason::Emergency, ReleaseReason::UserRequested);
+    }
+
+    /// 手动保持存在时：自动恢复必须被拦截，用户主动解除不得被拦。
+    #[test]
+    fn manual_hold_blocks_only_automatic_release() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+        crate::egate_monitor::mark_manual_hold().unwrap();
+
+        // 自动恢复：在拿锁前就会被判定为「不该解除」。
+        assert_eq!(
+            crate::egate_monitor::manual_hold_state(),
+            crate::egate_monitor::ManualHold::Held
+        );
+        // 用户主动解除与紧急恢复的来源值不同，因此不会走手动保持拦截分支。
+        assert_ne!(ReleaseReason::UserRequested, ReleaseReason::Automatic);
+        assert_ne!(ReleaseReason::Emergency, ReleaseReason::Automatic);
+
+        crate::egate_monitor::clear_manual_hold().unwrap();
     }
 }

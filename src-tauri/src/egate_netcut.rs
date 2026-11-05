@@ -661,7 +661,13 @@ try {{
     let out = crate::platform::imp::run_powershell(&script)
         .map_err(|e| format!("查询阻断规则失败：{e}"))?;
     match out.trim().to_ascii_lowercase().as_str() {
-        "present" => Ok(RuleState::Present),
+        "present" => {
+            // 统一核验当前生效策略的活动网络 Profile，不能只信持久配置。
+            match crate::platform::imp::effective_firewall_enabled() {
+                Some(true) => Ok(RuleState::Present),
+                Some(false) | None => Ok(RuleState::Unknown),
+            }
+        }
         "absent" => Ok(RuleState::Absent),
         "wrong" => Ok(RuleState::WrongAttributes),
         "unknown" => Ok(RuleState::Unknown),
@@ -975,7 +981,12 @@ pub fn restore_all() -> RecoveryReport {
     }
 
     // 3. 解除应用隔离并回查（已持锁）。
-    let isolation_ok = match crate::egate_trip::release_all_verified_locked(&guard) {
+    // **P0-04**：紧急恢复不受「手动保持」拦截——用户执行急救时明确要求恢复，
+    // 与自动恢复不是一回事。此处已持锁，走无锁版本。
+    let isolation_ok = match crate::egate_trip::release_verified_locked(
+        &guard,
+        crate::egate_trip::ReleaseReason::Emergency,
+    ) {
         Ok(report) if report.verified => true,
         Ok(report) => {
             failures.push(format!("应用隔离：{}", report.failures.join("；")));

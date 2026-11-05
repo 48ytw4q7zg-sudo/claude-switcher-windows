@@ -1411,6 +1411,46 @@ fn parse_killed(json: &str) -> Result<Vec<String>, String> {
 ///
 /// 仅供本项目的**专用平台能力**调用（如防火墙规则）；业务代码不要直接用它拼
 /// 任意脚本——需要新能力时在这里加一个有名字、可被单测覆盖的函数。
+/// 当前活动网络对应的防火墙配置档是否已启用。
+/// `None` = 无法确认（查询失败、没有配置或类别未知）。
+pub fn effective_firewall_enabled() -> Option<bool> {
+    let script = "$ErrorActionPreference='Stop'
+$profiles = @(Get-NetFirewallProfile -PolicyStore ActiveStore -ErrorAction Stop)
+$connections = @(Get-NetConnectionProfile -ErrorAction Stop)
+$map = @{}
+foreach ($p in $profiles) { $map[[string]$p.Name] = ($p.Enabled -eq 'True') }
+[pscustomobject]@{ profiles = $map; categories = @($connections | ForEach-Object { [string]$_.NetworkCategory }) } | ConvertTo-Json -Compress";
+    let value: serde_json::Value =
+        serde_json::from_str(run_powershell(script).ok()?.trim()).ok()?;
+    let map: std::collections::BTreeMap<String, bool> =
+        serde_json::from_value(value.get("profiles")?.clone()).ok()?;
+    if map.is_empty() {
+        return None;
+    }
+    let cats = match value.get("categories")? {
+        serde_json::Value::Array(items) => items
+            .iter()
+            .map(|v| v.as_str().map(str::to_string))
+            .collect::<Option<Vec<_>>>()?,
+        serde_json::Value::String(s) => vec![s.clone()],
+        _ => return None,
+    };
+    if cats.is_empty() {
+        return Some(map.values().all(|enabled| *enabled));
+    }
+    let mut enabled = true;
+    for cat in cats {
+        let profile = match cat.as_str() {
+            "DomainAuthenticated" => "Domain",
+            "Private" => "Private",
+            "Public" => "Public",
+            _ => return None,
+        };
+        enabled &= *map.get(profile)?;
+    }
+    Some(enabled)
+}
+
 pub fn run_powershell(script: &str) -> Result<String, String> {
     run_ps(script)
 }

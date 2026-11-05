@@ -556,6 +556,7 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
             original_existed: live.is_dir(),
             live_dir: live.to_string_lossy().to_string(),
             store_commit: None,
+            snapshot_swap: None,
             phase: DesktopSwitchPhase::Prepared,
             started_at: chrono::Utc::now().timestamp(),
         };
@@ -575,6 +576,8 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
             &transaction,
         );
         if outcome.is_ok() {
+            // 事务 ID 与当前 Desktop 账号在同一次账号库保存中原子落盘。
+            store.last_desktop_transaction_id = Some(tx_id.clone());
             switched = true;
         }
         outcome
@@ -706,6 +709,17 @@ struct StoreCommitMarker {
     committed_at: i64,
 }
 
+/// 回存当前账号快照的两段式替换状态。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SnapshotSwapState {
+    snapshot_id: String,
+    snapshot: String,
+    staging: String,
+    retired: String,
+    /// 原快照已改名为 retired；此时若正式目录缺失，启动恢复必须把它请回来。
+    retired_original: bool,
+}
+
 /// **P0-08**：Desktop 切换事务账本（落盘，崩溃后恢复用）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DesktopSwitchLedger {
@@ -728,6 +742,9 @@ struct DesktopSwitchLedger {
     /// 阶段枚举本身不足以证明：崩溃可能恰好发生在保存成功与阶段更新之间。
     #[serde(default)]
     store_commit: Option<StoreCommitMarker>,
+    /// 当前账号快照回存子事务。
+    #[serde(default)]
+    snapshot_swap: Option<SnapshotSwapState>,
     /// 事务阶段。
     ///
     /// **P0-02**：从任意字符串改为枚举。原实现用 `"prepared"` / `"backup_verified"`
@@ -867,6 +884,39 @@ fn read_pending_switch_ledger() -> Result<Option<DesktopSwitchLedger>, String> {
     Ok(Some(ledger))
 }
 
+/// 推进/清除当前切换里的快照替换子事务。
+fn advance_snapshot_swap(swap: SnapshotSwapState, live_dir: &Path) -> Result<(), String> {
+    let path = desktop_switch_ledger_path()?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut ledger: DesktopSwitchLedger = serde_json::from_str(&crate::jsonio::decode_text(&bytes))
+        .map_err(|e| format!("切换账本损坏：{e}"))?;
+    if !crate::platform::imp::paths_equivalent(Path::new(&ledger.live_dir), live_dir) {
+        return Err("快照替换账本与本次切换的活目录不一致".to_string());
+    }
+    ledger.snapshot_swap = Some(swap);
+    write_switch_ledger(&ledger)
+}
+
+fn clear_snapshot_swap(live_dir: &Path) -> Result<(), String> {
+    let path = desktop_switch_ledger_path()?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut ledger: DesktopSwitchLedger = serde_json::from_str(&crate::jsonio::decode_text(&bytes))
+        .map_err(|e| format!("切换账本损坏：{e}"))?;
+    if !crate::platform::imp::paths_equivalent(Path::new(&ledger.live_dir), live_dir) {
+        return Err("快照替换账本与本次切换的活目录不一致".to_string());
+    }
+    ledger.snapshot_swap = None;
+    write_switch_ledger(&ledger)
+}
+
 /// 删除事务账本。
 ///
 /// **P0-02**：改为返回 `Result`。原实现吞掉删除失败，调用方以为「已清理」，
@@ -905,6 +955,30 @@ pub fn heal_desktop_switch() -> Vec<String> {
 
     let mut messages = Vec::new();
     let live = std::path::PathBuf::from(&ledger.live_dir);
+    if let Some(swap) = &ledger.snapshot_swap {
+        let snapshot = std::path::PathBuf::from(&swap.snapshot);
+        let retired = std::path::PathBuf::from(&swap.retired);
+        let staging = std::path::PathBuf::from(&swap.staging);
+        if !snapshot.exists() && swap.retired_original && retired.is_dir() {
+            match fsx::rename_with_retry(&retired, &snapshot) {
+                Ok(()) => messages.push(format!(
+                    "Desktop 回存在替换时中断，已将账号 {} 的原快照恢复到正式目录",
+                    swap.snapshot_id
+                )),
+                Err(error) => {
+                    messages.push(format!(
+                        "Desktop 原快照仍在 {}，恢复正式目录失败：{error}；账本已保留",
+                        retired.display()
+                    ));
+                    return messages;
+                }
+            }
+        }
+        if let Err(error) = fsx::retry_io(|| fs::remove_dir_all(&staging)) {
+            messages.push(format!("Desktop 回存半成品清理失败：{error}；账本已保留"));
+            return messages;
+        }
+    }
 
     // **P0-A**：阶段不足以判定「账号库是否已提交」。
     //
@@ -919,7 +993,10 @@ pub fn heal_desktop_switch() -> Vec<String> {
     // 4. 只有确认「账号库不是本次目标」时，才按阶段回滚。
     let store_state = store::load_store();
     let committed_target: Option<bool> = match &store_state {
-        Ok(data) => Some(data.current_desktop_profile_id.as_deref() == Some(ledger.to_id.as_str())),
+        Ok(data) => Some(
+            data.last_desktop_transaction_id.as_deref() == Some(ledger.transaction_id.as_str())
+                && data.current_desktop_profile_id.as_deref() == Some(ledger.to_id.as_str()),
+        ),
         Err(_) => None,
     };
     if committed_target == Some(true) {
@@ -1149,6 +1226,18 @@ fn switch_desktop_profile_in(
                     let _ = fsx::retry_io(|| fs::remove_dir_all(&staging));
                     let _ = fsx::retry_io(|| fs::remove_dir_all(&retired));
                     copy(live_dir, &staging)?;
+                    if let Err(error) = advance_snapshot_swap(
+                        SnapshotSwapState {
+                            snapshot_id: current.id.clone(),
+                            snapshot: current_snapshot.to_string_lossy().to_string(),
+                            staging: staging.to_string_lossy().to_string(),
+                            retired: retired.to_string_lossy().to_string(),
+                            retired_original: true,
+                        },
+                        live_dir,
+                    ) {
+                        return Err(format!("回存快照前无法登记恢复依据：{error}"));
+                    }
                     fsx::retry_io(|| fs::rename(&current_snapshot, &retired)).map_err(|e| {
                         format!(
                             "回存账号「{}」时替换旧快照失败（{}）：{}",
@@ -1183,7 +1272,13 @@ fn switch_desktop_profile_in(
                             }
                         }
                     }
-                    let _ = fsx::retry_io(|| fs::remove_dir_all(&retired));
+                    if let Err(error) = clear_snapshot_swap(live_dir) {
+                        return Err(format!(
+                            "回存已完成但清除替换账本失败（保留旧快照供恢复）：{error}"
+                        ));
+                    }
+                    fsx::retry_io(|| fs::remove_dir_all(&retired))
+                        .map_err(|e| format!("回存已完成，但删除旧快照失败（保留现场）：{e}"))?;
                     // size_bytes 只算一次：快照有几个 GB 时，重复走完整目录遍历
                     // 会让每次切换都白等一遍。
                     let saved_size = dir_size(&current_snapshot);
@@ -2446,6 +2541,7 @@ mod tests {
                 original_existed: true,
                 live_dir: live.to_string_lossy().to_string(),
                 store_commit: None,
+                snapshot_swap: None,
                 phase,
                 started_at: 0,
             };
@@ -2494,6 +2590,7 @@ mod tests {
             original_existed: true,
             live_dir: live.to_string_lossy().to_string(),
             store_commit: None,
+            snapshot_swap: None,
             phase: DesktopSwitchPhase::BackupVerified,
             started_at: 0,
         };
@@ -2565,6 +2662,7 @@ mod tests {
                 meta: None,
             }],
             current_desktop_profile_id: Some("b".into()),
+            last_desktop_transaction_id: Some("t".into()),
             ..Default::default()
         };
         store::save_store(&store_data).unwrap();
@@ -2578,6 +2676,7 @@ mod tests {
             original_existed: true,
             live_dir: live.to_string_lossy().to_string(),
             store_commit: None,
+            snapshot_swap: None,
             phase: DesktopSwitchPhase::FilesSwitching,
             started_at: 0,
         };
@@ -2592,6 +2691,45 @@ mod tests {
         assert!(
             !desktop_switch_ledger_path().unwrap().exists(),
             "应清理账本"
+        );
+    }
+
+    /// 当前账号本来就是 B，但本次事务尚未提交，不能误认已成功。
+    #[test]
+    fn heal_requires_matching_transaction_id_not_just_target() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let data = dir.path().join(".claude-switcher");
+        fs::create_dir_all(&data).unwrap();
+        let backup = data.join("backup-B");
+        fs::create_dir_all(&backup).unwrap();
+        fs::write(backup.join("who.txt"), b"original-B").unwrap();
+        let live = dir.path().join("Claude");
+        fs::create_dir_all(&live).unwrap();
+        fs::write(live.join("who.txt"), b"partial-B").unwrap();
+        store::save_store(&Store {
+            current_desktop_profile_id: Some("b".into()),
+            ..Default::default()
+        })
+        .unwrap();
+        write_switch_ledger(&DesktopSwitchLedger {
+            transaction_id: "new-tx".into(),
+            from_id: Some("b".into()),
+            to_id: "b".into(),
+            backup_path: Some(backup.to_string_lossy().to_string()),
+            original_existed: true,
+            live_dir: live.to_string_lossy().to_string(),
+            store_commit: None,
+            snapshot_swap: None,
+            phase: DesktopSwitchPhase::FilesSwitching,
+            started_at: 0,
+        })
+        .unwrap();
+        heal_desktop_switch();
+        assert_eq!(
+            fs::read_to_string(live.join("who.txt")).unwrap(),
+            "original-B"
         );
     }
 
@@ -2626,6 +2764,7 @@ mod tests {
             original_existed: true,
             live_dir: live.to_string_lossy().to_string(),
             store_commit: None,
+            snapshot_swap: None,
             phase: DesktopSwitchPhase::FilesSwitching,
             started_at: 0,
         };
@@ -2637,5 +2776,51 @@ mod tests {
             "A-account",
             "账号库未提交，必须回滚到切换前内容"
         );
+    }
+
+    /// 回存中断在 `.old` 阶段时，必须把原快照请回正式目录。
+    #[test]
+    fn heal_restores_snapshot_from_retired() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let data = dir.path().join(".claude-switcher");
+        let accounts = data.join("desktop-accounts");
+        std::fs::create_dir_all(&accounts).unwrap();
+        // 正式快照缺失，.old 里是原数据。
+        let retired = accounts.join("a.old");
+        std::fs::create_dir_all(&retired).unwrap();
+        std::fs::write(retired.join("who.txt"), b"original-snapshot").unwrap();
+        let staging = accounts.join("a.new");
+        std::fs::create_dir_all(&staging).unwrap();
+
+        let live = dir.path().join("Claude");
+        std::fs::create_dir_all(&live).unwrap();
+        let ledger = DesktopSwitchLedger {
+            transaction_id: "t".into(),
+            from_id: Some("a".into()),
+            to_id: "b".into(),
+            backup_path: None,
+            original_existed: true,
+            live_dir: live.to_string_lossy().to_string(),
+            store_commit: None,
+            snapshot_swap: Some(SnapshotSwapState {
+                snapshot_id: "a".into(),
+                snapshot: accounts.join("a").to_string_lossy().to_string(),
+                staging: staging.to_string_lossy().to_string(),
+                retired: retired.to_string_lossy().to_string(),
+                retired_original: true,
+            }),
+            phase: DesktopSwitchPhase::FilesSwitching,
+            started_at: 0,
+        };
+        write_switch_ledger(&ledger).unwrap();
+        heal_desktop_switch();
+        assert_eq!(
+            std::fs::read(accounts.join("a").join("who.txt")).unwrap(),
+            b"original-snapshot",
+            "原快照必须回到正式目录"
+        );
+        assert!(!staging.exists(), "半成品 .new 必须清理");
     }
 }

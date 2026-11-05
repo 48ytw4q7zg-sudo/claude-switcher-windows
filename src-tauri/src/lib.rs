@@ -165,6 +165,7 @@ struct RestoreResult {
 /// 用户可按备份 id 回滚（restore_backup），而不是面对半切换状态猜。
 #[derive(Debug, Clone, Serialize, serde::Deserialize)]
 struct SwitchJournal {
+    transaction_id: String,
     target_id: String,
     step: String,
     backup_id: Option<String>,
@@ -201,10 +202,16 @@ fn clear_switch_journal() -> Result<(), String> {
 }
 
 /// 启动/刷新时读取残留的切换事务日志（无残留返回 None）。
-fn read_switch_journal() -> Option<SwitchJournal> {
-    let path = paths::switch_journal_path().ok()?;
-    let raw = fs::read_to_string(path).ok()?;
-    serde_json::from_str(&raw).ok()
+fn read_switch_journal() -> Result<Option<SwitchJournal>, String> {
+    let path = paths::switch_journal_path()?;
+    let raw = match fs::read_to_string(&path) {
+        Ok(raw) => raw,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("读取切换事务日志失败：{error}")),
+    };
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|e| format!("切换事务日志损坏，请人工核对：{e}"))
 }
 
 /// 切换前预检：目标快照可解密、凭据存储可写、磁盘可写。
@@ -416,7 +423,7 @@ fn get_status_blocking(offline: bool) -> Result<ClaudeStatus, String> {
     }
 
     // 残留的切换事务日志 = 上次切换中断；提示用户用备份回滚。
-    let pending_switch = read_switch_journal();
+    let pending_switch = read_switch_journal().ok().flatten();
     if let Some(journal) = &pending_switch {
         warnings.push(format!(
             "检测到上次切换未完成（目标 {}，步骤 {}）——可用「备份与恢复」回滚到切换前备份",
@@ -981,6 +988,14 @@ async fn set_auto_adopt(enabled: bool) -> Result<appconfig::AppConfig, String> {
 }
 
 fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
+    // 已有未完成事务或日志不可读时拒绝覆盖，避免回滚到上一笔事务的备份。
+    if let Some(pending) = read_switch_journal()? {
+        return Err(format!(
+            "检测到未完成的切换事务（{}），请先在「备份与恢复」处理或重启应用",
+            pending.transaction_id
+        ));
+    }
+    let transaction_id = uuid::Uuid::new_v4().simple().to_string();
     // H-2：整个切换是一次账号库事务，读—改—写全程持 with_store 锁。
     // 内部调用（preflight/backup/reconcile/clash/accounts/isolation/keep）均不获取
     // STORE_LOCK，无重入死锁；只读路径（read_lightweight/load_store）不持锁。
@@ -1006,6 +1021,7 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
         // 切换事务日志：从「备份已建」起记录——此刻备份是回滚点，
         // 之后任何中断都能按 backup_id 恢复。备份失败则什么都没改，不需要日志。
         write_switch_journal(&SwitchJournal {
+            transaction_id: transaction_id.clone(),
             target_id: id.clone(),
             step: "backup-created".to_string(),
             backup_id: Some(backup.id.clone()),
@@ -1164,13 +1180,19 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
             Ok(done)
         }
         Err(error) => {
+            // 本次事务根本没建日志（例如目标不存在/预检失败）→ 没动数据，不能回滚。
+            let journal = read_switch_journal()?;
+            if journal.as_ref().map(|j| j.transaction_id.as_str()) != Some(transaction_id.as_str())
+            {
+                return Err(error);
+            }
             // **P0-E**：账号库保存失败时，**在本次调用里**就尝试把实际账号材料
             // 回滚到备份状态。原实现只保留日志并提示「下次启动按备份恢复」，
             // 于是失败后的一段时间里，磁盘上的凭据/隔离目录已经是 B，而账号库
             // 仍是 A——用户此时启动 Claude Code 会登进一个"未登记"的账号。
             //
             // 回滚是 best-effort：失败时如实告知，并保留日志与备份。
-            let rolled_back = rollback_account_material_after_failed_switch();
+            let rolled_back = rollback_account_material_after_failed_switch(&transaction_id);
             Err(match rolled_back {
                 Ok(backup_id) => format!(
                     "{error}；切换未完成，已自动把账号材料回滚到切换前状态（备份 {backup_id}）"
@@ -1186,9 +1208,12 @@ fn switch_profile_blocking(id: String) -> Result<SwitchResult, String> {
 /// **P0-E**：切号保存失败后，把账号材料回滚到备份状态。
 ///
 /// 用事务日志里记录的备份 id（就是切换前刚建的那份），避免回滚到更早的备份。
-fn rollback_account_material_after_failed_switch() -> Result<String, String> {
+fn rollback_account_material_after_failed_switch(transaction_id: &str) -> Result<String, String> {
     let journal =
-        read_switch_journal().ok_or_else(|| "找不到切换事务日志，无法确定回滚目标".to_string())?;
+        read_switch_journal()?.ok_or_else(|| "找不到切换事务日志，无法确定回滚目标".to_string())?;
+    if journal.transaction_id != transaction_id {
+        return Err("残留的切换日志不属于本次事务，已拒绝使用其中的备份".to_string());
+    }
     let backup_id = journal
         .backup_id
         .ok_or_else(|| "事务日志没有记录备份 id".to_string())?;
@@ -3111,7 +3136,7 @@ async fn egate_trip_now() -> Result<egate_trip::TripReport, String> {
 async fn egate_release_now() -> Result<u32, String> {
     blocking(|| {
         // **P0-NEW-02**：只有回查确认规则真的消失才清除熔断状态。
-        let report = egate_trip::release_all_verified()?;
+        let report = egate_trip::release_verified(egate_trip::ReleaseReason::UserRequested)?;
         if !report.verified {
             return Err(format!(
                 "隔离规则未能全部清除（剩余 {} 条）：{}",
@@ -3288,27 +3313,6 @@ pub fn run() {
         std::process::exit(1);
     }
 
-    // 出口门禁断网自愈：上次进程崩溃/被杀留下的断网现场在这里恢复。
-    // fail-closed：宁可多恢复一次，也不能让用户以为「还断着」却没人接管。
-    for message in egate_netcut::heal() {
-        log_error(&message);
-    }
-    // **P0-B**：恢复中断的完整迁移。必须**早于** Desktop 切换恢复——
-    // 迁移会整体替换 `desktop-accounts`，先跑 Desktop 恢复会拿旧账本去操作
-    // 已被替换的目录。
-    for message in export::recover_full_migration() {
-        log_error(&message);
-    }
-    // **P0-08**：恢复中断的 Desktop 切换（崩溃残留）。
-    for message in desktop::heal_desktop_switch() {
-        log_error(&message);
-    }
-    // **P0-06**：先从真实系统状态重建熔断状态（进程重启后内存归零，
-    // 但防火墙规则仍在）。
-    egate_monitor::rebuild_trip_state_from_system();
-    // 出口门禁常驻巡检（幂等：门禁未开启时线程空转，不产生副作用）。
-    egate_monitor::start_monitor();
-
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_notification::init())
@@ -3331,6 +3335,23 @@ pub fn run() {
             }
         })
         .setup(move |app| {
+            // 单实例插件已先完成转交：只有进入本回调的主实例才能执行恢复。
+            // 第二实例在插件中直接退出，不会触碰仍在运行实例的事务。
+            for message in egate_netcut::heal() {
+                log_error(&message);
+            }
+            for message in export::recover_full_migration() {
+                log_error(&message);
+            }
+            if let Err(error) = rules::heal_rules_transaction() {
+                log_error(&format!("Clash 双文件崩溃恢复未完成：{error}"));
+            }
+            for message in desktop::heal_desktop_switch() {
+                log_error(&message);
+            }
+            egate_monitor::rebuild_trip_state_from_system();
+            egate_monitor::start_monitor();
+
             // P1-01：把 AppHandle 交给常驻监控线程（Tauri 的 .setup 是替换而非追加，
             // 必须放在唯一的 setup 里，否则先前的回调会失效）。
             egate_monitor::set_app_handle(app.handle().clone());
@@ -3502,4 +3523,51 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Claude Switcher");
+}
+
+#[cfg(test)]
+mod switch_journal_tests {
+    use super::*;
+
+    /// 日志文件损坏时必须报错，不能当成「没有未完成切换」。
+    #[test]
+    fn corrupt_switch_journal_is_an_error_not_none() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+        let path = paths::switch_journal_path().unwrap();
+        std::fs::write(&path, b"{broken").unwrap();
+        let result = read_switch_journal();
+        assert!(result.is_err(), "损坏的日志必须返回 Err");
+    }
+
+    /// 不存在日志时返回 Ok(None)，与损坏区分开。
+    #[test]
+    fn missing_switch_journal_is_none() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+        assert!(matches!(read_switch_journal(), Ok(None)));
+    }
+
+    /// 回滚只能使用本事务的备份；别的残留事务一律拒绝。
+    #[test]
+    fn rollback_rejects_foreign_transaction_backup() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+        write_switch_journal(&SwitchJournal {
+            transaction_id: "old-tx".into(),
+            target_id: "x".into(),
+            step: "backup-created".into(),
+            backup_id: Some("whatever".into()),
+            started_at: Utc::now(),
+        })
+        .unwrap();
+        let err = rollback_account_material_after_failed_switch("new-tx").unwrap_err();
+        assert!(err.contains("不属于本次事务"), "{err}");
+    }
 }
