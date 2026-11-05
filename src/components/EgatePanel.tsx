@@ -498,6 +498,34 @@ export function EgatePanel() {
           <ShieldAlert />
           直连泄露观察
         </button>
+        {/* **P1-13**：严格防泄漏模式。开启后「接入未知 / TUN 路由未证明」也会
+            封锁受管应用出站（不杀进程）。这是产品安全契约上的主动选择，因此
+            默认关闭，由用户自己决定。 */}
+        <button
+          className={config?.strict_leak_protection ? 'ghost' : 'ghost'}
+          disabled={busy}
+          title={
+            config?.strict_leak_protection
+              ? '严格防泄漏已开启：接入路径无法证明时也会封锁受管应用出站（不杀进程）。点击关闭'
+              : '开启后，接入路径未知或 TUN 路由未证明时也会封锁受管应用出站（不杀进程、不全局断网）。普通模式只显示「未验证」'
+          }
+          onClick={async () => {
+            setSaving(true);
+            try {
+              const next = !config?.strict_leak_protection;
+              await invoke('egate_set_strict_leak', { enabled: next });
+              setConfig((c) => (c ? { ...c, strict_leak_protection: next } : c));
+              setNote(next ? '严格防泄漏模式已开启' : '严格防泄漏模式已关闭');
+            } catch (e) {
+              setError(formatError(e));
+            } finally {
+              setSaving(false);
+            }
+          }}
+        >
+          <ShieldAlert />
+          {config?.strict_leak_protection ? '严格防泄漏：开' : '严格防泄漏：关'}
+        </button>
         <button className="ghost" onClick={togglePause} disabled={busy} title="暂停期间照常检测，但不会执行熔断">
           {monitor?.paused ? '恢复暂停' : '暂停守护 30 分钟'}
         </button>
@@ -534,22 +562,53 @@ export function EgatePanel() {
             权限状态无法确认
           </span>
         )}
-        {monitor?.uncovered_lock && !monitor?.uncovered_lock_verified && (
-          <span
-            className="pill bad"
-            title={monitor?.uncovered_lock_note ?? '未接入代理的兜底封锁已启用，但核验未通过'}
-          >
-            兜底封锁（未核验{monitor?.uncovered_lock_note ? `：${monitor.uncovered_lock_note}` : ''}）
-          </span>
-        )}
-        {monitor?.uncovered_lock && monitor?.uncovered_lock_verified && (
-          <span
-            className="pill muted"
-            title={`未接入代理时自动封锁受管应用出站（${monitor?.uncovered_lock_note ?? '已核验'}）`}
-          >
-            兜底封锁中
-          </span>
-        )}
+        {/* **L-16（v0.7.5）**：兜底封锁要区分四种状态，不能只有「核验过 / 没核验过」。
+            - 当前核验通过：规则确实在，覆盖完整。
+            - 历史核验已失效：以前核验过，但配置/规则/时间已变——用户看到的是
+              「上一刻的事实」，不能继续显示成当前事实。
+            - 尚未核验：从没核验过，不知道规则是否真的在。
+            - 覆盖不完整：核验了，但部分规则没生效。 */}
+        {monitor?.uncovered_lock &&
+          (() => {
+            const note = monitor?.uncovered_lock_note ?? '';
+            const stale = note.includes('核验已失效');
+            const partial = note.includes('不完整') || note.includes('部分');
+            if (monitor.uncovered_lock_verified && !stale) {
+              return (
+                <span
+                  className="pill ok"
+                  title={`未接入代理时自动封锁受管应用出站（${note || '当前核验通过'}）`}
+                >
+                  兜底封锁中（已核验）
+                </span>
+              );
+            }
+            if (stale) {
+              return (
+                <span
+                  className="pill bad"
+                  title={`${note}。请重新检查一轮以刷新状态`}
+                >
+                  兜底封锁（历史核验已失效）
+                </span>
+              );
+            }
+            if (partial) {
+              return (
+                <span className="pill bad" title={note || '覆盖不完整'}>
+                  兜底封锁（覆盖不完整）
+                </span>
+              );
+            }
+            return (
+              <span
+                className="pill muted"
+                title={note || '未接入代理的兜底封锁已启用，但尚未核验'}
+              >
+                兜底封锁（未核验）
+              </span>
+            );
+          })()}
         {monitor?.manual_hold && (
           <span className="pill muted" title="由你手动触发的隔离，自动恢复不会解除">
             手动保持隔离

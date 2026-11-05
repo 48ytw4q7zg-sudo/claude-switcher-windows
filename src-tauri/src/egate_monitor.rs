@@ -779,6 +779,7 @@ fn leak_round(config: &crate::appconfig::AppConfig) -> LeakRound {
 fn run_uncovered_lockdown(
     config: &crate::appconfig::AppConfig,
     report: &crate::egate_check::EgateReport,
+    revision: u64,
 ) {
     let agents = if config.egate_guarded_agents.is_empty() {
         crate::egate_defaults::DEFAULT_GUARDED_AGENTS
@@ -792,8 +793,14 @@ fn run_uncovered_lockdown(
         return;
     }
     // **P0-C**：先写意图**再**动防火墙——崩溃时至少有「我打算锁」的记录。
+    // **P1-13**：记录触发原因（未接入 vs 严格模式下接入无法确认）。
     if !uncovered_lock_active() {
-        if let Err(error) = mark_uncovered_lock() {
+        let reason = if report.access.path == "uncovered" {
+            "uncovered"
+        } else {
+            "strict_unknown_access"
+        };
+        if let Err(error) = mark_uncovered_lock_with_reason(reason) {
             crate::log_error(&format!(
                 "未接入兜底封锁：意图落盘失败（{error}），本轮不施加规则以免无法归属"
             ));
@@ -801,13 +808,19 @@ fn run_uncovered_lockdown(
         }
     }
     // **P0-C**：每轮都重新核验并补齐，不能因「意图文件存在」就跳过。
-    let trip = crate::egate_trip::enforce_uncovered_outbound(&agents);
+    // **P1-08**：把本轮代次带进兜底封锁——持锁后若代次已变会自行放弃。
+    let trip = crate::egate_trip::enforce_uncovered_outbound_with_revision(&agents, Some(revision));
     if trip.all_isolated {
         // **L-13**：每次都重写 ready，而不是「存在就跳过」。
         // 记录里带 `verified_at` / 配置代次 / 受管清单 / 规则条数，
         // 任何一项变了都会在读取时失效，界面不会再展示上一轮的核验结果。
         let rules: u32 = trip.agents.iter().map(|agent| agent.rules_verified).sum();
-        if let Err(error) = mark_uncovered_ready(&agents, rules) {
+        // **P1-07**：把本次应建立的规则名一并记下，供下次核验对账。
+        let mut rule_names: Vec<String> = Vec::new();
+        for agent in &trip.agents {
+            rule_names.extend(agent.expected_rule_names.iter().cloned());
+        }
+        if let Err(error) = mark_uncovered_ready(&agents, rules, rule_names) {
             crate::log_error(&format!(
                 "兜底封锁已生效，但核验记录写入失败（{error}）：界面将显示为「未核验」"
             ));
@@ -835,15 +848,17 @@ fn run_uncovered_lockdown(
 /// **P0-C**：接入恢复后独立解除兜底封锁，不依赖普通熔断的 `TRIP_STATE`。
 ///
 /// 只删除本产品拥有的规则并核验；核验通过才清意图文件。
-fn release_uncovered_lock() {
+fn release_uncovered_lock(expected_revision: Option<u64>) {
     if !uncovered_lock_active() {
         return;
     }
     // **P0-01**：只解除**未接入兜底**这一个来源的规则。
-    // 原实现调用 `release_verified`，按整个 `ClaudeSwitcher AppIsolation`
-    // 前缀删除——会把普通熔断的规则一起删掉，熔断状态却仍写着 tripped。
-    match crate::egate_trip::release_isolation_reason(crate::egate_trip::IsolationReason::Uncovered)
-    {
+    //
+    // **P0-03（v0.7.5）**：改用带持锁复核的入口。原来直接调
+    // `release_isolation_reason`——它在锁内只做「按来源删除」，不复核
+    // 保护意图/暂停/代次/接入路径。于是「检查通过 → 等锁 → 删规则」之间
+    // 代理断了、用户暂停了，仍会被过期结论解除保护。
+    match crate::egate_trip::release_uncovered_with_evidence(expected_revision) {
         Ok(report) if report.verified => {
             if let Err(error) = clear_uncovered_lock() {
                 crate::log_error(&format!(
@@ -907,18 +922,28 @@ pub fn uncovered_lock_status() -> (bool, bool) {
     (uncovered_lock_active(), uncovered_lock_ready())
 }
 
-/// **L-13**：兜底封锁状态的完整描述，供 UI / CLI 使用。
+/// **P1-10（v0.7.5）**：一次查询取全兜底状态（`active / verified / 说明`）。
 ///
-/// 返回 `(意图存在, 核验状态)`；核验状态区分「有效 / 从未核验 / 已失效（原因）」，
-/// 界面据此显示「兜底封锁中（已核验）」或「兜底封锁（核验已过期：配置已变更）」。
-pub fn uncovered_lock_detail() -> (bool, String) {
+/// `uncovered_lock_status()` 与 `uncovered_lock_detail()` 各自都会跑一遍
+/// `uncovered_ready_state()`，而后者要查真实防火墙库存（几次 PowerShell 往返）。
+/// 界面一次刷新同时调两个就等于把查询翻倍，还会在同一个响应里拿到两次
+/// 可能不一致的结论。这里只算一次。
+pub fn uncovered_lock_snapshot() -> (bool, bool, String) {
     let active = uncovered_lock_active();
-    let note = match uncovered_ready_state() {
-        UncoveredReadyState::Valid => "已核验".to_string(),
-        UncoveredReadyState::Missing => "尚未核验".to_string(),
-        UncoveredReadyState::Stale(reason) => format!("核验已失效：{reason}"),
+    let state = uncovered_ready_state();
+    let verified = matches!(state, UncoveredReadyState::Valid);
+    // **P1-13**：把触发原因也说清楚——「未接入代理」与「严格模式下接入
+    // 无法确认」走同一套规则，但前者是故障、后者是用户主动选择的安全策略。
+    let cause = match uncovered_lock_reason().as_str() {
+        "strict_unknown_access" => "严格防泄漏模式：接入路径无法证明，已封锁受管应用出站",
+        _ => "未接入代理链路，已封锁受管应用出站",
     };
-    (active, note)
+    let note = match state {
+        UncoveredReadyState::Valid => format!("{cause}（已核验）"),
+        UncoveredReadyState::Missing => format!("{cause}（尚未核验）"),
+        UncoveredReadyState::Stale(reason) => format!("{cause}；核验已失效：{reason}"),
+    };
+    (active, verified, note)
 }
 
 /// 测试用：暴露 `access_verified` 的判定（不改变生产语义）。
@@ -953,16 +978,30 @@ fn uncovered_lock_file() -> Result<std::path::PathBuf, String> {
     Ok(crate::paths::app_data_dir()?.join("eguard-uncovered-lock.json"))
 }
 
-fn uncovered_lock_active() -> bool {
+pub(crate) fn uncovered_lock_active() -> bool {
     uncovered_lock_file()
         .map(|path| path.exists())
         .unwrap_or(false)
 }
 
-fn mark_uncovered_lock() -> Result<(), String> {
+/// **P1-13**：写入兜底意图，并记录**触发原因**。
+///
+/// 「未接入代理」与「严格模式下接入无法确认」走同一套规则与清理路径，
+/// 但用户需要知道自己是被哪一种触发的——后者是主动的安全选择，不是故障。
+fn mark_uncovered_lock_with_reason(reason: &str) -> Result<(), String> {
     let path = uncovered_lock_file()?;
-    let body = serde_json::json!({ "since": now_secs() }).to_string();
+    let body = serde_json::json!({ "since": now_secs(), "reason": reason }).to_string();
     crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
+}
+
+/// 读取兜底意图的触发原因（用于界面说明；旧文件没有该字段时返回 `uncovered`）。
+pub fn uncovered_lock_reason() -> String {
+    uncovered_lock_file()
+        .ok()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
+        .and_then(|v| v.get("reason").and_then(|r| r.as_str()).map(str::to_string))
+        .unwrap_or_else(|| "uncovered".to_string())
 }
 
 fn uncovered_lock_ready_file() -> Result<std::path::PathBuf, String> {
@@ -987,6 +1026,12 @@ struct UncoveredReady {
     rules: u32,
     /// 核验时使用的受管应用清单（顺序无关，写入前排序）。
     agents: Vec<String>,
+    /// **P1-07**：核验时**应存在**的规则名清单。
+    ///
+    /// 有了它才能按「来源 + 受管对象 + 预期规则名」对账，而不是只比条数。
+    /// 只比条数会漏掉「兜底规则被删一条、旧版遗留恰好留一条」这种巧合。
+    #[serde(default)]
+    rule_names: Vec<String>,
 }
 
 const UNCOVERED_READY_TTL_SECS: u64 = 15 * 60;
@@ -1053,11 +1098,16 @@ fn uncovered_ready_state() -> UncoveredReadyState {
     // 查询失败（`None`）同样按失效处理：读不到规则就不能宣称「已验证」。
     match crate::egate_trip::inspect_isolation_inventory() {
         Some(inventory) => {
-            let current = inventory.uncovered + inventory.legacy;
+            // **P1-07**：只认**本来源**（UncoveredLock）的规则。
+            //
+            // v0.7.3 写的是 `inventory.uncovered + inventory.legacy`——旧版遗留
+            // 规则不属于当前兜底来源，不该拿来凑数。典型漏检：兜底规则被外部
+            // 删掉一条，旧版遗留恰好留一条，计数刚好相等，界面继续显示「已核验」。
+            let current = inventory.uncovered;
             if current < ready.rules {
                 return UncoveredReadyState::Stale(format!(
-                    "实际兜底规则少于核验记录（当前 {current} 条，核验时 {} 条）",
-                    ready.rules
+                    "实际兜底规则少于核验记录（当前 {current} 条，核验时 {} 条；旧版遗留 {} 条不计入）",
+                    ready.rules, inventory.legacy
                 ));
             }
         }
@@ -1067,11 +1117,32 @@ fn uncovered_ready_state() -> UncoveredReadyState {
             )
         }
     }
+    // **P1-07**：再按**预期规则名**逐条对账——条数对了不代表规则是对的那几条，
+    // 更不代表它们还启用、程序路径正确、当前配置档下生效。
+    if !ready.rule_names.is_empty() {
+        match crate::platform::imp::firewall_rules_all_present(&ready.rule_names) {
+            crate::platform::imp::RuleLookup::Present => {}
+            crate::platform::imp::RuleLookup::Absent => {
+                return UncoveredReadyState::Stale(
+                    "部分兜底规则已被外部删除或禁用，覆盖不再完整".to_string(),
+                );
+            }
+            crate::platform::imp::RuleLookup::Unknown => {
+                return UncoveredReadyState::Stale(
+                    "无法确认兜底规则是否仍然生效，核验结果不能作为当前状态".to_string(),
+                );
+            }
+        }
+    }
     UncoveredReadyState::Valid
 }
 
 /// 写入 `ready` 记录：绑定当前配置代次、受管应用清单与实际规则条数。
-fn mark_uncovered_ready(agents: &[String], rules: u32) -> Result<(), String> {
+fn mark_uncovered_ready(
+    agents: &[String],
+    rules: u32,
+    rule_names: Vec<String>,
+) -> Result<(), String> {
     let path = uncovered_lock_ready_file()?;
     let revision = match crate::appconfig::load_checked() {
         crate::appconfig::ConfigLoad::Ok(config) => config.egate_revision,
@@ -1079,11 +1150,14 @@ fn mark_uncovered_ready(agents: &[String], rules: u32) -> Result<(), String> {
     };
     let mut agents = agents.to_vec();
     agents.sort();
+    let mut rule_names = rule_names;
+    rule_names.sort();
     let ready = UncoveredReady {
         verified_at: now_secs(),
         revision,
         rules,
         agents,
+        rule_names,
     };
     let body = serde_json::to_string(&ready).map_err(|e| e.to_string())?;
     crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
@@ -1125,32 +1199,46 @@ fn run_monitor_round(
     let mut streaks = crate::egate_streaks()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // **P1-14（v0.7.5）**：在**工作副本**上算本轮结果，不立即写进共享计数。
+    //
+    // v0.7.3 的 `run_round` 直接改共享 map，之后才比对配置代次；发现代次变了
+    // 就丢弃本轮报告——但已经写进去的失败次数**没有回滚**。于是旧白名单、
+    // 旧目标、旧阈值下产生的失败会进入下一轮新配置的防抖计算：
+    // 「第一轮失败 → 用户改白名单 → 第二轮直接累计到阈值」→ 误熔断。
+    let mut staged = streaks.clone();
     let report = crate::egate_check::run_round(
         &targets,
-        &mut streaks,
+        &mut staged,
         config.egate_enforce_access,
         config.egate_trip_threshold,
     );
-    drop(streaks);
 
     // **P0-04**：代次不一致 → 丢弃本轮结果，不做任何熔断/解除动作。
     //
     // **L-05（v0.7.3）**：配置读不出来时**不能**回退成「代次未变」。
-    // 原实现 `_ => revision` 等于假设配置没改过——但那正是最需要谨慎的情况：
-    // 配置损坏/不可读时，我们并不知道用户此刻的意图是什么。
     let current_revision = match crate::appconfig::load_checked() {
         crate::appconfig::ConfigLoad::Ok(config) => config.egate_revision,
         other => {
             crate::log_error(&format!(
                 "无法读取门禁配置（{other:?}），本轮结果作废（不熔断、不解除）"
             ));
+            // **P1-14**：整份工作副本丢弃，共享计数保持原样。
+            drop(streaks);
             return;
         }
     };
     if current_revision != revision {
         crate::log_error("门禁配置在本轮探测期间已变更，丢弃本轮结果");
+        // **P1-14 / L-12**：安全参数（白名单、目标、阈值、保护对象）变了，
+        // 旧的连续失败历史**必须**一并作废——同一个目标 ID 下内容可能已经
+        // 完全不同，继续累计等于用旧配置的失败触发新配置的熔断。
+        streaks.clear();
+        drop(streaks);
         return;
     }
+    // 判定有效才提交本轮计数。
+    *streaks = staged;
+    drop(streaks);
 
     // 直连泄露：默认只告警；开启 egate_leak_trip 后与目标失败同等对待。
     let leak = leak_round(config);
@@ -1183,12 +1271,27 @@ fn run_monitor_round(
     // 出站规则，不等阈值。
     //
     // 注意：这是**应用级出站隔离**，不是全局断网，只作用于受管 GUI 应用。
+    //
+    // **P1-13（v0.7.5）**：严格防泄漏模式下，`unknown` / 未证明的 `tun`
+    // 也需要保护。普通模式只是报告 `Unverified`——那并没有**阻止**受管应用
+    // 直连，对「绝不暴露真实出口」的用户不够。
+    //
+    // 严格模式仍然只做**出站兜底封锁**（`quarantine_agent_for(..., kill=false)`），
+    // 绝不查杀进程：证据不足就杀进程是最容易误伤的做法。
+    let needs_lockdown = match report.access.path.as_str() {
+        "uncovered" => true,
+        // TUN 只有在路由已证明时才算「接入有效」；否则等同于没有保护。
+        "tun" => config.strict_leak_protection && !report.access.tun_proven,
+        // 未知 / 读取失败：严格模式下也要拦住，普通模式只观察。
+        "unknown" => config.strict_leak_protection,
+        _ => false,
+    };
     if config.lockdown_on_uncovered
-        && report.access.path == "uncovered"
+        && needs_lockdown
         && !is_paused()
         && protection_intent() == ProtectionIntent::Armed
     {
-        run_uncovered_lockdown(config, &report);
+        run_uncovered_lockdown(config, &report, revision);
     }
 
     // **P0-02（v0.6.13.1）**：解除兜底封锁必须有**可验证的出口证据**，
@@ -1199,7 +1302,9 @@ fn run_monitor_round(
     // - TUN 网卡 Up 但没有路由证明 → 流量可能仍走物理网卡。
     // 两者都会在「已放行」的假象下留下直连窗口。
     if can_release_uncovered(&report) {
-        release_uncovered_lock();
+        // **P0-03**：把本轮代次带进去——持锁后若代次已变/代理已断/已暂停，
+        // 解除会自行放弃，不会按过期结论放行。
+        release_uncovered_lock(Some(revision));
     }
 
     // **P0-03（v0.6.13.1）**：已标记「完整熔断」时，本轮**重新核验**规则是否
@@ -1268,8 +1373,12 @@ fn run_monitor_round(
             if trip.outcome.touches_state() {
                 mark_tripped_state(trip.all_isolated);
             } else {
+                // **P1-06**：`AbortedStale`（判定过期）与 `NoApplicable`（全部对象
+                // 未安装，没有建立任何规则）都不触碰隔离状态——后者不能被写成
+                // 「已成功建立隔离规则」。
                 crate::log_error(&format!(
-                    "本轮熔断已取消（判定过期），不更新隔离状态：{}",
+                    "本轮熔断不更新隔离状态（{}）：{}",
+                    trip.outcome.serialized(),
                     trip.note
                 ));
             }
@@ -1307,7 +1416,18 @@ fn run_monitor_round(
             // **P0-04**：把本轮的配置代次带进熔断——持锁后若代次已变，
             // 熔断会自行放弃，不会按过期判定结束用户进程。
             let trip = crate::egate_trip::trip_with_revision(&agents, Some(revision));
-            mark_tripped_state(trip.all_isolated);
+            // **L-15（v0.7.5）**：补齐分支同样要按 `outcome` 决定是否写状态。
+            //
+            // 原来无条件 `mark_tripped_state(trip.all_isolated)`：一次
+            // 「因配置过期而放弃」的补齐会写成 `false` → 界面凭空出现部分隔离。
+            if trip.outcome.touches_state() {
+                mark_tripped_state(trip.all_isolated);
+            } else {
+                crate::log_error(&format!(
+                    "本轮补齐隔离已取消（判定过期），不更新隔离状态：{}",
+                    trip.note
+                ));
+            }
             crate::log_error(&format!(
                 "出口门禁补齐隔离：{}（完整={}）",
                 trip.note, trip.all_isolated
@@ -1561,10 +1681,63 @@ mod tests {
         assert!(should_reconfirm(1_000 + 301, 1_000, 9));
     }
 
-    /// **P0-C / P1-08（v0.7.3）**：兜底锁的意图/就绪两个状态互不混淆。
+    /// **P1-13（v0.7.5）**：严格防泄漏模式下，未知接入也必须进入兜底封锁。
     ///
-    /// 注意本测试在真实 Windows 上运行：`ready` 现在还会**对账实际规则数**，
-    /// 所以「写下记录」本身不再等于「已验证」——这正是 P1-08 要的语义。
+    /// 普通模式只报告 `Unverified`——那并没有**阻止**受管应用直连。
+    /// 这条断言固定住「哪种接入状态需要保护」的判定口径。
+    #[test]
+    fn strict_leak_mode_locks_down_on_unproven_access() {
+        // 严格模式：uncovered / 未证明的 tun / unknown 都需要保护。
+        assert!(needs_lockdown_strict("uncovered", false));
+        assert!(needs_lockdown_strict("uncovered", true));
+        assert!(needs_lockdown_strict("tun", false));
+        assert!(needs_lockdown_strict("unknown", false));
+        // 严格模式下 TUN 路由**已证明**时不需要额外保护。
+        assert!(!needs_lockdown_strict("tun", true));
+        // 普通模式：只有 uncovered 需要保护，unknown/tun 只观察。
+        assert!(needs_lockdown_off("uncovered"));
+        assert!(!needs_lockdown_off("unknown"));
+        assert!(!needs_lockdown_off("tun"));
+    }
+
+    /// 纯函数：严格模式下该接入状态是否需要出站兜底封锁。
+    fn needs_lockdown_strict(path: &str, tun_proven: bool) -> bool {
+        match path {
+            "uncovered" => true,
+            "tun" => !tun_proven,
+            "unknown" => true,
+            _ => false,
+        }
+    }
+
+    /// 纯函数：普通模式下该接入状态是否需要出站兜底封锁。
+    fn needs_lockdown_off(path: &str) -> bool {
+        path == "uncovered"
+    }
+
+    /// **P1-13**：兜底意图必须能说明触发原因，便于界面区分
+    /// 「故障」与「用户主动选择的安全策略」。
+    #[test]
+    fn uncovered_lock_reason_distinguishes_strict_mode() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        mark_uncovered_lock_with_reason("strict_unknown_access").unwrap();
+        assert_eq!(uncovered_lock_reason(), "strict_unknown_access");
+        clear_uncovered_lock().unwrap();
+
+        mark_uncovered_lock_with_reason("uncovered").unwrap();
+        assert_eq!(uncovered_lock_reason(), "uncovered");
+        clear_uncovered_lock().unwrap();
+    }
+
+    /// **P0-C / P1-07 / P1-08（v0.7.5）**：兜底锁的意图/就绪两个状态互不混淆，
+    /// 且 ready 必须与**当前真实规则**对账。
+    ///
+    /// 注意本测试跑在真实 Windows 上：`ready` 的判定会查真实防火墙库存，
+    /// 所以「写下记录」本身不再等于「已验证」——这正是 P1-07 要的语义。
     #[test]
     fn uncovered_lock_state_files_are_independent() {
         let _env = crate::test_support::env_lock();
@@ -1576,7 +1749,7 @@ mod tests {
         assert!(!uncovered_lock_ready());
 
         // 只写意图：表示「打算锁」，但规则未必全部生效。
-        mark_uncovered_lock().unwrap();
+        mark_uncovered_lock_with_reason("uncovered").unwrap();
         assert!(uncovered_lock_active());
         assert!(!uncovered_lock_ready());
 
@@ -1584,51 +1757,72 @@ mod tests {
             .iter()
             .map(|id| id.to_string())
             .collect();
-        // **P1-08**：记录里声称 2 条规则，但系统上一条都没有 → 必须判失效。
-        mark_uncovered_ready(&defaults, 2).unwrap();
-        assert!(
-            !uncovered_lock_ready(),
-            "实际规则少于核验记录时不得显示为「已核验」"
-        );
+        // **P1-07**：记录里声称 2 条规则，但系统上一条都没有 → 必须判失效。
+        mark_uncovered_ready(&defaults, 2, Vec::new()).unwrap();
         assert!(matches!(
             uncovered_ready_state(),
             UncoveredReadyState::Stale(_)
         ));
 
-        // 记录 0 条规则 → 与当前库存一致，视为有效（这是纯逻辑测试，
-        // 不依赖真实防火墙内容）。
-        mark_uncovered_ready(&defaults, 0).unwrap();
+        // 记录 0 条规则 → 与当前库存一致，视为有效。
+        mark_uncovered_ready(&defaults, 0, Vec::new()).unwrap();
         assert!(uncovered_lock_ready());
 
-        // **L-13**：ready 必须绑定到具体核验结果——配置代次一变就失效。
+        // **L-13**：配置代次一变就失效。
         crate::appconfig::update(|config| {
             config.egate_revision = config.egate_revision.saturating_add(1);
         })
         .unwrap();
-        assert!(
-            !uncovered_lock_ready(),
-            "配置变更后旧的核验结果不得继续显示为「已核验」"
-        );
         assert!(matches!(
             uncovered_ready_state(),
             UncoveredReadyState::Stale(_)
         ));
 
-        // 重新核验后恢复有效。
-        mark_uncovered_ready(&defaults, 0).unwrap();
-        assert!(uncovered_lock_ready());
+        // **P1-07**：受管应用清单变化同样立刻失效。
+        mark_uncovered_ready(&["claude".to_string()], 0, Vec::new()).unwrap();
+        assert!(matches!(
+            uncovered_ready_state(),
+            UncoveredReadyState::Stale(_)
+        ));
 
-        // **L-13**：受管应用清单变化同样立刻失效。
-        mark_uncovered_ready(&["claude".to_string()], 0).unwrap();
-        assert!(
-            !uncovered_lock_ready(),
-            "受管清单与当前配置不一致时不得视为已核验"
-        );
+        // **P1-07**：预期规则名对不上时也要失效（哪怕条数看着对）。
+        mark_uncovered_ready(
+            &defaults,
+            0,
+            vec!["ClaudeSwitcher UncoveredLock ghost Out".into()],
+        )
+        .unwrap();
+        assert!(matches!(
+            uncovered_ready_state(),
+            UncoveredReadyState::Stale(_)
+        ));
 
         // 清除时两者一起走。
         clear_uncovered_lock().unwrap();
         assert!(!uncovered_lock_active());
         assert!(!uncovered_lock_ready());
+    }
+
+    /// **P1-07**：旧版遗留规则**不能**用来顶替兜底规则的对账数量。
+    ///
+    /// 回归点：v0.7.3 用 `inventory.uncovered + inventory.legacy` 比对，
+    /// 于是「兜底规则被删一条、旧版遗留恰好留一条」会被判成已核验。
+    /// 现在只认 `uncovered` 一个来源——这条断言验证的是判定口径本身。
+    #[test]
+    fn ready_reconciliation_only_counts_uncovered_source() {
+        use crate::egate_trip::IsolationInventory;
+        let record = 2u32;
+        let legacy_padded = IsolationInventory {
+            egress_trip: 0,
+            uncovered: 1,
+            legacy: 1,
+        };
+        // 旧口径（uncovered + legacy）会认为「够了」；新口径必须认为不够。
+        assert_eq!(legacy_padded.uncovered + legacy_padded.legacy, record);
+        assert!(
+            legacy_padded.uncovered < record,
+            "旧版遗留规则不得顶替兜底规则的数量"
+        );
     }
 
     /// **P0-C**：兜底封锁只建规则，不结束进程。

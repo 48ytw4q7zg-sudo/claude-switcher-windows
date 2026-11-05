@@ -82,6 +82,20 @@ pub struct AppConfig {
     /// 也不碰 Node/终端宿主。
     #[serde(default = "default_lockdown_on_uncovered")]
     pub lockdown_on_uncovered: bool,
+    /// **P1-13（v0.7.5）**：严格防泄漏模式（默认关）。
+    ///
+    /// 普通模式下，接入路径「未知」或「TUN 路由未证明」只是 `Unverified`
+    /// ——不会触发任何保护动作。这对「避免误杀」是对的，但对「绝不暴露真实
+    /// 出口」的用户不够：显示 Unverified 并不等于**阻止**了受管应用直连。
+    ///
+    /// 严格模式开启后，`unknown` / 未证明的 `tun` 会被当作「需要保护」，
+    /// 进入**独立的出站兜底封锁**（只挡受管 GUI 应用的出站，不杀进程、
+    /// 不做全局断网）。它的优先级低于用户显式紧急恢复，与手动保持隔离互斥。
+    ///
+    /// `#[serde(default)]`：旧版本的 appconfig.json 没有这个字段，
+    /// 缺失必须按「未开启」处理（不能让老配置整体解析失败）。
+    #[serde(default)]
+    pub strict_leak_protection: bool,
     /// 被守护的桌面应用 id（claude / chatgpt / antigravity）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egate_guarded_agents: Vec<String>,
@@ -165,6 +179,7 @@ impl Default for AppConfig {
             egate_trip_threshold: default_egate_trip_threshold(),
             egate_interval_secs: default_egate_interval(),
             egate_enforce_access: default_egate_enforce_access(),
+            strict_leak_protection: false,
             lockdown_on_uncovered: default_lockdown_on_uncovered(),
             egate_guarded_agents: Vec::new(),
             egate_leak_trip: false,
@@ -272,6 +287,46 @@ pub enum ConfigLoad {
     Corrupt(String),
 }
 
+impl AppConfig {
+    /// **P1-12（v0.7.5）**：影响保护判定的字段指纹。
+    ///
+    /// `egate_revision` 只应当在**安全相关**字段变化时递增。
+    ///
+    /// v0.7.3 的 `update()` 每次写盘都递增，于是「环境检查顺手记一下上一次
+    /// 出口 IP」「改个日志级别」都会让正在进行的门禁探测结果过期——那轮探测
+    /// 直接作废，用户看到的是响应变慢、状态反复重算，而不是保护更严。
+    ///
+    /// 安全相关的只有：接入策略、门禁判定、保护对象、恢复资格这四类。
+    /// `last_egress_ip` / 日志 / 额度提醒 / WSL 开关 都不是。
+    pub fn security_fingerprint(&self) -> String {
+        // 用可读的格式化字符串做比较（便于日志定位是哪一项变了），
+        // 不用哈希：这里数据量小，可读性比性能重要。
+        let targets = serde_json::to_string(&self.egate_targets).unwrap_or_default();
+        let mut agents = self.egate_guarded_agents.clone();
+        agents.sort();
+        let mut checks = self.disabled_checks.clone();
+        checks.sort();
+        format!(
+            "tz={:?}|country={:?}|locale={:?}|proxy_mode={:?}|proxy_group={:?}|webrtc={:?}|\
+             targets={targets}|enabled={}|trip_threshold={}|interval={}|enforce={}|\
+             lock={}|strict={}|agents={agents:?}|checks={checks:?}|leak_trip={}",
+            self.tz_target,
+            self.country_target,
+            self.locale_target,
+            self.proxy_mode,
+            self.proxy_group,
+            self.webrtc_policy,
+            self.egate_enabled,
+            self.egate_trip_threshold,
+            self.egate_interval_secs,
+            self.egate_enforce_access,
+            self.lockdown_on_uncovered,
+            self.strict_leak_protection,
+            self.egate_leak_trip,
+        )
+    }
+}
+
 /// **P0-12**：严格加载配置，区分「首次安装」「正常读取」「配置损坏」。
 ///
 /// 门禁监控、恢复器和受保护启动入口必须用这个版本——用 `load()` 的默认值
@@ -293,6 +348,22 @@ pub fn load_checked() -> ConfigLoad {
 /// 在跨进程排他锁内完成读取、修改和原子保存。
 /// 闭包只修改传入配置，不得再次调用 update。
 pub fn update(mut f: impl FnMut(&mut AppConfig)) -> Result<AppConfig, String> {
+    let accept = |_: &AppConfig| -> Result<(), String> { Ok(()) };
+    try_update(&mut f, &accept)
+}
+
+/// **P1-09（v0.7.5）**：带校验的配置写入——校验与保存在同一把配置锁内完成。
+///
+/// 原来的 `egate_update_settings` 是「先 `validate_arm_readiness()` 读一次配置
+/// 检查目标，再 `appconfig::update()` **再读一次**写开关」。两次读之间如果别的
+/// 进程/窗口改了目标表，就会出现「校验通过的是旧目标、真正布防的是新目标」。
+///
+/// 这里把两步压成一步：在**持有配置锁**的情况下，对**即将写入的那份配置**做
+/// 校验，通过后一次性落盘。校验失败则什么都不写（不留半份修改）。
+pub fn try_update(
+    f: &mut dyn FnMut(&mut AppConfig),
+    validate: &dyn Fn(&AppConfig) -> Result<(), String>,
+) -> Result<AppConfig, String> {
     let path = config_path()?;
     let parent = path
         .parent()
@@ -308,13 +379,89 @@ pub fn update(mut f: impl FnMut(&mut AppConfig)) -> Result<AppConfig, String> {
     fs4::FileExt::lock(&lock).map_err(|error| format!("获取配置锁失败：{error}"))?;
     // **P1-02**：写入路径也走迁移——避免旧程序把高版本配置覆盖成旧结构。
     let mut config = load_from_migrated(&path)?;
+    let before = config.clone();
     f(&mut config);
-    // **P0-04**：任何配置写入都推进门禁代次，使进行中的旧探测结果失效。
-    config.egate_revision = config.egate_revision.saturating_add(1);
+    // **P0-04 / P1-12**：只有**安全相关字段**变了才推进门禁代次。
+    //
+    // 原来无条件递增：「记录上一次出口 IP」「改日志级别」这类写入也会让
+    // 进行中的门禁探测结果作废。现在只有接入策略 / 门禁判定 / 保护对象 /
+    // 恢复资格发生变化时才递增（见 `security_fingerprint`）。
+    if config.security_fingerprint() != before.security_fingerprint() {
+        config.egate_revision = config.egate_revision.saturating_add(1);
+    }
+    // **P1-09**：校验在**写盘之前**、且仍在配置锁内——校验的正是要保存的那份。
+    // 失败则直接返回，一个字段都不落盘。
+    validate(&config)?;
     let text = serde_json::to_string_pretty(&config)
         .map_err(|error| format!("序列化应用配置失败：{error}"))?;
     fsx::write_atomically(&path, &text).map_err(|error| format!("保存应用配置失败：{error}"))?;
     Ok(config)
+}
+
+#[cfg(test)]
+mod revision_tests {
+    use super::*;
+
+    /// **P1-12（v0.7.5）**：只有安全相关字段变化才推进门禁代次。
+    ///
+    /// 回归点：`update()` 原来无条件递增。`checks.rs` 每次环境检查都会写
+    /// `last_egress_ip`，于是「看一眼出口 IP」就把正在进行的门禁探测判成过期
+    /// ——探测作废、响应变慢、状态反复重算，用户却什么都没改。
+    #[test]
+    fn revision_bumps_only_for_security_relevant_changes() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        let start = update(|c| c.egate_enabled = true).unwrap();
+        let base_revision = start.egate_revision;
+
+        // ① 非安全字段（出口 IP / 日志 / 额度 / WSL）→ 不递增。
+        for mutate in [
+            (|c: &mut AppConfig| c.last_egress_ip = Some("1.2.3.4".into())) as fn(&mut AppConfig),
+            |c: &mut AppConfig| c.log_level = "debug".to_string(),
+            |c: &mut AppConfig| c.log_enabled = false,
+            |c: &mut AppConfig| c.quota_reminder_threshold = 50,
+            |c: &mut AppConfig| c.auto_adopt_enabled = false,
+            |c: &mut AppConfig| c.wsl_integration_enabled = true,
+        ] {
+            let after = update(mutate).unwrap();
+            assert_eq!(
+                after.egate_revision, base_revision,
+                "非安全字段写入不得让进行中的门禁探测过期"
+            );
+        }
+
+        // ② 安全字段（白名单 / 门禁开关 / 阈值 / 保护对象 / 接入策略）→ 必须递增。
+        let after = update(|c| {
+            c.egate_targets = vec![crate::egate::EgateTarget {
+                id: "x".into(),
+                name: "x".into(),
+                anchor_url: "https://example.invalid".into(),
+                anchor_kind: crate::egate::AnchorKind::Trace,
+                expect_ips: vec!["1.2.3.4".into()],
+                expect_regions: vec!["US".into()],
+                enabled: true,
+                timeout_secs: 5,
+            }]
+        })
+        .unwrap();
+        assert!(
+            after.egate_revision > base_revision,
+            "修改白名单必须让旧探测结果过期"
+        );
+
+        let before2 = after.egate_revision;
+        let after2 = update(|c| c.egate_trip_threshold = 7).unwrap();
+        assert!(after2.egate_revision > before2, "修改阈值必须递增代次");
+        let before3 = after2.egate_revision;
+        let after3 = update(|c| c.egate_guarded_agents = vec!["claude".into()]).unwrap();
+        assert!(after3.egate_revision > before3, "修改保护对象必须递增代次");
+        let before4 = after3.egate_revision;
+        let after4 = update(|c| c.proxy_mode = Some("other".into())).unwrap();
+        assert!(after4.egate_revision > before4, "修改接入策略必须递增代次");
+    }
 }
 
 #[cfg(test)]

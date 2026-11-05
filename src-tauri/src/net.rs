@@ -355,72 +355,151 @@ fn clash_api_with_config(
 ///
 /// 超时预算：直连 4s + 代理 4s = 最坏 8s。托盘 tooltip 刷新是同步调用，
 /// 两次各 6s（合计 12s）会把刷新周期拖得肉眼可见，故压到 4s。
-pub fn claude_oauth_api(path: &str, access_token: &str) -> Result<Value, String> {
-    let url = format!("https://api.anthropic.com{path}");
-    let runtime = detect_clash_runtime_config();
-    // **P0-08（v0.7.3）**：请求顺序由**保护策略**决定，不是「先直连再代理」。
-    //
-    // 原实现先 `no_proxy()` 直连、失败才走代理。这个请求携带
-    // `Authorization: Bearer …`，一旦用户已开启严格出口保护，直连就意味着
-    // 带着凭据从真实家宽出口发出请求——目标服务（以及链路上的观察者）
-    // 能看到真实出口地址，而这正是严格模式要防的事。
-    //
-    // 现在的语义：
-    // - 严格模式（门禁已开启且接入为系统代理）→ **只**走代理，代理不可用直接报错；
-    // - 非严格模式 → 保持原有的「直连优先、代理兜底」，因为这是用户明确
-    //   选择的普通使用方式，且失败回退能改善弱网体验。
-    if let Some(proxy) = strict_oauth_proxy(&runtime) {
-        return oauth_get(&url, access_token, Some(&proxy), Duration::from_secs(8)).map_err(
-            |error| format!("严格出口模式下请求必须经代理（{proxy}），本次未改用直连：{error}"),
+/// **P0-01 / L-01（v0.7.5）**：严格出口请求的策略。
+///
+/// v0.7.3 的 `strict_oauth_proxy() -> Option<String>` 把两种完全不同的含义
+/// 折叠成同一个 `None`：「用户关闭了严格保护」与「严格保护已开启但没有可用
+/// 代理」。调用方据此 `match None` 直接走直连分支——于是带着
+/// `Authorization: Bearer …` 的请求会从真实家宽出口发出去，恰恰是严格模式
+/// 要防的事。
+///
+/// 现在三种情况必须分开，且第三种**绝不**进入任何发送分支。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OauthPolicy {
+    /// 用户未启用严格保护：沿用原有「直连优先、代理兜底」。
+    Unrestricted,
+    /// 严格保护已开启且有可信代理：**只**允许走它。
+    StrictProxy(String),
+    /// 严格保护已开启但没有可信代理，**或配置无法读取**：禁止一切请求。
+    StrictBlocked(String),
+}
+
+/// 纯策略判定（**P0-01**：可表驱动测试）。
+///
+/// `config = None` 表示配置**损坏/不可读**，此时无法确认用户是否开启了严格
+/// 保护——**必须**按严格处理（`StrictBlocked`），绝不能当成「用户没开保护」。
+fn oauth_policy_decide(
+    config: Option<&crate::appconfig::AppConfig>,
+    evidence: &crate::egate_access::ProxyEvidence,
+    runtime_proxy: Option<&str>,
+) -> OauthPolicy {
+    let Some(config) = config else {
+        return OauthPolicy::StrictBlocked(
+            "无法读取应用配置，不能确认严格保护是否开启；请求已取消".to_string(),
         );
+    };
+    if !config.egate_enabled {
+        return OauthPolicy::Unrestricted;
     }
-    match oauth_get(&url, access_token, None, Duration::from_secs(4)) {
-        Ok(value) => Ok(value),
-        Err(direct_error) => match runtime.proxy {
-            Some(proxy) => {
-                match oauth_get(&url, access_token, Some(&proxy), Duration::from_secs(4)) {
-                    Ok(value) => Ok(value),
-                    Err(proxy_error) => Err(format!(
-                        "直连失败（{direct_error}）；走 Clash 代理也失败（{proxy_error}）"
-                    )),
-                }
+    // 严格模式：必须有**可信**代理，否则禁止（不退回直连）。
+    //
+    // **L-17（v0.7.5）**：「什么算可用代理」由 `network_policy` 单点判定。
+    // 原来这里自己写了一份「读得出 + 已启用 + Http 可解析」的判断，
+    // 与 `network_policy::usable_system_proxy` 是两套实现——它们一旦分叉，
+    // 就会出现「网络策略认为可用、OAuth 认为不可用」这种最难查的偏差。
+    if let Some(proxy) = crate::network_policy::usable_system_proxy(evidence) {
+        return OauthPolicy::StrictProxy(proxy.addr);
+    }
+    // ② Clash 控制器探测到的代理地址（TUN 不算：路由未经证明时不能凭网卡放行）。
+    if let Some(addr) = runtime_proxy.map(str::trim).filter(|p| !p.is_empty()) {
+        return OauthPolicy::StrictProxy(addr.to_string());
+    }
+    OauthPolicy::StrictBlocked(
+        "严格出口保护已开启，但没有可用的代理通道；本次未发送任何请求，也未改用直连".to_string(),
+    )
+}
+
+/// 取当前策略（读配置 + 注册表 + Clash 运行时）。
+fn oauth_policy_current(runtime: &ClashRuntimeConfig) -> OauthPolicy {
+    let config = match crate::appconfig::load_checked() {
+        // Fresh = 首次安装，还没有任何配置 → `egate_enabled` 缺省为 false。
+        crate::appconfig::ConfigLoad::Ok(config) => Some(*config),
+        crate::appconfig::ConfigLoad::Fresh => Some(crate::appconfig::AppConfig::default()),
+        // **P0-01**：配置损坏时**不能**当成「用户关闭了保护」。
+        crate::appconfig::ConfigLoad::Corrupt(_) => None,
+    };
+    let evidence = crate::egate_check::read_proxy_evidence();
+    oauth_policy_decide(config.as_ref(), &evidence, runtime.proxy.as_deref())
+}
+
+pub fn claude_oauth_api(path: &str, access_token: &str) -> Result<Value, String> {
+    oauth_request("https://api.anthropic.com", path, access_token)
+}
+
+/// 策略分发的请求入口（基地址可注入，便于用本地夹具测试）。
+fn oauth_request(base: &str, path: &str, access_token: &str) -> Result<Value, String> {
+    let url = format!("{base}{path}");
+    let runtime = detect_clash_runtime_config();
+    match oauth_policy_current(&runtime) {
+        // 严格保护已开启但拿不到可信代理：**直接失败**。
+        //
+        // 这里绝不 fall through 到下面的 `oauth_get(..., None)`——那正是
+        // v0.7.3 的漏洞：`None` 被同时解释成「非严格模式」。
+        OauthPolicy::StrictBlocked(reason) => Err(format!(
+            "{reason}。请先恢复代理/Clash 后重试；本工具在严格保护下不会把带凭据的请求发往真实出口"
+        )),
+        // 严格模式：只走已确认的代理，失败就是失败（不直连、不回退、不跟随重定向）。
+        OauthPolicy::StrictProxy(proxy) => {
+            oauth_get_strict(&url, access_token, &proxy).map_err(|error| {
+                format!("严格出口模式下请求必须经代理（{proxy}），本次未改用直连：{error}")
+            })
+        }
+        // 非严格模式：沿用原有的直连优先 + 代理兜底（用户明确选择的普通用法）。
+        OauthPolicy::Unrestricted => {
+            match oauth_get(&url, access_token, None, Duration::from_secs(4)) {
+                Ok(value) => Ok(value),
+                Err(direct_error) => match runtime.proxy {
+                    Some(proxy) => {
+                        match oauth_get(&url, access_token, Some(&proxy), Duration::from_secs(4)) {
+                            Ok(value) => Ok(value),
+                            Err(proxy_error) => Err(format!(
+                                "直连失败（{direct_error}）；走 Clash 代理也失败（{proxy_error}）"
+                            )),
+                        }
+                    }
+                    None => Err(direct_error),
+                },
             }
-            None => Err(direct_error),
-        },
+        }
     }
 }
 
-/// **P0-08（v0.7.3）**：严格出口模式下必须使用的代理地址。
+/// 严格出口模式下的请求：**只**经指定代理。
 ///
-/// 返回 `Some` 表示「本次请求只允许经该代理」，没有可用代理时调用方必须
-/// **报错而不是直连**；返回 `None` 表示当前不是严格模式。
-///
-/// 判定刻意保守：只有「门禁已开启」+「接入路径是系统代理」+「代理地址
-/// 可等价复用」三者同时成立才算严格模式。TUN 路线**不算**——TUN 下守护器
-/// 自身能否复用该路径需要真实路由证明（见 egate_access::RouteEvidence），
-/// 在证明之前不允许凭「有 TUN 网卡」就发出带凭据的直连请求。
-fn strict_oauth_proxy(runtime: &ClashRuntimeConfig) -> Option<String> {
-    let config = match crate::appconfig::load_checked() {
-        crate::appconfig::ConfigLoad::Ok(config) => *config,
-        // 配置读不出来：无法确认是否为严格模式，按「不是」处理（保持原有
-        // 非严格行为），但绝不因此把直连当成「已确认的安全路径」。
-        _ => return None,
-    };
-    if !config.egate_enabled {
-        return None;
+/// 三处刻意的收紧（**P0-01** 要求）：
+/// 1. `.no_proxy()` **必须先调用**再 `.proxy()` —— reqwest 的 `system-proxy`
+///    特性会在 `build()` 时把系统代理也加进列表；顺序颠倒会让请求走系统代理
+///    而不是我们指定的那个，Bearer token 也就落到了别的出口上。
+/// 2. 不跟随重定向：3xx 会把带凭据的请求转到别处，宁可报错。
+/// 3. 任何失败都返回 `Err`，**没有**直连回退分支。
+fn oauth_get_strict(url: &str, access_token: &str, proxy: &str) -> Result<Value, String> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(8))
+        .connect_timeout(Duration::from_secs(3))
+        .user_agent("claude-code/2.1.0")
+        .no_proxy()
+        .proxy(
+            reqwest::Proxy::all(format!("http://{proxy}"))
+                .map_err(|e| format!("代理配置失败: {e}"))?,
+        )
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| format!("初始化 HTTP 客户端失败: {e}"))?;
+    let response = client
+        .get(url)
+        .header("Authorization", format!("Bearer {access_token}"))
+        .header("Accept", "application/json")
+        .header("anthropic-beta", "oauth-2025-04-20")
+        .send()
+        .map_err(|e| format!("调用 Claude OAuth API 失败: {e}"))?;
+    let status = response.status();
+    let text = response
+        .text()
+        .map_err(|e| format!("读取 Claude OAuth API 响应失败: {e}"))?;
+    if !status.is_success() {
+        return Err(format!("Claude OAuth API HTTP {status}: {text}"));
     }
-    let evidence = crate::egate_check::read_proxy_evidence();
-    if evidence.read_error().is_none() && evidence.enable {
-        if let crate::egate_access::ProxyParse::Http(addr) =
-            crate::egate_access::parse_proxy_server(evidence.server.as_deref())
-        {
-            // 系统代理可用时以它为准（那才是应用实际走的路径）。
-            return Some(addr);
-        }
-    }
-    // 系统代理关闭/无法等价复用：退回 Clash 控制器探测到的代理地址。
-    // 两者都没有时返回 None —— 调用方据此**报错**，绝不直连。
-    runtime.proxy.clone()
+    serde_json::from_str(&text).map_err(|e| format!("Claude OAuth API JSON 解析失败: {e}"))
 }
 
 fn oauth_get(
@@ -543,67 +622,219 @@ mod tests {
         }
     }
 
-    /// **P0-08（v0.7.3）**：门禁关闭时不是严格模式——保持原有的直连优先行为。
+    /// **P0-01 / L-01（v0.7.5）**：严格出口策略的判定表。
     ///
-    /// 这里只验证「策略判定」，不真的对外发请求：`strict_oauth_proxy`
-    /// 为 None 时调用方才会走 direct-first 分支。
+    /// 核心断言：**严格模式下任何「无可用代理」的情况都必须 `StrictBlocked`，
+    /// 绝不产生 `Unrestricted`** —— 那正是 v0.7.3 让带凭据请求退回直连的入口。
     #[test]
-    fn strict_oauth_mode_is_off_when_gate_disabled() {
-        let _env = crate::test_support::env_lock();
-        let dir = tempfile::tempdir().unwrap();
-        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
-        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
-        crate::appconfig::update(|config| config.egate_enabled = false).unwrap();
-        let runtime = ClashRuntimeConfig {
-            controller: "http://127.0.0.1:9097".to_string(),
-            secret: None,
-            proxy: Some("127.0.0.1:7890".to_string()),
-            controller_error: None,
+    fn strict_oauth_policy_never_allows_direct_when_gate_is_on() {
+        use crate::egate_access::ProxyEvidence;
+        use OauthPolicy::*;
+
+        let evidence_ok = |enable: bool, server: Option<&str>| ProxyEvidence {
+            enable,
+            server: server.map(str::to_string),
+            autoconfig: None,
+            overrides: None,
+            complete: true,
+            error: None,
         };
-        assert!(
-            strict_oauth_proxy(&runtime).is_none(),
-            "门禁关闭时不属于严格模式"
+        let on = crate::appconfig::AppConfig {
+            egate_enabled: true,
+            ..crate::appconfig::AppConfig::default()
+        };
+        let off = crate::appconfig::AppConfig::default();
+
+        // (1) 门禁关闭 -> 允许既有普通模式。
+        assert_eq!(
+            oauth_policy_decide(Some(&off), &evidence_ok(false, None), None),
+            Unrestricted
         );
+        assert_eq!(
+            oauth_policy_decide(Some(&off), &evidence_ok(false, None), Some("127.0.0.1:1")),
+            Unrestricted
+        );
+
+        // (2) 门禁开启且代理有效 -> 只连接代理。
+        assert_eq!(
+            oauth_policy_decide(Some(&on), &evidence_ok(true, Some("127.0.0.1:7890")), None),
+            StrictProxy("127.0.0.1:7890".to_string())
+        );
+
+        // (3) 门禁开启但代理缺失 -> StrictBlocked（不是 Unrestricted）。
+        assert!(matches!(
+            oauth_policy_decide(Some(&on), &evidence_ok(false, None), None),
+            StrictBlocked(_)
+        ));
+
+        // (4) 门禁开启但代理地址不可等价复用（socks）-> 同样不允许直连。
+        assert!(matches!(
+            oauth_policy_decide(
+                Some(&on),
+                &evidence_ok(true, Some("socks5://127.0.0.1:7890")),
+                None
+            ),
+            StrictBlocked(_)
+        ));
+
+        // (5) 注册表读取失败 -> 严格模式下不得当成「没有代理，可以直连」。
+        let broken = ProxyEvidence::unreadable("拒绝访问");
+        assert!(matches!(
+            oauth_policy_decide(Some(&on), &broken, None),
+            StrictBlocked(_)
+        ));
+
+        // (6) 配置损坏 -> 必须 StrictBlocked，不能当成普通模式。
+        assert!(matches!(
+            oauth_policy_decide(None, &evidence_ok(false, None), None),
+            StrictBlocked(_)
+        ));
+        // 配置损坏且有代理：仍然只能走代理，不能退回直连。
+        assert!(matches!(
+            oauth_policy_decide(None, &evidence_ok(false, None), Some("127.0.0.1:1")),
+            StrictBlocked(_)
+        ));
+
+        // (7) 系统代理不可用时，Clash 探测到的代理可作为兜底通道。
+        assert_eq!(
+            oauth_policy_decide(Some(&on), &evidence_ok(false, None), Some("127.0.0.1:7890")),
+            StrictProxy("127.0.0.1:7890".to_string())
+        );
+        // 空白字符串不能当代理地址。
+        assert!(matches!(
+            oauth_policy_decide(Some(&on), &evidence_ok(false, None), Some("   ")),
+            StrictBlocked(_)
+        ));
     }
 
-    /// **P0-08**：门禁开启时必须给出「只能用代理」的结论，而不是允许直连。
+    /// **P0-01**：`StrictBlocked` 绝不能进入任何发送分支（零直连请求）。
+    ///
+    /// 用本地 TCP 夹具统计**真实连接次数**：策略被拦住时夹具必须一次请求都
+    /// 收不到，而不是「请求发了但失败」。
     #[test]
-    fn strict_oauth_mode_requires_a_proxy_when_gate_enabled() {
+    fn strict_blocked_makes_zero_outbound_connections() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&connections);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_millis(800);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let mut buf = [0u8; 1];
+                        let _ = stream.read(&mut buf);
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                              Content-Length: 2\r\n\r\n{}",
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        // 强制走 StrictBlocked：门禁开启 + 系统代理关闭 + 无 Clash 代理。
         let _env = crate::test_support::env_lock();
         let dir = tempfile::tempdir().unwrap();
         let _home = crate::test_support::set_env("USERPROFILE", dir.path());
         std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
-        crate::appconfig::update(|config| config.egate_enabled = true).unwrap();
+        crate::appconfig::update(|c| c.egate_enabled = true).unwrap();
+
         let runtime = ClashRuntimeConfig {
-            controller: "http://127.0.0.1:9097".to_string(),
+            controller: format!("http://{address}"),
             secret: None,
-            proxy: Some("127.0.0.1:7890".to_string()),
-            controller_error: None,
-        };
-        // 测试环境里系统代理通常是关闭的（读注册表 → 未启用），因此这里走
-        // 「退回 Clash 探测到的代理」分支。若开发机恰好开着系统代理，
-        // 结果会是那个地址——两种都算正确，关键是**不能为 None**。
-        assert!(
-            strict_oauth_proxy(&runtime).is_some(),
-            "严格模式下必须有确定的代理地址，否则调用方应报错而不是直连"
-        );
-        // 连 Clash 代理都没有时：若系统代理也不可用，函数返回 None。
-        // 调用方（claude_oauth_api）在严格模式下遇到 None 必须报错而不是
-        // 直连——见 `strict_mode_never_allows_direct`。
-        let no_proxy = ClashRuntimeConfig {
             proxy: None,
-            ..runtime
+            controller_error: None,
         };
-        let system_proxy_usable = {
-            let evidence = crate::egate_check::read_proxy_evidence();
-            crate::network_policy::usable_system_proxy(&evidence).is_some()
-        };
-        if !system_proxy_usable {
-            assert!(strict_oauth_proxy(&no_proxy).is_none());
-        }
-        crate::appconfig::update(|config| config.egate_enabled = false).unwrap();
+        let policy = oauth_policy_current(&runtime);
+        assert!(
+            matches!(policy, OauthPolicy::StrictBlocked(_)),
+            "严格保护开启但无代理时必须是 StrictBlocked，实际：{policy:?}"
+        );
+
+        // 真实发一次请求：策略拦住时应当直接 Err，且一次连接都不建立。
+        let result = oauth_request(&format!("http://{address}"), "/fake", "sk-ant-test-token");
+        assert!(
+            result.is_err(),
+            "严格模式下无代理必须失败，实际：{result:?}"
+        );
+        assert!(
+            result.as_ref().unwrap_err().contains("未发送任何请求"),
+            "错误文案应说明没有发请求：{:?}",
+            result
+        );
+
+        server.join().unwrap();
+        let attempts = connections.load(Ordering::SeqCst);
+        assert_eq!(
+            attempts, 0,
+            "严格模式被拦住时不得有任何直连请求（实际发出 {attempts} 次）"
+        );
     }
 
+    /// **P0-01**：严格模式拿到代理后必须只连该代理，且拒绝跟随重定向。
+    #[test]
+    fn strict_proxy_path_is_used_and_redirects_are_refused() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use std::time::Instant;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let counter = Arc::clone(&seen);
+        let server = std::thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf);
+                        // 回一个 302 到别的主机：严格模式不得跟随。
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/elsewhere\r\n\
+                              Content-Length: 0\r\n\r\n",
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let result = oauth_get_strict(
+            &format!("http://{address}/v1/messages"),
+            "sk-ant-test-token",
+            &address.to_string(),
+        );
+        server.join().unwrap();
+
+        // 302 不是 success -> 必须报错，而不是跟随到别的主机。
+        assert!(result.is_err(), "严格模式必须拒绝 302，实际：{result:?}");
+        assert_eq!(
+            seen.load(Ordering::SeqCst),
+            1,
+            "应当只连了指定代理一次，不跟随重定向"
+        );
+    }
     #[test]
     fn invalid_override_blocks_authenticated_request_before_fallback() {
         let _env_lock = crate::test_support::env_lock();

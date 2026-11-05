@@ -91,6 +91,8 @@ export interface AppConfig {
   egate_guarded_agents?: string[];
   /** 发现绕过代理的直连时是否熔断（默认只告警）。 */
   egate_leak_trip?: boolean;
+  /** **P1-13**：严格防泄漏模式（默认关）。开启后接入无法证明时也封锁出站。 */
+  strict_leak_protection?: boolean;
 }
 
 /** 出口门禁：一个被监控的出口链路。 */

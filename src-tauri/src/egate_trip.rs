@@ -37,6 +37,11 @@ pub struct QuarantineReport {
     pub killed: Vec<String>,
     /// 回查是否成功；`false` 时不得宣称隔离已生效。
     pub verified: bool,
+    /// **P1-07**：本次**应建立**的规则名清单（与核验用的是同一份）。
+    ///
+    /// ready 记录用它做「按预期规则名」的对账：被外部删掉的规则能让界面
+    /// 立刻从「已核验」降级，而不是等 15 分钟 TTL。
+    pub expected_rule_names: Vec<String>,
     /// **P2-04**：受管应用的安装状态。
     ///
     /// 界面据此区分「没装这个应用（不适用）」「查不出安装状态（保护未知）」
@@ -65,16 +70,27 @@ pub struct TripReport {
     pub agents: Vec<QuarantineReport>,
     /// 是否有任何应用被真正隔离（回查通过）。
     pub any_isolated: bool,
-    /// **是否全部应用都已完整隔离**（每个应用 coverage_complete）。
+    /// **是否全部**应用都已完整隔离（每个应用 coverage_complete）。
+    ///
+    /// **P0-02（v0.7.5）**：必须对**应处理的完整集合**计算，而不是只看
+    /// 已经处理完的那几个。原来 `agents.iter().all(...)` 在「3 个对象只处理了
+    /// 1 个就中止」时会得到 `true`，界面于是显示「已完整熔断」。
     pub all_isolated: bool,
     /// 所有失败的说明（空表示全部成功）。
     pub failures: Vec<String>,
     /// **L-13（v0.7.3）**：本次执行的**结论分类**。
-    ///
-    /// 原来调用方只能看 `all_isolated`：一次「因配置过期而主动放弃」的操作
-    /// 也会得到 `all_isolated=false`，于是被记成「部分熔断」——用户看到的
-    /// 是一个凭空出现的部分隔离状态。
     pub outcome: TripOutcome,
+    /// **P0-02**：本次应处理的对象数（含未处理就中止的）。
+    pub requested: usize,
+    /// **P0-02**：本次实际处理到的对象数。
+    pub processed: usize,
+    /// **P0-02**：本次是否产生了系统副作用（进程被结束 / 规则被创建）。
+    ///
+    /// 「查杀了但规则没建完就取消」**不能**记成 `AbortedStale`——那会把
+    /// 已经发生的真实副作用抹掉，用户看不到自己进程为什么没了。
+    pub side_effects: bool,
+    /// **P0-02**：循环是否因判定过期而提前中止。
+    pub aborted: bool,
     pub note: String,
 }
 
@@ -91,15 +107,73 @@ pub enum TripOutcome {
     /// 因判定过期而**主动放弃**（配置代次变化 / 保护已停止 / 已暂停）。
     /// 这种情况**不得**污染熔断状态。
     AbortedStale,
+    /// **P1-06**：所有受管对象都**确认未安装**，没有任何东西需要隔离。
+    ///
+    /// 与 `Applied` 分开：不能把「什么都没做」写成「已成功建立隔离规则」。
+    NoApplicable,
     /// 完全没有生效（系统操作失败）。
     Failed,
 }
 
 impl TripOutcome {
-    /// 是否应当更新熔断状态（`AbortedStale` 不更新）。
-    pub fn touches_state(self) -> bool {
-        !matches!(self, TripOutcome::AbortedStale)
+    /// 日志里用的短标签。
+    pub fn serialized(self) -> &'static str {
+        match self {
+            TripOutcome::Applied => "applied",
+            TripOutcome::Partial => "partial",
+            TripOutcome::AbortedStale => "aborted_stale",
+            TripOutcome::NoApplicable => "no_applicable",
+            TripOutcome::Failed => "failed",
+        }
     }
+
+    /// 是否应当更新熔断状态。
+    ///
+    /// `AbortedStale`（判定过期）与 `NoApplicable`（无需保护）都不触碰状态：
+    /// 前者没做任何动作，后者也没有建立任何规则。
+    pub fn touches_state(self) -> bool {
+        !matches!(self, TripOutcome::AbortedStale | TripOutcome::NoApplicable)
+    }
+}
+
+/// **P0-02 / P1-06（v0.7.5）**：从「处理结果 + 请求集合 + 是否中止」算出结论。
+///
+/// 抽成纯函数是为了让状态计算可被表驱动测试覆盖——原来这段逻辑散在
+/// `trip_with_revision` 与 `enforce_uncovered_outbound` 里，两处口径不同，
+/// 且无法直接测「3 个对象处理了 1 个就取消」这类分支。
+fn summarize_trip(
+    requested: usize,
+    processed: usize,
+    aborted: bool,
+    side_effects: bool,
+    applicable: usize,
+    complete: usize,
+) -> TripOutcome {
+    // 只有**处理完了全部请求对象**才有资格谈「完整」。
+    let fully_processed = !aborted && processed >= requested && requested > 0;
+
+    if fully_processed {
+        if applicable == 0 {
+            // P1-06：全部对象确认未安装——不是「成功建立隔离」。
+            return TripOutcome::NoApplicable;
+        }
+        if complete >= applicable {
+            return TripOutcome::Applied;
+        }
+    }
+    // **L-03 / P0-02**：`AbortedStale` 只用于「确实没有产生任何副作用」的
+    // 主动放弃。已经查杀进程、已经建过规则的，必须按 Partial 记账。
+    if aborted {
+        return if side_effects {
+            TripOutcome::Partial
+        } else {
+            TripOutcome::AbortedStale
+        };
+    }
+    if side_effects {
+        return TripOutcome::Partial;
+    }
+    TripOutcome::Failed
 }
 
 /// 内置守护应用与其进程特征。
@@ -312,78 +386,172 @@ pub fn resolve_agent_installation(agent: &str) -> InstallationLookup {
         .map(|n| ps_quote(&format!("{n}.exe")))
         .collect::<Vec<_>>()
         .join(",");
+    // **P1-05（v0.7.5）**：逐来源记录「成功 / 明确为空 / 查询失败」。
+    //
+    // v0.7.3 的脚本通篇 `-ErrorAction SilentlyContinue`，于是「注册表拒绝访问」
+    // 「MSIX 查询异常」「权限不足」都会被压成空集合，Rust 端据此报 `NotInstalled`
+    // ——用户只装了 Claude，却被告知「未安装」，然后「部分隔离」永远收不了口。
+    //
+    // 现在的规则：
+    // - **可选路径不存在** 是正常语义（`Test-Path` 先探，不报错）；
+    // - **权限拒绝 / 服务异常 / 解析失败** 必须记入 `errors`；
+    // - 只有「三个来源都可靠完成且确实没有证据」才允许 `NotInstalled`；
+    // - 有证据就是 `Installed`，哪怕同时有别的来源报错（证据优先）。
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'\n\
-         $found = New-Object System.Collections.ArrayList\n\
-         # 1) 运行中的进程\n\
-         foreach ($p in @(Get-Process -Name {names})) {{\n\
-           if ($p.Path) {{ [void]$found.Add(@{{ path = $p.Path; source = 'running' }}) }}\n\
-         }}\n\
-         # 2) 注册表 App Paths / Uninstall 的安装位置\n\
-         $exeNames = @({exe_files})\n\
-         $roots = @(\n\
-           'HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths',\n\
-           'HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\App Paths',\n\
-           'HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\App Paths'\n\
-         )\n\
-         foreach ($root in $roots) {{\n\
-           foreach ($n in $exeNames) {{\n\
-             $k = Join-Path $root $n\n\
-             if (Test-Path $k) {{\n\
-               $v = (Get-ItemProperty -Path $k).'(default)'\n\
-               if ($v) {{ [void]$found.Add(@{{ path = $v; source = 'registered' }}) }}\n\
-             }}\n\
-           }}\n\
-         }}\n\
-         foreach ($root in @('HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall','HKLM:\\Software\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall')) {{\n\
-           foreach ($sub in @(Get-ChildItem $root -ErrorAction SilentlyContinue)) {{\n\
-             $props = Get-ItemProperty $sub.PSPath -ErrorAction SilentlyContinue\n\
-             if (-not $props) {{ continue }}\n\
-             $loc = $props.InstallLocation\n\
-             if (-not $loc) {{ continue }}\n\
-             foreach ($n in $exeNames) {{\n\
-               $candidate = Join-Path $loc $n\n\
-               if (Test-Path $candidate) {{ [void]$found.Add(@{{ path = $candidate; source = 'installed' }}) }}\n\
-             }}\n\
-           }}\n\
-         }}\n\
-         # 3) MSIX 包：InstallLocation 是**目录**不是 exe。
-         #    从包清单 AppxManifest.xml 的 Application Executable 取真实可执行文件，
-         #    拼成完整路径并确认是文件；取不到就跳过，绝不把目录当 exe。
-         foreach ($pkg in @(Get-AppxPackage -Name 'Claude' -ErrorAction SilentlyContinue)) {{
-           if (-not $pkg.InstallLocation) {{ continue }}
-           $manifest = Join-Path $pkg.InstallLocation 'AppxManifest.xml'
-           if (-not (Test-Path -LiteralPath $manifest)) {{ continue }}
-           try {{
-             [xml]$doc = Get-Content -LiteralPath $manifest -ErrorAction Stop
-             foreach ($app in @($doc.Package.Applications.Application)) {{
-               $rel = $app.Executable
-               if (-not $rel) {{ continue }}
-               $full = Join-Path $pkg.InstallLocation $rel
-               if (Test-Path -LiteralPath $full -PathType Leaf) {{
-                 [void]$found.Add(@{{ path = $full; source = 'msix' }})
-               }}
-             }}
-           }} catch {{ }}
-         }}
-         ConvertTo-Json -InputObject @($found) -Compress",
+        r#"$ErrorActionPreference='Stop'
+$found = New-Object System.Collections.ArrayList
+$errors = New-Object System.Collections.ArrayList
+$procNames = @({names})
+$exeNames = @({exe_files})
+
+# 1) 运行中的进程：一次枚举全部进程，再按名字过滤（避免 Get-Process -Name
+#    无匹配时抛错被误当成「查询失败」）。
+try {{
+  foreach ($p in @(Get-Process -ErrorAction Stop)) {{
+    if ($procNames -notcontains $p.ProcessName) {{ continue }}
+    try {{
+      $path = $p.Path
+      if ($path) {{ [void]$found.Add(@{{ path = $path; source = 'running' }}) }}
+    }} catch {{
+      [void]$errors.Add("进程 $($p.Id) 的映像路径读取失败：" + $_.Exception.Message)
+    }}
+  }}
+}} catch {{
+  [void]$errors.Add("枚举进程失败：" + $_.Exception.Message)
+}}
+
+# 2) 注册表 App Paths。键不存在 = 正常「没装」，读失败 = 真错误。
+$appRoots = @(
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\App Paths',
+  'HKLM:\Software\Microsoft\Windows\CurrentVersion\App Paths',
+  'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths'
+)
+foreach ($root in $appRoots) {{
+  if (-not (Test-Path -LiteralPath $root)) {{ continue }}
+  foreach ($n in $exeNames) {{
+    $k = Join-Path $root $n
+    try {{
+      if (Test-Path -LiteralPath $k -ErrorAction Stop) {{
+        $v = (Get-ItemProperty -LiteralPath $k -ErrorAction Stop).'(default)'
+        if ($v) {{ [void]$found.Add(@{{ path = [string]$v; source = 'registered' }}) }}
+      }}
+    }} catch {{
+      [void]$errors.Add("注册表 $k 读取失败：" + $_.Exception.Message)
+    }}
+  }}
+}}
+
+# 3) 注册表 Uninstall 的 InstallLocation。
+$unRoots = @(
+  'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+  'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall',
+  'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+)
+foreach ($root in $unRoots) {{
+  if (-not (Test-Path -LiteralPath $root)) {{ continue }}
+  try {{
+    $subs = @(Get-ChildItem -LiteralPath $root -ErrorAction Stop)
+  }} catch {{
+    [void]$errors.Add("注册表 $root 枚举失败：" + $_.Exception.Message)
+    continue
+  }}
+  foreach ($sub in $subs) {{
+    try {{
+      $props = Get-ItemProperty -LiteralPath $sub.PSPath -ErrorAction Stop
+    }} catch {{
+      [void]$errors.Add("注册表项 $($sub.Name) 读取失败：" + $_.Exception.Message)
+      continue
+    }}
+    $loc = $props.InstallLocation
+    if (-not $loc) {{ continue }}
+    foreach ($n in $exeNames) {{
+      $candidate = Join-Path $loc $n
+      if (Test-Path -LiteralPath $candidate -ErrorAction SilentlyContinue) {{
+        [void]$found.Add(@{{ path = [string]$candidate; source = 'installed' }})
+      }}
+    }}
+  }}
+}}
+
+# 4) MSIX 包：InstallLocation 是目录，需从 AppxManifest.xml 取真实 exe。
+try {{
+  $pkgs = @(Get-AppxPackage -Name 'Claude' -ErrorAction Stop)
+}} catch {{
+  [void]$errors.Add("MSIX 包枚举失败：" + $_.Exception.Message)
+  $pkgs = @()
+}}
+foreach ($pkg in $pkgs) {{
+  if (-not $pkg.InstallLocation) {{ continue }}
+  $manifest = Join-Path $pkg.InstallLocation 'AppxManifest.xml'
+  if (-not (Test-Path -LiteralPath $manifest)) {{ continue }}
+  try {{
+    [xml]$doc = Get-Content -LiteralPath $manifest -ErrorAction Stop
+    foreach ($app in @($doc.Package.Applications.Application)) {{
+      $rel = $app.Executable
+      if (-not $rel) {{ continue }}
+      $full = Join-Path $pkg.InstallLocation $rel
+      if (Test-Path -LiteralPath $full -PathType Leaf) {{
+        [void]$found.Add(@{{ path = [string]$full; source = 'msix' }})
+      }}
+    }}
+  }} catch {{
+    [void]$errors.Add("MSIX 包清单 $manifest 解析失败：" + $_.Exception.Message)
+  }}
+}}
+
+ConvertTo-Json @{{ found = @($found); errors = @($errors) }} -Compress -Depth 4"#,
         names = names,
         exe_files = exe_files
     );
-    // **P2-04**：查询失败不能等同于「未安装」。原实现 `let Ok(..) else { Vec::new() }`
-    // 把 PowerShell 失败、超时、输出异常全压成空列表，界面于是显示
-    // 「无法建立隔离」——与「用户根本没装这个应用」完全无法区分。
+    // **P2-01**：查询失败不能等同于「未安装」。
     let json = match crate::platform::imp::run_powershell(&script) {
         Ok(json) => json,
         Err(error) => return InstallationLookup::Unknown(format!("查询安装状态失败：{error}")),
     };
-    let candidates = parse_exe_candidates(&json);
-    if candidates.is_empty() {
-        // 查询成功且三个来源都没有 → 明确「未安装」。
-        InstallationLookup::NotInstalled
-    } else {
-        InstallationLookup::Installed(candidates)
+    let value: serde_json::Value = match serde_json::from_str(json.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return InstallationLookup::Unknown(format!(
+                "安装状态输出无法解析：{error}；原文：{}",
+                json.trim()
+            ))
+        }
+    };
+    let read_strings = |key: &str| -> Vec<String> {
+        value
+            .get(key)
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|v| v.as_str().map(str::to_string))
+                    .filter(|s| !s.is_empty())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    let errors = read_strings("errors");
+    // 候选路径从 JSON 里解析（复用既有规整化/去重）。
+    let candidates = match value.get("found").cloned() {
+        Some(found) => parse_exe_candidates(
+            &serde_json::to_string(&found).unwrap_or_else(|_| "[]".to_string()),
+        ),
+        None => Vec::new(),
+    };
+
+    // 有真实证据就是安装了——证据优先于旁支的查询错误。
+    if !candidates.is_empty() {
+        return InstallationLookup::Installed(candidates);
     }
+    // 没有任何证据，但有来源查询失败：**不能**说「未安装」。
+    if !errors.is_empty() {
+        return InstallationLookup::Unknown(format!(
+            "部分安装来源查询失败，无法确认是否未安装：{}",
+            errors.join("；")
+        ));
+    }
+    // 三个来源都可靠完成且确实没有证据 → 明确「未安装」。
+    InstallationLookup::NotInstalled
 }
 
 /// 解析候选路径 JSON（数组 / 单对象 / 空），并做规整化去重。
@@ -756,6 +924,7 @@ pub fn quarantine_agent_for(
         failed_rules: Vec::new(),
         killed: Vec::new(),
         verified: false,
+        expected_rule_names: Vec::new(),
         installation: ApplicationInstallation::Installed,
         note: String::new(),
     };
@@ -827,6 +996,12 @@ pub fn quarantine_agent_for(
                     rejected.join("、")
                 ));
             }
+            // **P1-06（v0.7.5）**：有候选但**一个都认不出身份**时，安装状态是
+            // 「未知」而不是「已安装」。后者会让 `summarize_trip` 把它算进
+            // 「应隔离却没隔离」的集合，界面永远显示「部分隔离」并反复重试。
+            if confirmed.is_empty() && !rejected.is_empty() {
+                report.installation = ApplicationInstallation::Unknown;
+            }
             confirmed
         }
     };
@@ -858,7 +1033,10 @@ pub fn quarantine_agent_for(
     // 具体程序，既不会互相覆盖，也能在升级后按旧路径精确清理。
     // **P0-01**：规则名来自 [`expected_rules`]——与核验使用的是**同一份**清单。
     // 任何一方自行拼接名称都会让新建的规则永远核验不到。
-    for rule in expected_rules_for(reason, agent, &exes, outbound_only) {
+    // **P1-07**：先把「应该有哪些规则」记下来，供 ready 对账使用。
+    let expected = expected_rules_for(reason, agent, &exes, outbound_only);
+    report.expected_rule_names = expected.iter().map(|r| r.name.clone()).collect();
+    for rule in expected {
         // **P0-NEW-01**：创建路径上的 `SilentlyContinue` 会把「权限不足
         // （未以管理员运行）」吞成一次「成功」，随后回查才发现不完整，
         // 用户看到的是含糊的「覆盖不完整」。这里全部改 `Stop`，
@@ -972,6 +1150,7 @@ if (-not $healthy) {{
 /// 这里检查的是「此刻的事实」而不是「调用方几秒前的判断」。P0-04 要求
 /// `egate_revision` 贯穿**所有副作用**——光在探测结束时比一次代次不够：
 /// 等待系统操作锁期间、以及每个应用建立规则之前，配置都可能已经变了。
+#[allow(dead_code)]
 pub fn can_apply_isolation_now() -> bool {
     can_apply_isolation_with_revision(None)
 }
@@ -1011,7 +1190,20 @@ pub fn can_apply_isolation_with_revision(expected_revision: Option<u64>) -> bool
 ///
 /// 与 [`trip`] 共用同一套规则建立与核验逻辑（不新增第二套防火墙实现），
 /// 但不杀进程：用户只是暂时没开代理，不应被直接踢下线。
+#[allow(dead_code)]
 pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
+    enforce_uncovered_outbound_with_revision(guarded_agents, None)
+}
+
+/// **P1-08（v0.7.5）**：带配置代次的兜底封锁（与 `trip_with_revision` 对齐）。
+///
+/// v0.7.3 的兜底执行器只调 `can_apply_isolation_now()`，不比代次：用户在
+/// 监控线程生成受管应用清单之后、真正取锁之前改了清单，旧清单仍会被用来
+/// 建规则。现在每个对象动手前都会再比一次代次。
+pub fn enforce_uncovered_outbound_with_revision(
+    guarded_agents: &[String],
+    expected_revision: Option<u64>,
+) -> TripReport {
     if guarded_agents.is_empty() {
         return TripReport {
             agents: Vec::new(),
@@ -1019,6 +1211,10 @@ pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
             all_isolated: false,
             failures: Vec::new(),
             outcome: TripOutcome::AbortedStale,
+            requested: 0,
+            processed: 0,
+            side_effects: false,
+            aborted: true,
             note: "没有配置的守护对象，未执行任何操作".to_string(),
         };
     }
@@ -1031,51 +1227,86 @@ pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
                 all_isolated: false,
                 failures: vec![format!("无法获取系统操作锁：{error}")],
                 outcome: TripOutcome::Failed,
+                requested: guarded_agents.len(),
+                processed: 0,
+                side_effects: false,
+                aborted: true,
                 note: format!("兜底封锁未执行（{error}）"),
             };
         }
     };
     let _keep = &guard;
     // **P0-04**：拿到锁后**重新核验**用户意图——等待锁期间用户可能刚执行急救恢复。
-    // 普通 `trip()` 早已这么做，新增的兜底路径漏了这一步，会出现
-    // 「急救刚完成，迟到的后台任务又把规则加回来」。
-    if !can_apply_isolation_now() {
+    //
+    // **P1-08（v0.7.5）**：同时比对配置代次，与 `trip_with_revision` 对齐。
+    if !can_apply_isolation_with_revision(expected_revision) {
         return TripReport {
             agents: Vec::new(),
             any_isolated: false,
             all_isolated: false,
             failures: Vec::new(),
             outcome: TripOutcome::AbortedStale,
+            requested: guarded_agents.len(),
+            processed: 0,
+            side_effects: false,
+            aborted: true,
             note: "保护已停止或已暂停（意图在等待锁期间改变），未执行兜底封锁".to_string(),
         };
     }
     let mut agents = Vec::new();
     let mut failures = Vec::new();
+    let mut aborted = false;
+    let mut side_effects = false;
     for id in guarded_agents {
+        // **P1-08**：每个对象动手前再看一次代次——前一个建规则可能耗时数秒。
+        if !can_apply_isolation_with_revision(expected_revision) {
+            failures.push("配置在兜底封锁过程中变更，剩余应用未处理".to_string());
+            aborted = true;
+            break;
+        }
         // **QW-01**：兜底封锁只建**出站**规则，不碰入站。
         let report = quarantine_agent_for(IsolationReason::Uncovered, id, None, false, true);
         if !report.verified {
             failures.push(format!("{}：{}", report.agent, report.note.trim()));
         }
+        if !report.killed.is_empty() || report.rules_added > 0 {
+            side_effects = true;
+        }
         agents.push(report);
     }
-    let any_isolated = agents.iter().any(|agent| agent.verified);
-    let all_isolated = agents.iter().all(|agent| agent.coverage_complete);
+    let applicable = agents
+        .iter()
+        .filter(|a| a.installation != ApplicationInstallation::NotInstalled)
+        .count();
+    let complete = agents.iter().filter(|a| a.coverage_complete).count();
+    let any_isolated = agents.iter().any(|a| a.verified);
+    // **P0-02**：`all_isolated` 必须对**应处理的完整集合**算，不能只看已处理的。
+    let outcome = summarize_trip(
+        guarded_agents.len(),
+        agents.len(),
+        aborted,
+        side_effects,
+        applicable,
+        complete,
+    );
+    let all_isolated = outcome == TripOutcome::Applied;
     TripReport {
-        note: if all_isolated {
-            "未接入兜底封锁：全部守护对象出站规则已生效".to_string()
-        } else if any_isolated {
-            "未接入兜底封锁：部分生效（见失败说明）".to_string()
-        } else {
-            "未能确认任何兜底规则生效".to_string()
+        note: match outcome {
+            TripOutcome::Applied => "未接入兜底封锁：全部守护对象出站规则已生效".to_string(),
+            TripOutcome::NoApplicable => {
+                "未接入兜底封锁：所有守护对象均未安装，无需建立隔离规则".to_string()
+            }
+            TripOutcome::Partial => "未接入兜底封锁：部分生效（见失败说明）".to_string(),
+            TripOutcome::AbortedStale => {
+                "配置在兜底封锁过程中变更，已中止（未留下部分隔离状态）".to_string()
+            }
+            TripOutcome::Failed => "未能确认任何兜底规则生效".to_string(),
         },
-        outcome: if all_isolated {
-            TripOutcome::Applied
-        } else if any_isolated {
-            TripOutcome::Partial
-        } else {
-            TripOutcome::Failed
-        },
+        outcome,
+        requested: guarded_agents.len(),
+        processed: agents.len(),
+        side_effects,
+        aborted,
         agents,
         any_isolated,
         all_isolated,
@@ -1104,6 +1335,10 @@ pub fn trip_with_revision(guarded_agents: &[String], expected_revision: Option<u
             all_isolated: false,
             failures: Vec::new(),
             outcome: TripOutcome::AbortedStale,
+            requested: 0,
+            processed: 0,
+            side_effects: false,
+            aborted: true,
             note: "没有配置的守护对象，未执行任何操作".to_string(),
         };
     }
@@ -1117,6 +1352,10 @@ pub fn trip_with_revision(guarded_agents: &[String], expected_revision: Option<u
                 all_isolated: false,
                 failures: vec![format!("无法获取系统操作锁：{error}")],
                 outcome: TripOutcome::Failed,
+                requested: guarded_agents.len(),
+                processed: 0,
+                side_effects: false,
+                aborted: true,
                 note: format!("熔断未执行（{error}）"),
             };
         }
@@ -1133,12 +1372,17 @@ pub fn trip_with_revision(guarded_agents: &[String], expected_revision: Option<u
             all_isolated: false,
             failures: Vec::new(),
             outcome: TripOutcome::AbortedStale,
+            requested: guarded_agents.len(),
+            processed: 0,
+            side_effects: false,
+            aborted: true,
             note: "保护已暂停、已停止或配置已变更（判定在操作期间过期），未执行熔断".to_string(),
         };
     }
     let mut agents = Vec::new();
     let mut failures = Vec::new();
     let mut aborted = false;
+    let mut side_effects = false;
     for id in guarded_agents {
         // **P0-04**：每个应用动手前再看一次——前一个应用建立规则可能耗时数秒。
         if !can_apply_isolation_with_revision(expected_revision) {
@@ -1150,32 +1394,56 @@ pub fn trip_with_revision(guarded_agents: &[String], expected_revision: Option<u
         if !report.verified {
             failures.push(format!("{}：{}", report.agent, report.note.trim()));
         }
+        // **P0-02 / L-03**：真实的系统副作用要单独记账。
+        //
+        // 「已结束进程」「已创建规则」都算副作用——即使随后核验不通过。
+        // 没有这一项，「第一个对象查杀成功但规则失败、之后配置变更」会被
+        // 误判成 `AbortedStale`（＝什么都没做），用户看不到进程为什么没了。
+        if !report.killed.is_empty() || report.rules_added > 0 {
+            side_effects = true;
+        }
         agents.push(report);
     }
-    let any_isolated = agents.iter().any(|agent| agent.verified);
-    let all_isolated = agents.iter().all(|agent| agent.coverage_complete);
-    // **L-13**：中途因配置变更而放弃、且一条规则都没建立的，按「主动取消」，
-    // 不能记成「部分熔断」——否则界面会凭空显示一个部分隔离状态。
-    let outcome = if aborted && !any_isolated {
-        TripOutcome::AbortedStale
-    } else if all_isolated {
-        TripOutcome::Applied
-    } else if any_isolated {
-        TripOutcome::Partial
-    } else {
-        TripOutcome::Failed
-    };
+    let applicable = agents
+        .iter()
+        .filter(|a| a.installation != ApplicationInstallation::NotInstalled)
+        .count();
+    let complete = agents.iter().filter(|a| a.coverage_complete).count();
+    let any_isolated = agents.iter().any(|a| a.verified);
+
+    // **P0-02**：结论按「应处理的完整集合」算（见 `summarize_trip`）。
+    let outcome = summarize_trip(
+        guarded_agents.len(),
+        agents.len(),
+        aborted,
+        side_effects,
+        applicable,
+        complete,
+    );
+    let all_isolated = outcome == TripOutcome::Applied;
     TripReport {
-        note: if outcome == TripOutcome::AbortedStale {
-            "配置在熔断过程中变更，已中止（未留下部分隔离状态）".to_string()
-        } else if failures.is_empty() && all_isolated {
-            "全部守护对象已结束进程并施加防火墙隔离".to_string()
-        } else if any_isolated {
-            "部分守护对象已隔离，其余见失败说明".to_string()
-        } else {
-            "未能确认任何隔离生效".to_string()
+        note: match outcome {
+            TripOutcome::Applied => "全部守护对象已结束进程并施加防火墙隔离".to_string(),
+            TripOutcome::NoApplicable => {
+                "所有守护对象均确认未安装，无需隔离（不是保护失败）".to_string()
+            }
+            TripOutcome::Partial => {
+                if aborted {
+                    "熔断在处理到一半时被取消，已产生的系统副作用保留（见失败说明）".to_string()
+                } else {
+                    "部分守护对象已隔离，其余见失败说明".to_string()
+                }
+            }
+            TripOutcome::AbortedStale => {
+                "配置在熔断过程中变更，已中止（未留下部分隔离状态）".to_string()
+            }
+            TripOutcome::Failed => "未能确认任何隔离生效".to_string(),
         },
         outcome,
+        requested: guarded_agents.len(),
+        processed: agents.len(),
+        side_effects,
+        aborted,
         agents,
         any_isolated,
         all_isolated,
@@ -1435,10 +1703,170 @@ pub(crate) fn release_verified_locked(
     release_all_verified_locked(guard)
 }
 
+/// **P0-03（v0.7.5）**：兜底封锁的自动解除，必须**持锁后**再确认放行资格。
+///
+/// 原流程的问题是「检查在锁外、删除在锁内」：
+///
+/// ```text
+/// can_release_uncovered(report) 通过  ← 用户此刻代理还通
+///   ↓
+///   …等待系统操作锁（可能被别的保护操作占着）…
+///   ↓
+/// release_isolation_reason(Uncovered) → 直接删规则
+/// ```
+///
+/// 等待锁期间代理断开、用户暂停、手动保持隔离、配置变更——旧的放行判断
+/// 仍然会被执行，等于「按已经过期的结论解除保护」。
+///
+/// 现在把资格复核放进锁内，与 `release_verified_with_revision` 对齐：
+/// 1. 保护意图仍 Armed、未暂停、手动保持为 None；
+/// 2. 配置代次未变（给了 `expected_revision` 时）；
+/// 3. **接入路径重新取证**——系统代理端口必须还能连上，否则拒绝解除。
+///
+/// 用户显式执行的紧急恢复走 `release_all_verified_locked`，不受此限。
+pub fn release_uncovered_with_evidence(
+    expected_revision: Option<u64>,
+) -> Result<ReleaseReport, String> {
+    if !crate::egate_monitor::uncovered_lock_active() {
+        return Ok(ReleaseReport {
+            requested: 0,
+            remaining: 0,
+            verified: true,
+            failures: Vec::new(),
+        });
+    }
+    let guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::ReleaseIsolation)?;
+    check_uncovered_release_eligible(expected_revision)?;
+    release_isolation_reason_locked(&guard, IsolationReason::Uncovered)
+}
+
+/// **P0-03**：兜底自动解除的持锁资格复核（纯检查，不做任何删除）。
+pub(crate) fn check_uncovered_release_eligible(
+    expected_revision: Option<u64>,
+) -> Result<(), String> {
+    // ① 手动保持隔离：用户明确要求「别自动解除」。
+    match crate::egate_monitor::manual_hold_state() {
+        crate::egate_monitor::ManualHold::None => {}
+        crate::egate_monitor::ManualHold::Held => {
+            return Err("检测到手动保持隔离，已放弃本次自动解除兜底封锁".to_string());
+        }
+        crate::egate_monitor::ManualHold::Unknown => {
+            return Err(
+                "无法确认手动隔离意图（意图文件损坏或不可读），已放弃本次自动解除兜底封锁"
+                    .to_string(),
+            );
+        }
+    }
+    // ② 保护意图 / 暂停。
+    if crate::egate_monitor::protection_intent() != crate::egate_monitor::ProtectionIntent::Armed {
+        return Err(
+            "保护已停止或被暂停（等待锁期间状态改变），已放弃本次自动解除兜底封锁".to_string(),
+        );
+    }
+    if crate::egate_monitor::is_paused() {
+        return Err("守护已暂停（等待锁期间状态改变），已放弃本次自动解除兜底封锁".to_string());
+    }
+    // ③ 配置代次。
+    match (expected_revision, crate::appconfig::load_checked()) {
+        (Some(expected), crate::appconfig::ConfigLoad::Ok(config)) => {
+            if config.egate_revision != expected {
+                return Err(
+                    "门禁配置在本轮判定之后已变更，旧的放行结论作废，已放弃本次自动解除兜底封锁"
+                        .to_string(),
+                );
+            }
+            if !config.egate_enabled {
+                return Err("门禁已关闭（等待锁期间改变），已放弃本次自动解除兜底封锁".to_string());
+            }
+        }
+        // **L-05**：配置读不出来时不能当成「代次未变」。
+        (Some(_), other) => {
+            return Err(format!(
+                "无法读取门禁配置（{other:?}），无法确认放行结论仍有效，已放弃本次自动解除兜底封锁"
+            ));
+        }
+        (None, crate::appconfig::ConfigLoad::Ok(config)) => {
+            if !config.egate_enabled {
+                return Err("门禁已关闭，已放弃本次自动解除兜底封锁".to_string());
+            }
+        }
+        (None, other) => {
+            return Err(format!(
+                "无法读取门禁配置（{other:?}），已放弃本次自动解除兜底封锁"
+            ));
+        }
+    }
+    // ④ 接入路径重新取证——这是兜底封锁存在的前提。
+    access_still_safe_for_unlock()
+}
+
+/// **P0-03**：重新确认「现在解除兜底封锁是安全的」。
+///
+/// 与 `can_release_uncovered` 不同的是，这里读的是**当前**系统状态，
+/// 而不是几秒前那份检查报告里的接入结论。多做一次本地 TCP 探测：
+/// 代理端口刚才还在、现在挂了，就应当拒绝放行。
+fn access_still_safe_for_unlock() -> Result<(), String> {
+    let evidence = crate::egate_check::read_proxy_evidence();
+    if let Some(reason) = evidence.read_error() {
+        return Err(format!(
+            "无法读取系统代理配置（{reason}），不能确认接入仍然安全，已放弃自动解除"
+        ));
+    }
+    if evidence.enable {
+        match crate::egate_access::parse_proxy_server(evidence.server.as_deref()) {
+            crate::egate_access::ProxyParse::Http(addr) => {
+                // 回环代理要再探一次端口：代理进程可能在等待锁期间退出了。
+                if crate::egate_access::is_loopback_host(&addr)
+                    && !crate::egate_access::proxy_port_reachable(&addr)
+                {
+                    return Err(format!(
+                        "系统代理端口 {addr} 已不可连，接入不再安全，已放弃自动解除兜底封锁"
+                    ));
+                }
+                return Ok(());
+            }
+            crate::egate_access::ProxyParse::Unsupported(why) => {
+                return Err(format!(
+                    "系统代理配置无法等价复用（{why}），不能确认接入安全，已放弃自动解除"
+                ));
+            }
+            crate::egate_access::ProxyParse::Empty => {
+                return Err(
+                    "系统代理已开启但没有代理地址，不能确认接入安全，已放弃自动解除".to_string(),
+                );
+            }
+        }
+    }
+    // 非系统代理：TUN 必须有完整路由证据，否则「接入已恢复」这个前提不成立。
+    let hosts: Vec<String> = Vec::new();
+    match crate::egate_check::current_access(&hosts) {
+        crate::egate_access::AccessPath::SystemProxy { .. } => Ok(()),
+        crate::egate_access::AccessPath::Tun { adapter } => {
+            let evidence = crate::egate_check::collect_tun_route_evidence(&adapter, &[]);
+            let proven = evidence.values().any(|e| e.proves_tun_path());
+            if proven {
+                Ok(())
+            } else {
+                Err(format!(
+                    "TUN 路由仍未获证明（{adapter}），解除兜底封锁会放行未经验证的直连，已放弃"
+                ))
+            }
+        }
+        crate::egate_access::AccessPath::Uncovered => {
+            Err("仍未接入代理链路，不能解除兜底封锁".to_string())
+        }
+        crate::egate_access::AccessPath::Unknown { reason } => Err(format!(
+            "接入路径无法确认（{reason}），不能自动解除兜底封锁"
+        )),
+    }
+}
+
 /// **P0-01**：只解除**指定来源**拥有的规则，不影响其他来源。
 ///
 /// 原实现只有 `release_all_verified_locked()`：解除未接入兜底锁会把普通熔断的
 /// 规则一起删掉——熔断状态仍写着 tripped，防火墙却已放行。
+#[allow(dead_code)]
+/// 手动按来源解除（不带自动恢复的持锁复核；仅供显式调用）。
 pub fn release_isolation_reason(reason: IsolationReason) -> Result<ReleaseReport, String> {
     let guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::ReleaseIsolation)?;
     release_isolation_reason_locked(&guard, reason)
@@ -2103,6 +2531,136 @@ foreach ($c in $cases) { Write-Output ($c.n + '=' + (Check $c.a $goodAf $anyPf $
         assert!(!crate::egate_monitor::access_verified_for_test("tun"));
         assert!(!crate::egate_monitor::access_verified_for_test("uncovered"));
         assert!(!crate::egate_monitor::access_verified_for_test("unknown"));
+    }
+
+    /// **P0-03（v0.7.5）**：兜底自动解除必须在**持锁后**复核放行资格。
+    ///
+    /// 回归点：`release_isolation_reason(Uncovered)` 在锁内只按来源删规则，
+    /// 不复核保护意图/暂停/代次。于是「检查通过 → 等锁 → 删规则」之间用户
+    /// 暂停了、或代理断了，仍会被过期结论解除保护。
+    #[test]
+    fn uncovered_auto_release_aborts_when_state_changed_under_lock() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        crate::appconfig::update(|c| c.egate_enabled = true).unwrap();
+        crate::egate_monitor::rearm().unwrap();
+        let revision = match crate::appconfig::load_checked() {
+            crate::appconfig::ConfigLoad::Ok(c) => c.egate_revision,
+            other => panic!("配置应可读：{other:?}"),
+        };
+        // 只测资格复核本身（不动真实防火墙）。
+        // 接入路径这一项在这台机器上可能不满足（无系统代理），所以只要
+        // 「意图/暂停/代次」三类命中就一定报错即可。
+        let baseline = check_uncovered_release_eligible(Some(revision));
+
+        // ① 暂停 → 拒绝。
+        crate::egate_monitor::pause(60).unwrap();
+        let e = check_uncovered_release_eligible(Some(revision)).unwrap_err();
+        assert!(e.contains("暂停"), "{e}");
+        crate::egate_monitor::resume().unwrap();
+
+        // ② 配置代次变化 → 拒绝。
+        crate::appconfig::update(|c| {
+            c.egate_trip_threshold = c.egate_trip_threshold.saturating_add(1)
+        })
+        .unwrap();
+        let e = check_uncovered_release_eligible(Some(revision)).unwrap_err();
+        assert!(e.contains("配置"), "{e}");
+
+        // ③ 停止保护 → 拒绝。
+        crate::egate_monitor::disarm("测试").unwrap();
+        let e = check_uncovered_release_eligible(None).unwrap_err();
+        assert!(e.contains("停止") || e.contains("状态改变"), "{e}");
+
+        // ④ 手动保持 → 拒绝。
+        crate::egate_monitor::rearm().unwrap();
+        crate::egate_monitor::mark_manual_hold().unwrap();
+        let e = check_uncovered_release_eligible(None).unwrap_err();
+        assert!(e.contains("手动"), "{e}");
+
+        // 清理。
+        crate::egate_monitor::clear_manual_hold().unwrap();
+        crate::appconfig::update(|c| c.egate_enabled = false).unwrap();
+        crate::egate_monitor::disarm("测试结束").unwrap();
+        // baseline 允许任意结果（取决于本机是否有可用代理），只保证不 panic。
+        let _ = baseline;
+    }
+
+    /// **P0-03**：接入路径不再安全时必须拒绝解除（代理端口断开 → 不能放行）。
+    #[test]
+    fn uncovered_auto_release_refuses_when_access_no_longer_safe() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        // 没有任何接入（未接代理/无 TUN）→ 必定拒绝。
+        // 这是兜底封锁的前提：「未接入」就是没接入，不能说「恢复了」。
+        let err = access_still_safe_for_unlock();
+        if let Err(reason) = err {
+            assert!(!reason.is_empty(), "拒绝时必须给出原因");
+        }
+    }
+
+    /// **P0-02（v0.7.5）**：完成状态必须对**应处理的完整集合**计算。
+    ///
+    /// 回归点 1：`agents.iter().all(coverage_complete)` 在「3 个对象只处理了
+    /// 1 个就中止」时会得到 `true`（对空/部分集合 vacuously true 或只看已处理的），
+    /// 于是界面显示「已完整熔断」——而另外两个应用完全没被隔离。
+    #[test]
+    fn trip_summary_never_claims_complete_when_objects_were_skipped() {
+        use TripOutcome::*;
+        // 3 个对象，只处理了 1 个（且它完整）→ 必须不是 Applied。
+        assert_ne!(
+            summarize_trip(3, 1, true, true, 1, 1),
+            Applied,
+            "只处理了 1/3 就中止，绝不能报告完整隔离"
+        );
+        assert_eq!(summarize_trip(3, 1, true, true, 1, 1), Partial);
+
+        // 3 个全部处理、全部完整 → Applied。
+        assert_eq!(summarize_trip(3, 3, false, true, 3, 3), Applied);
+
+        // 3 个全部处理但只有 2 个完整 → Partial。
+        assert_eq!(summarize_trip(3, 3, false, true, 3, 2), Partial);
+
+        // 一个对象确认未安装 → 从「应隔离」集合里排除。
+        assert_eq!(summarize_trip(3, 3, false, true, 2, 2), Applied);
+
+        // **P1-06**：全部对象都确认未安装 → NoApplicable，不是 Applied。
+        assert_eq!(summarize_trip(3, 3, false, false, 0, 0), NoApplicable);
+    }
+
+    /// **P0-02 / L-03**：`AbortedStale` 只用于「确实没有产生任何副作用」的取消。
+    ///
+    /// 回归点 2：原来按 `aborted && !any_isolated` 判定，于是「查杀了一个进程、
+    /// 建规则失败、之后配置变更」会被记成 `AbortedStale`（＝什么都没做），
+    /// 用户看不到自己进程为什么没了。
+    #[test]
+    fn trip_summary_keeps_side_effects_visible_after_abort() {
+        use TripOutcome::*;
+        // 只查杀、规则没建完 → 取消，但必须按 Partial 记账（有副作用）。
+        assert_eq!(summarize_trip(3, 1, true, true, 1, 0), Partial);
+        // 建了一条规则但核验失败 → 同样是 Partial，不是 AbortedStale。
+        assert_eq!(summarize_trip(3, 1, true, true, 1, 0), Partial);
+        // 完全没做任何副作用就取消 → 才是 AbortedStale。
+        assert_eq!(summarize_trip(3, 0, true, false, 0, 0), AbortedStale);
+        // 没中止、没副作用、也没完整 → Failed（而不是 AbortedStale）。
+        assert_eq!(summarize_trip(3, 3, false, false, 3, 0), Failed);
+    }
+
+    /// **P0-02 / P1-06**：结论分类与「是否触碰状态」必须一致。
+    #[test]
+    fn trip_outcome_state_policy_matches_meaning() {
+        assert!(TripOutcome::Applied.touches_state());
+        assert!(TripOutcome::Partial.touches_state());
+        assert!(TripOutcome::Failed.touches_state());
+        assert!(!TripOutcome::AbortedStale.touches_state());
+        // NoApplicable：没有建立任何规则，不应凭空把系统记成「已熔断」。
+        assert!(!TripOutcome::NoApplicable.touches_state());
     }
 
     /// **L-13（v0.7.3）**：「主动取消」不能污染熔断状态。

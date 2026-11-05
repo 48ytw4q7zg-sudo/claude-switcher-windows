@@ -118,7 +118,18 @@ jobs:
             'unknown_reconfirm_backs_off_and_caps',
             'auto_probe_requires_proven_udp_route',
             'unsigned_updates_are_never_auto_executed',
-            'strict_oauth_mode'
+            'strict_oauth_mode',
+            'trip_summary',
+            'trip_outcome_state_policy',
+            'uncovered_auto_release',
+            'strict_blocked_makes_zero_outbound_connections',
+            'strict_proxy_path_is_used_and_redirects_are_refused',
+            'tun_route_issuses_zero_dns_queries',
+            'trusted_dns_channel_is_not_available_yet',
+            'ready_reconciliation_only_counts_uncovered_source',
+            'revision_bumps_only_for_security_relevant_changes',
+            'strict_leak_mode_locks_down_on_unproven_access',
+            'uncovered_lock_reason_distinguishes_strict_mode'
           )
           $failed = @()
           foreach ($g in $groups) {

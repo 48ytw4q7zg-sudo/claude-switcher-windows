@@ -39,10 +39,10 @@
 
 | 项 | 状态 |
 | --- | --- |
-| 源码 | `main` 分支（本仓库），当前版本 **v0.7.3**（安全修订） |
-| 安装包 | **[Release v0.7.3](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.7.3)**，由 `.github/workflows/windows-build.yml` 在打 `v0.7.3` tag 时构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停） |
-| SHA256 | `ClaudeSwitcher_0.7.3_x64-setup.exe` `0a7cdf9b451a6377927707a33000f043cad393349d8ae78049630159fe3c503b`<br>`ClaudeSwitcher-portable.zip` `c09f65b36c42d8d4cea4be3580bb880b142a72fd65f38de87b75024ae4747c7f`<br>（已用 `sha256sum -c SHA256SUMS.txt` 与独立重算双重核对）<br>校验：`Get-FileHash .\<文件名> -Algorithm SHA256`，或 `gh attestation verify <文件> -R 48ytw4q7zg-sudo/claude-switcher-windows` 验证来源证明 |
-| 开发分支验证 | 11 月 5 日（v0.7.3）：完整 Rust 回归 **678 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。<br>**真实系统验证（管理员，本机）**：<br>① `tests/windows-integration/02-firewall-isolation.ps1`：三类测试规则 4 条 → `--exit-restore` → 退出码 **0**、规则 **4 → 0**；重复执行幂等返回 0。<br>② `tests/windows-integration/03-restore-ledger.ps1`：隔离规则 + 兜底意图 + ready 记录 → 恢复后规则 0、两个意图文件均被清除、退出码 0。<br>本轮修项见 [v0.7.3 发布说明](docs/release-v0.7.3.md) |
+| 源码 | `main` 分支（本仓库），当前版本 **v0.7.5**（安全与状态机修订）。版本号跳过 v0.7.4，用于区分「已发布的 v0.7.3」与本地中间态 |
+| 安装包 | **v0.7.5**：源码就绪，安装包由 `.github/workflows/windows-build.yml` 在打 `v0.7.5` tag 时构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停）。最近一个已发布版本是 [v0.7.3](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.7.3) |
+| SHA256 | v0.7.5 安装包尚未构建，因此**没有可核对的哈希**（不写占位值）。构建后以 Release 里的 `SHA256SUMS.txt` 为准，本地校验：`Get-FileHash .\<文件名> -Algorithm SHA256`，或 `gh attestation verify <文件> -R 48ytw4q7zg-sudo/claude-switcher-windows` 验证来源证明 |
+| 开发分支验证 | 11 月 6 日（v0.7.5）：完整 Rust 回归 **690 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。<br>**真实系统验证（管理员，本机）**：<br>① `02-firewall-isolation.ps1`：三类规则 4 条 → `--exit-restore` → 退出码 **0**、规则 **4 → 0**；重复执行幂等。<br>② `03-restore-ledger.ps1`：**真实构造的断网账本** + 阻断规则 + 兜底意图 + ready → 全部清除、退出码 0。<br>③ `04-corrupt-ledger.ps1`：账本损坏时退出码 **1**、规则与账本均保留（不猜、不删）。<br>本轮修项见 [v0.7.5 发布说明](docs/release-v0.7.5.md) |
 | 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；逐项状态与剩余差异见[功能对等记录](docs/upstream-baseline.md)与[对等核对](docs/parity-gap-final-2026-11-04.md) |
 | 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
@@ -322,10 +322,12 @@ ClaudeSwitcher-portable.zip                                       # 便携版
 | **Claude Desktop 切换**（进程结束、活目录回存、快照载入、回滚） | 未实机验证 |
 | **应用隔离多路径 / ActiveStore 核验**（未运行的已安装应用、多安装形态、升级后旧路径清理） | 纯逻辑与解析有单测。**v0.7.2 已在本机实机验证**：三类规则（普通熔断 / 兜底封锁 / 旧版遗留）同时存在时 `--exit-restore` 全部清零且退出码为 0；无残留时重复执行同样返回 0。<br>**仍未验证**：未运行的已安装应用、多安装形态（用户级 + 系统级 + MSIX 共存）、被组策略接管的规则、非管理员运行时的拒绝路径 |
 | **网卡禁用/恢复**（改名、驱动变化、名称不稳定） | 账本已保存 `guid` 与原始管理状态；真实断网恢复需在可回滚虚拟机验证。v0.7.2 起恢复失败不再被 `SilentlyContinue` 吞掉（未以管理员运行时必须报错而不是「已恢复」） |
-| **P1-01 TUN 路由实证**（`Find-NetRoute` + 默认路由是否由 TUN 承接） | v0.7.3 改为**逐目标 × 逐协议族**三态证据；**真实 TUN 环境未实机验证**。<br>当前版本对 TUN 直连探测一律 `Skip`：系统 DNS 的解析路径无法证明未走裸链路，因此在接入可信解析通道前不放行（见发布说明 §2） |
+| **P1-01 TUN 路由实证** | v0.7.5：TUN 路线**连域名解析都不做**（`TRUSTED_DNS_AVAILABLE = false`）。要放行需先建立 TUN 内 DNS 或经证明的 DoH，再把该常量置 true。**真实 TUN 环境未实机验证** |
 | **P1-02 管理员权限能力** | 已实机确认本机以管理员运行（`is_elevated` 返回 true），界面可区分「权限不足」与「隔离失败」；**受限 helper 进程模型未实现**（普通权限 UI + 特权 helper 属架构级改动，本轮未做） |
-| **P1-04 更新清单签名** | 未实现（无可信签名根）。v0.7.3 起**不再自动运行下载的安装包**（`TRUSTED_UPDATE_CHAIN_AVAILABLE = false`），只下载 + 校验 SHA-256 并引导用户去官方 Release 核对后手动安装；下载改为有界流式（缺 `Content-Length` 也拦得住） |
+| **P1-04 更新清单签名** | 未实现（无可信签名根）。**不自动运行下载的安装包**（`TRUSTED_UPDATE_CHAIN_AVAILABLE = false`），只下载 + 校验 SHA-256 并引导用户去官方 Release 核对后手动安装；下载为有界流式 |
 | **自动更新全流程** | 下载 + SHA256 校验已实现；`installed: false` 如实表示「安装向导已启动」而非已安装。安装后的版本替换与回滚需实机验收。<br>**v0.7.2 明确的边界**：发布清单**没有签名根**，因此 SHA256 的来源仍由「调用方传入」决定——这不足以证明制品来自本项目的发布者。在具备可信签名链之前，自动下载+运行安装包**不应被视为完整的可信更新路径**；用户在更新提示中看到的官方 Release 页面才是可信来源 |
+| **P1-13 严格防泄漏模式** | 新增 `strict_leak_protection`（默认关）：开启后接入路径未知或 TUN 路由未证明时也会封锁受管应用出站（不杀进程、不全局断网）。**未实机验证**完整触发链 |
+| **P1-02 管理员 helper** | 仍未实现受限特权 helper（架构级）；`is_elevated` 与界面权限提示已有 |
 | **加密快照跨机导入** | 单元测试已覆盖「源机导出 → 另一 USERPROFILE 导入 → 账号库与 Desktop 快照同时恢复」；真实两台机器间的迁移仍需实机执行（DPAPI 系统凭据不在包内，Desktop 可能需重新登录） |
 | **托盘一键切换**（动态菜单、点击切换、系统通知、菜单重建） | 未完成完整实机验收 |
 | **按终端并行多账号**（wt/cmd 拉起、独立配置目录、共享 skills） | 未实机验证 |

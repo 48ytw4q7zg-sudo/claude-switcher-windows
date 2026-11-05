@@ -223,12 +223,43 @@ pub fn monitored_hosts(targets: &[EgateTarget]) -> Vec<String> {
 /// 当前实现把「系统 DNS」视为不可信来源：只有接入路径本身是
 /// 已确认的 TUN/代理时，才认为解析没有走裸链路。这样在严格场景下
 /// 保持保守，宁可 Unverified 也不贸然直连探测。
-fn collect_tun_route_evidence(
+pub(crate) fn collect_tun_route_evidence(
     adapter: &str,
     targets: &[EgateTarget],
 ) -> std::collections::BTreeMap<String, crate::egate_access::RouteEvidence> {
     use crate::egate_access::RouteEvidence;
     let mut out = std::collections::BTreeMap::new();
+
+    // **P0-04（v0.7.5）**：可信 DNS 通道尚未建立之前，TUN 路线**不做任何域名解析**。
+    //
+    // v0.7.3 已经把 `dns_trusted` 固定为 false，让 HTTP 直连探测全部 Skip，
+    // 这一点是对的。但代码顺序是：
+    //
+    //   检测到 TUN → resolve_host_addresses() → **系统 DNS 解析**
+    //        → 采路由证据 → dns_trusted = false → 跳过 HTTP 探测
+    //
+    // 也就是说它挡住了后面的 HTTP 请求，却没挡住**前面那次 DNS 查询**。
+    // 当系统 DNS 走物理网络时，域名查询照样从不受保护的路径发出去——
+    // 那正是这条策略要防的事，而且更难被发现（HTTP 看起来什么都没做）。
+    //
+    // 现在：没建立可信解析通道就直接返回 Unverified，**连 DNS 都不问**。
+    // 要重新放行 TUN 出口验证，必须先把解析路径换成 TUN 内 DNS 或经证明的
+    // DoH，再把 TRUSTED_DNS_AVAILABLE 置 true（那是一次有意识的决定）。
+    if !TRUSTED_DNS_AVAILABLE {
+        for target in targets.iter().filter(|t| t.enabled) {
+            out.insert(
+                target.id.clone(),
+                RouteEvidence::unknown(
+                    &target.id,
+                    "可信 DNS 解析通道尚未建立，TUN 直连探测已跳过（未发出任何域名解析请求）",
+                ),
+            );
+        }
+        return out;
+    }
+
+    // ---- 以下路径仅在可信 DNS 就绪后才会执行 ----
+    //
     // TUN 网卡的 ifIndex 从适配器列表里按名字/描述匹配。
     let tun_index = match crate::platform::imp::list_adapters() {
         Ok(adapters) => adapters
@@ -271,17 +302,32 @@ fn collect_tun_route_evidence(
             RouteEvidence::unknown(&id, "无法解析目标主机名，无法取得路由证据"),
         );
     }
-    // P0-03：系统 DNS 查询本身不能证明「解析过程没走裸链路」。
-    //
-    // 因此 `dns_trusted` 一律为 false —— 这意味着 TUN 直连探测在 v0.7.3
-    // **仍然全部 Skip**（保持 Unverified）。这不是退步：v0.7.2 的
-    // 「拿到路由证据就放行」本质上默认了 DNS 已安全，而这个假设不成立。
-    // 要真正放行，需要接入一条已证明安全的解析通道（TUN 内的 DNS 或
-    // 经过验证的 DoH），属于后续工作，见 docs/release-v0.7.3.md。
+    // 即使将来启用 TUN 验证，也必须把解析结果与实际连接地址绑定：
+    // 多 A 记录、TTL 变化都可能让「验证的地址」与「连的地址」不同。
     for item in evidence.values_mut() {
-        item.dns_trusted = false;
+        item.dns_trusted = TRUSTED_DNS_AVAILABLE;
     }
     evidence
+}
+
+/// **P0-04**：可信 DNS 解析通道是否已建立。
+///
+/// 当前**恒为 false**：本项目还没有一条能证明「解析过程没走裸链路」的通道。
+/// 在此之前 TUN 路线不做任何域名解析，也就不会把真实出口通过 DNS 暴露出去。
+///
+/// 要置 true 必须先满足：TUN 内 DNS 或经证明的 DoH，且解析结果与实际连接
+/// 地址绑定（多地址/变化都要能跟踪）。
+const TRUSTED_DNS_AVAILABLE: bool = false;
+
+/// **P0-04**：测试用的域名解析计数器。
+///
+/// 用来断言「TUN 模式下一次解析请求都不发」——这是本版的核心安全断言。
+#[cfg(test)]
+static DNS_QUERY_COUNT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(crate) fn dns_query_count() -> usize {
+    DNS_QUERY_COUNT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// 解析主机名得到 (IPv4, IPv6) **全部**地址。
@@ -292,6 +338,9 @@ fn collect_tun_route_evidence(
 /// 由平台层给出「目标无 AAAA 记录」的显式结论。
 fn resolve_host_addresses(host: &str) -> Option<(Option<String>, Option<String>)> {
     use std::net::ToSocketAddrs;
+    // **P0-04**：统计真实解析次数（测试断言「TUN 模式零解析」用）。
+    #[cfg(test)]
+    DNS_QUERY_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     let addrs = (host, 443u16).to_socket_addrs().ok()?;
     let mut v4: Vec<String> = Vec::new();
     let mut v6: Vec<String> = Vec::new();
@@ -580,6 +629,60 @@ mod tests {
             enabled,
             timeout_secs: 2,
         }
+    }
+
+    /// **P0-04（v0.7.5）**：TUN 路线在可信 DNS 建立之前**必须零域名解析**。
+    ///
+    /// 回归点：v0.7.3 虽然把 HTTP 直连探测全部 Skip，但代码顺序仍然是
+    /// 「先 resolve_host_addresses（真的发 DNS 查询）→ 再置 dns_trusted=false」。
+    /// 挡住了 HTTP 却没挡住 DNS，真实出口照样可能从解析路径漏出去。
+    #[test]
+    fn tun_route_issuses_zero_dns_queries_until_trusted_channel_exists() {
+        let target = EgateTarget {
+            id: "t".to_string(),
+            name: "t".to_string(),
+            // 这个域名一定不解析；如果代码真的去问 DNS，计数会增加且结果为 None。
+            anchor_url: "https://nonexistent-domain-for-dns-leak-test.invalid/trace".to_string(),
+            anchor_kind: crate::egate::AnchorKind::Trace,
+            expect_ips: vec!["1.2.3.4".to_string()],
+            expect_regions: vec!["US".to_string()],
+            enabled: true,
+            timeout_secs: 2,
+        };
+        let before = dns_query_count();
+        let evidence = collect_tun_route_evidence("Mihomo", &[target]);
+        let after = dns_query_count();
+
+        assert_eq!(
+            after, before,
+            "TUN 模式在可信 DNS 未就绪时不得发出任何域名解析请求"
+        );
+        let item = evidence.get("t").expect("应为启用目标产出证据");
+        assert!(!item.proves_tun_path(), "未做过解析就不能声称路由已证明");
+        assert!(
+            item.unverified_reason().contains("DNS"),
+            "原因应说明 DNS 通道未建立：{}",
+            item.unverified_reason()
+        );
+    }
+
+    /// **P0-04**：`TRUSTED_DNS_AVAILABLE` 未就绪这一事实本身就是安全契约。
+    ///
+    /// 等哪天要放行 TUN 出口验证，必须同时改这条断言——让「打开 DNS 查询」
+    /// 成为一次有意识的决定，而不是顺手把常量翻成 true。
+    #[test]
+    fn trusted_dns_channel_is_not_available_yet() {
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(
+                !TRUSTED_DNS_AVAILABLE,
+                "可信 DNS 通道未建立前，TUN 路线不得做域名解析"
+            );
+        }
+        let before = dns_query_count();
+        let evidence = collect_tun_route_evidence("Mihomo", &[]);
+        assert_eq!(dns_query_count(), before);
+        assert!(evidence.is_empty());
     }
 
     #[test]

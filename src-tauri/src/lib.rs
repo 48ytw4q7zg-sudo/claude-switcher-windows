@@ -2647,14 +2647,20 @@ fn set_webrtc_policy(policy: String) -> Result<(), String> {
 /// 读取当前全局环境/代理偏好（前端面板回显已保存值，避免重启后显示默认值、
 /// 用户一点击就把旧选择覆盖掉）。
 #[tauri::command]
-fn get_appconfig() -> appconfig::AppConfig {
-    // P1-08: config corruption must not be shown as "user's current settings".
+fn get_appconfig() -> Result<appconfig::AppConfig, String> {
+    // **P1-10（v0.7.5）**：安全相关的界面**不能**在配置损坏时拿默认值充数。
+    //
+    // 原来返回 `AppConfig::default()`，其 `egate_enabled = false` ——用户明明
+    // 开着严格保护，界面却显示「门禁已关闭」，于是他以为保护没生效去乱试。
+    // 现在直接报错，前端会把错误显示出来；`Fresh`（首次安装）仍是合法默认值。
     match appconfig::load_checked() {
-        appconfig::ConfigLoad::Ok(config) => *config,
-        appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+        appconfig::ConfigLoad::Ok(config) => Ok(*config),
+        appconfig::ConfigLoad::Fresh => Ok(appconfig::AppConfig::default()),
         appconfig::ConfigLoad::Corrupt(error) => {
-            log_error(&format!("应用配置损坏，界面显示的是默认值：{error}"));
-            appconfig::AppConfig::default()
+            log_error(&format!("应用配置损坏，拒绝向界面返回默认值：{error}"));
+            Err(format!(
+                "应用配置损坏，无法读取真实设置（{error}）。请修复 appconfig.json 或从备份恢复，                 修复前界面不会显示任何「默认」的安全状态"
+            ))
         }
     }
 }
@@ -2700,13 +2706,20 @@ fn egate_reset_targets() -> Result<Vec<egate::EgateTarget>, String> {
 
 /// 出口门禁：读取当前生效的目标表（未配置时返回内置默认表，便于首次配置）。
 #[tauri::command]
-fn egate_get_targets() -> Vec<egate::EgateTarget> {
-    let config = appconfig::load();
-    if config.egate_targets.is_empty() {
+fn egate_get_targets() -> Result<Vec<egate::EgateTarget>, String> {
+    // **P1-10**：目标表喂给门禁判定，配置损坏时不能回退默认值充数。
+    let config = match appconfig::load_checked() {
+        appconfig::ConfigLoad::Ok(config) => *config,
+        appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+        appconfig::ConfigLoad::Corrupt(error) => {
+            return Err(format!("应用配置损坏，无法读取目标表：{error}"))
+        }
+    };
+    Ok(if config.egate_targets.is_empty() {
         egate_defaults::builtin_targets()
     } else {
         config.egate_targets
-    }
+    })
 }
 
 /// 下载并校验更新（不安装，供用户确认后安装）。
@@ -2771,46 +2784,6 @@ fn egate_disabled_checks() -> Vec<String> {
 }
 
 /// 出口门禁：开关与参数（整体更新，缺省保持原值由前端回读保证）。
-/// **P1-05 / P0-05（v0.7.3）**：布防就绪校验。
-///
-/// v0.7.2 的漏洞：`egate_targets.is_empty()` 时直接 `return Ok(())`，
-/// 理由是「内置默认表自带期望值」。但 `builtin_targets()` 实际上把
-/// `expect_ips` / `expect_regions` 全部留空——于是全新安装、没做任何配置的
-/// 用户可以直接开启门禁；第一次真的拿到出口信息时 `evaluate()` 判 `Fail`
-/// （`empty_whitelist_with_geo_fails_closed`），达到阈值后自动熔断，
-/// 把用户正在用的桌面程序结束掉。
-///
-/// 现在的规则按**实际生效的目标表**判定（用户配置为空就用内置默认表）：
-/// - `AnchorKind::Reachability` 只看可达性，不要求 IP/地区白名单；
-/// - 其余目标必须至少有一个期望 IP 或期望地区；
-/// - 任一启用目标不满足即拒绝布防，并点名是哪一个。
-fn validate_arm_readiness() -> Result<(), String> {
-    let config = match appconfig::load_checked() {
-        appconfig::ConfigLoad::Ok(config) => *config,
-        appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
-        appconfig::ConfigLoad::Corrupt(error) => {
-            return Err(format!(
-                "配置损坏（{error}），请先修复配置再开启门禁，避免按默认值误判"
-            ))
-        }
-    };
-    // **关键**：与 `egate_check_once` / 监控线程使用**同一份**目标表。
-    let targets = if config.egate_targets.is_empty() {
-        egate_defaults::builtin_targets()
-    } else {
-        config.egate_targets.clone()
-    };
-    let unready = unready_targets(&targets);
-    if unready.is_empty() {
-        return Ok(());
-    }
-    Err(format!(
-        "以下目标尚未配置期望出口（IP 或地区），开启后会被判定为失败并触发熔断：{}。\
-         请先在出口门禁面板为它们填写白名单，或先停用这些目标",
-        unready.join("、")
-    ))
-}
-
 /// 挑出「已启用但无法判定」的目标（纯函数，便于单测）。
 ///
 /// 只有 `Reachability` 锚点可以不配白名单——它本来就不看出口 IP/地区。
@@ -2835,10 +2808,12 @@ fn egate_update_settings(
     // **P1-05（v0.7.1）**：开启门禁前必须确认「布防就绪」——
     // 目标缺少白名单时 `evaluate()` 会对拿到出口信息的目标直接判 Fail，
     // 新装用户一打开开关就可能结束正在运行的桌面程序。
-    if enabled {
-        validate_arm_readiness()?;
-    }
-    appconfig::update(|config| {
+    //
+    // **P1-09（v0.7.5）**：校验与写入放进**同一把配置锁**。
+    // 原来是「先 validate_arm_readiness() 读一次、再 appconfig::update()
+    // 再读一次写开关」——两次读之间别的窗口改了目标表，就会出现
+    // 「校验通过的是旧目标、真正布防的是新目标」。
+    let mut mutate = |config: &mut appconfig::AppConfig| {
         config.egate_enabled = enabled;
         config.egate_trip_threshold = trip_threshold;
         config.egate_interval_secs = egate_check::clamp_timeout(interval_secs);
@@ -2852,7 +2827,27 @@ fn egate_update_settings(
                 .map(|id| id.to_string())
                 .collect();
         }
-    })?;
+    };
+    let validate = |config: &appconfig::AppConfig| -> Result<(), String> {
+        if !config.egate_enabled {
+            return Ok(());
+        }
+        // 对**即将保存的那份配置**算生效目标表，而不是再读一次。
+        let targets = if config.egate_targets.is_empty() {
+            egate_defaults::builtin_targets()
+        } else {
+            config.egate_targets.clone()
+        };
+        let unready = unready_targets(&targets);
+        if unready.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "以下目标尚未配置期望出口（IP 或地区），开启后会被判定为失败并触发熔断：{}。             请先在出口门禁面板为它们填写白名单，或先停用这些目标",
+            unready.join("、")
+        ))
+    };
+    appconfig::try_update(&mut mutate, &validate)?;
     Ok(())
 }
 
@@ -2901,6 +2896,20 @@ async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
         ))
     })
     .await
+}
+
+/// **P1-13（v0.7.5）**：切换严格防泄漏模式。
+///
+/// 开启后，接入路径「未知」或「TUN 路由未证明」时也会施加**出站兜底封锁**
+/// （只挡受管 GUI 应用的出站，不杀进程、不全局断网）。这是产品安全契约上的
+/// 显式选择，因此必须由用户主动开启，默认关闭。
+#[tauri::command]
+fn egate_set_strict_leak(enabled: bool) -> Result<(), String> {
+    appconfig::try_update(
+        &mut |config: &mut appconfig::AppConfig| config.strict_leak_protection = enabled,
+        &|_| Ok(()),
+    )?;
+    Ok(())
 }
 
 /// 出口门禁：发送一条测试通知（`--notify-test <kind>` 与界面按钮共用）。
@@ -3101,6 +3110,7 @@ fn egate_rearm() -> Result<serde_json::Value, String> {
 #[tauri::command]
 fn egate_monitor_status() -> serde_json::Value {
     let unknown = egate_monitor::is_trip_state_unknown();
+    let uncovered = egate_monitor::uncovered_lock_snapshot();
     serde_json::json!({
         "paused": egate_monitor::is_paused(),
         "remaining_secs": egate_monitor::paused_remaining_secs(),
@@ -3112,11 +3122,11 @@ fn egate_monitor_status() -> serde_json::Value {
         // 界面把两者混在一起会让用户以为自动恢复可以解除隔离。
         "manual_hold_unknown": egate_monitor::manual_hold_state()
             == egate_monitor::ManualHold::Unknown,
-        // **L-03**：兜底封锁的真实状态（意图 + 是否已核验覆盖）。
-        "uncovered_lock": egate_monitor::uncovered_lock_status().0,
-        "uncovered_lock_verified": egate_monitor::uncovered_lock_status().1,
+        // **P1-10**：兜底状态一次性取全（避免两遍真实防火墙查询、且同一响应内口径一致）。
+        "uncovered_lock": uncovered.0,
+        "uncovered_lock_verified": uncovered.1,
         // **L-13**：核验结论的可读说明（「已核验 / 尚未核验 / 核验已失效：…」）。
-        "uncovered_lock_note": egate_monitor::uncovered_lock_detail().1,
+        "uncovered_lock_note": uncovered.2,
         "disarmed": egate_monitor::is_disarmed(),
         "intent": egate_monitor::protection_intent(),
         // **P1-02**：当前进程是否具备管理员权限。界面据此区分
@@ -3164,7 +3174,15 @@ async fn egate_leak_watch() -> Result<egate_netwatch::LeakReport, String> {
     blocking(|| {
         let evidence = egate_check::read_proxy_evidence();
         let proxy_port = egate_netwatch::proxy_port_from_evidence(&evidence);
-        let config = appconfig::load();
+        // **P1-10**：直连观察要读受管对象清单——配置损坏时不能拿默认值充数，
+        // 否则会去观察错误的进程集合并给出误导性结论。
+        let config = match appconfig::load_checked() {
+            appconfig::ConfigLoad::Ok(config) => *config,
+            appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+            appconfig::ConfigLoad::Corrupt(error) => {
+                return Err(format!("应用配置损坏，无法执行直连泄露观察：{error}"))
+            }
+        };
         let targets = if config.egate_targets.is_empty() {
             egate_defaults::builtin_targets()
         } else {
@@ -3200,7 +3218,14 @@ async fn egate_leak_watch() -> Result<egate_netwatch::LeakReport, String> {
 #[tauri::command]
 async fn egate_trip_now() -> Result<egate_trip::TripReport, String> {
     blocking(|| {
-        let config = appconfig::load();
+        // **P1-10**：受管对象清单读不出来时不能拿默认值充数。
+        let config = match appconfig::load_checked() {
+            appconfig::ConfigLoad::Ok(config) => *config,
+            appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+            appconfig::ConfigLoad::Corrupt(error) => {
+                return Err(format!("应用配置损坏，无法执行手动隔离：{error}"))
+            }
+        };
         let agents = if config.egate_guarded_agents.is_empty() {
             egate_defaults::DEFAULT_GUARDED_AGENTS
                 .iter()
@@ -3216,12 +3241,22 @@ async fn egate_trip_now() -> Result<egate_trip::TripReport, String> {
         egate_monitor::mark_manual_hold()
             .map_err(|e| format!("{e}；本次手动隔离已取消（否则自动恢复可能擅自解除它）"))?;
         let result = egate_trip::trip(&agents);
-        if !result.any_isolated && !result.all_isolated {
-            // 没有任何隔离实际生效：回滚意图，避免留下「手动保持」但系统上
-            // 根本没有隔离的矛盾状态。
+        // **L-14（v0.7.5）**：只有**确实没有产生任何系统副作用**时才回滚意图。
+        //
+        // v0.7.3 用的是 `!any_isolated && !all_isolated` ——那两个布尔值描述的是
+        // 「隔离覆盖是否完整」，不能证明「一个进程都没结束、一条规则都没建」。
+        // 真实场景：查杀成功但规则因权限不足失败，用户进程已经没了，
+        // 手动保持却被清掉，自动恢复随即把这条隔离当成「无人认领」解除掉。
+        if !result.side_effects && !result.any_isolated && !result.all_isolated {
             if let Err(error) = egate_monitor::clear_manual_hold() {
                 log_error(&format!("清理未生效的手动隔离意图失败：{error}"));
             }
+        } else if result.side_effects && !result.any_isolated {
+            // 已经动过系统但覆盖不完整：保留手动保持意图，等用户手动处理，
+            // 并把「有副作用」如实告诉界面。
+            log_error(
+                "手动隔离产生了系统副作用但覆盖不完整：已保留手动保持意图，避免自动恢复擅自解除",
+            );
         }
         Ok(result)
     })
@@ -3613,6 +3648,7 @@ pub fn run() {
             egate_env_check,
             stun_probe_manual,
             egate_supported_regions,
+            egate_set_strict_leak,
             egate_set_disabled_checks,
             set_log_config,
             download_update_verify,

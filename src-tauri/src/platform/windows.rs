@@ -2105,6 +2105,43 @@ if ($rules.Count -gt 0) {{ 'present' }} else {{ 'absent' }}",
     }
 }
 
+/// 一次性确认**一组**规则是否全部仍存在（**P1-07**）。
+///
+/// 比逐条 `firewall_rule_exists` 少 N-1 次 PowerShell 往返，且结果仍然三态：
+/// - `Present` = 全部都在；
+/// - `Absent` = 至少一条不在（说明资源被外部清理过）；
+/// - `Unknown` = 查询本身失败（不能当成「还在」也不能当成「没了」）。
+pub fn firewall_rules_all_present(names: &[String]) -> RuleLookup {
+    if names.is_empty() {
+        return RuleLookup::Absent;
+    }
+    let list = names
+        .iter()
+        .map(|n| ps_single_quote(n))
+        .collect::<Vec<_>>()
+        .join(",");
+    let script = format!(
+        "$ErrorActionPreference='Stop'
+$names = @({list})
+$missing = 0
+foreach ($n in $names) {{
+  $pattern = [WildcardPattern]::Escape($n)
+  $hit = @(Get-NetFirewallRule -DisplayName ($pattern + '*') -ErrorAction Stop |
+           Where-Object {{ $_.DisplayName -eq $n }}).Count -gt 0
+  if (-not $hit) {{ $missing++ }}
+}}
+if ($missing -eq 0) {{ 'present' }} else {{ 'absent' }}"
+    );
+    match run_ps_outcome(&script) {
+        PsOutcome::Success(out) => match out.trim().to_ascii_lowercase().as_str() {
+            "present" => RuleLookup::Present,
+            "absent" => RuleLookup::Absent,
+            _ => RuleLookup::Unknown,
+        },
+        PsOutcome::Failed(_) | PsOutcome::Unknown(_) => RuleLookup::Unknown,
+    }
+}
+
 /// 当前进程是否以管理员身份运行（**P1-02**：权限能力探测）。
 ///
 /// 只用于**展示能力与给出可操作提示**，不作为安全边界：真正的边界是

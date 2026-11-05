@@ -364,6 +364,11 @@ pub(crate) fn restore_locked(_guard: &crate::egate_lock::OperationGuard) -> (boo
         Err(error) => return (false, format!("读取断网现场失败，未做任何恢复：{error}")),
     };
     let mut failures = Vec::new();
+    // **L-13 / P1-11（v0.7.5）**：用结构化状态做安全决策，不靠文本匹配。
+    //
+    // 原来写的是 `failures.iter().any(|f| f.contains("网卡"))`——凡是措辞改一个字，
+    // 或将来新增别的错误分支，行为就悄悄变了。文本只用来给人看。
+    let mut nic_restore_ok = true;
 
     // 顺序：先恢复网卡、最后删规则——恢复过程中网络始终被规则挡着。
     if let Some(state) = &state {
@@ -379,6 +384,9 @@ pub(crate) fn restore_locked(_guard: &crate::egate_lock::OperationGuard) -> (boo
             .cloned()
             .collect();
         let (restored_guids, guid_failures) = enable_nics_by_guid(&snapshots);
+        if !guid_failures.is_empty() {
+            nic_restore_ok = false;
+        }
         failures.extend(guid_failures);
         let _ = restored_guids;
 
@@ -396,14 +404,17 @@ pub(crate) fn restore_locked(_guard: &crate::egate_lock::OperationGuard) -> (boo
             .collect();
         if !legacy_names.is_empty() {
             if let Err(error) = enable_nics(&legacy_names) {
+                nic_restore_ok = false;
                 failures.push(format!("按名称启用网卡失败（旧账本兼容路径）：{error}"));
             } else {
                 match verify_nics_up(&legacy_names) {
                     Ok(gone) if !gone.is_empty() => {
+                        nic_restore_ok = false;
                         failures.push(format!("网卡未能恢复（可能驱动延迟）：{}", gone.join("、")));
                     }
                     Ok(_) => {}
                     Err(error) => {
+                        nic_restore_ok = false;
                         failures.push(format!("网卡状态核验失败：{error}"));
                     }
                 }
@@ -413,8 +424,10 @@ pub(crate) fn restore_locked(_guard: &crate::egate_lock::OperationGuard) -> (boo
 
     // **P0-05**：网卡恢复失败时**不解除全局阻断**——保留规则作为最后一道
     // 保护，进入待恢复状态；下次恢复会重试。
-    let nics_failed = failures.iter().any(|f| f.contains("网卡"));
-    if nics_failed {
+    //
+    // **L-13 / P1-11**：判据是结构化标志 `nic_restore_ok`，
+    // 不再用「错误文本里有没有「网卡」两个字」来决定要不要保留阻断规则。
+    if !nic_restore_ok {
         // 保留账本与阻断规则，明确报告未完成。
         return (
             false,
