@@ -168,6 +168,24 @@ scripts/check-security-regressions.ps1     36/36 组通过
 
 ---
 
+## 10.1 发布产物（2026-11-06 已发布）
+
+| 资产 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `ClaudeSwitcher_0.7.6_x64-setup.exe` | 8,317,477 B | `fd9a4bd96e1768a4ff279d3a9bc1f1c6c54e24bc2f200b64dedc8401ac948f70` |
+| `ClaudeSwitcher-portable.zip` | 9,767,620 B | `4742e5883eecb1aa56338ce5af150360d6d76cd9d732f60fa2cbda1f4106e6d0` |
+| `SHA256SUMS.txt` | 195 B | 随包分发 |
+
+- Release：<https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.7.6>
+- 哈希已用 `sha256sum -c SHA256SUMS.txt` 与独立重算**双重核对**，两者一致。
+- 构建来源证明已通过 `gh attestation verify`（含 sigstore 证书），绑定
+  `windows-build.yml` @ `refs/tags/v0.7.6`。
+- 发布工作流里 **`Security regression scenarios` 与 CI 是同一份脚本**
+  （`scripts/check-security-regressions.ps1`），本次构建该步骤 `success`
+  ——P2-02 的两套门禁分叉问题已闭合。
+- 安装包是 **NSIS** 自解压 PE32，未代码签名（SmartScreen 提示属预期，
+  请用上述哈希或 attestation 自行核对）。
+
 ## 11. 行为变化（升级须知）
 
 1. **配置文件丢失后不再当成首次安装**：会报错并拒绝用默认值重建。
