@@ -1,6 +1,12 @@
-# v0.6.13.1 — 第十五轮审计收口（恢复完整性与放行条件）
+# v0.6.13 修正版 — 第十五轮审计收口（恢复完整性与放行条件）
 
 发布日期：2026-11-05
+
+> **版本号说明**：`Cargo.toml` / `package.json` / 安装包版本均为 **`0.6.13`**
+> —— Cargo 不接受四段版本号（`0.6.13.1` 会让 `cargo metadata` 直接报
+> `unexpected character '.' after patch version number`）。
+> 本文件用「0.6.13 修正版」区分这次补丁，GitHub tag 为 `v0.6.13.1`。
+> 安装包名与上一版相同，靠 SHA256 与 Release 说明区分。
 基线：v0.6.13（`e954b01`）→ 本版
 依据：GPT-6 第十五轮深度复审（固定 `e954b01`）
 
@@ -90,8 +96,8 @@ v0.6.13 把隔离拆成 `ClaudeSwitcher AppIsolation` 与 `ClaudeSwitcher Uncove
 - `ClaudeSwitcher_0.6.13_x64-setup.exe`（NSIS）
 - `ClaudeSwitcher-portable.zip`
 
-**安装包版本号仍为 `0.6.13`**（Tauri bundle 版本需三段式），
-源码版本为 `0.6.13.1`。MSI 继续停发。
+**安装包文件名与上一版相同**（版本号必须三段式）。请以本 Release 的
+`SHA256SUMS.txt` 为准区分——本版哈希与 v0.6.13 不同。MSI 继续停发。
 
 ## 八、已知边界
 

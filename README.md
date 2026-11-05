@@ -42,7 +42,7 @@
 | 源码 | `main` 分支（本仓库） |
 | 安装包 | **[Release v0.6.13](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.6.13)**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停），产物来源可审计 |
 | SHA256 | 每个 Release 附 `SHA256SUMS.txt`；校验：`Get-FileHash .\<文件名> -Algorithm SHA256` 后与其比对。本版发布后此处补上已核验的具体值 |
-| 开发分支验证 | 11 月 5 日（v0.6.13.1）：完整 Rust 回归 **643 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。第十五轮修项见 [v0.6.13.1 发布说明](docs/release-v0.6.13.1.md)，上一轮见 [v0.6.13](docs/release-v0.6.13.md) |
+| 开发分支验证 | 11 月 5 日（v0.6.13 修正版）：完整 Rust 回归 **643 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。第十五轮修项见 [v0.6.13 修正版发布说明](docs/release-v0.6.13.1.md)，上一轮见 [v0.6.13](docs/release-v0.6.13.md) |
 | 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；逐项状态与剩余差异见[功能对等记录](docs/upstream-baseline.md)与[对等核对](docs/parity-gap-final-2026-11-04.md) |
 | 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
