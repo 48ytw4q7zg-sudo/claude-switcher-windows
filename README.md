@@ -41,7 +41,7 @@
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
 | 安装包 | **[Release v0.6.13](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.6.13)**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停），产物来源可审计 |
-| SHA256 | 每个 Release 附 `SHA256SUMS.txt`；校验：`Get-FileHash .\<文件名> -Algorithm SHA256` 后与其比对。本版发布后此处补上已核验的具体值 |
+| SHA256 | `0.6.13_x64-setup.exe` `b813e57026a86fa4b0784466c2625bec6d54e966cf38c6c4559c391dc3cd793d`<br>`ClaudeSwitcher-portable.zip` `c6b88b26e1b2fbb783b28b4af732c93ffe513f51017a3b0b09ec1683b177a518`<br>（以上为 **v0.6.13 修正版** 的哈希，与 v0.6.13 不同）<br>校验：`Get-FileHash .\<文件名> -Algorithm SHA256`，与 Release 的 `SHA256SUMS.txt` 比对 |
 | 开发分支验证 | 11 月 5 日（v0.6.13 修正版）：完整 Rust 回归 **643 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。第十五轮修项见 [v0.6.13 修正版发布说明](docs/release-v0.6.13.1.md)，上一轮见 [v0.6.13](docs/release-v0.6.13.md) |
 | 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；逐项状态与剩余差异见[功能对等记录](docs/upstream-baseline.md)与[对等核对](docs/parity-gap-final-2026-11-04.md) |
 | 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |
