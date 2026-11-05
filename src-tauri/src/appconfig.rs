@@ -59,6 +59,13 @@ pub struct AppConfig {
     /// 出口门禁总开关（默认关：这是「持续校验 + 熔断」能力，需用户显式启用）。
     #[serde(default)]
     pub egate_enabled: bool,
+    /// **P0-04（v0.7.1）**：门禁配置代次。
+    ///
+    /// 网络探测可能耗时数秒；期间用户可能关闭门禁、改目标或执行急救恢复。
+    /// 探测开始时代次与提交前不一致，说明结果已过期，必须丢弃——
+    /// 否则旧判定会按新配置的「已关闭」状态之外的理由去杀进程。
+    #[serde(default)]
+    pub egate_revision: u64,
     /// 熔断防抖阈值：连续 N 次失败才熔断（默认 2，0 表示关闭熔断）。
     #[serde(default = "default_egate_trip_threshold")]
     pub egate_trip_threshold: u32,
@@ -154,6 +161,7 @@ impl Default for AppConfig {
             wsl_integration_enabled: false,
             egate_targets: Vec::new(),
             egate_enabled: false,
+            egate_revision: 0,
             egate_trip_threshold: default_egate_trip_threshold(),
             egate_interval_secs: default_egate_interval(),
             egate_enforce_access: default_egate_enforce_access(),
@@ -301,6 +309,8 @@ pub fn update(mut f: impl FnMut(&mut AppConfig)) -> Result<AppConfig, String> {
     // **P1-02**：写入路径也走迁移——避免旧程序把高版本配置覆盖成旧结构。
     let mut config = load_from_migrated(&path)?;
     f(&mut config);
+    // **P0-04**：任何配置写入都推进门禁代次，使进行中的旧探测结果失效。
+    config.egate_revision = config.egate_revision.saturating_add(1);
     let text = serde_json::to_string_pretty(&config)
         .map_err(|error| format!("序列化应用配置失败：{error}"))?;
     fsx::write_atomically(&path, &text).map_err(|error| format!("保存应用配置失败：{error}"))?;

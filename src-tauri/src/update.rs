@@ -129,10 +129,17 @@ fn write_cache(path: &Path, now: i64, result: &UpdateCheckResult) {
 
 fn fetch_latest(current: &str) -> UpdateCheckResult {
     // GitHub API 要求 User-Agent；限流 403 / 断网都归入「检查失败」静默。
-    let client = match reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(8))
-        .build()
-    {
+    //
+    // **P1-10**：版本号查询走 `Standard` 策略——它只取公开的 tag_name，
+    // 不携带任何账号信息，代理不可用时直连也不构成泄漏；但策略必须显式，
+    // 不能靠「用了裸 builder 所以默认行为就是这样」。
+    let client = match crate::network_policy::build_client(
+        &crate::network_policy::ClientSpec::new(
+            crate::network_policy::NetworkPolicy::Standard,
+            Duration::from_secs(8),
+        ),
+        None,
+    ) {
         Ok(client) => client,
         Err(e) => return failure(current, format!("HTTP 客户端初始化失败: {e}")),
     };
@@ -189,22 +196,64 @@ fn result_for_version(current: &str, latest: &str, url: &str) -> Result<UpdateCh
     {
         return Err("发布页地址不属于本项目的 GitHub Release".to_string());
     }
-    let candidate =
-        semver::Version::parse(latest).map_err(|e| format!("发布版本号格式无效: {e}"))?;
-    let installed =
-        semver::Version::parse(current).map_err(|e| format!("当前版本号格式无效: {e}"))?;
+    let candidate = parse_release_version(latest)?;
+    let installed = match parse_release_version(current) {
+        Ok(version) => version,
+        // **P1-09**：本机装的是历史四段版本（如 `0.6.13.1`，Cargo 早已不接受
+        // 这种写法，但它确实发布过）。此时不能报「版本号格式无效」让用户
+        // 永久看不到更新——按 SemVer 语义把第四段当作构建号忽略。
+        Err(error) => match parse_legacy_four_segment(current) {
+            Some(version) => version,
+            None => return Err(error),
+        },
+    };
     let has_update = candidate.cmp_precedence(&installed).is_gt();
+    let legacy_note = if current.trim().split('.').count() == 4 {
+        "（检测到旧版四段版本号，已按前三段比较）"
+    } else {
+        ""
+    };
     Ok(UpdateCheckResult {
         message: if has_update {
-            format!("发现新版本 v{latest}（当前 v{current}）")
+            format!("发现新版本 v{latest}（当前 v{current}）{legacy_note}")
         } else {
-            format!("已是最新版本（v{current}）")
+            format!("已是最新版本（v{current}）{legacy_note}")
         },
         current_version: current.to_string(),
         latest_version: Some(latest.to_string()),
         has_update,
         release_url: url.to_string(),
     })
+}
+
+/// 解析发布版本号（必须是三段 SemVer 或带预发布的 SemVer）。
+fn parse_release_version(raw: &str) -> Result<semver::Version, String> {
+    let trimmed = raw.trim();
+    // 只接受 `x.y.z` 与 `x.y.z-pre`：四段版本会被 semver 拒绝，而 GitHub
+    // tag 里出现 `v1.2.3.4` 时应当明确报错而不是静默截断。
+    if trimmed.is_empty() {
+        return Err("发布版本号为空".to_string());
+    }
+    semver::Version::parse(trimmed).map_err(|e| format!("发布版本号格式无效: {e}"))
+}
+
+/// 把历史四段版本 `x.y.z.w` 转成可比较的 SemVer（丢弃第四段）。
+///
+/// **P1-09**：v0.6.13.1 是用四段号发布的；Cargo 后来不再接受四段，
+/// 但用户机器上装的仍是那个版本。升级检查必须能把它读出来，
+/// 否则这些用户永远看不到新版本（每次检查都是「版本号格式无效」）。
+fn parse_legacy_four_segment(raw: &str) -> Option<semver::Version> {
+    let parts: Vec<&str> = raw.trim().split('.').collect();
+    if parts.len() != 4 {
+        return None;
+    }
+    if !parts
+        .iter()
+        .all(|p| p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty())
+    {
+        return None;
+    }
+    semver::Version::parse(&format!("{}.{}.{}", parts[0], parts[1], parts[2])).ok()
 }
 
 fn failure(current: &str, message: String) -> UpdateCheckResult {
@@ -284,6 +333,7 @@ pub fn download_and_install_blocking(
     version: &str,
     sha256: &str,
 ) -> Result<UpdateInstallResult, String> {
+    validate_update_params(version, sha256)?;
     // **P1-04**：更新前先确认没有正在进行的保护/恢复事务。
     //
     // 安装会替换正在运行的程序；若此刻系统处于隔离/断网/未知状态，
@@ -293,18 +343,38 @@ pub fn download_and_install_blocking(
     let url = format!(
         "https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/download/v{version}/{asset_name}"
     );
-    let local_path = std::env::temp_dir().join(&asset_name);
+    // **P1-04**：写入**每次新建的随机暂存目录**，不再复用固定的
+    // `%TEMP%\<固定文件名>`。固定路径有两个真实风险：
+    // 1. 另一个进程可先在该路径放同名文件（本地提权的经典手法）；
+    // 2. 两次下载并发时会互相覆盖，校验和与文件内容可能不是同一份。
+    let staging = make_staging_dir().map_err(|error| format!("创建下载暂存目录失败：{error}"))?;
+    let local_path = staging.join(&asset_name);
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()
-        .map_err(|e| format!("初始化下载客户端失败：{e}"))?;
+    // **P1-10**：安装包下载走 `Standard` 策略：下载的是本项目的公开制品，
+    // 地址是固定的 GitHub Release，不含用户凭据；且断网/代理不可用时
+    // 下载本来就会失败，不会造成身份泄漏。策略仍显式声明，避免默认行为漂移。
+    let client = crate::network_policy::build_client(
+        &crate::network_policy::ClientSpec::new(
+            crate::network_policy::NetworkPolicy::Standard,
+            Duration::from_secs(600),
+        ),
+        None,
+    )
+    .map_err(|e| format!("初始化下载客户端失败：{e}"))?;
     let response = client
         .get(&url)
         .send()
         .map_err(|e| format!("下载安装包失败：{e}"))?;
     if !response.status().is_success() {
         return Err(format!("下载失败（HTTP {}）", response.status()));
+    }
+    // L-06: refuse absurdly large downloads instead of buffering them fully.
+    if let Some(len) = response.content_length() {
+        if len > MAX_UPDATE_BYTES {
+            return Err(format!(
+                "安装包体积异常（{len} 字节，上限 {MAX_UPDATE_BYTES}），已拒绝下载"
+            ));
+        }
     }
     let bytes = response
         .bytes()
@@ -339,27 +409,100 @@ pub fn download_and_install_blocking(
     })
 }
 
+/// **P1-04**：为一次下载创建全新的随机暂存目录。
+///
+/// 目录名带随机后缀且**必须新建成功**（`create_dir` 而非 `create_dir_all`：
+/// 已存在就失败，避免复用一个可能被别人预置过的目录）。
+fn make_staging_dir() -> std::io::Result<std::path::PathBuf> {
+    use rand::Rng;
+    let base = std::env::temp_dir();
+    // 最多重试若干次，避免随机后缀碰撞（碰撞概率极低，但不做重试就等于偶发失败）。
+    for _ in 0..8 {
+        let suffix: u64 = rand::thread_rng().gen();
+        let dir = base.join(format!("claude-switcher-update-{suffix:016x}"));
+        match std::fs::create_dir(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => return Err(error),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "无法创建唯一的下载暂存目录",
+    ))
+}
+
+/// L-06 (v0.7.1): validate untrusted update parameters before touching the network
+/// or building any filesystem path from them.
+///
+/// `version` and `sha256` come from the release feed; a crafted value such as
+/// `../../x` would otherwise flow straight into the download URL and file name.
+fn validate_update_params(version: &str, sha256: &str) -> Result<(), String> {
+    let v = version.trim();
+    if v.is_empty() || v.len() > 32 {
+        return Err("更新版本号为空或过长，已拒绝".to_string());
+    }
+    if !v
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == '.' || c == '-' || c.is_ascii_alphanumeric())
+        || v.contains("..")
+        || v.contains('/')
+        || v.contains('\\')
+    {
+        return Err(format!("更新版本号包含非法字符，已拒绝：{v}"));
+    }
+    let h = sha256.trim();
+    if h.len() != 64 || !h.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("更新校验值不是合法的 SHA-256（需 64 位十六进制），已拒绝".to_string());
+    }
+    Ok(())
+}
+
+/// Upper bound for a downloaded installer (200 MiB).
+const MAX_UPDATE_BYTES: u64 = 200 * 1024 * 1024;
+
 /// 下载 + 校验但不安装。
 pub fn download_and_verify_blocking(
     version: &str,
     sha256: &str,
 ) -> Result<UpdateInstallResult, String> {
+    validate_update_params(version, sha256)?;
     let asset_name = format!("ClaudeSwitcher_{version}_x64-setup.exe");
     let url = format!(
         "https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/download/v{version}/{asset_name}"
     );
-    let local_path = std::env::temp_dir().join(&asset_name);
+    // **P1-04**：写入**每次新建的随机暂存目录**，不再复用固定的
+    // `%TEMP%\<固定文件名>`。固定路径有两个真实风险：
+    // 1. 另一个进程可先在该路径放同名文件（本地提权的经典手法）；
+    // 2. 两次下载并发时会互相覆盖，校验和与文件内容可能不是同一份。
+    let staging = make_staging_dir().map_err(|error| format!("创建下载暂存目录失败：{error}"))?;
+    let local_path = staging.join(&asset_name);
 
-    let client = reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()
-        .map_err(|e| format!("初始化下载客户端失败：{e}"))?;
+    // **P1-10**：安装包下载走 `Standard` 策略：下载的是本项目的公开制品，
+    // 地址是固定的 GitHub Release，不含用户凭据；且断网/代理不可用时
+    // 下载本来就会失败，不会造成身份泄漏。策略仍显式声明，避免默认行为漂移。
+    let client = crate::network_policy::build_client(
+        &crate::network_policy::ClientSpec::new(
+            crate::network_policy::NetworkPolicy::Standard,
+            Duration::from_secs(600),
+        ),
+        None,
+    )
+    .map_err(|e| format!("初始化下载客户端失败：{e}"))?;
     let response = client
         .get(&url)
         .send()
         .map_err(|e| format!("下载安装包失败：{e}"))?;
     if !response.status().is_success() {
         return Err(format!("下载失败（HTTP {}）", response.status()));
+    }
+    // L-06: refuse absurdly large downloads instead of buffering them fully.
+    if let Some(len) = response.content_length() {
+        if len > MAX_UPDATE_BYTES {
+            return Err(format!(
+                "安装包体积异常（{len} 字节，上限 {MAX_UPDATE_BYTES}），已拒绝下载"
+            ));
+        }
     }
     let bytes = response
         .bytes()
@@ -594,6 +737,29 @@ mod tests {
         assert!(version_newer("0.1.1", "0.1.0"));
         assert!(!version_newer("0.1.0", "0.1.0"));
         assert!(!version_newer("0.0.9", "0.1.0"));
+    }
+
+    /// **P1-09**：历史四段版本（v0.6.13.1 时代发布过）必须仍能收到更新。
+    ///
+    /// 回归点：`semver` 拒绝四段号，旧实现会把它报成「版本号格式无效」，
+    /// 于是一台装着 0.6.13.1 的机器永远看不到任何新版本。
+    #[test]
+    fn legacy_four_segment_installed_version_still_sees_updates() {
+        let result = result_for_version("0.6.13.1", "0.7.2", RELEASE_URL).unwrap();
+        assert!(
+            result.has_update,
+            "四段旧版本必须能识别出 0.7.2 更新：{}",
+            result.message
+        );
+        assert!(result.message.contains("旧版四段版本号"));
+        // 四段号本身作为「发布版本」仍然非法：不能从 tag 推断更新。
+        assert!(result_for_version("0.7.1", "0.7.2.1", RELEASE_URL).is_err());
+        // 非数字四段不被当成旧版兼容。
+        assert!(parse_legacy_four_segment("0.6.13.beta").is_none());
+        assert_eq!(
+            parse_legacy_four_segment("0.6.13.1").map(|v| v.to_string()),
+            Some("0.6.13".to_string())
+        );
     }
 
     #[test]

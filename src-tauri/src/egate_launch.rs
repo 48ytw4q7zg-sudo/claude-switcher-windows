@@ -156,17 +156,83 @@ pub fn launch_claude() -> Result<String, String> {
         }
         return Ok(format!("已通过 MSIX 身份请求启动 Claude（{aumid}）"));
     }
-    // 回退：按 exe 名尝试启动（传统安装）。
-    let script = "\
-$ErrorActionPreference='Stop'\n\
-$p = Get-Process -Name Claude,claude -ErrorAction SilentlyContinue | Where-Object { $_.Path } | Select-Object -First 1\n\
-if ($p) { Start-Process $p.Path; exit 0 }\n\
-$candidates = @(\"$env:LOCALAPPDATA\\AnthropicClaude\\claude.exe\", \"$env:LOCALAPPDATA\\Programs\\Claude\\Claude.exe\")\n\
-foreach ($c in $candidates) { if (Test-Path $c) { Start-Process $c; exit 0 } }\n\
-exit 1";
+    // L-11 (v0.7.2): pick ONLY a confirmed desktop GUI executable.
+    //
+    // The old code took the first process named Claude/claude, which can be a
+    // Claude Code CLI running from an npm/node directory - launching that
+    // would start the wrong product.
+    //
+    // The marker lists mirror `platform::windows::is_managed_gui_path` exactly;
+    // a drift between the two makes "which process may be killed" and
+    // "which process may be launched" disagree about what the desktop app is.
+    //
+    // Note: this is a RAW Rust string, so backslashes are literal. Writing
+    // '\\node_modules\\' here would compare against double backslashes and
+    // never match - PowerShell single-quoted strings have no escape sequences.
+    //
+    // P0-NEW-01: no statement-level `exit` in the script; it would bypass the
+    // sentinel run_ps() uses to decide success.
+    let script = r#"$ErrorActionPreference = 'Stop'
+function Is-ManagedGui([string]$path) {
+  if (-not $path) { return $false }
+  $p = $path.ToLowerInvariant()
+  foreach ($m in @(
+      '\node_modules\',
+      '\npm\',
+      '\nvm\',
+      '\fnm\',
+      '\volta\',
+      '\.bun\',
+      '\.deno\'
+  )) {
+    if ($p.Contains($m)) { return $false }
+  }
+  foreach ($m in @(
+      '\anthropicclaude',
+      '\programs\claude',
+      '\program files\claude',
+      '\windowsapps',
+      '\programs\chatgpt',
+      '\program files\chatgpt',
+      '\antigravity'
+  )) {
+    if ($p.Contains($m)) { return $true }
+  }
+  return $false
+}
+$launched = $null
+foreach ($proc in @(Get-Process -Name Claude,claude -ErrorAction SilentlyContinue)) {
+  if ($proc.Path -and (Is-ManagedGui $proc.Path)) {
+    Start-Process $proc.Path
+    $launched = $proc.Path
+    break
+  }
+}
+if (-not $launched) {
+  $candidates = @(
+    (Join-Path $env:LOCALAPPDATA 'AnthropicClaude\claude.exe'),
+    (Join-Path $env:LOCALAPPDATA 'Programs\Claude\Claude.exe'),
+    (Join-Path $env:ProgramFiles 'Claude\Claude.exe')
+  )
+  foreach ($c in $candidates) {
+    if ((Test-Path $c) -and (Is-ManagedGui $c)) {
+      Start-Process $c
+      $launched = $c
+      break
+    }
+  }
+}
+if ($launched) { "launched=$launched" } else { "launched=" }"#;
     match crate::platform::imp::run_powershell(script) {
-        Ok(_) => Ok("已按程序路径启动 Claude".to_string()),
-        Err(_) => Err("找不到 Claude 的启动入口（既非 MSIX 也未在常见安装路径中找到）".to_string()),
+        Ok(out) if out.trim() != "launched=" => Ok(format!(
+            "已按程序路径启动 Claude（{}）",
+            out.trim().trim_start_matches("launched=")
+        )),
+        Ok(_) => Err(
+            "找不到已确认的 Claude Desktop 图形界面程序。为避免误启动 Claude Code CLI，             本次未执行启动；请手动打开 Claude Desktop 后重试"
+                .to_string(),
+        ),
+        Err(e) => Err(format!("启动 Claude 失败：{e}")),
     }
 }
 

@@ -190,6 +190,32 @@ fn run_egate_restore() -> i32 {
     for failure in &report.failures {
         eprintln!("{failure}");
     }
+    // **P0-NEW-01**：恢复不能只看「命令返回成功」。
+    // 真实事故现场是「BEFORE trip=1 cov=1 → AFTER 0/0/0，但退出码非 0」，
+    // 卸载钩子因此阻止了本来已经完成的卸载。反之也可能出现「退出码 0，
+    // 但规则还在」。所以这里**再直接查一次系统**，与报告交叉核对：
+    // 报告成功 + 系统仍有规则 → 依然失败（数据优先于自述）。
+    let residual =
+        crate::egate_trip::inspect_isolation_inventory().map(|inventory| inventory.total());
+    match residual {
+        Some(0) => {}
+        Some(remaining) => {
+            eprintln!("残留检查失败：本产品仍存在 {remaining} 条防火墙隔离规则");
+            return 1;
+        }
+        None => {
+            eprintln!("残留检查失败：无法查询防火墙规则状态，不能确认已完整恢复");
+            return 1;
+        }
+    }
+    if crate::egate_monitor::uncovered_lock_status().0 {
+        eprintln!("残留检查失败：兜底封锁意图文件仍存在");
+        return 1;
+    }
+    if let Err(error) = crate::egate_netcut::load_state() {
+        eprintln!("断网账本无法确认：{error}");
+        return 1;
+    }
     // **P0-02**：只有全部必要项完成（含停用意图）才返回成功。
     if report.complete {
         0

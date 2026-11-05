@@ -248,6 +248,7 @@ mod tests {
             trip_threshold: 2,
             access_trip: false,
             access_streak: 0,
+            tun_route_note: None,
         };
         assert!(trip_detail(&report).contains("Claude 出口"));
         assert!(

@@ -395,6 +395,8 @@ mod tests {
             server: Some("127.0.0.1:7890".to_string()),
             autoconfig: None,
             overrides: None,
+            complete: true,
+            error: None,
         };
         assert_eq!(proxy_port_from_evidence(&one), 7890);
         let pair = ProxyEvidence {
@@ -402,6 +404,8 @@ mod tests {
             server: Some("http=127.0.0.1:7891;https=127.0.0.1:7892".to_string()),
             autoconfig: None,
             overrides: None,
+            complete: true,
+            error: None,
         };
         assert_eq!(proxy_port_from_evidence(&pair), 7892, "https 段优先");
         let none = ProxyEvidence::default();

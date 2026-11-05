@@ -14,7 +14,8 @@ use serde::Serialize;
 
 use crate::egate::{EgateTarget, Evaluation, Overall, ProbeResult, Verdict};
 use crate::egate_access::{
-    plan_route, select_tun, verdict, AccessInfo, AccessPath, ProbeRoute, ProxyEvidence,
+    plan_route, plan_route_with_evidence, select_tun, verdict, AccessInfo, AccessPath, ProbeRoute,
+    ProxyEvidence,
 };
 
 /// 单个目标的一轮结果。
@@ -54,37 +55,103 @@ pub struct EgateReport {
     pub access_trip: bool,
     /// 接入路径连续未覆盖次数。
     pub access_streak: u32,
+    /// **P1-01**：TUN 路由证据的结论说明。
+    ///
+    /// `None` = 非 TUN 路径（不需要证据）。`Some` 时说明「为什么允许/不允许
+    /// 做直连探测」，让界面能区分「没探测因为没接入」与「没探测因为路由没证实」。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tun_route_note: Option<String>,
 }
 
 /// 从注册表读系统代理配置（`HKCU\...\Internet Settings`）。
 ///
-/// 读不到任何一项都按「未配置」处理，不因为读失败就误判为未接入。
+/// **P1-03**：原实现「读不到任何一项都按未配置处理」——键打不开时直接返回
+/// `default()`（`ProxyEnable = false`），于是「注册表读不了」与「代理确实关着」
+/// 得到同一个结论，判定层接着走「未接入 → 兜底封锁/熔断」。
+///
+/// 现在的分类：
+/// - 键**不存在** = 系统从未配置过代理 → 正常的 `ProxyEnable = 0`（`complete`）；
+/// - 键存在但被**拒绝访问** / 结构异常 / 值读取失败 → `complete = false`，
+///   判定层据此给出 `Unknown`，不产生任何保护副作用；
+/// - 可选值缺失（如从未设置 `ProxyServer`）仍按「未配置」处理，这是正常语义。
 pub fn read_proxy_evidence() -> ProxyEvidence {
-    use winreg::enums::HKEY_CURRENT_USER;
+    use std::io::ErrorKind;
+    use winreg::enums::{HKEY_CURRENT_USER, KEY_READ};
     use winreg::RegKey;
-    let key = RegKey::predef(HKEY_CURRENT_USER)
-        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings");
-    let Ok(key) = key else {
-        return ProxyEvidence::default();
+    let path = "Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings";
+    let key = match RegKey::predef(HKEY_CURRENT_USER).open_subkey_with_flags(path, KEY_READ) {
+        Ok(key) => key,
+        // 键不存在：这台机器没有任何代理配置，属于**确定的**「未启用」。
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            return ProxyEvidence {
+                complete: true,
+                ..ProxyEvidence::default()
+            }
+        }
+        // 拒绝访问 / 重定向异常 / 其它：无法确认，绝不臆造成「关闭」。
+        Err(error) => {
+            return ProxyEvidence::unreadable(format!("打开 Internet Settings 失败：{error}"))
+        }
     };
-    let string = |name: &str| -> Option<String> {
-        key.get_value::<String, _>(name)
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
+    // 可选字符串值：`NotFound` 是正常的「未设置」；其它错误说明注册表结构异常。
+    let mut problems: Vec<String> = Vec::new();
+    let mut read_string = |name: &str| -> Option<String> {
+        match key.get_value::<String, _>(name) {
+            Ok(value) => {
+                let trimmed = value.trim().to_string();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed)
+                }
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => {
+                problems.push(format!("读取 {name} 失败：{error}"));
+                None
+            }
+        }
     };
-    let enable = key.get_value::<u32, _>("ProxyEnable").unwrap_or(0) != 0;
-    ProxyEvidence {
-        enable,
-        server: string("ProxyServer"),
-        autoconfig: string("AutoConfigURL"),
-        overrides: string("ProxyOverride"),
+    let server = read_string("ProxyServer");
+    let autoconfig = read_string("AutoConfigURL");
+    let overrides = read_string("ProxyOverride");
+    // `ProxyEnable` 是 DWORD。缺失 = 从未开启过代理（正常）；类型不符/被拒 = 异常。
+    let enable = match key.get_value::<u32, _>("ProxyEnable") {
+        Ok(value) => value != 0,
+        Err(error) if error.kind() == ErrorKind::NotFound => false,
+        Err(error) => {
+            problems.push(format!("读取 ProxyEnable 失败：{error}"));
+            false
+        }
+    };
+    if problems.is_empty() {
+        ProxyEvidence {
+            enable,
+            server,
+            autoconfig,
+            overrides,
+            complete: true,
+            error: None,
+        }
+    } else {
+        ProxyEvidence {
+            enable,
+            server,
+            autoconfig,
+            overrides,
+            complete: false,
+            error: Some(problems.join("；")),
+        }
     }
 }
 
 /// 枚举 Up 状态的 TUN 网卡（复用平台层网卡枚举，返回 (描述, 友好名, Up)）。
-pub fn detect_tun_adapter() -> Option<String> {
-    let adapters = crate::platform::imp::list_adapters().ok()?;
+///
+/// **P1-03**：返回 `Result`——网卡枚举失败不能压成「没有 TUN」。
+/// 旧保镖曾用 `unwrap_or_default()`，一次查询失败就会被判「代理离线」并查杀。
+pub fn detect_tun_adapter_strict() -> Result<Option<String>, String> {
+    let adapters = crate::platform::imp::list_adapters()
+        .map_err(|error| format!("枚举网络适配器失败：{error}"))?;
     let candidates: Vec<(String, String, bool)> = adapters
         .iter()
         .map(|adapter| {
@@ -95,12 +162,36 @@ pub fn detect_tun_adapter() -> Option<String> {
             )
         })
         .collect();
-    select_tun(&candidates)
+    Ok(select_tun(&candidates))
+}
+
+/// 枚举 Up 状态的 TUN 网卡（宽松版：查询失败按「没有 TUN」）。
+///
+/// 只用于**纯粹展示**的调用点；任何会影响保护决策的路径必须用
+/// [`detect_tun_adapter_strict`]。当前没有调用点，保留是为了保证
+/// 「展示用宽松版」与「决策用严格版」的差异在代码里可见。
+#[allow(dead_code)]
+pub fn detect_tun_adapter() -> Option<String> {
+    detect_tun_adapter_strict().ok().flatten()
 }
 
 /// 判定当前接入方式（注册表 + TUN）。
+///
+/// **P1-03**：网卡枚举失败同样升级为 `Unknown`——「读不到网卡」与
+/// 「没有 TUN 网卡」不能得到同一个结论。
 pub fn current_access(hosts: &[String]) -> AccessPath {
-    verdict(&read_proxy_evidence(), detect_tun_adapter(), hosts)
+    let evidence = read_proxy_evidence();
+    let tun = match detect_tun_adapter_strict() {
+        Ok(tun) => tun,
+        // 注册表已经读失败时，原因以注册表为准（更贴近用户可操作的问题）。
+        Err(error) if evidence.read_error().is_none() => {
+            return AccessPath::Unknown {
+                reason: format!("{error}，无法确认是否存在 TUN 接入"),
+            }
+        }
+        Err(_) => None,
+    };
+    verdict(&evidence, tun, hosts)
 }
 
 /// 被监控目标实际会访问的主机名（用于绕过列表风险判定）。
@@ -114,6 +205,61 @@ pub fn monitored_hosts(targets: &[EgateTarget]) -> Vec<String> {
         }
     }
     out
+}
+
+/// **P1-01**：为 TUN 路线采集路由证据。
+///
+/// 返回 `None` 表示「无法采集」——调用方必须保持 `Skip`（Unverified），
+/// 绝不能退化成「大概走了 TUN」。
+///
+/// 探测地址取自被监控目标的锚点主机：只有真正要访问的地址才值得看路由，
+/// 拿一个无关地址证明「TUN 接管了默认路由」并不成立。
+/// IPv4/IPv6 两条路径分别取证，任一条可能被旁路都要看。
+fn collect_tun_route_evidence(
+    adapter: &str,
+    targets: &[EgateTarget],
+) -> Option<crate::egate_access::RouteEvidence> {
+    // TUN 网卡的 ifIndex 从适配器列表里按名字/描述匹配。
+    let adapters = crate::platform::imp::list_adapters().ok()?;
+    let tun_index = adapters
+        .iter()
+        .find(|a| {
+            a.status.eq_ignore_ascii_case("Up")
+                && (a.name.eq_ignore_ascii_case(adapter)
+                    || a.description.eq_ignore_ascii_case(adapter))
+        })
+        .map(|a| a.if_index)?;
+    // 用目标的真实主机名解析出的地址作为取证对象；全部解析失败就不取证。
+    let host = targets
+        .iter()
+        .filter(|t| t.enabled)
+        .find_map(|t| crate::egate_access::host_of(&t.anchor_url))?;
+    let (ipv4, ipv6) = resolve_host_addresses(&host)?;
+    Some(crate::platform::imp::collect_route_evidence(
+        tun_index, &ipv4, &ipv6,
+    ))
+}
+
+/// 解析主机名得到 (IPv4, IPv6) 字面量。
+///
+/// 只做一次 DNS（系统解析器，与应用的解析路径一致）。任一簇缺失时用
+/// 回环占位不行——那会让 `Find-NetRoute` 查到假结果。因此要求 IPv4 必须存在；
+/// IPv6 缺失时用一个明确的「本机 IPv6 不存在」判定（由平台层读取绑定状态）。
+fn resolve_host_addresses(host: &str) -> Option<(String, String)> {
+    use std::net::ToSocketAddrs;
+    let addrs = (host, 443u16).to_socket_addrs().ok()?;
+    let mut ipv4 = None;
+    let mut ipv6 = None;
+    for addr in addrs {
+        match addr.ip() {
+            std::net::IpAddr::V4(v4) if ipv4.is_none() => ipv4 = Some(v4.to_string()),
+            std::net::IpAddr::V6(v6) if ipv6.is_none() => ipv6 = Some(v6.to_string()),
+            _ => {}
+        }
+    }
+    // IPv6 缺失时给一个文档地址段的占位：`Find-NetRoute` 对它的结果只用于
+    // 判断「是否经 TUN」，不会真的发包；平台层还会叠加「IPv6 是否启用」。
+    Some((ipv4?, ipv6.unwrap_or_else(|| "2001:db8::1".to_string())))
 }
 
 /// 跑一轮检查：先判接入，再按路由决定是否探测，最后逐目标判定并汇总。
@@ -131,7 +277,36 @@ pub fn run_round(
 
     // 未接入 / 无法确认：按 enforce 开关决定是否跳过探测。
     let skip = enforce_access_path && !access.is_known();
-    let route = plan_route(&access);
+    // **P1-01**：TUN 路线只有在拿到**路由证据**时才允许直连探测。
+    // 证据只看「接入是 TUN」时才采集：其它路径要么走代理，要么根本不探测。
+    let (route, tun_route_note) = match &access {
+        AccessPath::Tun { adapter } => match collect_tun_route_evidence(adapter, targets) {
+            Some(evidence) => {
+                let plan = plan_route_with_evidence(&access, Some(&evidence));
+                let note = if evidence.proves_tun_path() {
+                    format!(
+                        "TUN 路由已证实（IPv4 出接口与默认路由均经 {}），本轮允许直连探测",
+                        adapter.trim()
+                    )
+                } else {
+                    format!(
+                        "TUN 路由未获证实：{}；本轮不发起直连探测（出口未验证）",
+                        evidence.unverified_reason()
+                    )
+                };
+                (plan, Some(note))
+            }
+            // 采不到证据（找不到 TUN 网卡 / 无可用探测地址）：保持 Skip。
+            None => (
+                plan_route(&access),
+                Some(
+                    "TUN 路由证据采集失败（找不到 TUN 网卡或无法解析目标地址），本轮不发起直连探测"
+                        .to_string(),
+                ),
+            ),
+        },
+        _ => (plan_route(&access), None),
+    };
     // **P0 降级修复**：`probed` 必须反映**最终实际执行**的探测，而不是只看
     // `skip` 变量。原实现只按 `enforce && !is_known()` 计算，因此：
     // - `enforce=false` + TUN → `skip=false`，但 `plan_route(Tun)=Skip`，
@@ -236,6 +411,7 @@ pub fn run_round(
         trip_threshold: threshold,
         access_trip,
         access_streak,
+        tun_route_note,
     }
 }
 

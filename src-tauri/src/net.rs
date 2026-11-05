@@ -204,12 +204,23 @@ fn http_client(
     timeout_secs: u64,
     no_proxy_when_local: bool,
 ) -> Result<reqwest::blocking::Client, String> {
+    // **P1-10**：本机控制器请求统一走 `Loopback` 策略（= 强制 no_proxy），
+    // 需要走代理的调用点归入 `Standard`。策略由 `network_policy` 单点解释，
+    // 这样「哪些请求允许直连 / 允许跟随系统代理」不再散落在各个 builder 里。
+    let policy = if no_proxy_when_local {
+        crate::network_policy::NetworkPolicy::Loopback
+    } else {
+        crate::network_policy::NetworkPolicy::Standard
+    };
+    let spec = crate::network_policy::ClientSpec::new(policy, Duration::from_secs(timeout_secs));
     let mut builder = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .connect_timeout(Duration::from_secs(3))
         .user_agent("claude-code/2.1.0");
+    // 策略合法性在这里单点判定（两种策略都不需要代理参数）。
+    crate::network_policy::validate(&spec)?;
     if no_proxy_when_local {
-        // 整个 client 不走代理（本机服务专用）。
+        // 整个 client 不走代理（本机服务专用），且不跟随重定向。
         builder = builder
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none());

@@ -37,8 +37,26 @@ pub struct QuarantineReport {
     pub killed: Vec<String>,
     /// 回查是否成功；`false` 时不得宣称隔离已生效。
     pub verified: bool,
+    /// **P2-04**：受管应用的安装状态。
+    ///
+    /// 界面据此区分「没装这个应用（不适用）」「查不出安装状态（保护未知）」
+    /// 与「装了但隔离失败」。三者对「是否已完整保护」的结论完全不同。
+    pub installation: ApplicationInstallation,
     /// 给人看的说明（含失败原因）。
     pub note: String,
+}
+
+/// **P2-04**：受管应用的安装状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApplicationInstallation {
+    /// 已确认安装（默认值，覆盖「显式传入了路径」的测试/预览场景）。
+    #[default]
+    Installed,
+    /// 已确认未安装：对该应用而言「不适用」，不算保护缺口。
+    NotInstalled,
+    /// 无法确认安装状态：不能当作「已完整保护」。
+    Unknown,
 }
 
 /// 一次熔断的完整结果。
@@ -206,8 +224,37 @@ pub struct ExeCandidate {
 /// 返回 **规整化后的去重列表**。调用方对每个路径都要建立规则，
 /// `rules_expected` 也随之按路径数放大。
 pub fn resolve_agent_exe_candidates(agent: &str) -> Vec<ExeCandidate> {
+    match resolve_agent_installation(agent) {
+        InstallationLookup::Installed(candidates) => candidates,
+        // 未安装 / 无法确认都返回空列表：调用方对这两种情况的**处置不同**
+        // （见 `quarantine_agent_for`），不能用同一个空 Vec 混过去。
+        InstallationLookup::NotInstalled | InstallationLookup::Unknown(_) => Vec::new(),
+    }
+}
+
+/// **P2-04**：受管应用的安装状态三态。
+///
+/// 原实现把「确认没装」与「查询失败」都变成空 `Vec`，于是界面只能显示
+/// 「无法建立隔离」——用户分不清是自己没装这个应用（正常），
+/// 还是保护能力出了问题（异常）。两者对「是否已完整保护」的结论完全不同。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstallationLookup {
+    /// 已确认安装，附带全部可执行文件路径。
+    Installed(Vec<ExeCandidate>),
+    /// 已确认未安装（查询成功，三个来源都没有）。
+    NotInstalled,
+    /// 无法确认（查询失败/输出异常）。
+    Unknown(String),
+}
+
+/// 查询受管应用的安装状态（三态）。
+///
+/// 与 [`resolve_agent_exe_candidates`] 用同一份脚本：区别只在于
+/// **把「查询失败」与「查询成功但为空」区分开**。
+pub fn resolve_agent_installation(agent: &str) -> InstallationLookup {
     let Some((_, exe_names)) = agent_spec(agent) else {
-        return Vec::new();
+        // 未知 agent id 是调用方的配置错误，不是「未安装」。
+        return InstallationLookup::Unknown(format!("未知的受管应用标识：{agent}"));
     };
     let names = exe_names
         .iter()
@@ -278,10 +325,20 @@ pub fn resolve_agent_exe_candidates(agent: &str) -> Vec<ExeCandidate> {
         names = names,
         exe_files = exe_files
     );
-    let Ok(json) = crate::platform::imp::run_powershell(&script) else {
-        return Vec::new();
+    // **P2-04**：查询失败不能等同于「未安装」。原实现 `let Ok(..) else { Vec::new() }`
+    // 把 PowerShell 失败、超时、输出异常全压成空列表，界面于是显示
+    // 「无法建立隔离」——与「用户根本没装这个应用」完全无法区分。
+    let json = match crate::platform::imp::run_powershell(&script) {
+        Ok(json) => json,
+        Err(error) => return InstallationLookup::Unknown(format!("查询安装状态失败：{error}")),
     };
-    parse_exe_candidates(&json)
+    let candidates = parse_exe_candidates(&json);
+    if candidates.is_empty() {
+        // 查询成功且三个来源都没有 → 明确「未安装」。
+        InstallationLookup::NotInstalled
+    } else {
+        InstallationLookup::Installed(candidates)
+    }
 }
 
 /// 解析候选路径 JSON（数组 / 单对象 / 空），并做规整化去重。
@@ -654,6 +711,7 @@ pub fn quarantine_agent_for(
         failed_rules: Vec::new(),
         killed: Vec::new(),
         verified: false,
+        installation: ApplicationInstallation::Installed,
         note: String::new(),
     };
     if !is_guarded_agent(agent) {
@@ -663,11 +721,65 @@ pub fn quarantine_agent_for(
 
     // 1. **先解析路径**：必须在进程还活着时取（结束后 Get-Process 拿不到）。
     let exes: Vec<String> = match exe_path {
+        // 显式传入的路径由调用方负责身份（测试/预览场景）。
         Some(explicit) => vec![explicit.to_string()],
-        None => resolve_agent_exe_candidates(agent)
-            .into_iter()
-            .map(|candidate| candidate.path)
-            .collect(),
+        None => {
+            // **P2-04**：三态。确认未安装与查询失败必须分开报告，否则用户
+            // 无法判断「没装这个应用（正常）」还是「保护能力失效（异常）」。
+            let candidates: Vec<String> = match resolve_agent_installation(agent) {
+                InstallationLookup::Installed(candidates) => {
+                    candidates.into_iter().map(|c| c.path).collect()
+                }
+                InstallationLookup::NotInstalled => {
+                    report.installation = ApplicationInstallation::NotInstalled;
+                    if kill {
+                        match kill_agent_processes(agent) {
+                            Ok(killed) => report.killed = killed,
+                            Err(error) => {
+                                report.note.push_str(&format!("结束进程失败（{error}）；"))
+                            }
+                        }
+                    }
+                    report.note.push_str(
+                        "未检测到该应用的安装记录（已确认未安装），无需隔离；这不是保护失败",
+                    );
+                    return report;
+                }
+                InstallationLookup::Unknown(error) => {
+                    report.installation = ApplicationInstallation::Unknown;
+                    if kill {
+                        match kill_agent_processes(agent) {
+                            Ok(killed) => report.killed = killed,
+                            Err(kill_error) => report
+                                .note
+                                .push_str(&format!("结束进程失败（{kill_error}）；")),
+                        }
+                    }
+                    report.note.push_str(&format!(
+                        "无法确认该应用的安装状态（{error}），不能宣称已保护；请重试或人工核对"
+                    ));
+                    return report;
+                }
+            };
+            // **P1-06（v0.7.1）**：只保留确认属于**受管 GUI** 的路径。
+            // 原实现把进程名匹配到的一切都收进来，原生 CLI 会被写成
+            // GUI 隔离规则——查杀端早就按 GUI 身份过滤，两端标准必须一致。
+            let gui = crate::platform::imp::filter_managed_gui_paths(candidates.clone());
+            if gui.is_empty() {
+                // 一个都不能确认属于 GUI：宁可不建规则，也不误伤 CLI。
+                candidates
+                    .into_iter()
+                    .filter(|path| {
+                        // 保留传统安装路径（无明确 CLI 特征且带程序目录）作为兜底，
+                        // 但显式排除 CLI 宿主路径。
+                        !path.to_ascii_lowercase().contains("\node_modules\\")
+                            && !path.to_ascii_lowercase().contains("\npm\\")
+                    })
+                    .collect()
+            } else {
+                gui
+            }
+        }
     };
     if exes.is_empty() {
         // 没有路径：仍然结束进程（至少阻止当前实例），但必须说明隔离未完成。
@@ -698,16 +810,33 @@ pub fn quarantine_agent_for(
     // **P0-01**：规则名来自 [`expected_rules`]——与核验使用的是**同一份**清单。
     // 任何一方自行拼接名称都会让新建的规则永远核验不到。
     for rule in expected_rules_for(reason, agent, &exes, outbound_only) {
+        // **P0-NEW-01**：创建路径上的 `SilentlyContinue` 会把「权限不足
+        // （未以管理员运行）」吞成一次「成功」，随后回查才发现不完整，
+        // 用户看到的是含糊的「覆盖不完整」。这里全部改 `Stop`，
+        // 让错误消息直接带出真正原因（拒绝访问）。
         let script = format!(
-            "$ErrorActionPreference='Stop'\n\
-             $existing = Get-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue\n\
-             if (-not $existing) {{\n\
-               New-NetFirewallRule -DisplayName {} -Direction {} -Action Block -Program {} -Enabled True | Out-Null\n\
-             }}",
-            ps_quote(&rule.name),
-            ps_quote(&rule.name),
-            rule.direction,
-            ps_quote(&rule.exe)
+            "$ProgressPreference='SilentlyContinue'
+$ErrorActionPreference='Stop'
+# 无语句级 exit/return：两者都会跳过执行结果哨兵。
+$name = {name}
+$wantDirection = {direction}
+$wantProgram = {program}
+$existing = @(Get-NetFirewallRule -DisplayName $name -ErrorAction SilentlyContinue)
+$healthy = $false
+foreach ($r in $existing) {{
+  $f = $r | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+  if ($r.Enabled -eq 'True' -and $r.Action -eq 'Block' -and
+      $r.Direction -eq $wantDirection -and $f.Program -and $f.Program -ieq $wantProgram) {{
+    $healthy = $true
+  }}
+}}
+if (-not $healthy) {{
+  if ($existing.Count -gt 0) {{ $existing | Remove-NetFirewallRule -ErrorAction Stop }}
+  New-NetFirewallRule -DisplayName $name -Direction $wantDirection -Action Block -Program $wantProgram -Enabled True -ErrorAction Stop | Out-Null
+}}",
+            name = ps_quote(&rule.name),
+            direction = rule.direction,
+            program = ps_quote(&rule.exe)
         );
         match crate::platform::imp::run_powershell(&script) {
             Ok(_) => report.rules_added += 1,
@@ -783,9 +912,43 @@ pub fn quarantine_agent_for(
 /// **P0-04**：是否允许此刻新增隔离副作用（普通熔断与兜底封锁共用）。
 ///
 /// 必须**在持有系统操作锁之后**调用：锁前读到的意图可能已经过期。
+///
+/// 这里检查的是「此刻的事实」而不是「调用方几秒前的判断」。P0-04 要求
+/// `egate_revision` 贯穿**所有副作用**——光在探测结束时比一次代次不够：
+/// 等待系统操作锁期间、以及每个应用建立规则之前，配置都可能已经变了。
 pub fn can_apply_isolation_now() -> bool {
-    crate::egate_monitor::protection_intent() == crate::egate_monitor::ProtectionIntent::Armed
-        && !crate::egate_monitor::is_paused()
+    can_apply_isolation_with_revision(None)
+}
+
+/// 带上「发起本次操作的配置代次」的版本。
+///
+/// `expected_revision = Some(r)` 时额外要求当前配置代次仍等于 `r`：
+/// 用户在探测之后、真正动手之前改了目标/阈值/开关，旧判定就必须作废。
+/// `None` 表示调用方没有代次信息（例如手动熔断按钮），只检查当前事实。
+pub fn can_apply_isolation_with_revision(expected_revision: Option<u64>) -> bool {
+    if crate::egate_monitor::protection_intent() != crate::egate_monitor::ProtectionIntent::Armed {
+        return false;
+    }
+    if crate::egate_monitor::is_paused() {
+        return false;
+    }
+    // **P0-04（v0.7.1）**：取锁后再确认门禁**当前**仍是开启的。
+    // 探测可能耗时数秒，期间用户可能把 egate_enabled 关掉——
+    // 此时旧判定不应再结束进程或写入规则。
+    match crate::appconfig::load_checked() {
+        crate::appconfig::ConfigLoad::Ok(config) => {
+            if !config.egate_enabled {
+                return false;
+            }
+            match expected_revision {
+                // 代次不一致 = 配置在决策之后被改过，旧判定作废。
+                Some(expected) => config.egate_revision == expected,
+                None => true,
+            }
+        }
+        // 配置损坏/首次安装：不据此施加新的隔离副作用。
+        _ => false,
+    }
 }
 
 /// **P0-C**：未接入兜底封锁——只建出站隔离，**不结束进程**。
@@ -858,6 +1021,15 @@ pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
 ///
 /// 与上游一致：**只处理 GUI 应用**；CLI 宿主不在守护列表里，避免误伤终端。
 pub fn trip(guarded_agents: &[String]) -> TripReport {
+    trip_with_revision(guarded_agents, None)
+}
+
+/// **P0-04**：带配置代次的熔断入口。
+///
+/// 监控线程在探测开始时就记下 `egate_revision`，真正动手前（已持锁）用
+/// [`can_apply_isolation_with_revision`] 比对。代次不一致说明用户在探测之后
+/// 改过目标/阈值/开关，这一轮的结论已经不作数——绝不按旧判定杀进程。
+pub fn trip_with_revision(guarded_agents: &[String], expected_revision: Option<u64>) -> TripReport {
     // 没有守护对象时不申请系统操作锁：无事可做的调用不该因为锁不可用而报错。
     if guarded_agents.is_empty() {
         return TripReport {
@@ -885,18 +1057,24 @@ pub fn trip(guarded_agents: &[String]) -> TripReport {
     // **P0-06**：拿到锁后重新核验保护意图——等待锁期间用户可能刚执行了
     // 紧急恢复（Disarmed），或状态文件损坏（Unknown）。此时旧的「该熔断」决策
     // 已过期，绝不能继续施加隔离。
-    if !can_apply_isolation_now() {
+    // **P0-04**：同时比对配置代次（用户可能改了目标/阈值/开关）。
+    if !can_apply_isolation_with_revision(expected_revision) {
         return TripReport {
             agents: Vec::new(),
             any_isolated: false,
             all_isolated: false,
             failures: Vec::new(),
-            note: "保护已暂停或已停止（用户意图在操作期间改变），未执行熔断".to_string(),
+            note: "保护已暂停、已停止或配置已变更（判定在操作期间过期），未执行熔断".to_string(),
         };
     }
     let mut agents = Vec::new();
     let mut failures = Vec::new();
     for id in guarded_agents {
+        // **P0-04**：每个应用动手前再看一次——前一个应用建立规则可能耗时数秒。
+        if !can_apply_isolation_with_revision(expected_revision) {
+            failures.push("配置在熔断过程中变更，剩余应用未处理".to_string());
+            break;
+        }
         let report = quarantine_agent(id, None);
         if !report.verified {
             failures.push(format!("{}：{}", report.agent, report.note.trim()));
@@ -929,7 +1107,13 @@ pub fn trip(guarded_agents: &[String]) -> TripReport {
 /// 因此只删除**匹配旧应用隔离格式**的规则（名字里含具体 agent 名），
 /// 绝不按 `ClaudeSwitcher Egate*` 通配删除。
 pub fn cleanup_legacy_rules() -> Result<u32, String> {
-    // 明确列出旧版应用隔离的规则名（只含内置 agent），不碰 Cut All。
+    // **回归修复（v0.7.2）**：这里曾被改成按 `ClaudeSwitcher Egate *` 通配删除。
+    // 那个前缀**同时覆盖全局断网规则** `ClaudeSwitcher Egate Cut All`，于是
+    // 「解除应用隔离」会顺手把用户的全局断网一起删掉，而 `restore_all()`
+    // 的账本仍写着「断网中」——恢复器随后又去核验一条已不存在的规则。
+    //
+    // 现在按**精确名称 + 精确谓词**删除：只处理旧版内置 agent 的两种方向，
+    // 额外的 `Where-Object` 再挡一层，未来新增的规则名不会被误删。
     let legacy_names: Vec<String> = ["claude", "chatgpt", "antigravity"]
         .iter()
         .flat_map(|agent| {
@@ -945,13 +1129,20 @@ pub fn cleanup_legacy_rules() -> Result<u32, String> {
         .collect::<Vec<_>>()
         .join(",");
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'
-         $removed = 0
-         foreach ($n in @({list})) {{
-           $r = Get-NetFirewallRule -DisplayName $n -ErrorAction SilentlyContinue
-           if ($r) {{ $r | Remove-NetFirewallRule -ErrorAction SilentlyContinue; $removed++ }}
-         }}
-         ConvertTo-Json @{{ removed = $removed }} -Compress"
+        "$ProgressPreference='SilentlyContinue'
+$ErrorActionPreference='Stop'
+# 无语句级 exit/return：两者都会跳过执行结果哨兵。
+$removed = 0
+foreach ($n in @({list})) {{
+  $pattern = [WildcardPattern]::Escape($n)
+  $rules = @(Get-NetFirewallRule -DisplayName ($pattern + '*') -ErrorAction Stop |
+             Where-Object {{ $_.DisplayName -eq $n }})
+  if ($rules.Count -gt 0) {{
+    $rules | Remove-NetFirewallRule -ErrorAction Stop
+    $removed += $rules.Count
+  }}
+}}
+ConvertTo-Json @{{ removed = $removed }} -Compress"
     );
     let json = crate::platform::imp::run_powershell(&script)
         .map_err(|e| format!("清理旧规则失败：{e}"))?;
@@ -984,24 +1175,26 @@ pub struct ReleaseReport {
 /// 查询失败或无法解析一律不删（宁可留残留，也不误删正在生效的规则）。
 pub fn prune_stale_rule_targets() -> Result<u32, String> {
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'
-         $rules = @(Get-NetFirewallRule -DisplayName {}* )
-         $removed = 0
-         foreach ($r in $rules) {{
-           $f = $r | Get-NetFirewallApplicationFilter
-           $p = $f.Program
-           # 只有明确设置了程序路径、且该路径确实不存在的规则才算失效。
-           # `Any` / 空 / 通配（全局阻断规则）绝不在这里处理。
-           if (-not $p) {{ continue }}
-           if ($p -eq 'Any') {{ continue }}
-           if ($p -like '*\\*') {{
-             if (-not (Test-Path -LiteralPath $p)) {{
-               $r | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-               $removed++
-             }}
-           }}
-         }}
-         ConvertTo-Json @{{ removed = $removed }} -Compress",
+        "$ProgressPreference='SilentlyContinue'
+$ErrorActionPreference='Stop'
+# 无语句级 exit/return：两者都会跳过执行结果哨兵。
+$rules = @(Get-NetFirewallRule -DisplayName ({} + '*') -ErrorAction Stop)
+$removed = 0
+foreach ($r in $rules) {{
+  $f = $r | Get-NetFirewallApplicationFilter -ErrorAction Stop
+  $p = $f.Program
+  # 只有明确设置了程序路径、且该路径确实不存在的规则才算失效。
+  # `Any` / 空 / 通配（全局阻断规则）绝不在这里处理。
+  if (-not $p) {{ continue }}
+  if ($p -eq 'Any') {{ continue }}
+  if ($p -like '*\\*') {{
+    if (-not (Test-Path -LiteralPath $p)) {{
+      $r | Remove-NetFirewallRule -ErrorAction Stop
+      $removed++
+    }}
+  }}
+}}
+ConvertTo-Json @{{ removed = $removed }} -Compress",
         ps_quote(RULE_PREFIX)
     );
     let json = crate::platform::imp::run_powershell(&script)
@@ -1018,6 +1211,16 @@ pub fn prune_stale_rule_targets() -> Result<u32, String> {
 pub fn verify_current_isolation(guarded_agents: &[String]) -> Option<bool> {
     if guarded_agents.is_empty() {
         return Some(true);
+    }
+    // **P0-03（v0.7.1）**：规则存在 ≠ 阻断生效。当前活动网络的防火墙
+    // 配置若被关闭，规则一条不少也不会拦任何流量。
+    // 这里与创建规则时的 `quarantine_agent_for()` 保持一致：必须同时成立。
+    match crate::platform::imp::effective_firewall_enabled() {
+        Some(true) => {}
+        // 明确关闭：覆盖不完整（返回 Some(false) 让调用方降级）。
+        Some(false) => return Some(false),
+        // 读不出来：无法确认。
+        None => return None,
     }
     let mut all_ok = true;
     for agent in guarded_agents {
@@ -1099,49 +1302,115 @@ fn release_isolation_reason_locked(
     _guard: &crate::egate_lock::OperationGuard,
     reason: IsolationReason,
 ) -> Result<ReleaseReport, String> {
+    use crate::platform::imp::RuleLookup;
     let prefix = reason.prefix();
+    // **P0-02**：先严格确认「到底有没有」，查询失败就不动、不报成功。
+    match crate::platform::imp::firewall_rules_exist(prefix) {
+        RuleLookup::Absent => {
+            return Ok(ReleaseReport {
+                requested: 0,
+                remaining: 0,
+                verified: true,
+                failures: Vec::new(),
+            })
+        }
+        RuleLookup::Unknown => {
+            return Err(format!(
+                "{} 规则状态无法确认（权限/服务/RPC 异常），未执行删除",
+                reason.label()
+            ))
+        }
+        RuleLookup::Present => {}
+    }
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'
-         $rules = @(Get-NetFirewallRule -DisplayName {}* )
-         $n = $rules.Count
-         $rules | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-         ConvertTo-Json @{{ removed = $n }} -Compress",
+        "$ProgressPreference='SilentlyContinue'
+$ErrorActionPreference='Stop'
+# 无语句级 exit/return：两者都会跳过执行结果哨兵。
+$rules = @(Get-NetFirewallRule -DisplayName ({} + '*') -ErrorAction Stop)
+$n = $rules.Count
+if ($n -gt 0) {{ $rules | Remove-NetFirewallRule -ErrorAction Stop }}
+ConvertTo-Json @{{ removed = $n }} -Compress",
         ps_quote(prefix)
     );
-    let json = crate::platform::imp::run_powershell(&script)?;
-    let value: serde_json::Value =
-        serde_json::from_str(json.trim()).map_err(|e| format!("清理结果解析失败：{e}"))?;
-    let requested = value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
-    // 回查：只统计**本来源**前缀下还剩多少条。
-    let remaining = count_rules_with_prefix(prefix);
-    match remaining {
-        Some(0) => Ok(ReleaseReport {
-            requested,
-            remaining: 0,
-            verified: true,
-            failures: Vec::new(),
-        }),
-        Some(remaining) => Ok(ReleaseReport {
-            requested,
-            remaining,
-            verified: false,
-            failures: vec![format!("{} 仍有 {remaining} 条规则残留", reason.label())],
-        }),
-        None => Ok(ReleaseReport {
-            requested,
-            remaining: 0,
-            verified: false,
-            failures: vec!["删除后无法查询规则状态，无法确认已清理".to_string()],
-        }),
+    // **P0-NEW-01**：删除失败要暴露，不能被吞成「删除 0 条」。
+    let mut remove_failures = Vec::new();
+    let requested = match crate::platform::imp::run_powershell(&script) {
+        Ok(json) => match serde_json::from_str::<serde_json::Value>(json.trim()) {
+            Ok(value) => value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            Err(e) => {
+                remove_failures.push(format!("{} 清理结果解析失败：{e}", reason.label()));
+                0
+            }
+        },
+        Err(e) => {
+            remove_failures.push(format!("{} 删除失败：{e}", reason.label()));
+            0
+        }
+    };
+    // 回查：**Unknown 绝不等于已清理**。
+    let present = crate::platform::imp::firewall_rules_exist(prefix);
+    let counted = count_rules_with_prefix(prefix);
+    match (present, counted) {
+        (RuleLookup::Absent, Some(0)) | (RuleLookup::Absent, None) => {
+            // 严格查询明确说不存在；计数失败也不推翻这个结论。
+            Ok(ReleaseReport {
+                requested,
+                remaining: 0,
+                verified: remove_failures.is_empty(),
+                failures: remove_failures,
+            })
+        }
+        (RuleLookup::Unknown, _) | (_, None) => {
+            let mut failures = remove_failures;
+            failures.push("删除后无法查询规则状态，无法确认已清理".to_string());
+            Ok(ReleaseReport {
+                requested,
+                remaining: 0,
+                verified: false,
+                failures,
+            })
+        }
+        (_, Some(remaining)) => {
+            let mut failures = remove_failures;
+            failures.push(format!(
+                "{} 仍有 {remaining} 条规则残留（可能被组策略或其他程序持有）",
+                reason.label()
+            ));
+            Ok(ReleaseReport {
+                requested,
+                remaining,
+                verified: false,
+                failures,
+            })
+        }
     }
+}
+
+/// 统计旧版遗留规则（`ClaudeSwitcher Egate * Out/In`），查询失败返回 `None`。
+fn count_legacy_rules() -> Option<u32> {
+    // 旧版遗留名必须以 ` … Out` / ` … In` 结尾；全局断网 `… Cut All` 不在此列，
+    // 因此这里不会把断网规则算成「应用隔离残留」。
+    let script = "$ErrorActionPreference='Stop'
+$n = @(Get-NetFirewallRule -DisplayName 'ClaudeSwitcher Egate * Out' -ErrorAction Stop).Count
+$n += @(Get-NetFirewallRule -DisplayName 'ClaudeSwitcher Egate * In' -ErrorAction Stop).Count
+ConvertTo-Json @{ total = $n } -Compress";
+    let json = crate::platform::imp::run_powershell(script).ok()?;
+    let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    value
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
 }
 
 /// 统计指定前缀下的规则数（查询失败返回 `None`）。
 fn count_rules_with_prefix(prefix: &str) -> Option<u32> {
+    // **P0-02**：必须用 `-ErrorAction Stop`。`SilentlyContinue` 会把权限不足
+    // /RPC 失败吞成空集，计数 0 与「确实没有规则」无法区分；这里失败就
+    // 返回 `None`，调用方据此报「无法确认」而不是「已清干净」。
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'
-         $n = @(Get-NetFirewallRule -DisplayName {}* -ErrorAction SilentlyContinue).Count
-         ConvertTo-Json @{{ total = $n }} -Compress",
+        "$ErrorActionPreference='Stop'
+$n = @(Get-NetFirewallRule -DisplayName ({} + '*') -ErrorAction Stop).Count
+ConvertTo-Json @{{ total = $n }} -Compress",
         ps_quote(prefix)
     );
     let json = crate::platform::imp::run_powershell(&script).ok()?;
@@ -1159,21 +1428,36 @@ pub(crate) fn release_all_verified_locked(
     // 该入口用于已经持锁的紧急恢复（Emergency），不再检查手动保持。
     //
     // **P0-01（v0.6.13.1）**：必须清理**两个**现行命名空间 + 旧版遗留。
-    // 原实现只按 `ClaudeSwitcher AppIsolation` 删除，于是「未接入兜底封锁」
-    // 的规则在紧急恢复后仍留在防火墙里——界面报告「已全部解除」，实际还在拦。
+    // **P0-02（v0.7.1）**：每个前缀都要先用严格查询确认「有没有」，
+    // 查询失败按 Unknown 处理并让最终 verified=false，绝不当成已清理。
     let legacy = cleanup_legacy_rules().unwrap_or(0);
     let mut requested = legacy;
     let mut remove_failures: Vec<String> = Vec::new();
+    let mut unknown = false;
     for prefix in [
         IsolationReason::EgressTrip.prefix(),
         IsolationReason::Uncovered.prefix(),
     ] {
+        match crate::platform::imp::firewall_rules_exist(prefix) {
+            crate::platform::imp::RuleLookup::Absent => continue,
+            crate::platform::imp::RuleLookup::Unknown => {
+                unknown = true;
+                remove_failures.push(format!("{prefix} 规则状态无法确认"));
+                continue;
+            }
+            crate::platform::imp::RuleLookup::Present => {}
+        }
+        // **P0-NEW-01**：删除必须 `-ErrorAction Stop`。`SilentlyContinue` 会把
+        // 权限不足/组策略持有这类失败吞掉，脚本仍然输出「removed = N」，
+        // 调用方据此以为删成功——正是「报告成功但规则还在」的来源。
         let script = format!(
-            "$ErrorActionPreference='SilentlyContinue'
-             $rules = @(Get-NetFirewallRule -DisplayName {}* )
-             $n = $rules.Count
-             $rules | Remove-NetFirewallRule -ErrorAction SilentlyContinue
-             ConvertTo-Json @{{ removed = $n }} -Compress",
+            "$ProgressPreference='SilentlyContinue'
+$ErrorActionPreference='Stop'
+# 无语句级 exit/return：两者都会跳过执行结果哨兵。
+$rules = @(Get-NetFirewallRule -DisplayName ({} + '*') -ErrorAction Stop)
+$n = $rules.Count
+if ($n -gt 0) {{ $rules | Remove-NetFirewallRule -ErrorAction Stop }}
+ConvertTo-Json @{{ removed = $n }} -Compress",
             ps_quote(prefix)
         );
         match crate::platform::imp::run_powershell(&script) {
@@ -1186,10 +1470,19 @@ pub(crate) fn release_all_verified_locked(
             Err(e) => remove_failures.push(format!("{prefix} 清理失败：{e}")),
         }
     }
-
     // P0-04：回查——删除命令返回成功不等于规则真的消失。
+    // **P0-02**：严格清点；查询失败 = 无法确认，绝不报成功。
     let mut failures = remove_failures;
-    match rule_count() {
+    if unknown {
+        failures.push("存在无法确认的来源，本次恢复不能报告完整成功".to_string());
+        return Ok(ReleaseReport {
+            requested,
+            remaining: 0,
+            verified: false,
+            failures,
+        });
+    }
+    match inspect_isolation_inventory().map(|i| i.total()) {
         Some(0) => Ok(ReleaseReport {
             requested,
             remaining: 0,
@@ -1220,17 +1513,72 @@ pub(crate) fn release_all_verified_locked(
 }
 
 /// 当前存在的本产品隔离规则数（恢复后核验用）。
+/// **P0-01（v0.7.1）**：按来源清点现存规则。
+///
+/// `rule_count()` 只给总数，无法回答「这些规则属于谁」。重启后若只剩
+/// 兜底封锁规则，却被当成普通熔断去 `RetryProtection`，就会走 `trip()`
+/// 去**结束 GUI 进程**——而兜底封锁的产品语义是「只挡出站、不杀进程」。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct IsolationInventory {
+    pub egress_trip: u32,
+    pub uncovered: u32,
+    pub legacy: u32,
+}
+
+impl IsolationInventory {
+    pub fn total(self) -> u32 {
+        self.egress_trip + self.uncovered + self.legacy
+    }
+
+    /// 存在任何形式的隔离。
+    pub fn any(self) -> bool {
+        self.total() > 0
+    }
+}
+
+/// 查询两类命名空间 + 旧版遗留的**分别**计数。
+///
+/// 查询失败返回 `None`（不能当成「没有规则」——那会让恢复器误报清理完成）。
+pub fn inspect_isolation_inventory() -> Option<IsolationInventory> {
+    use crate::platform::imp::RuleLookup;
+    let mut counts = [0u32; 3];
+    let prefixes = [
+        IsolationReason::EgressTrip.prefix(),
+        IsolationReason::Uncovered.prefix(),
+    ];
+    for (index, prefix) in prefixes.iter().enumerate() {
+        match crate::platform::imp::firewall_rules_exist(prefix) {
+            // 严格查询只回答「有没有」；数量由下面的精确统计补。
+            RuleLookup::Absent => counts[index] = 0,
+            RuleLookup::Present => {
+                counts[index] = count_rules_with_prefix(prefix)?;
+            }
+            // **P0-02**：查询失败不能被当成「没有规则」。
+            RuleLookup::Unknown => return None,
+        }
+    }
+    counts[2] = count_legacy_rules()?;
+    Some(IsolationInventory {
+        egress_trip: counts[0],
+        uncovered: counts[1],
+        legacy: counts[2],
+    })
+}
+
 pub fn rule_count() -> Option<u32> {
     // **P0-01（v0.6.13.1）**：统计**两个**现行命名空间 + 旧版遗留。
     // 原实现只数 `ClaudeSwitcher AppIsolation`：兜底封锁残留时仍报 0，
     // 于是恢复器/重建器会误判「没有任何隔离」。
+    // **P0-02**：只用 `-ErrorAction Stop`。`SilentlyContinue` 会把权限不足/RPC
+    // 失败吞成 0——调用方（恢复器、界面、重建器）都把 0 当「已清干净」，
+    // 这是「报告已恢复但规则还在」的根源。查询失败必须返回 `None`。
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'
-         $a = @(Get-NetFirewallRule -DisplayName {trip}* -ErrorAction SilentlyContinue).Count
-         $u = @(Get-NetFirewallRule -DisplayName {covered}* -ErrorAction SilentlyContinue).Count
-         $legacy = @(Get-NetFirewallRule -DisplayName 'ClaudeSwitcher Egate * Out' -ErrorAction SilentlyContinue).Count
-         $legacy += @(Get-NetFirewallRule -DisplayName 'ClaudeSwitcher Egate * In' -ErrorAction SilentlyContinue).Count
-         ConvertTo-Json @{{ total = ($a + $u + $legacy) }} -Compress",
+        "$ErrorActionPreference='Stop'
+$a = @(Get-NetFirewallRule -DisplayName ({trip} + '*') -ErrorAction Stop).Count
+$u = @(Get-NetFirewallRule -DisplayName ({covered} + '*') -ErrorAction Stop).Count
+$legacy = @(Get-NetFirewallRule -DisplayName 'ClaudeSwitcher Egate * Out' -ErrorAction Stop).Count
+$legacy += @(Get-NetFirewallRule -DisplayName 'ClaudeSwitcher Egate * In' -ErrorAction Stop).Count
+ConvertTo-Json @{{ total = ($a + $u + $legacy) }} -Compress",
         trip = ps_quote(RULE_PREFIX),
         covered = ps_quote(IsolationReason::Uncovered.prefix())
     );
@@ -1519,18 +1867,64 @@ foreach ($c in $cases) { Write-Output ($c.n + '=' + (Check $c.a $goodAf $anyPf $
         let _home = crate::test_support::set_env("USERPROFILE", dir.path());
         std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
 
-        // 默认未暂停：允许（意图为 Armed 时）。
+        // P0-04 (v0.7.1): the predicate now also requires egate_enabled.
+        // Default config has the gate OFF, so isolation must be refused.
         let armed = crate::egate_monitor::protection_intent()
             == crate::egate_monitor::ProtectionIntent::Armed;
+        let gate_on = match crate::appconfig::load_checked() {
+            crate::appconfig::ConfigLoad::Ok(config) => config.egate_enabled,
+            _ => false,
+        };
         assert_eq!(
             can_apply_isolation_now(),
-            armed && !crate::egate_monitor::is_paused()
+            armed && !crate::egate_monitor::is_paused() && gate_on
         );
+        assert!(!can_apply_isolation_now(), "门禁默认关闭时不得施加隔离");
 
         // 暂停后必须拒绝，即使仍处于 Armed。
         crate::egate_monitor::pause(60).unwrap();
         assert!(!can_apply_isolation_now(), "暂停期间不得施加新的隔离");
         crate::egate_monitor::resume().unwrap();
+    }
+
+    /// **P0-04（v0.7.2）**：配置代次必须贯穿到**动手之前**，而不只是探测结束时。
+    ///
+    /// 场景：监控线程在探测开始时记下代次 R；用户随后在 GUI 里改了目标
+    /// （代次变成 R+1）；探测结果回来了，仍按旧判定去熔断。
+    /// 带代次的入口必须拒绝，否则就是「按用户已经改掉的配置去杀进程」。
+    #[test]
+    fn isolation_refuses_when_expected_revision_is_stale() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        // 打开门禁（否则谓词在第一步就拒绝，测不到代次分支）。
+        crate::appconfig::update(|config| config.egate_enabled = true).unwrap();
+        crate::egate_monitor::rearm().unwrap();
+        let current = match crate::appconfig::load_checked() {
+            crate::appconfig::ConfigLoad::Ok(config) => config.egate_revision,
+            other => panic!("配置应可读：{other:?}"),
+        };
+        assert!(
+            can_apply_isolation_with_revision(Some(current)),
+            "代次一致时应允许"
+        );
+        // 模拟「探测之后用户改了配置」。
+        crate::appconfig::update(|config| {
+            config.egate_trip_threshold = config.egate_trip_threshold.saturating_add(1)
+        })
+        .unwrap();
+        assert!(
+            !can_apply_isolation_with_revision(Some(current)),
+            "代次过期后不得再施加隔离副作用"
+        );
+        // 不带代次的入口只检查当前事实，用于手动熔断按钮。
+        assert!(can_apply_isolation_now());
+
+        // 清理：恢复默认的「未启用」，避免影响同进程内的其它测试。
+        crate::appconfig::update(|config| config.egate_enabled = false).unwrap();
+        crate::egate_monitor::disarm("测试结束").unwrap();
     }
 
     /// **P0-01 回归**：全量解除必须覆盖两个命名空间，规则统计也必须两边都数。
@@ -1556,5 +1950,105 @@ foreach ($c in $cases) { Write-Output ($c.n + '=' + (Check $c.a $goodAf $anyPf $
         assert!(!crate::egate_monitor::access_verified_for_test("tun"));
         assert!(!crate::egate_monitor::access_verified_for_test("uncovered"));
         assert!(!crate::egate_monitor::access_verified_for_test("unknown"));
+    }
+
+    /// P0-01 (v0.7.1): the inventory must distinguish the two namespaces.
+    ///
+    /// The regression this guards: `rule_count()` counted everything, so a
+    /// restart with only UncoveredLock rules left marked the app as
+    /// "partial trip" and the next round ran `trip()` - killing GUI processes
+    /// for a rule set that is documented as "outbound block only, never kill".
+    /// **P2-04**：安装状态三态必须可区分——「没装」不能被算成「保护失败」，
+    /// 「查不出」也不能被算成「已完整保护」。
+    #[test]
+    fn installation_state_distinguishes_not_installed_from_unknown() {
+        assert_ne!(
+            ApplicationInstallation::NotInstalled,
+            ApplicationInstallation::Unknown
+        );
+        assert_ne!(
+            ApplicationInstallation::Installed,
+            ApplicationInstallation::Unknown
+        );
+        // 未知 agent 标识是配置错误，归入「无法确认」而不是「未安装」。
+        match resolve_agent_installation("no-such-agent") {
+            InstallationLookup::Unknown(reason) => assert!(reason.contains("未知")),
+            other => panic!("未知 agent 应报无法确认，实际：{other:?}"),
+        }
+    }
+
+    #[test]
+    fn isolation_inventory_separates_sources() {
+        let inv = IsolationInventory {
+            egress_trip: 0,
+            uncovered: 3,
+            legacy: 0,
+        };
+        assert_eq!(inv.total(), 3);
+        assert!(inv.any());
+        // Only uncovered rules present: no egress-trip rules => must not be
+        // treated as a trip.
+        assert_eq!(inv.egress_trip, 0);
+
+        let empty = IsolationInventory::default();
+        assert!(!empty.any());
+
+        let both = IsolationInventory {
+            egress_trip: 2,
+            uncovered: 1,
+            legacy: 1,
+        };
+        assert_eq!(both.total(), 4);
+    }
+
+    /// **回归（v0.7.2）**：解除应用隔离**绝不能**顺带删掉全局断网规则。
+    ///
+    /// 事故链：`cleanup_legacy_rules()` 曾被改成按 `ClaudeSwitcher Egate *`
+    /// 通配删除，而 `ClaudeSwitcher Egate Cut All` 正落在这个前缀下。
+    /// 结果是「解除隔离」把用户的全局断网一起解除，账本却仍写着断网中。
+    ///
+    /// 这里验证的是**删除清单本身**（纯逻辑，不动真实防火墙）：
+    /// 旧版清理只允许命中「内置 agent × 方向」这 6 个精确名字。
+    #[test]
+    fn legacy_cleanup_never_targets_the_global_cut_rule() {
+        let legacy_names: Vec<String> = ["claude", "chatgpt", "antigravity"]
+            .iter()
+            .flat_map(|agent| {
+                [
+                    format!("ClaudeSwitcher Egate {agent} Out"),
+                    format!("ClaudeSwitcher Egate {agent} In"),
+                ]
+            })
+            .collect();
+        assert_eq!(legacy_names.len(), 6);
+        assert!(
+            !legacy_names
+                .iter()
+                .any(|name| name == crate::egate_netcut::CUT_RULE),
+            "全局断网规则不得出现在解除隔离的删除清单里"
+        );
+        // 旧规则的两种方向都在清单内（升级后必须能清干净）。
+        assert!(legacy_names.contains(&"ClaudeSwitcher Egate claude Out".to_string()));
+        assert!(legacy_names.contains(&"ClaudeSwitcher Egate antigravity In".to_string()));
+        // 现行两个命名空间与断网规则的命名互不重叠。
+        assert!(!RULE_PREFIX.starts_with("ClaudeSwitcher Egate "));
+        assert!(!IsolationReason::Uncovered
+            .prefix()
+            .starts_with("ClaudeSwitcher Egate "));
+    }
+
+    /// P0-02 (v0.7.1): the strict lookup must have exactly three states, and
+    /// `Unknown` must be distinguishable from `Absent` (a silent query failure
+    /// must never be reported as "no rules left").
+    #[test]
+    fn rule_lookup_is_three_state() {
+        use crate::platform::imp::RuleLookup;
+        assert_ne!(RuleLookup::Unknown, RuleLookup::Absent);
+        assert_ne!(RuleLookup::Unknown, RuleLookup::Present);
+        // Querying a prefix that cannot exist must be Absent (proves the strict
+        // path actually runs and does not degrade to Unknown on this machine).
+        let missing =
+            crate::platform::imp::firewall_rules_exist("ClaudeSwitcher DefinitelyNotPresent zzz");
+        assert_eq!(missing, RuleLookup::Absent);
     }
 }

@@ -54,6 +54,29 @@ jobs:
       # cs.exe 是本包第二个 [[bin]]（src/bin/cs.rs），由后续 tauri build 自动编译并打包；
       # 不再使用 bundle.externalBin 与占位文件（externalBin 与 cargo 二进制重复打包会触发
       # WiX ICE30）。
+      # L-08 (v0.7.1): fail fast on a malformed/mismatched version.
+      # The 4-segment version broke `cargo metadata` and killed the whole
+      # build after every other check had already passed.
+      - name: Version consistency and manifest preflight
+        shell: pwsh
+        run: |
+          $cargoVer = (Select-String -Path src-tauri/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $pkgVer = (Select-String -Path package.json -Pattern '"version"\s*:\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $tauriVer = (Select-String -Path src-tauri/tauri.conf.json -Pattern '"version"\s*:\s*"([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
+          Write-Host "cargo=$cargoVer package=$pkgVer tauri=$tauriVer"
+          if ($cargoVer -ne $pkgVer -or $cargoVer -ne $tauriVer) {
+            throw "Version mismatch: Cargo.toml=$cargoVer package.json=$pkgVer tauri.conf.json=$tauriVer"
+          }
+          if ($cargoVer -notmatch '^\d+\.\d+\.\d+$') {
+            throw "Version must be exactly three numeric segments (Cargo rejects 4): $cargoVer"
+          }
+          Push-Location src-tauri
+          try {
+            cargo metadata --format-version 1 --no-deps | Out-Null
+            if ($LASTEXITCODE -ne 0) { throw "cargo metadata failed" }
+          } finally { Pop-Location }
+          Write-Host "version + manifest preflight OK"
+
       - name: Rust fmt
         working-directory: src-tauri
         run: cargo fmt --check

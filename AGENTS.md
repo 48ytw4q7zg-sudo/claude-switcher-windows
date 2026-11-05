@@ -39,7 +39,7 @@ cargo clippy --all-targets -- -D warnings   # 必须零警告
 cargo test --lib                            # 必须全绿
 cd ..
 npx tsc --noEmit                            # 前端类型
-npm run tauri build                        # 出 MSI + NSIS
+npm run tauri build                        # 出 NSIS（MSI 自 v0.6.13 起停发）
 ```
 
 **MSVC bin 路径随机器版本号变化**，用通配探测：
@@ -268,6 +268,9 @@ async fn xxx() -> Result<T, String> {
 - TUN 网卡、verge.yaml TUN 恢复后 Clash Verge 实机重启。
 - open-safe 真实浏览器拉起/WebRTC 标志/profile 销毁；自动更新全流程。
 - 安装包升级/卸载回归。
+- **v0.7.2 已验证**：`AppIsolation`/`UncoveredLock`/旧版 `Egate ... Out` 三类规则共存时
+  `cs.exe --exit-restore` 退出码 0 且规则清零；无残留时幂等返回 0。未验证：非管理员拒绝路径、
+  组策略持有规则、进程中断/输出截断注入、真实 TUN 路由证据。
 - 托盘一键切换（动态菜单/通知/重建）、按终端并行多账号（wt/cmd 拉起）。
 - 额度阈值通知/提醒（Toast/AUMID）、MCP 真实拉起、便携版解压运行。
 - 完整便携版固定 WebView2（约 150MB）：本环境无固定运行时，用

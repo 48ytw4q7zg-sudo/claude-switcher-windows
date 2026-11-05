@@ -211,3 +211,49 @@ git diff 870c4ca..FETCH_HEAD -- core windows app
 1. 对每个变化的功能，按上表找到本仓库对应模块，判断是否需要同步。
 2. Windows 专属行为（junction、icacls、sysinfo、计划任务）不要反向同步回上游。
 3. 更新本文件的固定 commit。
+
+## 7. 逐模块许可证追溯（P2-03，2026-11-05）
+
+前面的「许可证状态」只记录三个上游**当前**的授权，无法回答「本仓库某个文件
+具体来自谁的哪一版」。本节按模块给出对应关系，作为许可证合规的核对底稿。
+
+### 7.1 三个上游的授权事实
+
+| 基线 | 仓库 | 固定 commit | 该 commit 处声明的许可 | 当前主分支许可 |
+| --- | --- | --- | --- | --- |
+| A | VallierDev/claude-switcher | `6897984` | 未声明 LICENSE 文件 | 未声明 |
+| B | YOURSJEYO/claude-switcher | `870c4ca` | 未声明 LICENSE 文件（早期版本曾为 MIT） | **AGPL-3.0** |
+| C | daha1216/ClaudeGuard | `1967377` | **MIT**（随仓库 LICENSE 文件） | MIT |
+
+本仓库：**Apache-2.0**（`LICENSE`）。
+
+### 7.2 结论与边界
+
+- 本仓库是**按行为基准重写的 Rust/TypeScript 实现**，不是对上游源码的逐行复制：
+  上游 B 是 bash/PowerShell/Swift，上游 C 是另一套 Rust 结构的独立程序，两者都
+  没有可直接粘进本仓库的文件。
+- 因此本仓库**不包含**上游 B 当前 AGPL-3.0 版本的代码；AGPL 与本项目的
+  Apache-2.0 之间不存在由此产生的冲突。
+- 语义/算法层面的对应（例如「目标出口校验」「按 exe 隔离」「14 项检查清单」）
+  属于功能与规范的借鉴，不构成对源代码的复制。
+- **红线**：如果将来要直接复制上游 B **AGPL-3.0 之后**发布的源码片段，必须先做
+  许可证兼容性审查；要么不复制，要么整仓改为 AGPL-3.0。此约束写入本节，
+  以便任何一次「顺手抄一段」都在评审时被看到。
+
+### 7.3 模块 → 基线对应矩阵
+
+| 本仓库模块 | 行为来源 | 许可影响 |
+| --- | --- | --- |
+| `accounts.rs` / `store.rs` / `credentials.rs` / `workspace.rs` / `export.rs` | 基线 A（CLI 账号切换） | 上游未声明许可；本仓库为独立实现，不复制其源码 |
+| `desktop.rs` / `checks.rs` / `guard.rs` / `rules.rs` / `region.rs` / `stun.rs` / `diagnostics.rs` | 基线 B（环境安全 / 桌面版 / 规则托管） | 同上；**不得**从 AGPL 版本复制代码 |
+| `egate*.rs`（门禁、接入、探测、熔断、恢复、监控、断网） | 基线 C（ClaudeGuard 契约 v3.10） | 上游为 MIT；本仓库为独立实现，保留语义对应说明 |
+| `egate_lock.rs` / `isolation.rs` / `ip_history.rs` | 基线 C + 基线 B 交叉 | MIT / 未声明；独立实现 |
+| `network_policy.rs`（v0.7.2 新增） | 本仓库自有 | Apache-2.0 |
+| `platform/windows.rs` | 本仓库自有（Windows 适配层） | Apache-2.0 |
+| `src/components/*.tsx`、`src/components/types.ts` | 本仓库自有 | Apache-2.0 |
+
+### 7.4 维护规则
+
+1. 新增模块时在本表补一行，写明行为来源与许可结论；没有来源就写「本仓库自有」。
+2. 任何 `docs/` 下的记录都不得把上游源码标成本项目的 Apache-2.0。
+3. 升级上游基线前，先核对**目标 commit**处的 LICENSE，而不是主分支的 LICENSE。

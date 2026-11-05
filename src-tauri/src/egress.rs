@@ -134,10 +134,19 @@ pub fn is_datacenter_org(org: &str) -> bool {
 }
 
 fn build_client() -> Result<reqwest::blocking::Client, String> {
-    reqwest::blocking::Client::builder()
-        .timeout(Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("HTTP 客户端初始化失败: {e}"))
+    // **P1-10**：出口诊断属于「泄露即失败」的请求——它要回答的就是
+    // 「外界看到我是什么 IP」，一旦代理不可用而静默直连，测出来的就是
+    // 用户家宽出口，等于把真实 IP 送给被测域名。
+    //
+    // 因此走严格策略：只接受**已确认可用**的系统代理，拿不到就明确失败。
+    // 原实现的裸 builder 会跟随系统代理，但代理挂掉时 reqwest 会直接连出去。
+    let evidence = crate::egate_check::read_proxy_evidence();
+    let proxy = crate::network_policy::usable_system_proxy(&evidence);
+    let spec = crate::network_policy::ClientSpec::new(
+        crate::network_policy::NetworkPolicy::StrictProxy,
+        Duration::from_secs(10),
+    );
+    crate::network_policy::build_client(&spec, proxy.as_ref())
 }
 
 /// 探测出口（阻塞，必须经 `blocking()` 调用）。

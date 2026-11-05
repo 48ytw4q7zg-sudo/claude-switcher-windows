@@ -29,6 +29,13 @@ pub enum SystemOperation {
     ReleaseIsolation,
     /// 完整恢复（急救/退出）。
     FullRestore,
+    /// **P0-05（v0.7.1）**：旧保镖的进程查杀。
+    ///
+    /// 与急救恢复共用同一把锁：否则保镖可能在恢复器还原之后，
+    /// 按巡检开始时读到的旧意图再杀一次进程。
+    GuardKill,
+    /// **P0-05（v0.7.1）**：时区看门狗改写系统时区。
+    TimezoneWrite,
 }
 
 impl SystemOperation {
@@ -39,6 +46,8 @@ impl SystemOperation {
             SystemOperation::RestoreNetwork => "恢复网络",
             SystemOperation::ReleaseIsolation => "解除隔离",
             SystemOperation::FullRestore => "完整恢复",
+            SystemOperation::GuardKill => "保镖查杀",
+            SystemOperation::TimezoneWrite => "时区改写",
         }
     }
 }

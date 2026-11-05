@@ -505,25 +505,43 @@ pub fn is_trip_state_unknown() -> bool {
 /// - 有规则但覆盖不完整 → 部分熔断（1）
 /// - 查询失败 → **未知（3）**，不是「未熔断」
 pub fn rebuild_trip_state_from_system() {
-    let count = match crate::egate_trip::rule_count() {
-        Some(count) => count,
+    // **P0-01（v0.7.1）**：必须**按来源**重建，不能把任何残留规则都当成
+    // 「普通熔断」。只剩兜底封锁规则时若标记成 Partial，下一轮会走
+    // `RetryProtection → trip()` 去结束 GUI 进程——而兜底封锁的语义是
+    // 「只挡出站、不杀进程」。
+    let inventory = match crate::egate_trip::inspect_isolation_inventory() {
+        Some(inventory) => inventory,
         None => {
-            // **低成本项 4**：查询失败不能落回默认的「未熔断」——那会让界面
-            // 与 CLI 在防火墙读不出来时误报安全。标记未知并保留原因。
             mark_trip_state_unknown();
             crate::log_error("无法查询防火墙规则，熔断状态无法确认（显示为「未知」，请人工核对）");
             return;
         }
     };
-    if count == 0 {
+
+    if !inventory.any() {
         clear_tripped();
+        // 规则都没了：兜底锁意图若还在，说明规则被外部清理过，
+        // 一并清掉意图，避免界面一直显示「兜底封锁中」。
+        clear_uncovered_if_orphaned();
         return;
     }
-    // 有规则：默认按部分熔断处理（保守——会触发补齐而非直接解除）。
-    mark_tripped_state(false);
-    crate::log_error(&format!(
-        "检测到 {count} 条本产品防火墙规则残留，已按「部分熔断」重建状态；下一轮巡检将补齐或恢复"
-    ));
+
+    if inventory.egress_trip > 0 || inventory.legacy > 0 {
+        // 存在正式熔断（或旧版遗留）规则：按部分熔断处理，下一轮补齐。
+        mark_tripped_state(false);
+        crate::log_error(&format!(
+            "检测到 {} 条熔断规则残留（旧版 {} 条），已按「部分熔断」重建；下一轮将补齐或恢复",
+            inventory.egress_trip, inventory.legacy
+        ));
+    } else {
+        // **只有兜底封锁规则**：这不是熔断，清掉内存熔断状态；
+        // 兜底规则由 `run_uncovered_lockdown` 每轮核验与补齐。
+        clear_tripped();
+        crate::log_error(&format!(
+            "检测到 {} 条未接入兜底封锁规则残留（非熔断），已恢复兜底状态；不会结束任何进程",
+            inventory.uncovered
+        ));
+    }
 }
 
 /// 用当前全局状态组装门控输入。
@@ -719,8 +737,14 @@ fn run_uncovered_lockdown(
     // **P0-C**：每轮都重新核验并补齐，不能因「意图文件存在」就跳过。
     let trip = crate::egate_trip::enforce_uncovered_outbound(&agents);
     if trip.all_isolated {
-        if !uncovered_lock_ready() {
-            let _ = mark_uncovered_ready();
+        // **L-13**：每次都重写 ready，而不是「存在就跳过」。
+        // 记录里带 `verified_at` / 配置代次 / 受管清单 / 规则条数，
+        // 任何一项变了都会在读取时失效，界面不会再展示上一轮的核验结果。
+        let rules: u32 = trip.agents.iter().map(|agent| agent.rules_verified).sum();
+        if let Err(error) = mark_uncovered_ready(&agents, rules) {
+            crate::log_error(&format!(
+                "兜底封锁已生效，但核验记录写入失败（{error}）：界面将显示为「未核验」"
+            ));
         }
         return;
     }
@@ -771,6 +795,15 @@ fn release_uncovered_lock() {
     }
 }
 
+/// 规则已全部不存在时收敛兜底意图（避免界面长期显示「封锁中」）。
+fn clear_uncovered_if_orphaned() {
+    if uncovered_lock_active() {
+        if let Err(error) = clear_uncovered_lock() {
+            crate::log_error(&format!("清理孤立兜底意图失败：{error}"));
+        }
+    }
+}
+
 /// **P0-02**：是否具备解除未接入兜底封锁的资格。
 ///
 /// 四个条件必须**同时**满足：
@@ -788,9 +821,13 @@ pub fn can_release_uncovered(report: &crate::egate_check::EgateReport) -> bool {
     if !access_verified(&report.access.path) {
         return false;
     }
-    protection_intent() == ProtectionIntent::Armed
-        && !is_paused()
-        && !matches!(manual_hold_state(), ManualHold::Held)
+    if protection_intent() != ProtectionIntent::Armed || is_paused() {
+        return false;
+    }
+    // L-01 (v0.7.1): Unknown must NOT be treated as "no manual hold".
+    // The intent file being corrupt/unreadable means we cannot confirm the
+    // user's wish - releasing on that basis would silently override it.
+    matches!(manual_hold_state(), ManualHold::None)
 }
 
 /// **L-03**：兜底封锁给界面用的真实状态。
@@ -799,6 +836,20 @@ pub fn can_release_uncovered(report: &crate::egate_check::EgateReport) -> bool {
 /// 只看意图文件存在会让界面在规则被外部删除后仍显示「封锁中」。
 pub fn uncovered_lock_status() -> (bool, bool) {
     (uncovered_lock_active(), uncovered_lock_ready())
+}
+
+/// **L-13**：兜底封锁状态的完整描述，供 UI / CLI 使用。
+///
+/// 返回 `(意图存在, 核验状态)`；核验状态区分「有效 / 从未核验 / 已失效（原因）」，
+/// 界面据此显示「兜底封锁中（已核验）」或「兜底封锁（核验已过期：配置已变更）」。
+pub fn uncovered_lock_detail() -> (bool, String) {
+    let active = uncovered_lock_active();
+    let note = match uncovered_ready_state() {
+        UncoveredReadyState::Valid => "已核验".to_string(),
+        UncoveredReadyState::Missing => "尚未核验".to_string(),
+        UncoveredReadyState::Stale(reason) => format!("核验已失效：{reason}"),
+    };
+    (active, note)
 }
 
 /// 测试用：暴露 `access_verified` 的判定（不改变生产语义）。
@@ -836,15 +887,102 @@ fn uncovered_lock_ready_file() -> Result<std::path::PathBuf, String> {
     Ok(crate::paths::app_data_dir()?.join("eguard-uncovered-lock-ready.json"))
 }
 
-fn uncovered_lock_ready() -> bool {
-    uncovered_lock_ready_file()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+/// **L-13**：兜底封锁的「已验证」状态必须**绑定到具体的核验结果**。
+///
+/// 原实现是一个空 `{}` 文件的存在性判断：一旦写下就永久代表「已验证」，
+/// 哪怕之后规则被外部删除、配置改了目标、受管应用清单变了——
+/// 界面仍会显示「兜底封锁中（已核验）」。用户看到的是过去某一刻的事实。
+///
+/// 现在写入 `verified_at` / `revision` / `rules` 三项；读取时逐项比对，
+/// 任一不匹配就视为**未验证**（并说明原因），由下一轮核验重写。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, Default, PartialEq, Eq)]
+struct UncoveredReady {
+    /// 写入时刻（Unix 秒）。
+    verified_at: u64,
+    /// 核验时的配置代次（`egate_revision`）；配置一改立即失效。
+    revision: u64,
+    /// 核验时实际生效的兜底规则条数。
+    rules: u32,
+    /// 核验时使用的受管应用清单（顺序无关，写入前排序）。
+    agents: Vec<String>,
 }
 
-fn mark_uncovered_ready() -> Result<(), String> {
+const UNCOVERED_READY_TTL_SECS: u64 = 15 * 60;
+
+fn read_uncovered_ready() -> Option<UncoveredReady> {
+    let path = uncovered_lock_ready_file().ok()?;
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&text).ok()
+}
+
+/// 当前 `ready` 记录是否仍可作为「已验证」的依据。
+fn uncovered_lock_ready() -> bool {
+    matches!(uncovered_ready_state(), UncoveredReadyState::Valid)
+}
+
+/// `ready` 的三种状态（**L-13**：界面需要能说明「为什么不再是已验证」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UncoveredReadyState {
+    /// 有记录且与当前配置/规则一致，且在有效期内。
+    Valid,
+    /// 从未核验过。
+    Missing,
+    /// 有过记录但已失效（附原因）。
+    Stale(String),
+}
+
+fn uncovered_ready_state() -> UncoveredReadyState {
+    let Some(ready) = read_uncovered_ready() else {
+        return UncoveredReadyState::Missing;
+    };
+    let config = match crate::appconfig::load_checked() {
+        crate::appconfig::ConfigLoad::Ok(config) => *config,
+        crate::appconfig::ConfigLoad::Fresh => crate::appconfig::AppConfig::default(),
+        crate::appconfig::ConfigLoad::Corrupt(error) => {
+            return UncoveredReadyState::Stale(format!("配置损坏（{error}）"))
+        }
+    };
+    if ready.revision != config.egate_revision {
+        return UncoveredReadyState::Stale("门禁配置已变更".to_string());
+    }
+    let mut expected = if config.egate_guarded_agents.is_empty() {
+        crate::egate_defaults::DEFAULT_GUARDED_AGENTS
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+    } else {
+        config.egate_guarded_agents.clone()
+    };
+    expected.sort();
+    let mut recorded = ready.agents.clone();
+    recorded.sort();
+    if recorded != expected {
+        return UncoveredReadyState::Stale("受管应用清单已变更".to_string());
+    }
+    let age = now_secs().saturating_sub(ready.verified_at);
+    if age > UNCOVERED_READY_TTL_SECS {
+        return UncoveredReadyState::Stale(format!("核验已过期（{} 分钟前）", age / 60));
+    }
+    UncoveredReadyState::Valid
+}
+
+/// 写入 `ready` 记录：绑定当前配置代次、受管应用清单与实际规则条数。
+fn mark_uncovered_ready(agents: &[String], rules: u32) -> Result<(), String> {
     let path = uncovered_lock_ready_file()?;
-    crate::fsx::write_atomically(&path, "{}").map_err(|e| e.to_string())
+    let revision = match crate::appconfig::load_checked() {
+        crate::appconfig::ConfigLoad::Ok(config) => config.egate_revision,
+        _ => 0,
+    };
+    let mut agents = agents.to_vec();
+    agents.sort();
+    let ready = UncoveredReady {
+        verified_at: now_secs(),
+        revision,
+        rules,
+        agents,
+    };
+    let body = serde_json::to_string(&ready).map_err(|e| e.to_string())?;
+    crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
 }
 
 fn clear_uncovered_ready() {
@@ -877,6 +1015,9 @@ fn run_monitor_round(
     } else {
         config.egate_targets.clone()
     };
+    // **P0-04**：记录本轮开始时的配置代次；探测结束后若代次已变，
+    // 说明用户改了目标/阈值/开关，本轮结果作废。
+    let revision = config.egate_revision;
     let mut streaks = crate::egate_streaks()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -887,6 +1028,16 @@ fn run_monitor_round(
         config.egate_trip_threshold,
     );
     drop(streaks);
+
+    // **P0-04**：代次不一致 → 丢弃本轮结果，不做任何熔断/解除动作。
+    let current_revision = match crate::appconfig::load_checked() {
+        crate::appconfig::ConfigLoad::Ok(config) => config.egate_revision,
+        _ => revision,
+    };
+    if current_revision != revision {
+        crate::log_error("门禁配置在本轮探测期间已变更，丢弃本轮结果");
+        return;
+    }
 
     // 直连泄露：默认只告警；开启 egate_leak_trip 后与目标失败同等对待。
     let leak = leak_round(config);
@@ -906,7 +1057,7 @@ fn run_monitor_round(
             recovery.blockers().join("、")
         ));
     }
-    let gate = current_gate(
+    let mut gate = current_gate(
         config.egate_enabled,
         report.should_trip || leak.trip,
         report.should_warn || leak.warn,
@@ -963,6 +1114,15 @@ fn run_monitor_round(
                 crate::log_error("无法核验隔离是否仍生效，已标记为「无法确认」");
             }
         }
+        // L-02 (v0.7.1): the gate above was built from the state BEFORE this
+        // re-verification. After downgrading to Partial/Unknown we must rebuild
+        // it, otherwise this round still decides on a stale "already_tripped".
+        gate = current_gate(
+            config.egate_enabled,
+            report.should_trip || leak.trip,
+            report.should_warn || leak.warn,
+            recovery,
+        );
     }
 
     match decide(gate) {
@@ -984,7 +1144,9 @@ fn run_monitor_round(
             } else {
                 config.egate_guarded_agents.clone()
             };
-            let trip = crate::egate_trip::trip(&agents);
+            // **P0-04**：把本轮的配置代次带进熔断——持锁后若代次已变，
+            // 熔断会自行放弃，不会按过期判定结束用户进程。
+            let trip = crate::egate_trip::trip_with_revision(&agents, Some(revision));
             // P0-06：只有全部隔离成功才标记完整熔断；部分成功进入可重试状态。
             mark_tripped_state(trip.all_isolated);
             if let Some(app) = ensure_app_handle(app_handle) {
@@ -1016,7 +1178,9 @@ fn run_monitor_round(
             } else {
                 config.egate_guarded_agents.clone()
             };
-            let trip = crate::egate_trip::trip(&agents);
+            // **P0-04**：把本轮的配置代次带进熔断——持锁后若代次已变，
+            // 熔断会自行放弃，不会按过期判定结束用户进程。
+            let trip = crate::egate_trip::trip_with_revision(&agents, Some(revision));
             mark_tripped_state(trip.all_isolated);
             crate::log_error(&format!(
                 "出口门禁补齐隔离：{}（完整={}）",
@@ -1265,9 +1429,39 @@ mod tests {
         assert!(uncovered_lock_active());
         assert!(!uncovered_lock_ready());
 
-        // 规则全部生效后才标记 ready。
-        mark_uncovered_ready().unwrap();
+        // 规则全部生效后才标记 ready。受管清单必须与当前配置一致，
+        // 否则记录本身就应被判为失效（见下面「清单变化」的断言）。
+        let defaults: Vec<String> = crate::egate_defaults::DEFAULT_GUARDED_AGENTS
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        mark_uncovered_ready(&defaults, 2).unwrap();
         assert!(uncovered_lock_ready());
+
+        // **L-13**：ready 必须绑定到具体核验结果——配置代次一变就失效。
+        crate::appconfig::update(|config| {
+            config.egate_revision = config.egate_revision.saturating_add(1);
+        })
+        .unwrap();
+        assert!(
+            !uncovered_lock_ready(),
+            "配置变更后旧的核验结果不得继续显示为「已核验」"
+        );
+        assert!(matches!(
+            uncovered_ready_state(),
+            UncoveredReadyState::Stale(_)
+        ));
+
+        // 重新核验后恢复有效。
+        mark_uncovered_ready(&defaults, 2).unwrap();
+        assert!(uncovered_lock_ready());
+
+        // **L-13**：受管应用清单变化同样立刻失效。
+        mark_uncovered_ready(&["claude".to_string()], 4).unwrap();
+        assert!(
+            !uncovered_lock_ready(),
+            "受管清单与当前配置不一致时不得视为已核验"
+        );
 
         // 清除时两者一起走。
         clear_uncovered_lock().unwrap();

@@ -88,6 +88,35 @@ pub struct ProxyEvidence {
     pub autoconfig: Option<String>,
     /// `ProxyOverride`（绕过列表）。
     pub overrides: Option<String>,
+    /// **P1-03**：本次读取是否**完整成功**。
+    ///
+    /// `false` 表示键打不开或某个值读失败（权限被拒、注册表结构异常、
+    /// 组策略重定向）。此时其余字段只是「能读到的那部分」，
+    /// 判定层必须据此给出 `Unknown`，**不能**把「读不到」当成
+    /// `ProxyEnable = 0`（= 直连）——那会把用户推向未接入路径的熔断。
+    pub complete: bool,
+    /// **P1-03**：读取失败的具体原因（仅用于界面与日志）。
+    pub error: Option<String>,
+}
+
+impl ProxyEvidence {
+    /// 读取失败（含部分字段缺失）时返回原因。
+    pub fn read_error(&self) -> Option<&str> {
+        if self.complete {
+            None
+        } else {
+            self.error.as_deref().or(Some("注册表读取不完整"))
+        }
+    }
+
+    /// 一份「明确读失败」的证据（不臆造任何字段）。
+    pub fn unreadable(reason: impl Into<String>) -> Self {
+        ProxyEvidence {
+            complete: false,
+            error: Some(reason.into()),
+            ..ProxyEvidence::default()
+        }
+    }
 }
 
 /// 应用当前的接入方式判定（纯函数）。
@@ -146,11 +175,20 @@ impl AccessPath {
 }
 
 /// 由注册表证据 + TUN 探测结果判定接入方式。
+///
+/// **P1-03**：注册表读不出来时**不能**落回「系统代理关闭 + 无 TUN = 未接入」。
+/// 那个结论会触发兜底封锁甚至熔断（结束用户正在用的桌面应用），
+/// 而依据只是「查询失败」。因此读取不完整一律 `Unknown`。
 pub fn verdict(
     evidence: &ProxyEvidence,
     tun_adapter: Option<String>,
     hosts: &[String],
 ) -> AccessPath {
+    if let Some(reason) = evidence.read_error() {
+        return AccessPath::Unknown {
+            reason: format!("系统代理配置读取失败（{reason}），无法确认应用出口路径"),
+        };
+    }
     if let Some(pac) = evidence
         .autoconfig
         .as_deref()
@@ -194,26 +232,84 @@ pub fn verdict(
 pub enum ProbeRoute {
     /// 经该地址探测。
     Proxy(String),
-    /// 直连探测（TUN 接管，与应用同路）。
+    /// 直连探测：**已用路由证据证明**目标流量会走 TUN（与应用同路）。
     ///
-    /// **P0-07**：当前不使用——仅检测到 TUN 网卡不足以证明路由经过它。
-    /// 保留该变体供未来实现真实路由核验后启用。
-    #[allow(dead_code)]
+    /// 只有 [`plan_route_with_evidence`] 在拿到明确路由证据时才产生它。
+    /// 「看到了 TUN 网卡」本身**不够**——Clash 退出后网卡可能残留，
+    /// IPv6 也可能没被接管。
     Direct,
     /// 不探测——守护器自身流量绝不带着家宽 IP 出机器。
     Skip,
 }
 
-/// 由接入方式决定探测路由（纯函数）。
+/// **P1-01**：目标路由证据（由平台层采集，纯数据便于单测）。
 ///
-/// **P0-07**：TUN 路线采用**保守策略**——只检测到 TUN 网卡存在不足以证明
-/// 目标流量真的经过它（Clash 可能已退出但网卡残留，或 IPv6 未接管）。
-/// 因此 TUN 也走 Skip：不做未经确认的直连探测，判定与保护由确定性检查承担。
-/// 这与上游「不能把网卡存在当作出口证明」一致。
+/// 语义是「目标地址的下一跳是否确定经过 TUN 接口」。任何一项读不出来
+/// 都是 **Unverified**，不是「大概走了」。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RouteEvidence {
+    /// 目标是否 IPv4 且其路由出接口就是 TUN 的 ifIndex。
+    pub ipv4_via_tun: Option<bool>,
+    /// 目标是否 IPv6 且其路由出接口就是 TUN 的 ifIndex。
+    pub ipv6_via_tun: Option<bool>,
+    /// TUN 是否接管了默认路由（0.0.0.0/0 或 ::/0）。
+    pub default_route_via_tun: Option<bool>,
+    /// 采集失败的原因（用于界面说明）。
+    pub error: Option<String>,
+}
+
+impl RouteEvidence {
+    /// 是否**完整**证明目标流量经过 TUN。
+    ///
+    /// 规则刻意保守：只有 IPv4 与默认路由两项都明确为真才算证明。
+    /// IPv6 允许「系统未启用 IPv6」——那种情况下不存在 IPv6 旁路，
+    /// 但必须是**明确读到未启用**，不能是查询失败。
+    pub fn proves_tun_path(&self) -> bool {
+        self.error.is_none()
+            && self.ipv4_via_tun == Some(true)
+            && self.default_route_via_tun == Some(true)
+            && self.ipv6_via_tun.is_some()
+    }
+
+    /// 无法证明时的人类可读原因。
+    pub fn unverified_reason(&self) -> String {
+        if let Some(error) = &self.error {
+            return format!("路由证据采集失败：{error}");
+        }
+        let mut parts = Vec::new();
+        if self.ipv4_via_tun != Some(true) {
+            parts.push("IPv4 目标路由未经 TUN");
+        }
+        if self.default_route_via_tun != Some(true) {
+            parts.push("默认路由未由 TUN 接管");
+        }
+        if self.ipv6_via_tun.is_none() {
+            parts.push("IPv6 路由状态无法确认");
+        }
+        parts.join("；")
+    }
+}
+
+/// 由接入方式决定探测路由（纯函数，**无路由证据**）。
+///
+/// **P0-07 / P1-01**：只检测到 TUN 网卡存在不足以证明目标流量真的经过它。
+/// 因此这个入口对 TUN 一律 `Skip`；需要放行必须显式提供
+/// [`RouteEvidence`]（见 [`plan_route_with_evidence`]）。
 pub fn plan_route(path: &AccessPath) -> ProbeRoute {
+    plan_route_with_evidence(path, None)
+}
+
+/// 带路由证据的探测决策。
+///
+/// 只有在「接入是 TUN」且「路由证据完整证明流量经 TUN」时才 `Direct`。
+/// 其余一律 `Skip`——保持 `Unverified`，绝不冒险发直连请求。
+pub fn plan_route_with_evidence(path: &AccessPath, evidence: Option<&RouteEvidence>) -> ProbeRoute {
     match path {
         AccessPath::SystemProxy { addr } => ProbeRoute::Proxy(format!("http://{addr}")),
-        AccessPath::Tun { .. } => ProbeRoute::Skip,
+        AccessPath::Tun { .. } => match evidence {
+            Some(evidence) if evidence.proves_tun_path() => ProbeRoute::Direct,
+            _ => ProbeRoute::Skip,
+        },
         AccessPath::Uncovered | AccessPath::Unknown { .. } => ProbeRoute::Skip,
     }
 }
@@ -443,6 +539,9 @@ mod tests {
             server: server.map(str::to_string),
             autoconfig: None,
             overrides: overrides.map(str::to_string),
+            // 测试里的证据是「读取成功」的显式构造。
+            complete: true,
+            error: None,
         }
     }
 

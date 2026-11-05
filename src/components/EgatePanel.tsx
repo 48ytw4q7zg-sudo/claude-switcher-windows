@@ -71,8 +71,14 @@ export function EgatePanel() {
     partial?: boolean;
     unknown?: boolean;
     manual_hold?: boolean;
+    /** **L-01**：手动保持状态无法确认（与「未保持」区分）。 */
+    manual_hold_unknown?: boolean;
     uncovered_lock?: boolean;
     uncovered_lock_verified?: boolean;
+    /** **L-13**：核验结论说明（已核验 / 尚未核验 / 核验已失效：原因）。 */
+    uncovered_lock_note?: string;
+    /** **P1-02**：`false` 明确无管理员权限，`null` 无法确认，`undefined` 未上报。 */
+    elevated?: boolean | null;
   } | null>(null);
   const [launchNote, setLaunchNote] = useState<string | null>(null);
   const [envCheck, setEnvCheck] = useState<EnvCheck | null>(null);
@@ -131,7 +137,19 @@ export function EgatePanel() {
     invoke<CutState | null>('egate_cut_state')
       .then(setCutState)
       .catch(() => setCutState(null));
-    invoke<{ paused: boolean; remaining_secs: number; tripped: boolean; partial?: boolean; unknown?: boolean; manual_hold?: boolean }>('egate_monitor_status')
+    invoke<{
+      paused: boolean;
+      remaining_secs: number;
+      tripped: boolean;
+      partial?: boolean;
+      unknown?: boolean;
+      manual_hold?: boolean;
+      manual_hold_unknown?: boolean;
+      uncovered_lock?: boolean;
+      uncovered_lock_verified?: boolean;
+      uncovered_lock_note?: string;
+      elevated?: boolean | null;
+    }>('egate_monitor_status')
       .then(setMonitor)
       .catch(() => setMonitor(null));
   }, [refreshQuarantine]);
@@ -423,6 +441,15 @@ export function EgatePanel() {
         </div>
       )}
 
+      {/* **P1-01**：TUN 路由证据的结论。没有它，用户只会看到「未探测」，
+          却分不清是「没接入」还是「接了但路由没被证实」——后者需要检查
+          Clash 的路由/TUN 设置，前者需要先开代理。 */}
+      {report?.tun_route_note && (
+        <div className="usage-note" style={{ marginTop: 6 }}>
+          {formatMessage(report.tun_route_note)}
+        </div>
+      )}
+
       <div className="profile-actions" style={{ marginTop: 12 }}>
         <button className="primary" onClick={check} disabled={busy}>
           {checking ? <Loader2 className="spin" /> : <RefreshCw />}
@@ -476,19 +503,48 @@ export function EgatePanel() {
             隔离状态无法确认
           </span>
         )}
+        {/* **L-09**：权限不足是**可操作**的失败，必须与「覆盖不完整」分开显示。
+            用户看到「隔离失败」会反复重试；看到「需要管理员权限」才知道该怎么做。 */}
+        {monitor?.elevated === false && (
+          <span
+            className="pill bad"
+            title="当前以普通权限运行：防火墙规则、网卡与系统时区的修改会被系统拒绝。请以管理员身份重新启动本程序"
+          >
+            权限不足（需管理员）
+          </span>
+        )}
+        {/* 管理员状态读不出来时同样不能当作「已确认有权限」。 */}
+        {monitor?.elevated === null && (
+          <span className="pill muted" title="无法确认当前是否具备管理员权限，保护能力未知">
+            权限状态无法确认
+          </span>
+        )}
         {monitor?.uncovered_lock && !monitor?.uncovered_lock_verified && (
-          <span className="pill bad" title="未接入代理的兜底封锁已启用，但本轮核验未通过">
-            兜底封锁（覆盖不完整）
+          <span
+            className="pill bad"
+            title={monitor?.uncovered_lock_note ?? '未接入代理的兜底封锁已启用，但核验未通过'}
+          >
+            兜底封锁（未核验{monitor?.uncovered_lock_note ? `：${monitor.uncovered_lock_note}` : ''}）
           </span>
         )}
         {monitor?.uncovered_lock && monitor?.uncovered_lock_verified && (
-          <span className="pill muted" title="未接入代理时自动封锁受管应用出站">
+          <span
+            className="pill muted"
+            title={`未接入代理时自动封锁受管应用出站（${monitor?.uncovered_lock_note ?? '已核验'}）`}
+          >
             兜底封锁中
           </span>
         )}
         {monitor?.manual_hold && (
           <span className="pill muted" title="由你手动触发的隔离，自动恢复不会解除">
             手动保持隔离
+          </span>
+        )}
+        {/* **L-01**：保持状态读不出来时不能显示成「未保持」——
+            用户会以为自动恢复会解除隔离。 */}
+        {monitor?.manual_hold_unknown && (
+          <span className="pill bad" title="手动保持状态文件损坏或不可读，无法确认自动恢复是否会解除隔离">
+            手动保持状态无法确认
           </span>
         )}
         {quarantineCount !== null && (
@@ -618,11 +674,18 @@ export function EgatePanel() {
           {tripReport.agents.map((agent) => (
             <div key={agent.agent} style={{ marginTop: 4, fontSize: 12 }}>
               {agent.agent}：
-              {agent.verified
-                ? `已隔离（${agent.rules_verified} 条规则生效${
-                    agent.killed.length ? `，结束 ${agent.killed.length} 个进程` : ''
-                  }）`
-                : `未确认生效（${formatMessage(agent.note)}）`}
+              {/* **P2-04**：三种安装状态必须分开显示。
+                  「没装这个应用」是正常情况（不适用），
+                  「查不出安装状态」是保护未知，两者都不能显示成「隔离失败」。 */}
+              {agent.installation === 'not_installed'
+                ? '未安装（不适用，无需隔离）'
+                : agent.installation === 'unknown'
+                  ? `无法确认安装状态（${formatMessage(agent.note)}）`
+                  : agent.verified
+                    ? `已隔离（${agent.rules_verified} 条规则生效${
+                        agent.killed.length ? `，结束 ${agent.killed.length} 个进程` : ''
+                      }）`
+                    : `未确认生效（${formatMessage(agent.note)}）`}
             </div>
           ))}
         </div>

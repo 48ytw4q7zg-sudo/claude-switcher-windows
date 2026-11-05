@@ -482,22 +482,43 @@ fn verify_nics_up(nics: &[String]) -> Result<Vec<String>, String> {
     }
 }
 
-/// 查询某条防火墙规则是否存在。
-fn rule_exists(name: &str) -> Result<bool, String> {
+/// 查询某条防火墙规则是否存在（**P0-02**：三态，不用 `SilentlyContinue`）。
+///
+/// 精确 `-DisplayName` 查询在「没有匹配」时会抛异常，而且异常消息随系统
+/// 语言本地化——用字符串匹配区分「不存在」与「查询失败」不可靠。
+/// 因此这里用「转义后的前缀通配 + 精确名过滤」：通配查询无匹配不抛错，
+/// 那么**任何异常都只能是真的查询失败**。
+fn rule_lookup(name: &str) -> crate::platform::imp::RuleLookup {
+    use crate::platform::imp::RuleLookup;
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'
-         $r = Get-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue
-         if ($r) {{ 'true' }} else {{ 'false' }}",
-        ps_quote(name)
+        "$ErrorActionPreference='Stop'
+$name = {name}
+$pattern = [WildcardPattern]::Escape($name)
+$rules = @(Get-NetFirewallRule -DisplayName ($pattern + '*') -ErrorAction Stop |
+           Where-Object {{ $_.DisplayName -eq $name }})
+if ($rules.Count -gt 0) {{ 'present' }} else {{ 'absent' }}",
+        name = ps_quote(name)
     );
-    let out =
-        crate::platform::imp::run_powershell(&script).map_err(|e| format!("查询规则失败：{e}"))?;
-    // 严格解析：只认明确的 true/false，其他输出一律报错——查询失败绝不能
-    // 被当成「规则不存在」。
-    match out.trim().to_ascii_lowercase().as_str() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        other => Err(format!("规则查询输出无法解析：{other:?}")),
+    match crate::platform::imp::run_powershell(&script) {
+        Ok(out) => match out.trim().to_ascii_lowercase().as_str() {
+            "present" => RuleLookup::Present,
+            "absent" => RuleLookup::Absent,
+            _ => RuleLookup::Unknown,
+        },
+        Err(_) => RuleLookup::Unknown,
+    }
+}
+
+/// 旧签名（`Result<bool, String>`）的薄包装：查询未知按错误处理。
+///
+/// 调用点必须想清楚「未知」怎么处理；新代码直接用 [`rule_lookup`]。
+fn rule_exists(name: &str) -> Result<bool, String> {
+    match rule_lookup(name) {
+        crate::platform::imp::RuleLookup::Present => Ok(true),
+        crate::platform::imp::RuleLookup::Absent => Ok(false),
+        crate::platform::imp::RuleLookup::Unknown => {
+            Err("规则状态无法确认（权限/服务/RPC 异常）".to_string())
+        }
     }
 }
 
@@ -607,76 +628,84 @@ fn query_cut_rule() -> Result<RuleState, String> {
     //
     // P0-D：`$anyOn` 只要有一档配置文件开启就算通过，而当前活动的网络连接
     // 可能属于**关闭的那一档**。改为按当前活动连接的网络类别逐项核对。
+    // **P0-NEW-01**：外层 `$ErrorActionPreference='Stop'` 只约束**终止错误**的
+    // 呈现；`-ErrorAction SilentlyContinue` 会把它逐条压回去，于是
+    // 「权限被拒 / RPC 失败 / 服务停止」全都表现为「0 条规则」= absent。
+    // 这里改成「前缀通配 + 精确过滤」：通配查询无匹配不抛错，任何异常都只
+    // 可能是真的查询失败，落到 catch 分支的 `unknown`。
     let script = format!(
         r#"$ErrorActionPreference='Stop'
 $name = {name}
+$pattern = [WildcardPattern]::Escape($name)
+$result = 'unknown'
 try {{
-  # ① 用 SilentlyContinue 枚举：无匹配 = 真正不存在，不抛异常。
-  $rules = @(Get-NetFirewallRule -DisplayName $name -PolicyStore PersistentStore -ErrorAction SilentlyContinue)
-  if ($rules.Count -eq 0) {{ 'absent'; exit 0 }}
-  foreach ($r in $rules) {{
-    if ($r.Enabled -ne 'True' -or $r.Direction -ne 'Outbound' -or $r.Action -ne 'Block') {{ 'wrong'; exit 0 }}
-  }}
-
-  # ② 生效策略里必须存在**属性完全匹配**的规则（P0-05）。
-  #
-  # 只判 Enabled+Action 不够：一条规则可能限定了 Profile、RemotePort、
-  # 远程地址或接口类型，当前网络/流量根本不在它的覆盖范围内。
-  # 全局断网要求：方向 Outbound、动作 Block、**不得**附加程序/端口/地址
-  # 限制（附加了就不是「全局」），且 Profile 不能把当前活动网络排除在外。
-  $active = @(Get-NetFirewallRule -DisplayName $name -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
-  $activeOk = $false
-  foreach ($a in $active) {{
-    if ($a.Enabled -ne 'True' -or $a.Action -ne 'Block' -or $a.Direction -ne 'Outbound') {{ continue }}
-    $af = $a | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
-    $pf = $a | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
-    $adf = $a | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
-    # **P0-B**：过滤器查询失败不能当成「没有限制」——那会把未知判成全局。
-    if (-not $af -or -not $pf -or -not $adf) {{ 'unknown'; exit 0 }}
-    $progAny = (-not $af.Program) -or $af.Program -eq 'Any'
-    $portAny = (
-                 ((-not $pf.Protocol) -or $pf.Protocol -eq 'Any') -and
-                 ((-not $pf.LocalPort) -or $pf.LocalPort -eq 'Any') -and
-                 ((-not $pf.RemotePort) -or $pf.RemotePort -eq 'Any')
-               )
-    $addrAny = (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and
-                ((-not $adf.RemoteAddress) -or $adf.RemoteAddress -eq 'Any'))
-    # Profile 必须覆盖「所有」配置档：只对 Domain 生效的规则挡不住 Public 流量。
-    $profileAll = ([string]$a.Profile).ToLowerInvariant() -eq 'any'
-    if ($progAny -and $portAny -and $addrAny -and $profileAll) {{ $activeOk = $true }}
-  }}
-  if (-not $activeOk) {{ 'unknown'; exit 0 }}
-
-  # ③ 当前**活动网络**所属的防火墙配置档必须开启。
-  #    Get-NetFirewallProfile 查询失败 → unknown（不能当成「已开」）。
-  $profiles = @(Get-NetFirewallProfile -ErrorAction SilentlyContinue)
-  if ($profiles.Count -eq 0) {{ 'unknown'; exit 0 }}
-  $statusMap = @{{}}
-  foreach ($p in $profiles) {{ $statusMap[[string]$p.Name] = ($p.Enabled -eq 'True') }}
-
-  $connections = @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)
-  if ($connections.Count -eq 0) {{
-    # 没有活动连接（例如已断网成功）：没有流量可放行，规则即可视为生效；
-    # 但仍要求至少一档配置开启，否则规则本身无从生效。
-    $anyOn = $false
-    foreach ($v in $statusMap.Values) {{ if ($v) {{ $anyOn = $true }} }}
-    if (-not $anyOn) {{ 'unknown'; exit 0 }}
-    'present'
-    exit 0
-  }}
-  foreach ($c in $connections) {{
-    $cat = [string]$c.NetworkCategory   # DomainAuthenticated / Private / Public
-    $key = switch ($cat) {{
-      'DomainAuthenticated' {{ 'Domain' }}
-      'Private' {{ 'Private' }}
-      'Public' {{ 'Public' }}
-      default {{ '' }}
+  $rules = @(Get-NetFirewallRule -DisplayName ($pattern + '*') -PolicyStore PersistentStore -ErrorAction Stop |
+             Where-Object {{ $_.DisplayName -eq $name }})
+  if ($rules.Count -eq 0) {{
+    $result = 'absent'
+  }} else {{
+    $attrsOk = $true
+    foreach ($r in $rules) {{
+      if ($r.Enabled -ne 'True' -or $r.Direction -ne 'Outbound' -or $r.Action -ne 'Block') {{ $attrsOk = $false }}
     }}
-    if ($key -eq '' -or -not $statusMap.ContainsKey($key)) {{ 'unknown'; exit 0 }}
-    if (-not $statusMap[$key]) {{ 'unknown'; exit 0 }}
+    if (-not $attrsOk) {{
+      $result = 'wrong'
+    }} else {{
+      # 生效策略查询本身失败 = 无法确认，不能让下面的 foreach 静默跳过。
+      $active = @(Get-NetFirewallRule -DisplayName ($pattern + '*') -PolicyStore ActiveStore -ErrorAction Stop |
+                  Where-Object {{ $_.DisplayName -eq $name }})
+      $activeOk = $false
+      foreach ($a in $active) {{
+        if ($a.Enabled -ne 'True' -or $a.Action -ne 'Block' -or $a.Direction -ne 'Outbound') {{ continue }}
+        $af = $a | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+        $pf = $a | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+        $adf = $a | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
+        if (-not $af -or -not $pf -or -not $adf) {{ continue }}
+        $progAny = (-not $af.Program) -or $af.Program -eq 'Any'
+        $portAny = (((-not $pf.Protocol) -or $pf.Protocol -eq 'Any') -and
+                    ((-not $pf.LocalPort) -or $pf.LocalPort -eq 'Any') -and
+                    ((-not $pf.RemotePort) -or $pf.RemotePort -eq 'Any'))
+        $addrAny = (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and
+                    ((-not $adf.RemoteAddress) -or $adf.RemoteAddress -eq 'Any'))
+        $profileAll = ([string]$a.Profile).ToLowerInvariant() -eq 'any'
+        if ($progAny -and $portAny -and $addrAny -and $profileAll) {{ $activeOk = $true }}
+      }}
+      if (-not $activeOk) {{
+        $result = 'unknown'
+      }} else {{
+        # 防火墙配置/活动连接读取失败必须变成 unknown，而不是靠空集合推断。
+        $profiles = @(Get-NetFirewallProfile -ErrorAction Stop)
+        if ($profiles.Count -eq 0) {{
+          $result = 'unknown'
+        }} else {{
+          $statusMap = @{{}}
+          foreach ($p in $profiles) {{ $statusMap[[string]$p.Name] = ($p.Enabled -eq 'True') }}
+          $connections = @(Get-NetConnectionProfile -ErrorAction Stop)
+          if ($connections.Count -eq 0) {{
+            $anyOn = $false
+            foreach ($v in $statusMap.Values) {{ if ($v) {{ $anyOn = $true }} }}
+            if ($anyOn) {{ $result = 'present' }} else {{ $result = 'unknown' }}
+          }} else {{
+            $result = 'present'
+            foreach ($c in $connections) {{
+              $cat = [string]$c.NetworkCategory
+              $key = switch ($cat) {{
+                'DomainAuthenticated' {{ 'Domain' }}
+                'Private' {{ 'Private' }}
+                'Public' {{ 'Public' }}
+                default {{ '' }}
+              }}
+              if ($key -eq '' -or -not $statusMap.ContainsKey($key) -or -not $statusMap[$key]) {{
+                $result = 'unknown'
+              }}
+            }}
+          }}
+        }}
+      }}
+    }}
   }}
-  'present'
-}} catch {{ 'unknown' }}"#,
+}} catch {{ $result = 'unknown' }}
+$result"#,
         name = ps_quote(CUT_RULE)
     );
     let out = crate::platform::imp::run_powershell(&script)
@@ -697,13 +726,37 @@ try {{
 }
 
 /// 删除全局出站阻断规则。
+///
+/// **P0-NEW-01**：删除「不存在的东西」和「删除失败」必须分开。
+/// 之前用 `SilentlyContinue`：未以管理员运行时删除会被静默拒绝，脚本仍以
+/// 成功结束，恢复流程于是报告「已恢复网络」，而规则还在阻断全部流量。
+///
+/// 现在的语义：
+/// - 规则本来就不存在 → `Ok`（幂等，重复恢复不报错）；
+/// - 规则存在但删不掉 → `Err`（带出系统给的拒绝原因）。
 fn remove_cut_rule() -> Result<(), String> {
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'\n\
-         Remove-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue",
-        ps_quote(CUT_RULE)
+        "$ProgressPreference='SilentlyContinue'
+$ErrorActionPreference='Stop'
+# 无语句级 exit/return：两者都会跳过执行结果哨兵。
+$name = {name}
+$pattern = [WildcardPattern]::Escape($name)
+$rules = @(Get-NetFirewallRule -DisplayName ($pattern + '*') -ErrorAction Stop |
+           Where-Object {{ $_.DisplayName -eq $name }})
+if ($rules.Count -gt 0) {{
+  $rules | Remove-NetFirewallRule -ErrorAction Stop
+  'removed'
+}} else {{
+  'absent'
+}}",
+        name = ps_quote(CUT_RULE)
     );
-    crate::platform::imp::run_powershell(&script).map(|_| ())
+    let out = crate::platform::imp::run_powershell(&script)
+        .map_err(|e| format!("删除全局阻断规则失败：{e}"))?;
+    match out.trim() {
+        "removed" | "absent" => Ok(()),
+        other => Err(format!("删除全局阻断规则输出无法解析：{other:?}")),
+    }
 }
 
 /// 枚举启用中的物理网卡并禁用它们；返回实际禁用的网卡名。
@@ -764,6 +817,11 @@ pub fn disable_one_nic(name: &str) -> Result<(), String> {
 }
 
 /// 重新启用记录在案的网卡。
+///
+/// **P0-NEW-01**：不能 `SilentlyContinue`。未以管理员运行时 `Enable-NetAdapter`
+/// 会被拒绝，静默后恢复流程以为网卡已启用、继续删阻断规则——用户的网卡
+/// 仍处于禁用状态却没有任何错误可看。这里逐块启用并收集失败，
+/// 由调用方决定是否保留阻断规则。
 fn enable_nics(nics: &[String]) -> Result<(), String> {
     let list = nics
         .iter()
@@ -771,12 +829,27 @@ fn enable_nics(nics: &[String]) -> Result<(), String> {
         .collect::<Vec<_>>()
         .join(",");
     let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'\n\
-         foreach ($n in @({list})) {{\n\
-           Enable-NetAdapter -Name $n -Confirm:$false -ErrorAction SilentlyContinue\n\
-         }}"
+        "$ProgressPreference='SilentlyContinue'
+$ErrorActionPreference='Stop'
+# 无语句级 exit/return：两者都会跳过执行结果哨兵。
+$failed = @()
+foreach ($n in @({list})) {{
+  try {{
+    Enable-NetAdapter -Name $n -Confirm:$false -ErrorAction Stop | Out-Null
+  }} catch {{
+    $failed += ($n + '：' + $_.Exception.Message)
+  }}
+}}
+ConvertTo-Json @($failed) -Compress"
     );
-    crate::platform::imp::run_powershell(&script).map(|_| ())
+    let json = crate::platform::imp::run_powershell(&script)?;
+    let failed: Vec<String> = serde_json::from_str(json.trim())
+        .map_err(|e| format!("启用网卡结果解析失败：{e}; 原文：{}", json.trim()))?;
+    if failed.is_empty() {
+        Ok(())
+    } else {
+        Err(failed.join("；"))
+    }
 }
 
 /// **P0-06**：按**稳定身份**（InterfaceGuid）恢复网卡，找不到就明确报错。
@@ -1034,6 +1107,15 @@ pub fn restore_all() -> RecoveryReport {
         }
     };
 
+    // **P1-07（v0.7.1）**：隔离确认清理干净后，收敛持久化保护意图。
+    // 否则重启后界面仍显示「兜底封锁中」，而规则已经不存在。
+    if isolation_ok {
+        if let Err(error) = crate::egate_monitor::clear_uncovered_lock() {
+            failures.push(format!("兜底封锁意图清理失败（{error}）"));
+            pending.push("兜底封锁意图".to_string());
+        }
+    }
+
     // 4. 还原环境账本。
     let env_ok = match crate::egate_env::restore() {
         Ok(_) => true,
@@ -1045,7 +1127,9 @@ pub fn restore_all() -> RecoveryReport {
     };
 
     // 5. **P0-02**：只有全部必要项完成才清除熔断状态。
-    let complete = intent_ok && network_ok && isolation_ok && env_ok;
+    // **P1-07**：意图收敛失败同样不算完整恢复（pending 已记录）。
+    let intent_converged = !pending.iter().any(|p| p.contains("兜底封锁意图"));
+    let complete = intent_ok && network_ok && isolation_ok && env_ok && intent_converged;
     if complete {
         crate::egate_monitor::clear_tripped();
     } else {

@@ -875,25 +875,199 @@ fn ps_single_quote(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-/// 用隐藏 PowerShell 执行一段脚本，返回 stdout（去尾换行）。
+/// PowerShell 脚本的执行结论（**P0-NEW-01**：三态，不是 `Result` 的二元）。
 ///
-/// - `-EncodedCommand`：脚本以 UTF-16LE 做 Base64，彻底绕开命令行引号、中文、
-///   `-Command` 参数拆分等坑。
-/// - `CREATE_NO_WINDOW`（来自 silent_command）：托盘常驻时不闪黑窗。
-/// - 脚本头强制 `[Console]::OutputEncoding = UTF8`：否则中文网卡名在 OEM 代码页
-///   （中文系统为 GBK）下会被 Rust 按 UTF-8 lossy 读成乱码。
-/// - 非零退出码转 Err，stderr/stdout 一并带回便于排错。
-fn run_ps(script: &str) -> Result<String, String> {
-    let wrapped = format!(
-        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8\n\
-         $OutputEncoding = [System.Text.Encoding]::UTF8\n\
-         $ErrorActionPreference = 'Stop'\n\
-         {script}"
-    );
+/// 为什么需要 `Unknown`：Windows 上 `powershell.exe` 的退出码**不是**执行结论
+/// 的可信来源——实测在 `-EncodedCommand` 下调用 NetSecurity 模块后，即使命令
+/// 完全成功，进程也可能以 1 退出；反过来，被 `SilentlyContinue` 吞掉的非终止
+/// 错误又会以 0 退出并留下空输出。用它判断「防火墙改成功了吗」会双向出错。
+///
+/// 因此协议改成：脚本尾部必须由包装层打印一个显式哨兵。
+/// - 看到 `__PS_OK__`：脚本跑到底且没有抛出终止错误 → 输出内容由调用方再解析；
+/// - 看到 `__PS_FAIL__`：捕获到异常 → `Failed`，stderr 带上可读原因；
+/// - 看不到任何哨兵：脚本中途 `exit`、解析失败、宿主崩溃、输出被截断
+///   → `Unknown`。**绝不能**当成成功，也不能当成「规则不存在」。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PsOutcome {
+    /// 脚本执行到尾部且未抛错，携带去掉哨兵后的标准输出。
+    Success(String),
+    /// 捕获到终止错误。
+    Failed(String),
+    /// 无法判断（无哨兵 / 超时 / 输出异常）。
+    Unknown(String),
+}
+
+#[allow(dead_code)]
+impl PsOutcome {
+    /// 成功时的输出；其余状态返回 `None`。
+    ///
+    /// 当前调用点用模式匹配而非这些便捷方法；保留是为了让「三态」在
+    /// 调用方代码里读起来更直白。
+    pub fn output(&self) -> Option<&str> {
+        match self {
+            PsOutcome::Success(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// 是否明确失败（不含 `Unknown`——调用方必须自行决定如何对待「未知」）。
+    pub fn is_failed(&self) -> bool {
+        matches!(self, PsOutcome::Failed(_))
+    }
+
+    /// 转成「失败就 Err、成功给输出、未知给 Err」的兼容形态。
+    ///
+    /// 只适用于「未知按失败处理」的调用点；需要区分 `Absent` 与 `Unknown`
+    /// 的地方必须直接用 [`run_ps_outcome`]。
+    pub fn into_result(self) -> Result<String, String> {
+        match self {
+            PsOutcome::Success(text) => Ok(text),
+            PsOutcome::Failed(message) | PsOutcome::Unknown(message) => Err(message),
+        }
+    }
+
+    /// 人类可读的说明（无论哪种状态）。
+    pub fn describe(&self) -> String {
+        match self {
+            PsOutcome::Success(text) => format!("成功（输出 {} 字节）", text.len()),
+            PsOutcome::Failed(message) => format!("失败：{message}"),
+            PsOutcome::Unknown(message) => format!("无法确认：{message}"),
+        }
+    }
+}
+
+/// 执行结果协议的哨兵。**任何 PowerShell 脚本都不得提前 `exit`**：
+/// 提前退出会让哨兵缺失，整条调用链退化为 `Unknown`。
+const PS_OK: &str = "__PS_OK__";
+const PS_FAIL: &str = "__PS_FAIL__";
+
+/// 单次 PowerShell 调用的默认上限。防火墙查询在慢盘/服务刚启动时可能数秒，
+/// 但超过这个时长基本意味着卡死，必须按 `Unknown` 处理而不是无限等待。
+const PS_TIMEOUT: StdDuration = StdDuration::from_secs(120);
+
+/// 包装脚本体：统一编码、进度抑制、终止错误转哨兵。
+///
+/// `-EncodedCommand` 下 `-Command` 的引号/中文/参数拆分坑全部规避；
+/// `[Console]::OutputEncoding` 必须在最前面，否则中文网卡名按 OEM 代码页输出。
+fn wrap_ps_script(script: &str) -> String {
+    format!(
+        "[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+$OutputEncoding = [System.Text.Encoding]::UTF8
+$ProgressPreference = 'SilentlyContinue'
+$ErrorActionPreference = 'Stop'
+$__cs_failed = $false
+try {{
+{script}
+}} catch {{
+  $__cs_failed = $true
+  [Console]::Error.WriteLine([string]$_.Exception.Message)
+}}
+if ($__cs_failed) {{ '{PS_FAIL}' }} else {{ '{PS_OK}' }}"
+    )
+}
+
+/// 在包装层之外再判一次「脚本里有没有提前退出」。
+///
+/// 提前 `exit` 会跳过哨兵，让调用方看到「成功退出码 + 半截输出」——这是
+/// P0-NEW-01 里最难发现的一类。这里直接静态拒绝：宁可立刻暴露，
+/// 也不要在真实系统上把半截执行当成功。
+///
+/// 判定按**语句边界**（行首、`;`、`{`、`}` 之后）而不是子串包含：
+/// `Write-Output 'exit 0'` 是合法输出，不能误伤。
+fn assert_no_early_exit(script: &str) -> Result<(), String> {
+    for line in script.lines() {
+        // 去掉整行注释；行内注释不处理（PowerShell 的 `#` 语义依赖引号上下文，
+        // 误判成注释会漏检，宁可在注释里提到 exit 时误报一次）。
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            continue;
+        }
+        // 按语句分隔符切分：行首、`;`、`{`、`}` 之后都是语句起点。
+        let statements = trimmed.split([';', '{', '}', '\n']);
+        for statement in statements {
+            let statement = statement.trim();
+            // `exit` 单独成句，或后面跟空白/数字/变量。
+            let is_exit = statement == "exit"
+                || statement
+                    .strip_prefix("exit")
+                    .is_some_and(|rest| rest.starts_with(char::is_whitespace));
+            if is_exit {
+                return Err(format!(
+                    "脚本包含提前 exit（{statement}），会绕过执行结果哨兵；请改用返回值表达结果"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// 解析 `powershell.exe` 的输出，得到三态结论。
+///
+/// 判据顺序刻意如此：
+/// 1. **哨兵优先**——退出码不可信（见 [`PsOutcome`] 的说明）；
+/// 2. 无哨兵 → `Unknown`，并把退出码、stderr 一并带上（绝不猜成成功）。
+fn classify_ps_output(stdout: &str, stderr: &str, exit_code: Option<i32>) -> PsOutcome {
+    let trimmed = stdout.trim_end();
+    // PowerShell 把 `'__PS_OK__'` 写进输出流时会带上引号与前导空白
+    // （实测形状是 `\r\n\r\n '__PS_OK__'`），必须先归一化再比较。
+    let normalize = |line: &str| {
+        line.trim()
+            .trim_matches(|c| c == '\'' || c == '"')
+            .trim()
+            .to_string()
+    };
+    let last = trimmed
+        .lines()
+        .rev()
+        .map(normalize)
+        .find(|line| !line.is_empty());
+    match last.as_deref() {
+        Some(PS_FAIL) => {
+            let body = strip_trailing_sentinel(trimmed, PS_FAIL);
+            let mut message = String::from("PowerShell 脚本执行失败");
+            let err = stderr.trim();
+            if !err.is_empty() {
+                message.push_str(&format!("：{err}"));
+            }
+            if !body.is_empty() {
+                message.push_str(&format!("；部分输出：{body}"));
+            }
+            PsOutcome::Failed(message)
+        }
+        Some(PS_OK) => PsOutcome::Success(strip_trailing_sentinel(trimmed, PS_OK)),
+        _ => PsOutcome::Unknown(format!(
+            "脚本未输出执行结果哨兵（退出码={:?}），可能提前退出、被中断或输出被截断；stderr={}；stdout={}",
+            exit_code,
+            stderr.trim(),
+            trimmed
+        )),
+    }
+}
+
+/// 去掉尾部哨兵行（含它的引号与空白），返回真正的脚本输出。
+fn strip_trailing_sentinel(payload: &str, sentinel: &str) -> String {
+    let mut body = payload.trim_end();
+    // 哨兵前可能有 `'`，也可能有空白；逐字符从尾部剥离直到哨兵本身消失。
+    if let Some(position) = body.rfind(sentinel) {
+        body = body[..position].trim_end();
+    }
+    body.trim_end_matches('\'').trim_end().to_string()
+}
+
+/// 用隐藏 PowerShell 执行一段脚本，返回三态执行结论。
+///
+/// 这是**唯一**的 PowerShell 执行入口；`run_ps()` 只是它在「未知按失败处理」
+/// 场景下的兼容包装。带 JSON/结构化输出的调用点必须直接用本函数，
+/// 否则「查询失败」会被压成「空结果」。
+pub fn run_ps_outcome(script: &str) -> PsOutcome {
+    if let Err(error) = assert_no_early_exit(script) {
+        return PsOutcome::Unknown(error);
+    }
+    let wrapped = wrap_ps_script(script);
     let wide: Vec<u8> = wrapped.encode_utf16().flat_map(u16::to_le_bytes).collect();
     let encoded = BASE64.encode(&wide);
     let ps = powershell_path();
-    let out = silent_command(ps.to_string_lossy().as_ref())
+    let mut child = match silent_command(ps.to_string_lossy().as_ref())
         .args([
             "-NoProfile",
             "-NonInteractive",
@@ -902,19 +1076,74 @@ fn run_ps(script: &str) -> Result<String, String> {
             "-EncodedCommand",
             &encoded,
         ])
-        .output()
-        .map_err(|e| format!("启动 powershell.exe 失败: {e}"))?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        return Err(format!(
-            "PowerShell 失败(退出码={:?}): stderr={} stdout={}",
-            out.status.code(),
-            stderr.trim_end(),
-            stdout.trim_end()
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) => return PsOutcome::Unknown(format!("启动 powershell.exe 失败: {e}")),
+    };
+    let mut stdout_pipe = match child.stdout.take() {
+        Some(pipe) => pipe,
+        None => return PsOutcome::Unknown("无法读取 powershell.exe 标准输出".to_string()),
+    };
+    let mut stderr_pipe = match child.stderr.take() {
+        Some(pipe) => pipe,
+        None => return PsOutcome::Unknown("无法读取 powershell.exe 标准错误".to_string()),
+    };
+    // 必须**并发**读管道：先等进程退出再读，输出超过管道缓冲区（约 64KB）
+    // 时子进程会阻塞在写端，双方互等直到超时——一种只在慢机器上复现的假死。
+    let stdout_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stdout_pipe, &mut buffer);
+        buffer
+    });
+    let stderr_reader = std::thread::spawn(move || {
+        let mut buffer = Vec::new();
+        let _ = std::io::Read::read_to_end(&mut stderr_pipe, &mut buffer);
+        buffer
+    });
+    // 超时必须能杀掉子进程：`output()` 会无限等，卡死的脚本会拖住整个巡检线程。
+    let deadline = std::time::Instant::now() + PS_TIMEOUT;
+    let exit_code = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status.code(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(StdDuration::from_millis(25));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return PsOutcome::Unknown(format!(
+                    "PowerShell 超过 {} 秒未返回，已终止（结果未知）",
+                    PS_TIMEOUT.as_secs()
+                ));
+            }
+            Err(e) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return PsOutcome::Unknown(format!("等待 powershell.exe 失败: {e}"));
+            }
+        }
+    };
+    let stdout_bytes = stdout_reader.join().unwrap_or_default();
+    let stderr_bytes = stderr_reader.join().unwrap_or_default();
+    let stdout = String::from_utf8_lossy(&stdout_bytes).to_string();
+    let stderr = String::from_utf8_lossy(&stderr_bytes).to_string();
+    classify_ps_output(&stdout, &stderr, exit_code)
+}
+
+/// 用隐藏 PowerShell 执行一段脚本，返回 stdout（去尾换行）。
+///
+/// 三态语义见 [`PsOutcome`]；本函数把 `Unknown` 与 `Failed` 一并转为 `Err`，
+/// 适用于「读不到就当失败」的调用点（配置写入、进程控制等）。
+fn run_ps(script: &str) -> Result<String, String> {
+    run_ps_outcome(script).into_result()
 }
 
 /// 全部网卡（含虚拟网卡）。
@@ -954,6 +1183,94 @@ fn parse_adapters(json: &str) -> Result<Vec<AdapterInfo>, String> {
         }
         serde_json::Value::Null => Ok(Vec::new()),
         other => Err(format!("网卡列表顶层应为数组/对象, 实为: {other}")),
+    }
+}
+
+/// **P1-01**：采集「目标流量是否真的经过 TUN」的路由证据。
+///
+/// 只做**读取**：`Find-NetRoute` 是 Windows 自带的「按目标地址查实际路由」
+/// cmdlet（Server 2012+ / Windows 8+），它返回的 `InterfaceIndex` 就是系统
+/// 此刻会用来发往该地址的接口——这才是证据；「存在一块 Up 的 TUN 网卡」不是。
+///
+/// 四项分别取：
+/// 1. IPv4 目标地址的实际出接口是否等于 TUN 的 ifIndex；
+/// 2. IPv6 目标地址同上（未启用 IPv6 也是**有效结论**，不是失败）；
+/// 3. 默认路由（0.0.0.0/0）是否由 TUN 承接；
+/// 4. 任一项查询抛错 → 整份证据不可用（`error` 非空）。
+///
+/// 任何一个「查不到」都不做乐观推断：调用方拿到 `error` 就必须按
+/// `Unverified` 处理，绝不发直连探测。
+pub fn collect_route_evidence(
+    tun_if_index: u32,
+    ipv4_probe: &str,
+    ipv6_probe: &str,
+) -> crate::egate_access::RouteEvidence {
+    use crate::egate_access::RouteEvidence;
+    let script = format!(
+        "$ErrorActionPreference='Stop'
+$tun = {tun}
+$v4 = {v4}
+$v6 = {v6}
+try {{
+  $r4 = @(Find-NetRoute -RemoteIPAddress $v4 -ErrorAction Stop)
+  $r6 = @(Find-NetRoute -RemoteIPAddress $v6 -ErrorAction Stop)
+  $default = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+               Where-Object {{ [uint32]$_.InterfaceIndex -eq $tun }})
+  $v6Enabled = @(Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction Stop |
+                 Where-Object {{ $_.Enabled }}).Count -gt 0
+  [pscustomobject]@{{
+    ipv4_via_tun = (@($r4 | Where-Object {{ [uint32]$_.InterfaceIndex -eq $tun }}).Count -gt 0)
+    default_via_tun = ($default.Count -gt 0)
+    ipv6_enabled = $v6Enabled
+    ipv6_via_tun = if ($v6Enabled) {{ @($r6 | Where-Object {{ [uint32]$_.InterfaceIndex -eq $tun }}).Count -gt 0 }} else {{ $true }}
+  }} | ConvertTo-Json -Compress
+}} catch {{
+  [pscustomobject]@{{ error = [string]$_.Exception.Message }} | ConvertTo-Json -Compress
+}}",
+        tun = tun_if_index,
+        v4 = ps_single_quote(ipv4_probe),
+        v6 = ps_single_quote(ipv6_probe)
+    );
+    let json = match run_ps(&script) {
+        Ok(json) => json,
+        Err(error) => {
+            return RouteEvidence {
+                error: Some(error),
+                ..RouteEvidence::default()
+            }
+        }
+    };
+    let value: serde_json::Value = match serde_json::from_str(json.trim()) {
+        Ok(value) => value,
+        Err(error) => {
+            return RouteEvidence {
+                error: Some(format!("路由证据解析失败：{error}；原文：{json}")),
+                ..RouteEvidence::default()
+            }
+        }
+    };
+    if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
+        return RouteEvidence {
+            error: Some(error.to_string()),
+            ..RouteEvidence::default()
+        };
+    }
+    let flag = |name: &str| value.get(name).and_then(|v| v.as_bool());
+    let ipv4 = flag("ipv4_via_tun");
+    let default_route = flag("default_via_tun");
+    let ipv6_enabled = flag("ipv6_enabled");
+    let ipv6 = match (ipv6_enabled, flag("ipv6_via_tun")) {
+        // IPv6 未启用：不存在 IPv6 旁路，这是**明确**结论（true），不是未知。
+        (Some(false), _) => Some(true),
+        (_, Some(via_tun)) => Some(via_tun),
+        // 字段缺失：无法确认。
+        (_, None) => None,
+    };
+    RouteEvidence {
+        ipv4_via_tun: ipv4,
+        ipv6_via_tun: ipv6,
+        default_route_via_tun: default_route,
+        error: None,
     }
 }
 
@@ -1324,6 +1641,44 @@ pub fn kill_processes_by_names(names: &[&str]) -> Result<Vec<String>, String> {
 ///
 /// 返回值与 [`kill_processes_by_names`] 一致（被结束进程的描述），
 /// 额外把跳过的进程追加为 `"<desc>（已跳过：<原因>）"`，便于用户核对为什么没杀。
+/// **P1-06（v0.7.1）**：判断一个映像路径是否属于**受管 GUI**（而非 CLI 宿主）。
+///
+/// 查杀逻辑早已按此区分，但「解析 exe 路径做防火墙规则」用的是另一套
+/// （只要进程名匹配就收）。两边标准不一致时，原生 CLI 会被写进 GUI 隔离规则。
+pub fn is_managed_gui_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    const CLI_MARKERS: &[&str] = &[
+        "\\node_modules\\",
+        "\\npm\\",
+        "\\nvm\\",
+        "\\fnm\\",
+        "\\volta\\",
+        "\\.bun\\",
+        "\\.deno\\",
+    ];
+    if CLI_MARKERS.iter().any(|m| lower.contains(m)) {
+        return false;
+    }
+    const GUI_MARKERS: &[&str] = &[
+        "\\anthropicclaude",
+        "\\programs\\claude",
+        "\\program files\\claude",
+        "\\windowsapps",
+        "\\programs\\chatgpt",
+        "\\program files\\chatgpt",
+        "\\antigravity",
+    ];
+    GUI_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// 过滤候选路径，只保留确认属于受管 GUI 的（**P1-06**）。
+pub fn filter_managed_gui_paths(paths: Vec<String>) -> Vec<String> {
+    paths
+        .into_iter()
+        .filter(|path| is_managed_gui_path(path))
+        .collect()
+}
+
 pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String> {
     if names.is_empty() {
         return Ok(Vec::new());
@@ -1336,6 +1691,7 @@ pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String>
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'
          $killed = New-Object System.Collections.ArrayList
+         $skipped = New-Object System.Collections.ArrayList
          $cliMarkers = @('\\node_modules\\', '\\npm\\', '\\nvm\\', '\\fnm\\', '\\volta\\', '\\.bun\\', '\\.deno\\')
          # **P1-02**：受管桌面 GUI 的安装特征（用户级 / 系统级 / MSIX）。
          # 只有落在这些目录里的同名进程才允许结束；其余按「身份未确认」跳过。
@@ -1353,11 +1709,11 @@ pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String>
              }}
            }}
            if ($isCli) {{
-             [void]$killed.Add(\"$desc（已跳过：CLI 宿主，只提醒不查杀）\")
+             [void]$skipped.Add(\"$desc（CLI 宿主，只提醒不查杀）\")
              continue
            }}
            if (-not $path) {{
-             [void]$killed.Add(\"$desc（已跳过：无法读取映像路径，不盲目结束）\")
+             [void]$skipped.Add(\"$desc（无法读取映像路径，不盲目结束）\")
              continue
            }}
            # **P1-02**：只结束能确认属于受管 GUI 安装的进程。
@@ -1368,7 +1724,7 @@ pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String>
              if ($lowerPath.Contains($h)) {{ $guiHint = $true }}
            }}
            if (-not $guiHint) {{
-             [void]$killed.Add(\"$desc（已跳过：不在受管 GUI 安装路径内，身份未确认）\")
+             [void]$skipped.Add(\"$desc（不在受管 GUI 安装路径内，身份未确认）\")
              continue
            }}
            Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
@@ -1451,8 +1807,121 @@ foreach ($p in $profiles) { $map[[string]$p.Name] = ($p.Enabled -eq 'True') }
     Some(enabled)
 }
 
+/// **P0-02（v0.7.1）**：防火墙规则查询的三态结果。
+///
+/// `SilentlyContinue` 会把「权限不足 / RPC 失败 / 服务停止」这类**非终止错误**
+/// 一起吞掉，只留下一个空数组——调用方看到的 `Count = 0` 与「确实没有规则」
+/// 完全无法区分。恢复器据此会把「查不到」当成「已清干净」。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RuleLookup {
+    /// 明确存在匹配规则。
+    Present,
+    /// 明确不存在（查询成功且无匹配）。
+    Absent,
+    /// 无法确认（权限、服务、RPC、输出异常）。
+    Unknown,
+}
+
+/// 严格查询指定显示名前缀下的规则是否存在。
+///
+/// 用 `-ErrorAction Stop` + `catch`：**「没有匹配对象」也会抛异常**，
+/// 因此必须用异常消息区分「No matching …」与真正的查询失败。
+/// PowerShell 单引号转义（本模块私有，避免跨模块依赖）。
+fn ps_quote_single(value: &str) -> String {
+    // PowerShell 里单引号用两个单引号转义。
+    let escaped = value.replace('\'', "''");
+    format!("'{escaped}'")
+}
+
+/// 按前缀严格查询规则是否存在（**P0-02** 的三态实现）。
+///
+/// 关键区别（实测过）：
+/// - **通配查询**（`-DisplayName "Prefix*"`）无匹配时**不抛异常**，返回空集合；
+/// - **精确查询**（`-DisplayName "Name"`）无匹配时**抛异常**。
+///
+/// 所以这里用通配 + `-ErrorAction Stop`：命令没抛错 → 计数可信（0 = 确实没有）；
+/// 抛错或脚本结果未知 → `Unknown`。绝不能用 `SilentlyContinue` 把权限/RPC/
+/// 服务停止这类非终止错误吞成「0 条规则」——恢复器会据此误报「已清干净」。
+pub fn firewall_rules_exist(prefix: &str) -> RuleLookup {
+    let script = format!(
+        "$ErrorActionPreference='Stop'
+$c = -1
+try {{
+  $c = @(Get-NetFirewallRule -DisplayName ({prefix} + '*') -ErrorAction Stop).Count
+}} catch {{
+  $c = -1
+}}
+if ($c -lt 0) {{ 'unknown' }} elseif ($c -eq 0) {{ 'absent' }} else {{ 'present' }}",
+        prefix = ps_quote_single(prefix)
+    );
+    match run_ps_outcome(&script) {
+        PsOutcome::Success(out) => match out.trim().to_ascii_lowercase().as_str() {
+            "present" => RuleLookup::Present,
+            "absent" => RuleLookup::Absent,
+            // 输出能解析但值不在枚举内：不能猜，按未知。
+            _ => RuleLookup::Unknown,
+        },
+        PsOutcome::Failed(_) | PsOutcome::Unknown(_) => RuleLookup::Unknown,
+    }
+}
+
+/// 精确查询单条规则是否存在。
+///
+/// **为什么不直接 `-DisplayName <精确名>`**：精确查询在「没有匹配对象」时
+/// **抛异常**，而异常消息随系统语言本地化（中文系统是「找不到任何…」），
+/// 靠字符串匹配区分「没有这条规则」与「查询本身失败」非常脆弱，本地化一变
+/// 就会把权限错误当成「规则已删除」。
+///
+/// 改用「通配前缀查询 + 精确名字过滤」：通配查询无匹配时**不抛错**，
+/// 于是**任何异常都只可能是真正的查询失败** → `Unknown`。
+#[allow(dead_code)]
+pub fn firewall_rule_exists(name: &str) -> RuleLookup {
+    let script = format!(
+        "$ErrorActionPreference='Stop'
+$name = {name}
+$pattern = [WildcardPattern]::Escape($name)
+$rules = @(Get-NetFirewallRule -DisplayName ($pattern + '*') -ErrorAction Stop |
+           Where-Object {{ $_.DisplayName -eq $name }})
+if ($rules.Count -gt 0) {{ 'present' }} else {{ 'absent' }}",
+        name = ps_quote_single(name)
+    );
+    // 注意：脚本里不得出现语句级 `return`/`exit`——两者都会跳过包装层尾部哨兵。
+    match run_ps_outcome(&script) {
+        PsOutcome::Success(out) => match out.trim().to_ascii_lowercase().as_str() {
+            "present" => RuleLookup::Present,
+            "absent" => RuleLookup::Absent,
+            _ => RuleLookup::Unknown,
+        },
+        PsOutcome::Failed(_) | PsOutcome::Unknown(_) => RuleLookup::Unknown,
+    }
+}
+
+/// 当前进程是否以管理员身份运行（**P1-02**：权限能力探测）。
+///
+/// 只用于**展示能力与给出可操作提示**，不作为安全边界：真正的边界是
+/// Windows 自己拒绝非管理员写防火墙/网卡/时区。
+pub fn is_elevated() -> Option<bool> {
+    let script = "$id = [Security.Principal.WindowsIdentity]::GetCurrent()
+$p = New-Object Security.Principal.WindowsPrincipal($id)
+if ($p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { 'yes' } else { 'no' }";
+    match run_ps_outcome(script) {
+        PsOutcome::Success(out) => match out.trim().to_ascii_lowercase().as_str() {
+            "yes" => Some(true),
+            "no" => Some(false),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 pub fn run_powershell(script: &str) -> Result<String, String> {
     run_ps(script)
+}
+
+/// 三态执行入口（**P0-NEW-01**）：需要区分「失败」与「无法确认」的调用方用它。
+#[allow(dead_code)]
+pub fn run_powershell_outcome(script: &str) -> PsOutcome {
+    run_ps_outcome(script)
 }
 
 #[cfg(test)]
@@ -1586,6 +2055,73 @@ mod tests {
             "Write-Error 不得被当成成功的 PowerShell 输出"
         );
         assert!(result.unwrap_err().contains("synthetic probe"));
+    }
+
+    /// **P0-NEW-01**：执行结果协议的核心规则——退出码不是成功信号，
+    /// 哨兵才是；没有哨兵就是 `Unknown`。
+    mod ps_protocol {
+        use super::super::{classify_ps_output, PsOutcome};
+
+        #[test]
+        fn sentinel_ok_means_success_even_when_exit_code_is_nonzero() {
+            // 这正是实测现象：NetSecurity 调用后 powershell.exe 以 1 退出，
+            // 但命令其实成功了。协议必须按输出判定。
+            let outcome = classify_ps_output("count=0\n__PS_OK__\n", "", Some(1));
+            assert_eq!(outcome, PsOutcome::Success("count=0".to_string()));
+        }
+
+        #[test]
+        fn sentinel_fail_carries_stderr_and_partial_output() {
+            let outcome = classify_ps_output("partial\n__PS_FAIL__\n", "拒绝访问", Some(0));
+            match outcome {
+                PsOutcome::Failed(message) => {
+                    assert!(message.contains("拒绝访问"), "必须带出系统原因：{message}");
+                    assert!(message.contains("partial"), "必须带出部分输出：{message}");
+                }
+                other => panic!("应判定为失败，实际：{other:?}"),
+            }
+        }
+
+        #[test]
+        fn missing_sentinel_is_unknown_not_success() {
+            // 脚本提前 exit：退出码 0 + 半截输出。绝不能当成成功。
+            let outcome = classify_ps_output("half of the output\n", "", Some(0));
+            match outcome {
+                PsOutcome::Unknown(message) => {
+                    assert!(message.contains("哨兵"), "原因应指出缺少哨兵：{message}");
+                }
+                other => panic!("缺少哨兵必须判为未知，实际：{other:?}"),
+            }
+        }
+
+        #[test]
+        fn trailing_blank_lines_do_not_hide_the_sentinel() {
+            // PowerShell 常把哨兵写成 `\r\n\r\n '__PS_OK__'`。
+            let outcome = classify_ps_output("\r\n\r\n '__PS_OK__'\r\n", "", Some(0));
+            assert_eq!(outcome, PsOutcome::Success(String::new()));
+        }
+
+        #[test]
+        fn unknown_into_result_is_an_error_not_empty_success() {
+            let outcome = PsOutcome::Unknown("超时".to_string());
+            assert!(outcome.into_result().is_err());
+            assert_eq!(PsOutcome::Success("x".into()).into_result().unwrap(), "x");
+        }
+
+        #[test]
+        fn early_exit_scripts_are_rejected_before_running() {
+            // 静态拒绝：带语句级 exit 的脚本会绕过哨兵，绝不能执行。
+            let outcome = super::super::run_ps_outcome("Write-Output 'x'; exit 0");
+            match outcome {
+                PsOutcome::Unknown(message) => {
+                    assert!(message.contains("提前 exit"), "原因：{message}")
+                }
+                other => panic!("带 exit 的脚本必须被拒绝，实际：{other:?}"),
+            }
+            // 字符串里出现 "exit" 不算（不能误伤正常输出）。
+            let ok = super::super::run_ps_outcome("Write-Output 'exit 0'");
+            assert!(matches!(ok, PsOutcome::Success(_)), "{ok:?}");
+        }
     }
 
     #[test]

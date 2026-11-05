@@ -52,6 +52,7 @@ mod links;
 mod mcp;
 mod naming;
 mod net;
+mod network_policy;
 mod notify_state;
 mod parallel;
 mod paths;
@@ -2647,7 +2648,15 @@ fn set_webrtc_policy(policy: String) -> Result<(), String> {
 /// 用户一点击就把旧选择覆盖掉）。
 #[tauri::command]
 fn get_appconfig() -> appconfig::AppConfig {
-    appconfig::load()
+    // P1-08: config corruption must not be shown as "user's current settings".
+    match appconfig::load_checked() {
+        appconfig::ConfigLoad::Ok(config) => *config,
+        appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+        appconfig::ConfigLoad::Corrupt(error) => {
+            log_error(&format!("应用配置损坏，界面显示的是默认值：{error}"));
+            appconfig::AppConfig::default()
+        }
+    }
 }
 
 /// 出口门禁：保存目标表（整体替换，与上游「保存整表」语义一致）。
@@ -2762,6 +2771,42 @@ fn egate_disabled_checks() -> Vec<String> {
 }
 
 /// 出口门禁：开关与参数（整体更新，缺省保持原值由前端回读保证）。
+/// **P1-05**：布防就绪校验。
+///
+/// 区分三种情形：
+/// - 完全没有配置目标 → 使用内置默认表（它自带期望 IP/地区），视为就绪；
+/// - 配置了目标但白名单为空 → **拒绝布防**，并指出缺配置的目标名；
+/// - 全部就绪 → 允许。
+fn validate_arm_readiness() -> Result<(), String> {
+    let config = match appconfig::load_checked() {
+        appconfig::ConfigLoad::Ok(config) => *config,
+        appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+        appconfig::ConfigLoad::Corrupt(error) => {
+            return Err(format!(
+                "配置损坏（{error}），请先修复配置再开启门禁，避免按默认值误判"
+            ))
+        }
+    };
+    if config.egate_targets.is_empty() {
+        return Ok(()); // 使用内置目标表
+    }
+    let unready: Vec<String> = config
+        .egate_targets
+        .iter()
+        .filter(|target| {
+            target.enabled && target.expect_ips.is_empty() && target.expect_regions.is_empty()
+        })
+        .map(|target| target.name.clone())
+        .collect();
+    if unready.is_empty() {
+        return Ok(());
+    }
+    Err(format!(
+        "以下目标尚未配置期望出口（IP 或地区），开启后会被判定为失败并触发熔断：{}。         请先在出口门禁面板补齐白名单",
+        unready.join("、")
+    ))
+}
+
 #[tauri::command]
 fn egate_update_settings(
     enabled: bool,
@@ -2770,6 +2815,12 @@ fn egate_update_settings(
     enforce_access: bool,
     leak_trip: bool,
 ) -> Result<(), String> {
+    // **P1-05（v0.7.1）**：开启门禁前必须确认「布防就绪」——
+    // 目标缺少白名单时 `evaluate()` 会对拿到出口信息的目标直接判 Fail，
+    // 新装用户一打开开关就可能结束正在运行的桌面程序。
+    if enabled {
+        validate_arm_readiness()?;
+    }
     appconfig::update(|config| {
         config.egate_enabled = enabled;
         config.egate_trip_threshold = trip_threshold;
@@ -2808,7 +2859,14 @@ pub(crate) fn egate_streaks() -> &'static std::sync::Mutex<std::collections::BTr
 #[tauri::command]
 async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
     blocking(|| {
-        let config = appconfig::load();
+        // P1-08: same strictness as protected launch.
+        let config = match appconfig::load_checked() {
+            appconfig::ConfigLoad::Ok(config) => *config,
+            appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+            appconfig::ConfigLoad::Corrupt(error) => {
+                return Err(format!("配置损坏，无法执行出口检查：{error}"))
+            }
+        };
         let targets = if config.egate_targets.is_empty() {
             egate_defaults::builtin_targets()
         } else {
@@ -3024,11 +3082,21 @@ fn egate_monitor_status() -> serde_json::Value {
         "partial": egate_monitor::is_partial(),
         "unknown": unknown,
         "manual_hold": egate_monitor::is_manual_hold(),
+        // **L-01**：手动继续保持的「无法确认」必须与「未保持」区分——
+        // 界面把两者混在一起会让用户以为自动恢复可以解除隔离。
+        "manual_hold_unknown": egate_monitor::manual_hold_state()
+            == egate_monitor::ManualHold::Unknown,
         // **L-03**：兜底封锁的真实状态（意图 + 是否已核验覆盖）。
         "uncovered_lock": egate_monitor::uncovered_lock_status().0,
         "uncovered_lock_verified": egate_monitor::uncovered_lock_status().1,
+        // **L-13**：核验结论的可读说明（「已核验 / 尚未核验 / 核验已失效：…」）。
+        "uncovered_lock_note": egate_monitor::uncovered_lock_detail().1,
         "disarmed": egate_monitor::is_disarmed(),
         "intent": egate_monitor::protection_intent(),
+        // **P1-02**：当前进程是否具备管理员权限。界面据此区分
+        // 「隔离失败」与「没有权限做这件事」，给出可操作提示而不是含糊失败。
+        // `null` = 查不到（同样属于能力未知，不得显示为「已完整保护」）。
+        "elevated": crate::platform::imp::is_elevated(),
     })
 }
 

@@ -129,6 +129,16 @@ export interface EgateReport {
   /** 是否到预警点。 */
   should_warn: boolean;
   trip_threshold: number;
+  /** 接入路径是否达到熔断阈值（独立于目标失败计数）。 */
+  access_trip?: boolean;
+  access_streak?: number;
+  /**
+   * **P1-01**：TUN 路由证据的结论说明。
+   *
+   * `undefined` = 非 TUN 路径；`Some` 时说明「为什么允许/不允许做直连探测」，
+   * 界面据此区分「没探测因为没接入」与「没探测因为路由没证实」。
+   */
+  tun_route_note?: string | null;
 }
 
 /** 出口门禁：单个应用的隔离结果。 */
@@ -136,8 +146,22 @@ export interface QuarantineReport {
   agent: string;
   rules_added: number;
   rules_verified: number;
+  /** Expected rule count (exe x directions). */
+  rules_expected: number;
+  /** Whether the query itself succeeded. */
+  query_ok: boolean;
+  /** Whether every expected rule is in effect. */
+  coverage_complete: boolean;
+  failed_rules: string[];
   killed: string[];
   verified: boolean;
+  /**
+   * **P2-04**：受管应用的安装状态。
+   *
+   * `not_installed` = 已确认未安装（不适用，不算保护缺口）；
+   * `unknown` = 查不出安装状态（保护未知，不能当作已完整保护）。
+   */
+  installation?: 'installed' | 'not_installed' | 'unknown';
   note: string;
 }
 

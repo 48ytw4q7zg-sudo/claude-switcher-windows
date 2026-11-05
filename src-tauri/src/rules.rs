@@ -107,8 +107,28 @@ pub struct RulesReport {
     pub kernel_verified: bool,
     /// 是否尝试过重启 Clash Verge。
     pub restart_attempted: bool,
+    /// **P1-13**：重启的实际结果。
+    ///
+    /// 原实现只有 `restart_attempted`：用户看到「已尝试重启」，但不知道
+    /// 代理到底有没有被拉回来。这里显式区分三种结果，界面与调用方据此提示。
+    pub restart_result: RestartResult,
     /// 人可读的过程/结果行（FIX:… 风格）。
     pub messages: Vec<String>,
+}
+
+/// Clash Verge 重启的结果（**P1-13**）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartResult {
+    /// 本轮不需要重启。
+    #[default]
+    NotNeeded,
+    /// 已重新拉起 GUI；内核是否加载新规则仍需 `/rules` 核验。
+    Relaunched,
+    /// 找不到可拉起的程序，**未结束**进程（保持现状，等待用户手动重启）。
+    AbortedNotRelaunchable,
+    /// 已结束进程但拉起失败（代理当前处于关闭状态，必须提示用户）。
+    LaunchFailed,
 }
 
 /// `clean_legacy_merge` 的输出：清理后的文本与是否发生变化。
@@ -740,14 +760,68 @@ fn backup_path_for(path: &Path) -> PathBuf {
 /// 也不匹配的名字，重启是彻底的 no-op——Script.js 改了但内核没重载。
 const RESTART_PROCESS_NAMES: [&str; 3] = ["Clash Verge", "clash-verge", "verge-mihomo"];
 
+/// **P1-13**：解析正在运行的 Clash Verge GUI 的真实可执行文件路径。
+///
+/// 为什么要先问进程再杀：自定义安装目录（用户把 `Clash Verge.exe` 装在
+/// `D:\Apps\...`）下，`Program Files` / `LocalAppData` 的固定候选全部落空，
+/// 结果是「杀掉了 GUI，但重启不起来」——用户的代理直接消失。
+/// 上游 Issue #5 记录过同类问题，修法就是优先使用运行中进程的真实路径。
+///
+/// 只返回**确认可重启**的路径：文件存在、看起来是 GUI（不是内核）。
+/// 内核 `verge-mihomo.exe` 由 GUI 拉起，绝不单独重启它。
+fn running_clash_gui_path() -> Option<PathBuf> {
+    let script = "$ErrorActionPreference='SilentlyContinue'
+@(Get-Process -Name 'Clash Verge','clash-verge' -ErrorAction SilentlyContinue |
+  Where-Object { $_.Path } | Select-Object -ExpandProperty Path -Unique) | ConvertTo-Json -Compress";
+    let json = imp::run_powershell(script).ok()?;
+    let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    let candidates: Vec<String> = match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        serde_json::Value::String(one) => vec![one],
+        _ => return None,
+    };
+    candidates
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file() && is_clash_gui_executable(path))
+}
+
+/// 该路径是否是 Clash Verge 的 **GUI** 可执行文件（排除内核）。
+fn is_clash_gui_executable(path: &std::path::Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    // 内核/服务进程绝不当作 GUI 拉起：单独启动它们没有任何意义，
+    // 还会留下一个没有 GUI 的孤儿进程。
+    if name.starts_with("verge-mihomo") || name == "mihomo.exe" || name == "clash.exe" {
+        return false;
+    }
+    name.ends_with(".exe")
+}
+
+/// 重启 Clash Verge：**先确认能重新拉起，才结束进程**。
+///
+/// **P1-13**：顺序是最关键的部分。原实现先杀后找，找不到就提示手动重启——
+/// 用户的代理已经被我们关掉了，规则却没生效。现在：
+/// 1. 取运行中 GUI 的真实路径（支持自定义安装目录）；
+/// 2. 固定目录候选作为补充；
+/// 3. **一个都不可用时直接放弃重启**并说明原因（不杀进程，保持现状）；
+/// 4. 确认可拉起后才结束 GUI + 内核，然后从已确认的路径启动。
+///
+/// 返回 `true` 表示已发起重启且进程拉起来了；之后内核是否真的加载了新规则
+/// 由 `wait_kernel_verified` 轮询核验，不能只看进程存在。
 fn restart_clash_verge(report: &mut RulesReport) {
     report.restart_attempted = true;
-    // GUI + 内核一起结束；内核作为服务/子进程随 GUI 重载，杀掉 GUI 进程名即可，
-    // 但 GUI 名的实际形态是 "Clash Verge"（带空格），必须显式列出。
-    let _ = imp::kill_processes_by_names(&RESTART_PROCESS_NAMES);
-    std::thread::sleep(Duration::from_secs(2));
-
+    // 1. 先确定「重启入口」，这一步不修改系统。
     let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(path) = running_clash_gui_path() {
+        candidates.push(path);
+    }
     for var in ["ProgramFiles", "ProgramFiles(x86)", "LOCALAPPDATA"] {
         if let Some(root) = std::env::var_os(var) {
             let root = PathBuf::from(root);
@@ -756,17 +830,46 @@ fn restart_clash_verge(report: &mut RulesReport) {
             candidates.push(root.join("Programs\\clash-verge\\Clash Verge.exe"));
         }
     }
-    for candidate in candidates {
-        if candidate.exists() && imp::start_detached(&candidate.to_string_lossy(), &[]).is_ok() {
+    // 去重（运行中路径很可能与固定候选重复）。
+    let mut seen = std::collections::BTreeSet::new();
+    candidates.retain(|path| {
+        let key = path.to_string_lossy().to_ascii_lowercase();
+        seen.insert(key)
+    });
+    let launchable: Vec<PathBuf> = candidates
+        .into_iter()
+        .filter(|path| path.is_file() && is_clash_gui_executable(path))
+        .collect();
+    if launchable.is_empty() {
+        // 2. **不杀进程**：杀掉了却重启不起来，比不重启更糟。
+        report.restart_result = RestartResult::AbortedNotRelaunchable;
+        report.messages.push(
+            "未找到可重新启动的 Clash Verge 程序（可能装在自定义目录且当前未运行）。                 为避免关闭代理后无法恢复，本次**未结束** Clash Verge；                 请手动重启 Clash Verge 使规则生效"
+                .to_string(),
+        );
+        return;
+    }
+
+    // 3. 确认具备重启能力后才结束进程。
+    // GUI + 内核一起结束；内核作为子进程随 GUI 重载，但必须显式列出
+    // `verge-mihomo`——只杀 GUI 时内核可能残留并继续加载旧规则。
+    let _ = imp::kill_processes_by_names(&RESTART_PROCESS_NAMES);
+    std::thread::sleep(Duration::from_secs(2));
+
+    for candidate in launchable {
+        if imp::start_detached(&candidate.to_string_lossy(), &[]).is_ok() {
+            report.restart_result = RestartResult::Relaunched;
             report
                 .messages
                 .push(format!("已重启 Clash Verge: {}", candidate.display()));
             return;
         }
     }
-    report
-        .messages
-        .push("未找到 Clash Verge 可执行文件，请手动重启 Clash Verge 使规则生效".to_string());
+    report.restart_result = RestartResult::LaunchFailed;
+    report.messages.push(
+        "已结束 Clash Verge 但未能重新启动（启动全部候选失败）。                 请手动打开 Clash Verge，并确认规则文件已加载"
+            .to_string(),
+    );
 }
 
 /// 轮询内核 `/rules` + `/proxies` 直到验证通过或超时（秒）。

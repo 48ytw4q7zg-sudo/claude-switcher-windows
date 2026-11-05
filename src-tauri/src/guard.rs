@@ -220,9 +220,19 @@ pub fn guard_tick() -> GuardTick {
         .clone()
         .unwrap_or_else(|| "clash-verge".to_string());
 
-    // list_adapters 失败时按空网卡处理 → 判离线 → fail-closed 杀（与 PS
-    // SilentlyContinue 返回空一致）。
-    let adapters = imp::list_adapters().unwrap_or_default();
+    // **P1-03**：网卡枚举失败**不能**压成空网卡列表。
+    //
+    // 旧代码 `unwrap_or_default()` → 空列表 → `tun_status_from_adapters` 判
+    // 「TUN 离线」→ 离线防抖 → `should_kill` → 结束用户正在用的 GUI。
+    // 也就是说：一次 PowerShell/网络栈查询失败就能触发一次查杀。
+    //
+    // 现在的语义：读不到 ≠ 离线。
+    // - 读失败 → 本轮**不做任何查杀决策**（保持健康，记录「无法确认」）；
+    // - 真离线（能读到网卡且 TUN 不在）→ 仍走原有的离线防抖与查杀。
+    let (adapters, adapters_unreadable) = match imp::list_adapters() {
+        Ok(adapters) => (adapters, None),
+        Err(error) => (Vec::new(), Some(error)),
+    };
     let running = running_process_names();
     let (tun_up, tun_detail) = tun_status_from_adapters(&adapters);
     let client_up = client_up_for(&mode, &running);
@@ -261,12 +271,38 @@ pub fn guard_tick() -> GuardTick {
     };
 
     let prev_offline = OFFLINE.swap(!alive_now, Ordering::SeqCst);
-    let (alive, log_offline, should_kill) = if use_system_proxy {
+    let decision = if use_system_proxy {
         // 系统代理模式下 TUN 缺失不算离线。
         tick_decision(true, client_up && proxy_usable, prev_offline)
     } else {
         tick_decision(tun_up, client_up, prev_offline)
     };
+    // **P1-03**：网卡读不出来 → 本轮的「离线」结论不可信，撤销查杀动作。
+    // `alive` 必须按「健康」上报：否则上层会把 `alive = false` 当成真离线
+    // 再走一次离线处置（告警 / 触发查杀），等于绕过了这里的抑制。
+    // 离线防抖状态保持原样，等下一次能读到网卡时继续判定。
+    if let Some(error) = &adapters_unreadable {
+        append_log(
+            "bodyguard.log",
+            &format!(
+                "{} 网卡信息读取失败，本轮跳过离线判定({})：{error}",
+                now_timestamp(),
+                if use_system_proxy {
+                    "系统代理"
+                } else {
+                    "TUN"
+                }
+            ),
+        );
+        return GuardTick {
+            alive: true,
+            tun_up: false,
+            client_up,
+            tun_detail: format!("无法确认（网卡信息读取失败：{error}）"),
+            killed: Vec::new(),
+        };
+    }
+    let (alive, log_offline, should_kill) = decision;
 
     if log_offline {
         let client_state = if mode == "auto" || mode == "other" {
@@ -291,13 +327,25 @@ pub fn guard_tick() -> GuardTick {
     }
 
     let mut killed = Vec::new();
-    if should_kill
-        // **P0-06**：真正执行查杀前重新核验意图——巡检过程可能耗时数秒，
-        // 期间用户已暂停或紧急恢复，此时不应再按旧决策杀进程。
+    // **P0-05（v0.7.1）**：查杀必须**持锁后**再核验意图。
+    //
+    // 原实现只读一次意图就直接杀：与 `--egate-restore` 交叉时，
+    // 恢复器刚解除保护、保镖仍按巡检开始时读到的旧意图再杀一次。
+    let kill_guard = if should_kill
         && crate::egate_monitor::protection_intent()
             == crate::egate_monitor::ProtectionIntent::Armed
         && !crate::egate_monitor::is_paused()
     {
+        crate::egate_lock::acquire(crate::egate_lock::SystemOperation::GuardKill).ok()
+    } else {
+        None
+    };
+    // 持锁后**再次**核验：等待锁期间用户可能已执行急救恢复。
+    let kill_allowed = kill_guard.is_some()
+        && crate::egate_monitor::protection_intent()
+            == crate::egate_monitor::ProtectionIntent::Armed
+        && !crate::egate_monitor::is_paused();
+    if kill_allowed {
         // **CLI 边界**：只结束后台 GUI（Claude Desktop），Claude Code CLI 只提醒。
         // `Get-Process -Name claude` 大小写不敏感，会把终端里的 CLI 一起打死；
         // 改用按**映像路径**判定的版本（node/npm/nvm 等宿主一律跳过）。
@@ -351,6 +399,41 @@ fn tz_watchdog_tick() {
         }
     };
     if current.eq_ignore_ascii_case(&target) {
+        return;
+    }
+    // **P0-05（v0.7.1）**：改写系统时区必须持系统操作锁，
+    // 否则可能与 `--egate-restore` 的时区还原交叉，把刚恢复的值又改回去。
+    let tz_guard =
+        match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::TimezoneWrite) {
+            Ok(guard) => guard,
+            Err(error) => {
+                append_log(
+                    "tz-watchdog.log",
+                    &format!(
+                        "{} 无法获取系统操作锁，跳过本轮时区校正: {error}",
+                        now_timestamp()
+                    ),
+                );
+                return;
+            }
+        };
+    // 持锁后重新核验意图与目标（等待锁期间可能已被急救恢复改过）。
+    if crate::egate_monitor::protection_intent() != crate::egate_monitor::ProtectionIntent::Armed {
+        drop(tz_guard);
+        return;
+    }
+    let target = match appconfig::load_checked() {
+        appconfig::ConfigLoad::Ok(config) => match config.tz_target.clone() {
+            Some(target) => target,
+            None => return,
+        },
+        _ => return,
+    };
+    if imp::current_timezone_id()
+        .map(|current| current.eq_ignore_ascii_case(&target))
+        .unwrap_or(false)
+    {
+        drop(tz_guard);
         return;
     }
     match imp::set_timezone_id(&target) {
