@@ -118,7 +118,9 @@ pub struct SnapshotPackStats {
 ///
 /// 打包时全部文件都会进内存（再 base64 膨胀 4/3），超过这个量级几乎必然
 /// 说明 `desktop-accounts` 下混进了不该打包的东西。
-const MAX_SNAPSHOT_TOTAL_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+// **P1-04**：原始快照总量上限要低于导入上限的 3/4 ——
+// Base64 膨胀约 4/3，留出 JSON 与加密开销后仍能保证「导得出就导得回」。
+const MAX_SNAPSHOT_TOTAL_BYTES: u64 = 1152 * 1024 * 1024;
 
 /// 不参与打包的目录名（切换/导入事务产生的中间目录）。
 const EXCLUDED_SNAPSHOT_DIR_NAMES: &[&str] = &[".live-backup", "_pre-import-desktop-accounts"];
@@ -376,6 +378,14 @@ struct MigrationJournal {
     staging: String,
     /// 目标快照目录。
     accounts_dir: String,
+    /// **P0-01**：账号库提交**已经开始**（写入此标记后才执行 tx.save）。
+    ///
+    /// 崩溃可能恰好落在「tx.save 成功」与「store_committed=true 落盘」之间。
+    /// 只看 `store_committed` 会误判「账号库没动过」，从而只回滚快照、
+    /// 留下「新账号库 + 旧快照」的混合状态。因此恢复时以
+    /// `store_commit_started` 作为「账号库可能已被改写」的依据。
+    #[serde(default)]
+    store_commit_started: bool,
     /// 账号库是否已提交。
     store_committed: bool,
     /// 快照目录是否已提交。
@@ -462,13 +472,13 @@ fn recover_full_migration_locked() -> Vec<String> {
     }
 
     // 未完成（含只提交一半）：回滚到完整旧状态。
-    let store_rollback = if journal.store_committed {
-        match store::load_store() {
-            Ok(_) => {
-                restore_store_backup(&journal.store_backup.as_ref().map(std::path::PathBuf::from))
-            }
-            Err(error) => Err(format!("账号库当前不可读：{error}")),
-        }
+    //
+    // **P0-01**：以 `store_commit_started` 判断「账号库可能已被改写」，
+    // 而不是 `store_committed`——后者可能因崩溃而漏写。
+    // **P0-01**：即使当前账号库已损坏，也要用完好备份恢复它，
+    // 不能因为「读不出来」就放弃回滚。
+    let store_rollback = if journal.store_commit_started {
+        restore_store_backup(&journal.store_backup.as_ref().map(std::path::PathBuf::from))
     } else {
         Ok(())
     };
@@ -514,6 +524,26 @@ pub fn has_pending_migration() -> bool {
     matches!(read_migration_journal(), Ok(Some(_)) | Err(_))
 }
 
+/// **P0-02**：普通写入的统一门禁。
+///
+/// - 账本不存在且可读 → 允许；
+/// - 账本存在 → 拒绝（迁移未收尾）；
+/// - 账本不可读/损坏 → 拒绝（无法确认状态）。
+///
+/// 错误信息区分两种情形，便于界面显示「待恢复」而不是笼统失败。
+pub fn ensure_no_pending_migration() -> Result<(), String> {
+    match read_migration_journal() {
+        Ok(None) => Ok(()),
+        Ok(Some(pending)) => Err(format!(
+            "存在未完成的完整迁移（{}），已暂停全部账号写操作。             请重启应用执行恢复，或查看「数据位置」中的迁移状态",
+            pending.transaction_id
+        )),
+        Err(error) => Err(format!(
+            "迁移事务账本无法读取（{error}），无法确认数据状态，已暂停全部账号写操作"
+        )),
+    }
+}
+
 /// **P0-03**：把账号库回滚到导入前的备份。
 ///
 /// 没有备份（原本就没有账号库）时，把当前账号库删掉即回到「不存在」状态；
@@ -528,18 +558,41 @@ fn restore_store_backup(backup: &Option<std::path::PathBuf>) -> Result<(), Strin
                     backup.display()
                 ));
             }
-            fsx::retry_io(|| fs::copy(backup, &store_path))
-                .map(|_| ())
-                .map_err(|e| format!("还原账号库失败：{e}"))
-        }
-        None => {
-            // 导入前没有账号库：回滚 = 删除本次写入的。
-            match std::fs::remove_file(&store_path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(format!("删除本次导入的账号库失败：{error}")),
+            // **P0-01**：恢复本身也必须原子——直接 fs::copy 覆盖，若中途断电
+            // 会留下截断的 store，比不恢复更糟。
+            let bytes = fs::read(backup).map_err(|e| format!("读取账号库备份失败：{e}"))?;
+            // 备份必须能解析成合法账号库，否则不拿它覆盖现有数据。
+            serde_json::from_slice::<store::Store>(&bytes)
+                .map_err(|e| format!("账号库备份已损坏，拒绝用它覆盖：{e}"))?;
+            let tmp = store_path
+                .with_file_name(format!(".store.restore-{}", uuid::Uuid::new_v4().simple()));
+            {
+                use std::io::Write as _;
+                let mut file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&tmp)
+                    .map_err(|e| format!("创建恢复临时文件失败：{e}"))?;
+                file.write_all(&bytes)
+                    .map_err(|e| format!("写入恢复临时文件失败：{e}"))?;
+                file.sync_all()
+                    .map_err(|e| format!("刷新恢复临时文件失败：{e}"))?;
             }
+            if let Err(error) = fsx::rename_with_retry(&tmp, &store_path) {
+                let _ = fs::remove_file(&tmp);
+                return Err(format!("原子替换账号库失败：{error}"));
+            }
+            // 回读校验：替换后再读一次，确认落盘内容确实可用。
+            let check = fs::read(&store_path).map_err(|e| format!("恢复后回读账号库失败：{e}"))?;
+            serde_json::from_slice::<store::Store>(&check)
+                .map_err(|e| format!("恢复后账号库校验失败（备份可能在磁盘上损坏）：{e}"))?;
+            Ok(())
         }
+        None => match std::fs::remove_file(&store_path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(format!("删除本次导入的账号库失败：{error}")),
+        },
     }
 }
 
@@ -669,7 +722,21 @@ pub fn export_full_migration_blocking(
         exported_at: chrono::Utc::now().timestamp(),
     };
     let plaintext = serde_json::to_vec(&payload).map_err(|e| format!("序列化迁移包失败: {e}"))?;
+    // **P1-04**：Base64 + JSON + 加密开销会让成品大于原始快照总量。
+    // 必须在这里就卡住，否则会出现「导出成功但自己导不回来」的包。
+    if plaintext.len() as u64 > MAX_IMPORT_PLAINTEXT_BYTES {
+        return Err(format!(
+            "迁移包序列化后超过导入上限（{} MiB）。请减少快照体积后重试；             仅备份账号库请使用「加密导出」",
+            MAX_IMPORT_PLAINTEXT_BYTES / (1024 * 1024)
+        ));
+    }
     let blob = encrypt_blob(&plaintext, password, FORMAT_VERSION_FULL)?;
+    if blob.len() as u64 > MAX_IMPORT_PLAINTEXT_BYTES {
+        return Err(format!(
+            "迁移包加密后超过导入上限（{} MiB），已中止导出",
+            MAX_IMPORT_PLAINTEXT_BYTES / (1024 * 1024)
+        ));
+    }
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent).map_err(|e| e.to_string())?;
     }
@@ -923,6 +990,7 @@ pub fn import_full_migration_blocking(
                 .then(|| snapshot_backup.to_string_lossy().to_string()),
             staging: staging.to_string_lossy().to_string(),
             accounts_dir: accounts_dir.to_string_lossy().to_string(),
+            store_commit_started: false,
             store_committed: false,
             snapshots_committed: false,
             started_at: chrono::Utc::now().timestamp(),
@@ -965,6 +1033,16 @@ pub fn import_full_migration_blocking(
                 )
             })?;
         }
+        // **P0-01**：先记「即将改写账号库」，再真正保存。
+        journal.store_commit_started = true;
+        write_migration_journal(&journal).map_err(|e| {
+            rollback_full_migration(
+                &journal,
+                &staging,
+                &old_store,
+                format!("账号库提交意图写入失败：{e}"),
+            )
+        })?;
         tx.save(&payload.store).map_err(|e| {
             rollback_full_migration(
                 &journal,
@@ -1048,9 +1126,19 @@ fn rollback_full_migration(
     reason: String,
 ) -> String {
     let mut notes = vec![reason];
-    if journal.store_committed {
-        if let Err(error) = store::save_store(old_store) {
-            notes.push(format!("账号库恢复失败：{error}"));
+    if journal.store_commit_started {
+        // **P0-01**：优先用原始备份文件回滚，而不是重新用主密钥加密写回——
+        // 备份是字节级原始状态，不依赖密钥后端，也不会二次改写内容。
+        let restored = restore_store_backup(&journal.store_backup.as_ref().map(PathBuf::from));
+        match restored {
+            Ok(()) => {}
+            // 没有备份（原本就没有账号库）且备份文件缺失时，退回内存快照。
+            Err(error) if journal.store_backup.is_none() => {
+                if let Err(e) = store::save_store(old_store) {
+                    notes.push(format!("账号库恢复失败：{error}；{e}"));
+                }
+            }
+            Err(error) => notes.push(format!("账号库恢复失败：{error}")),
         }
     }
     if let Err(error) =
@@ -1903,6 +1991,7 @@ mod tests {
             snapshot_backup: Some(snapshot_backup.to_string_lossy().to_string()),
             staging: staging.to_string_lossy().to_string(),
             accounts_dir: data.join("desktop-accounts").to_string_lossy().to_string(),
+            store_commit_started: true,
             store_committed: true,
             snapshots_committed: false,
             started_at: 0,
@@ -1949,6 +2038,7 @@ mod tests {
                 .join("desktop-accounts")
                 .to_string_lossy()
                 .to_string(),
+            store_commit_started: true,
             store_committed: true,
             snapshots_committed: true,
             started_at: 0,
@@ -1978,6 +2068,7 @@ mod tests {
             snapshot_backup: None,
             staging: "x".into(),
             accounts_dir: "y".into(),
+            store_commit_started: false,
             store_committed: false,
             snapshots_committed: false,
             started_at: 0,
@@ -2102,5 +2193,147 @@ mod tests {
         );
         // 账本已清理，可以再次导入。
         assert!(!migration_journal_path().unwrap().exists());
+    }
+
+    /// **P0-01**：崩溃落在「Store 已保存、store_committed 未落盘」之间时，
+    /// 恢复器必须依据 store_commit_started 回滚账号库，不能只回滚快照。
+    #[test]
+    fn recovery_rolls_back_store_when_only_started_marker_exists() {
+        let _guard = crate::test_support::env_lock();
+        let _key_guard = store::TestKeyBackendGuard::install_in_memory();
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let data = home.join(".claude-switcher");
+        std::fs::create_dir_all(data.join("desktop-accounts").join("old")).unwrap();
+        std::fs::write(
+            data.join("desktop-accounts").join("old").join("a.txt"),
+            b"old",
+        )
+        .unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", &home);
+
+        // 旧账号库（备份）与"已写入的新账号库"。
+        let mut original = sample_store();
+        original.profiles[0].name = "ORIGINAL".to_string();
+        store::with_store(|current| {
+            *current = original.clone();
+            Ok(())
+        })
+        .unwrap();
+        let backup = data.join("store.private.json.pre-import-test");
+        std::fs::copy(data.join("store.private.json"), &backup).unwrap();
+        let mut replaced = sample_store();
+        replaced.profiles[0].name = "REPLACED".to_string();
+        store::with_store(|current| {
+            *current = replaced;
+            Ok(())
+        })
+        .unwrap();
+
+        let snapshot_backup = data.join("_pre-import-desktop-accounts-test");
+        std::fs::rename(data.join("desktop-accounts"), &snapshot_backup).unwrap();
+        std::fs::create_dir_all(data.join("desktop-accounts").join("new")).unwrap();
+
+        write_migration_journal(&MigrationJournal {
+            transaction_id: "t".into(),
+            store_backup: Some(backup.to_string_lossy().to_string()),
+            snapshot_backup: Some(snapshot_backup.to_string_lossy().to_string()),
+            staging: data
+                .join("_import-staging-test")
+                .to_string_lossy()
+                .to_string(),
+            accounts_dir: data.join("desktop-accounts").to_string_lossy().to_string(),
+            store_commit_started: true,
+            // 崩溃导致该标记未落盘：
+            store_committed: false,
+            snapshots_committed: false,
+            started_at: 0,
+        })
+        .unwrap();
+
+        recover_full_migration();
+        // 账号库必须回到 ORIGINAL（而不是停留在 REPLACED）。
+        let after = store::load_store().unwrap();
+        assert_eq!(
+            after.profiles[0].name, "ORIGINAL",
+            "store_commit_started 即意味着账号库可能已被改写，必须回滚"
+        );
+        assert_eq!(
+            std::fs::read(data.join("desktop-accounts").join("old").join("a.txt")).unwrap(),
+            b"old"
+        );
+    }
+
+    /// **P0-01**：账号库损坏时仍能用完好备份恢复。
+    #[test]
+    fn recovery_restores_corrupt_store_from_backup() {
+        let _guard = crate::test_support::env_lock();
+        let _key_guard = store::TestKeyBackendGuard::install_in_memory();
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        let data = home.join(".claude-switcher");
+        std::fs::create_dir_all(&data).unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", &home);
+
+        store::with_store(|current| {
+            *current = sample_store();
+            Ok(())
+        })
+        .unwrap();
+        let backup = data.join("store.private.json.pre-import-test");
+        std::fs::copy(data.join("store.private.json"), &backup).unwrap();
+        // 正式 store 被写坏。
+        std::fs::write(data.join("store.private.json"), b"{truncated").unwrap();
+
+        write_migration_journal(&MigrationJournal {
+            transaction_id: "t".into(),
+            store_backup: Some(backup.to_string_lossy().to_string()),
+            snapshot_backup: None,
+            staging: data
+                .join("_import-staging-test")
+                .to_string_lossy()
+                .to_string(),
+            accounts_dir: data.join("desktop-accounts").to_string_lossy().to_string(),
+            store_commit_started: true,
+            store_committed: false,
+            snapshots_committed: false,
+            started_at: 0,
+        })
+        .unwrap();
+
+        recover_full_migration();
+        let after = store::load_store().expect("损坏的账号库应已被备份替换");
+        assert_eq!(after.profiles.len(), 1);
+    }
+
+    /// **P0-02**：存在未完成迁移时，普通写入必须被统一门禁拒绝。
+    #[test]
+    fn pending_migration_blocks_ordinary_store_writes() {
+        let _guard = crate::test_support::env_lock();
+        let _key_guard = store::TestKeyBackendGuard::install_in_memory();
+        let work = tempfile::tempdir().unwrap();
+        let home = work.path().join("home");
+        std::fs::create_dir_all(home.join(".claude-switcher")).unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", &home);
+
+        write_migration_journal(&MigrationJournal {
+            transaction_id: "pending".into(),
+            store_backup: None,
+            snapshot_backup: None,
+            staging: "x".into(),
+            accounts_dir: "y".into(),
+            store_commit_started: false,
+            store_committed: false,
+            snapshots_committed: false,
+            started_at: 0,
+        })
+        .unwrap();
+
+        let err = store::with_store(|_| Ok(())).unwrap_err();
+        assert!(err.contains("未完成的完整迁移"), "{err}");
+        // 损坏的账本同样拒绝（不能当成「没有事务」）。
+        std::fs::write(migration_journal_path().unwrap(), b"{broken").unwrap();
+        let err = store::with_store(|_| Ok(())).unwrap_err();
+        assert!(err.contains("无法读取"), "{err}");
     }
 }

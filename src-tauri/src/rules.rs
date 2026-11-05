@@ -803,6 +803,10 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
     let script_path = profiles.join("Script.js");
     let merge_path = profiles.join("Merge.yaml");
 
+    // **P1-03**：先恢复上次未完成的事务，再读取任何文件。
+    // 否则会读到上次失败留下的半成品，并把它当成「原始内容」写进新账本。
+    heal_rules_transaction()?;
+
     // **P0-08**：所有可能失败的读取与校验必须在**任何写入之前**完成。
     //
     // 原实现先清理 Merge.yaml 再读 Script.js：若 Script.js 读失败，
@@ -834,7 +838,6 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
     } else {
         None
     };
-    heal_rules_transaction()?;
     let mut tx = RulesTransaction {
         transaction_id: uuid::Uuid::new_v4().simple().to_string(),
         merge_path: merge_path.to_string_lossy().to_string(),
@@ -893,6 +896,14 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
             // 只有真的清理过 Merge 才需要重启一次让内核丢弃旧 prepend-rules。
             if report.merge_changed {
                 restart_clash_verge(&mut report);
+                // **P1-03**：清理成功也要提交账本——否则下次启动会把刚清理掉的
+                // Merge.yaml 恢复回来，白白撤销一次成功修复。
+                tx.kernel_verified = true;
+                write_rules_transaction(&tx)?;
+                clear_rules_transaction()?;
+            } else {
+                // 完全没动过文件：账本无意义，直接清掉。
+                clear_rules_transaction()?;
             }
             return Ok(report);
         }
@@ -1020,17 +1031,25 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
         }
     } else if merge_changed {
         // P0-04：Script 没改但 Merge 改了且内核验证失败 → 同样恢复 Merge。
-        if let Err(error) = restore_merge(&merge_path, merge_original.as_deref(), true) {
-            report
-                .messages
-                .push(format!("Merge.yaml 回滚失败：{error}（请手动恢复备份）"));
-        } else {
+        let merge_restored = match restore_merge(&merge_path, merge_original.as_deref(), true) {
+            Ok(_) => true,
+            Err(error) => {
+                report.messages.push(format!(
+                    "Merge.yaml 回滚失败：{error}（事务账本与备份已保留，下次启动会重试恢复）"
+                ));
+                false
+            }
+        };
+        if merge_restored {
             report
                 .messages
                 .push("内核未加载规则；已恢复本次对 Merge.yaml 的修改".to_string());
         }
         restart_clash_verge(&mut report);
-        clear_rules_transaction()?;
+        // **P1-03**：只有真的恢复成功才删账本；失败必须留着重试。
+        if merge_restored {
+            clear_rules_transaction()?;
+        }
     } else {
         // 块本就在文件里（未改动），但内核没加载——只告警，不回滚。
         report

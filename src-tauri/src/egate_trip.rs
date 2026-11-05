@@ -408,6 +408,22 @@ fn count_rules_for(agent: &str, exes: &[String]) -> RuleVerification {
                    $af = $ar | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
                    if ($ar.Enabled -ne 'True' -or $ar.Action -ne 'Block') {{ $reason = '生效策略中的规则属性不符' }}
                    elseif ($ar.Direction -ne $s.direction -or -not $af.Program -or $af.Program -ine $s.exe) {{ $reason = '生效策略的方向或程序过滤条件不符' }}
+                   # **P0-05**：端口/地址过滤器若被限定，就不再覆盖该程序的全部出站流量。
+                   $pf = $ar | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+                   $adf = $ar | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
+                   $portAny = (-not $pf) -or (
+                     (((-not $pf.Protocol) -or $pf.Protocol -eq 'Any') -and
+                      ((-not $pf.LocalPort) -or $pf.LocalPort -eq 'Any') -and
+                      ((-not $pf.RemotePort) -or $pf.RemotePort -eq 'Any'))
+                   )
+                   $addrAny = (-not $adf) -or (
+                     (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and
+                      ((-not $adf.RemoteAddress) -or $adf.RemoteAddress -eq 'Any'))
+                   )
+                   $profileAll = ([string]$ar.Profile).ToLowerInvariant() -eq 'any'
+                   if (-not $portAny) {{ $reason = '生效策略限定了端口范围，未覆盖全部流量' }}
+                   elseif (-not $addrAny) {{ $reason = '生效策略限定了地址范围，未覆盖全部流量' }}
+                   elseif (-not $profileAll) {{ $reason = '生效策略只对部分网络配置档生效' }}
                    else {{ $ok = $true }}\n\
                  }}\n\
                }}\n\
@@ -836,10 +852,6 @@ pub enum ReleaseReason {
     Automatic,
     UserRequested,
     Emergency,
-}
-
-pub fn release_all_verified() -> Result<ReleaseReport, String> {
-    release_verified(ReleaseReason::Automatic)
 }
 
 /// 自动恢复、用户手动解除和紧急恢复共用核验删除逻辑，但只有自动恢复受手动保持拦截。

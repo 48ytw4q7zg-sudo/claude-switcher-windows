@@ -68,6 +68,13 @@ pub struct AppConfig {
     /// 是否启用「接入路径检查」：未接入代理链路时跳过探测并按阈值处理（默认开）。
     #[serde(default = "default_egate_enforce_access")]
     pub egate_enforce_access: bool,
+    /// **P0-06**：未接入代理时**立即**锁住受管应用出站（不等普通熔断阈值）。
+    ///
+    /// 默认开启：独立于目标失败熔断的「兜底封锁」意图，对齐 ClaudeGuard 的
+    /// `lockdown_on_uncovered`。它只封锁受管 GUI 应用的出站，不是全局断网，
+    /// 也不碰 Node/终端宿主。
+    #[serde(default = "default_lockdown_on_uncovered")]
+    pub lockdown_on_uncovered: bool,
     /// 被守护的桌面应用 id（claude / chatgpt / antigravity）。
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub egate_guarded_agents: Vec<String>,
@@ -102,6 +109,11 @@ fn default_egate_interval() -> u64 {
 }
 
 /// 默认启用接入路径检查。
+/// 未接入兜底封锁默认开启（保护方向：宁可先锁住，也不留裸连窗口）。
+fn default_lockdown_on_uncovered() -> bool {
+    true
+}
+
 fn default_egate_enforce_access() -> bool {
     true
 }
@@ -145,6 +157,7 @@ impl Default for AppConfig {
             egate_trip_threshold: default_egate_trip_threshold(),
             egate_interval_secs: default_egate_interval(),
             egate_enforce_access: default_egate_enforce_access(),
+            lockdown_on_uncovered: default_lockdown_on_uncovered(),
             egate_guarded_agents: Vec::new(),
             egate_leak_trip: false,
             disabled_checks: Vec::new(),

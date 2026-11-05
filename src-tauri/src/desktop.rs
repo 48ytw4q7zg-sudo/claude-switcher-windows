@@ -599,9 +599,17 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
         .borrow()
         .as_ref()
         .map(|p| p.to_string_lossy().to_string());
-    // **P0-02**：`switched` 只表示**闭包**执行成功，此时账号库还没保存。
-    // 真正的提交点在 `with_store` 成功返回之后（见下面的 Ok 分支）。
-    final_ledger.phase = DesktopSwitchPhase::FilesSwitched;
+    // **P0-03**：**绝不在失败路径上把账本推进到比实际更靠后的阶段。**
+    //
+    // 原实现在这里无条件写 `FilesSwitched`：一次「目标快照不存在」的前置
+    // 检查失败，就会留下 `original_existed=true + backup_path=None` 的账本，
+    // 恢复器无法判断如何恢复只能保留，之后每次切换都被
+    // `read_pending_switch_ledger()` 拒绝——一次普通失败永久卡死切换功能。
+    //
+    // 现在只在**确实完成了文件切换**时推进；否则保持在已落盘的真实阶段。
+    if switched {
+        final_ledger.phase = DesktopSwitchPhase::FilesSwitched;
+    }
 
     match result {
         Ok(mut warnings) => {
@@ -669,12 +677,22 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
             //   已经一致的状态；因此这里**清掉**账本，但清失败要如实报告。
             // - 回滚失败：账本必须留下（下次启动重试恢复），且阶段保持
             //   `FilesSwitched`（可回滚态）。
-            let rolled_back =
-                transaction.backup_path.borrow().is_some() || !transaction.original_existed.get();
-            if rolled_back {
-                // 上面两条 return 已经处理了「有备份」与「原本无目录」两种情况；
-                // 能走到这里说明切换尚未成功（switched=false），账本停在
-                // Prepared/BackupVerified/FilesSwitching 之一，保留即可。
+            // **P0-03**：失败时按「实际做到哪一步」决定账本去留：
+            // - 还没动过活目录（账本停在 Prepared）→ 清掉账本，不留待恢复事务；
+            // - 已备份/已开始替换 → 保留账本与备份，让恢复器能回滚。
+            let touched_files = matches!(
+                final_ledger.phase,
+                DesktopSwitchPhase::BackupVerified
+                    | DesktopSwitchPhase::FilesSwitching
+                    | DesktopSwitchPhase::FilesSwitched
+            );
+            if !touched_files {
+                if let Err(clear_error) = clear_switch_ledger() {
+                    return Err(format!(
+                        "{error}；且清理未开始的切换账本失败（{clear_error}）"
+                    ));
+                }
+                return Err(error);
             }
             if let Err(write_error) = write_switch_ledger(&final_ledger) {
                 return Err(format!(
@@ -940,8 +958,17 @@ pub fn heal_desktop_switch() -> Vec<String> {
     let Ok(path) = desktop_switch_ledger_path() else {
         return Vec::new();
     };
-    let Ok(bytes) = std::fs::read(&path) else {
-        return Vec::new();
+    // **P0-02**：只有「文件不存在」才等于「没有待恢复事务」。
+    // 权限错误、磁盘读取错误都必须报出来——把它们当成「无事发生」
+    // 会让一次真实中断被静默忽略。
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Vec::new(),
+        Err(error) => {
+            return vec![format!(
+                "Desktop 切换账本无法读取（{error}），已保留现场请人工核对"
+            )];
+        }
     };
     let text = crate::jsonio::decode_text(&bytes);
     let ledger: DesktopSwitchLedger = match serde_json::from_str(&text) {
@@ -1449,36 +1476,71 @@ fn switch_desktop_profile_in(
 /// 删除 Desktop 账号登记；`also_files` 为 true 时连快照目录一起删除。
 /// 登记不存在视为幂等成功。
 pub fn delete_desktop_profile(id: &str, also_files: bool) -> Result<(), String> {
-    // H-2：读—改—写走 with_store；返回被删 profile（供锁外删物理文件）。
-    let removed = store::with_store(|store| {
-        let Some(pos) = store.desktop_profiles.iter().position(|p| p.id == id) else {
-            return Ok(None); // 幂等：登记不存在，直接成功
-        };
-        let profile = store.desktop_profiles.remove(pos);
-        // 删的是当前账号：清掉当前标记，避免下次切换尝试回存到不存在的快照。
-        if store.current_desktop_profile_id.as_deref() == Some(id) {
-            store.current_desktop_profile_id = None;
+    // **P0-04**：整个删除过程持有与导入/切换相同的执行权。
+    //
+    // 原实现「先在 with_store 里删登记 → 释放锁 → 再 remove_dir_all」：
+    // 两步之间若另一个导入事务重建了同 ID 的快照，删除动作会把**新导入的
+    // 数据**一起删掉。这个窗口不需要两个实例，同进程两个命令并发就够。
+    store::with_store_transaction(|tx| {
+        // 未收尾的迁移/切换事务存在时，不做删除（避免删掉正在被恢复的数据）。
+        crate::export::ensure_no_pending_migration()?;
+        if let Some(pending) = read_pending_switch_ledger()? {
+            return Err(format!(
+                "存在未完成的 Desktop 切换（{}），请先重启应用完成恢复再删除",
+                pending.transaction_id
+            ));
         }
-        Ok(Some(profile))
-    })?;
-
-    if let Some(profile) = removed {
-        if also_files {
-            let snapshot = desktop_snapshot_dir(&profile.id)?;
-            if snapshot.exists() {
-                fsx::retry_io(|| fs::remove_dir_all(&snapshot)).map_err(|e| {
-                    format!(
-                        "删除快照目录失败 {}: {}",
-                        snapshot.display(),
-                        fsx::humanize_io_error(&e)
-                    )
-                })?;
+        let mut data = tx.load()?;
+        let Some(pos) = data.desktop_profiles.iter().position(|p| p.id == id) else {
+            return Ok(()); // 幂等：登记不存在，直接成功
+        };
+        let profile = data.desktop_profiles.remove(pos);
+        if data.current_desktop_profile_id.as_deref() == Some(id) {
+            data.current_desktop_profile_id = None;
+        }
+        if !also_files {
+            tx.save(&data)?;
+            return Ok(());
+        }
+        // 先把物理目录改名成唯一的「待删除」名：改名是原子的，且此后即使
+        // 有并发导入重建了同 ID 目录，也不会被本次删除波及。
+        let snapshot = desktop_snapshot_dir(&profile.id)?;
+        let pending = snapshot.with_file_name(format!(
+            ".{}.delete-pending-{}",
+            profile.id,
+            uuid::Uuid::new_v4().simple()
+        ));
+        let renamed = if snapshot.exists() {
+            fsx::rename_with_retry(&snapshot, &pending).map_err(|e| {
+                format!(
+                    "移走快照目录失败 {}: {}（账号未删除）",
+                    snapshot.display(),
+                    fsx::humanize_io_error(&e)
+                )
+            })?;
+            true
+        } else {
+            false
+        };
+        // 登记保存失败 → 把目录改回原名，保证「登记与文件」一致。
+        if let Err(error) = tx.save(&data) {
+            if renamed {
+                let _ = fsx::rename_with_retry(&pending, &snapshot);
+            }
+            return Err(format!("保存账号库失败，已恢复快照目录：{error}"));
+        }
+        if renamed {
+            if let Err(error) = fsx::retry_io(|| std::fs::remove_dir_all(&pending)) {
+                // 登记已删、目录已移走：残留不影响正确性，但要如实说明位置。
+                return Err(format!(
+                    "账号已删除，但清理快照目录失败（{error}）；残留目录：{}",
+                    pending.display()
+                ));
             }
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
-
 /// 重命名 Desktop 账号（不动物理快照）。
 pub fn rename_desktop_profile(id: &str, name: &str) -> Result<DesktopProfile, String> {
     let name = name.trim().to_string();
@@ -2822,5 +2884,65 @@ mod tests {
             "原快照必须回到正式目录"
         );
         assert!(!staging.exists(), "半成品 .new 必须清理");
+    }
+
+    /// **P0-03**：一次前置检查失败（目标快照不存在）不得留下永久待恢复事务。
+    #[test]
+    fn failed_switch_does_not_leave_permanent_ledger() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+        // 没有注册任何 Desktop 账号：切换必然在查找阶段失败。
+        let err = switch_desktop_profile("nonexistent-id").unwrap_err();
+        assert!(!err.is_empty());
+        assert!(
+            !desktop_switch_ledger_path().unwrap().exists(),
+            "未动任何文件就失败时，账本必须清掉；实际残留：{err}"
+        );
+        // 之后仍能正常建立下一次事务（不会被上一次失败卡死）。
+        assert!(read_pending_switch_ledger().unwrap().is_none());
+    }
+
+    /// **P0-04**：删除快照时，物理目录先被改名成唯一待删名；
+    /// 即使此时另有导入重建了同 ID 目录，也不会被本次删除波及。
+    #[test]
+    fn delete_renames_snapshot_before_removal() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let data = dir.path().join(".claude-switcher");
+        let snapshot = data.join("desktop-accounts").join("a-id");
+        std::fs::create_dir_all(&snapshot).unwrap();
+        std::fs::write(snapshot.join("who.txt"), b"A").unwrap();
+        store::with_store(|store| {
+            store.desktop_profiles.push(DesktopProfile {
+                id: "a-id".into(),
+                name: "A".into(),
+                notes: None,
+                created_at: Utc::now(),
+                updated_at: Utc::now(),
+                last_switched_at: None,
+                snapshot_rel: "desktop-accounts/a-id".into(),
+                size_bytes: 0,
+                meta: None,
+            });
+            store.current_desktop_profile_id = Some("a-id".into());
+            Ok(())
+        })
+        .unwrap();
+
+        delete_desktop_profile("a-id", true).unwrap();
+        assert!(!snapshot.exists(), "快照目录应被删除");
+        // 不应残留任何待删目录。
+        let leftovers: Vec<String> = std::fs::read_dir(data.join("desktop-accounts"))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert!(leftovers.is_empty(), "残留：{leftovers:?}");
+        let after = store::load_store().unwrap();
+        assert!(after.desktop_profiles.is_empty());
+        assert!(after.current_desktop_profile_id.is_none());
     }
 }

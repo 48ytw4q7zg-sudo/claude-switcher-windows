@@ -683,6 +683,79 @@ fn leak_round(config: &crate::appconfig::AppConfig) -> LeakRound {
     }
 }
 
+/// **P0-06**：未接入时的即时兜底封锁（独立于阈值熔断）。
+///
+/// - 只在确认「未接入」时施加，不对 Unknown / 未验证 TUN 动手；
+/// - 使用与熔断相同的应用级隔离执行器（不新增第二套防火墙逻辑）；
+/// - 结果写入独立的持久化意图文件，便于重启后判断「这批规则是兜底锁」；
+/// - 建立失败只记 Degraded，绝不宣称已保护。
+fn run_uncovered_lockdown(
+    config: &crate::appconfig::AppConfig,
+    report: &crate::egate_check::EgateReport,
+) {
+    let agents = if config.egate_guarded_agents.is_empty() {
+        crate::egate_defaults::DEFAULT_GUARDED_AGENTS
+            .iter()
+            .map(|id| id.to_string())
+            .collect::<Vec<_>>()
+    } else {
+        config.egate_guarded_agents.clone()
+    };
+    if agents.is_empty() {
+        return;
+    }
+    // 已经处于兜底锁状态时不重复施加（避免每轮都去动防火墙）。
+    if uncovered_lock_active() {
+        return;
+    }
+    let trip = crate::egate_trip::trip(&agents);
+    if trip.any_isolated {
+        if let Err(error) = mark_uncovered_lock() {
+            crate::log_error(&format!(
+                "未接入兜底封锁已施加，但意图落盘失败（{error}）：重启后可能无法识别这批规则"
+            ));
+        }
+        crate::log_error(&format!(
+            "未接入代理链路：已立即建立应用级兜底封锁（{}）",
+            trip.note
+        ));
+    } else {
+        crate::log_error(&format!(
+            "未接入代理链路，但兜底封锁未能建立（Degraded）：{}",
+            report
+                .targets
+                .iter()
+                .map(|t| t.name.as_str())
+                .collect::<Vec<_>>()
+                .join("、")
+        ));
+    }
+}
+
+/// 兜底封锁意图文件（与手动保持隔离分开，互不覆盖）。
+fn uncovered_lock_file() -> Result<std::path::PathBuf, String> {
+    Ok(crate::paths::app_data_dir()?.join("eguard-uncovered-lock.json"))
+}
+
+fn uncovered_lock_active() -> bool {
+    uncovered_lock_file()
+        .map(|path| path.exists())
+        .unwrap_or(false)
+}
+
+fn mark_uncovered_lock() -> Result<(), String> {
+    let path = uncovered_lock_file()?;
+    let body = serde_json::json!({ "since": now_secs() }).to_string();
+    crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
+}
+
+/// 接入恢复后清除兜底锁记录（规则由自动恢复统一解除）。
+pub fn clear_uncovered_lock() {
+    if let Ok(path) = uncovered_lock_file() {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
 /// 跑一轮监控（含熔断执行）。
 fn run_monitor_round(
     config: &crate::appconfig::AppConfig,
@@ -728,6 +801,21 @@ fn run_monitor_round(
         report.should_warn || leak.warn,
         recovery,
     );
+    // **P0-06**：未接入代理时的**即时兜底封锁**。
+    //
+    // 独立的 `access_streak` 阈值熔断要等若干轮；而在「系统代理关 + 无 TUN」
+    // 的那一刻，受管应用就已经在直连了。这里在发现 Uncovered 的当轮就同步
+    // 出站规则，不等阈值。
+    //
+    // 注意：这是**应用级出站隔离**，不是全局断网，只作用于受管 GUI 应用。
+    if config.lockdown_on_uncovered
+        && report.access.path == "uncovered"
+        && !is_paused()
+        && protection_intent() == ProtectionIntent::Armed
+    {
+        run_uncovered_lockdown(config, &report);
+    }
+
     match decide(gate) {
         RoundAction::Trip => {
             // P0-02：若另一进程正在修改系统保护资源，本轮跳过（下轮再试），
@@ -789,7 +877,9 @@ fn run_monitor_round(
         RoundAction::Recover => {
             // P0-07：出口已恢复，自动解除隔离。
             // **P0-NEW-02**：只有核验通过才清除熔断状态。
-            match crate::egate_trip::release_all_verified() {
+            // 接入已恢复：兜底锁不再需要，规则由下面的统一解除处理。
+            clear_uncovered_lock();
+            match crate::egate_trip::release_verified(crate::egate_trip::ReleaseReason::Automatic) {
                 Ok(report) if report.verified => {
                     let removed = report.requested;
                     clear_tripped();

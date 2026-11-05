@@ -618,11 +618,31 @@ try {{
     if ($r.Enabled -ne 'True' -or $r.Direction -ne 'Outbound' -or $r.Action -ne 'Block') {{ 'wrong'; exit 0 }}
   }}
 
-  # ② 必须在当前生效策略里也能看到（防止组策略覆盖）。
+  # ② 生效策略里必须存在**属性完全匹配**的规则（P0-05）。
+  #
+  # 只判 Enabled+Action 不够：一条规则可能限定了 Profile、RemotePort、
+  # 远程地址或接口类型，当前网络/流量根本不在它的覆盖范围内。
+  # 全局断网要求：方向 Outbound、动作 Block、**不得**附加程序/端口/地址
+  # 限制（附加了就不是「全局」），且 Profile 不能把当前活动网络排除在外。
   $active = @(Get-NetFirewallRule -DisplayName $name -PolicyStore ActiveStore -ErrorAction SilentlyContinue)
   $activeOk = $false
   foreach ($a in $active) {{
-    if ($a.Enabled -eq 'True' -and $a.Action -eq 'Block') {{ $activeOk = $true }}
+    if ($a.Enabled -ne 'True' -or $a.Action -ne 'Block' -or $a.Direction -ne 'Outbound') {{ continue }}
+    $af = $a | Get-NetFirewallApplicationFilter -ErrorAction SilentlyContinue
+    $pf = $a | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue
+    $adf = $a | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue
+    $progAny = (-not $af) -or (-not $af.Program) -or $af.Program -eq 'Any'
+    $portAny = (-not $pf) -or (
+                 ((-not $pf.Protocol) -or $pf.Protocol -eq 'Any') -and
+                 ((-not $pf.LocalPort) -or $pf.LocalPort -eq 'Any') -and
+                 ((-not $pf.RemotePort) -or $pf.RemotePort -eq 'Any')
+               )
+    $addrAny = (-not $adf) -or
+               (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and
+                ((-not $adf.RemoteAddress) -or $adf.RemoteAddress -eq 'Any'))
+    # Profile 必须覆盖「所有」配置档：只对 Domain 生效的规则挡不住 Public 流量。
+    $profileAll = ([string]$a.Profile).ToLowerInvariant() -eq 'any'
+    if ($progAny -and $portAny -and $addrAny -and $profileAll) {{ $activeOk = $true }}
   }}
   if (-not $activeOk) {{ 'unknown'; exit 0 }}
 

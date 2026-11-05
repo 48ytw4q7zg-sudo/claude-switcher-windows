@@ -3343,6 +3343,11 @@ pub fn run() {
             for message in export::recover_full_migration() {
                 log_error(&message);
             }
+            // **P0-02**：迁移未收尾时进入「待恢复」：界面照常显示只读数据，
+            // 但所有普通账号写操作会被 store 门禁拒绝（见 store::with_store）。
+            if export::has_pending_migration() {
+                log_error("完整迁移未收尾，已暂停账号写操作；重启或完成恢复前请勿修改数据");
+            }
             if let Err(error) = rules::heal_rules_transaction() {
                 log_error(&format!("Clash 双文件崩溃恢复未完成：{error}"));
             }

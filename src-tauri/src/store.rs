@@ -817,6 +817,13 @@ pub fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<
     let _guard = STORE_LOCK
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // **P0-02**：存在未完成的完整迁移时，**所有普通写入**都必须被拒绝。
+    //
+    // 原实现只有部分入口自己检查 `has_pending_migration()`：迁移恢复失败后
+    // 应用照常启动，用户仍能切号/建号/捕获快照，之后重试恢复会用旧备份
+    // 覆盖掉这些新改动。门禁放在这里，任何普通写路径都绕不过去。
+    // 恢复专用入口走 `with_store_transaction()`，不受本门禁阻塞。
+    crate::export::ensure_no_pending_migration()?;
     let mut store_data = load_store()?;
     match f(&mut store_data) {
         Ok(value) => {
