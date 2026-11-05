@@ -144,7 +144,10 @@ export interface QuarantineReport {
 /** 出口门禁：一次熔断的完整结果。 */
 export interface TripReport {
   agents: QuarantineReport[];
-  isolated: boolean;
+  /** 有任一应用被真正隔离（Rust 字段名，勿改）。 */
+  any_isolated: boolean;
+  /** 所有应用都已完整覆盖。 */
+  all_isolated: boolean;
   failures: string[];
   note: string;
 }

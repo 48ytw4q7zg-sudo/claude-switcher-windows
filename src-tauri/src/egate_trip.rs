@@ -1011,6 +1011,36 @@ pub fn prune_stale_rule_targets() -> Result<u32, String> {
     Ok(value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32)
 }
 
+/// **P0-03**：只读核验「当前熔断是否仍然真正生效」。
+///
+/// 复用 `count_rules_for_reason`（ActiveStore + 属性 + 过滤器全覆盖），
+/// 不靠规则条数判断。返回 `None` 表示查询失败（无法确认）。
+pub fn verify_current_isolation(guarded_agents: &[String]) -> Option<bool> {
+    if guarded_agents.is_empty() {
+        return Some(true);
+    }
+    let mut all_ok = true;
+    for agent in guarded_agents {
+        let exes = resolve_agent_exe_candidates(agent)
+            .into_iter()
+            .map(|c| c.path)
+            .collect::<Vec<_>>();
+        if exes.is_empty() {
+            // 没有可执行路径：无法建立也无法核验，按「不完整」处理。
+            all_ok = false;
+            continue;
+        }
+        let verification = count_rules_for_reason(IsolationReason::EgressTrip, agent, &exes, false);
+        if !verification.query_ok {
+            return None;
+        }
+        if verification.verified < verification.expected {
+            all_ok = false;
+        }
+    }
+    Some(all_ok)
+}
+
 /// 解除隔离的来源，决定是否检查手动保持意图。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReleaseReason {
@@ -1127,23 +1157,38 @@ pub(crate) fn release_all_verified_locked(
     _guard: &crate::egate_lock::OperationGuard,
 ) -> Result<ReleaseReport, String> {
     // 该入口用于已经持锁的紧急恢复（Emergency），不再检查手动保持。
-    // P0-C：先尝试清理旧版残留（升级兼容），失败不阻断主流程。
+    //
+    // **P0-01（v0.6.13.1）**：必须清理**两个**现行命名空间 + 旧版遗留。
+    // 原实现只按 `ClaudeSwitcher AppIsolation` 删除，于是「未接入兜底封锁」
+    // 的规则在紧急恢复后仍留在防火墙里——界面报告「已全部解除」，实际还在拦。
     let legacy = cleanup_legacy_rules().unwrap_or(0);
-    let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'\n\
-         $rules = @(Get-NetFirewallRule -DisplayName {}* )\n\
-         $n = $rules.Count\n\
-         $rules | Remove-NetFirewallRule -ErrorAction SilentlyContinue\n\
-         ConvertTo-Json @{{ removed = $n }} -Compress",
-        ps_quote(RULE_PREFIX)
-    );
-    let json = crate::platform::imp::run_powershell(&script)?;
-    let value: serde_json::Value =
-        serde_json::from_str(json.trim()).map_err(|e| format!("清理结果解析失败：{e}"))?;
-    let requested = value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32 + legacy;
+    let mut requested = legacy;
+    let mut remove_failures: Vec<String> = Vec::new();
+    for prefix in [
+        IsolationReason::EgressTrip.prefix(),
+        IsolationReason::Uncovered.prefix(),
+    ] {
+        let script = format!(
+            "$ErrorActionPreference='SilentlyContinue'
+             $rules = @(Get-NetFirewallRule -DisplayName {}* )
+             $n = $rules.Count
+             $rules | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+             ConvertTo-Json @{{ removed = $n }} -Compress",
+            ps_quote(prefix)
+        );
+        match crate::platform::imp::run_powershell(&script) {
+            Ok(json) => match serde_json::from_str::<serde_json::Value>(json.trim()) {
+                Ok(value) => {
+                    requested += value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32
+                }
+                Err(e) => remove_failures.push(format!("{prefix} 清理结果解析失败：{e}")),
+            },
+            Err(e) => remove_failures.push(format!("{prefix} 清理失败：{e}")),
+        }
+    }
 
     // P0-04：回查——删除命令返回成功不等于规则真的消失。
-    let mut failures = Vec::new();
+    let mut failures = remove_failures;
     match rule_count() {
         Some(0) => Ok(ReleaseReport {
             requested,
@@ -1176,14 +1221,18 @@ pub(crate) fn release_all_verified_locked(
 
 /// 当前存在的本产品隔离规则数（恢复后核验用）。
 pub fn rule_count() -> Option<u32> {
-    // 同时统计新版前缀与旧版应用隔离（不含 Cut All，避免把断网规则算进来）。
+    // **P0-01（v0.6.13.1）**：统计**两个**现行命名空间 + 旧版遗留。
+    // 原实现只数 `ClaudeSwitcher AppIsolation`：兜底封锁残留时仍报 0，
+    // 于是恢复器/重建器会误判「没有任何隔离」。
     let script = format!(
         "$ErrorActionPreference='SilentlyContinue'
-         $new = @(Get-NetFirewallRule -DisplayName {}* -ErrorAction SilentlyContinue).Count
+         $a = @(Get-NetFirewallRule -DisplayName {trip}* -ErrorAction SilentlyContinue).Count
+         $u = @(Get-NetFirewallRule -DisplayName {covered}* -ErrorAction SilentlyContinue).Count
          $legacy = @(Get-NetFirewallRule -DisplayName 'ClaudeSwitcher Egate * Out' -ErrorAction SilentlyContinue).Count
          $legacy += @(Get-NetFirewallRule -DisplayName 'ClaudeSwitcher Egate * In' -ErrorAction SilentlyContinue).Count
-         ConvertTo-Json @{{ total = ($new + $legacy) }} -Compress",
-        ps_quote(RULE_PREFIX)
+         ConvertTo-Json @{{ total = ($a + $u + $legacy) }} -Compress",
+        trip = ps_quote(RULE_PREFIX),
+        covered = ps_quote(IsolationReason::Uncovered.prefix())
     );
     let json = crate::platform::imp::run_powershell(&script).ok()?;
     let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
@@ -1482,5 +1531,30 @@ foreach ($c in $cases) { Write-Output ($c.n + '=' + (Check $c.a $goodAf $anyPf $
         crate::egate_monitor::pause(60).unwrap();
         assert!(!can_apply_isolation_now(), "暂停期间不得施加新的隔离");
         crate::egate_monitor::resume().unwrap();
+    }
+
+    /// **P0-01 回归**：全量解除必须覆盖两个命名空间，规则统计也必须两边都数。
+    ///
+    /// 这是「紧急恢复后兜底规则仍留在防火墙里」的根因：只删了 AppIsolation。
+    #[test]
+    fn full_release_and_count_cover_both_namespaces() {
+        // 两个来源的前缀必须是不同的字符串常量，且都被 rule_count 统计。
+        let trip = IsolationReason::EgressTrip.prefix();
+        let cov = IsolationReason::Uncovered.prefix();
+        assert_ne!(trip, cov);
+        // 兜底前缀不能是熔断前缀的前缀（否则通配会互相吞掉）。
+        assert!(!cov.starts_with(trip));
+        assert!(!trip.starts_with(cov));
+    }
+
+    /// **P0-02**：只有系统代理视为「可验证接入」；TUN 无路由证明时不得放行。
+    #[test]
+    fn release_eligibility_requires_verified_access() {
+        assert!(crate::egate_monitor::access_verified_for_test(
+            "system_proxy"
+        ));
+        assert!(!crate::egate_monitor::access_verified_for_test("tun"));
+        assert!(!crate::egate_monitor::access_verified_for_test("uncovered"));
+        assert!(!crate::egate_monitor::access_verified_for_test("unknown"));
     }
 }

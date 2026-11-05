@@ -71,6 +71,8 @@ export function EgatePanel() {
     partial?: boolean;
     unknown?: boolean;
     manual_hold?: boolean;
+    uncovered_lock?: boolean;
+    uncovered_lock_verified?: boolean;
   } | null>(null);
   const [launchNote, setLaunchNote] = useState<string | null>(null);
   const [envCheck, setEnvCheck] = useState<EnvCheck | null>(null);
@@ -474,6 +476,16 @@ export function EgatePanel() {
             隔离状态无法确认
           </span>
         )}
+        {monitor?.uncovered_lock && !monitor?.uncovered_lock_verified && (
+          <span className="pill bad" title="未接入代理的兜底封锁已启用，但本轮核验未通过">
+            兜底封锁（覆盖不完整）
+          </span>
+        )}
+        {monitor?.uncovered_lock && monitor?.uncovered_lock_verified && (
+          <span className="pill muted" title="未接入代理时自动封锁受管应用出站">
+            兜底封锁中
+          </span>
+        )}
         {monitor?.manual_hold && (
           <span className="pill muted" title="由你手动触发的隔离，自动恢复不会解除">
             手动保持隔离
@@ -585,8 +597,24 @@ export function EgatePanel() {
       )}
 
       {tripReport && (
-        <div className={tripReport.isolated ? 'inline-warning' : 'inline-error'} style={{ marginTop: 10 }}>
+        <div
+          className={
+            tripReport.all_isolated
+              ? 'inline-warning'
+              : tripReport.any_isolated
+                ? 'inline-warning'
+                : 'inline-error'
+          }
+          style={{ marginTop: 10 }}
+        >
           <strong>{tripReport.note}</strong>
+          <div style={{ fontSize: 12, marginTop: 2 }}>
+            {tripReport.all_isolated
+              ? '全部隔离'
+              : tripReport.any_isolated
+                ? '部分隔离（覆盖不完整）'
+                : '未确认隔离'}
+          </div>
           {tripReport.agents.map((agent) => (
             <div key={agent.agent} style={{ marginTop: 4, fontSize: 12 }}>
               {agent.agent}：

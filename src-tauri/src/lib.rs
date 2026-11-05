@@ -3024,6 +3024,9 @@ fn egate_monitor_status() -> serde_json::Value {
         "partial": egate_monitor::is_partial(),
         "unknown": unknown,
         "manual_hold": egate_monitor::is_manual_hold(),
+        // **L-03**：兜底封锁的真实状态（意图 + 是否已核验覆盖）。
+        "uncovered_lock": egate_monitor::uncovered_lock_status().0,
+        "uncovered_lock_verified": egate_monitor::uncovered_lock_status().1,
         "disarmed": egate_monitor::is_disarmed(),
         "intent": egate_monitor::protection_intent(),
     })

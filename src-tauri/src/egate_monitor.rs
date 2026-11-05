@@ -142,6 +142,9 @@ pub fn decide(gate: Gate) -> RoundAction {
     if gate.already_tripped {
         return if gate.recovery.allowed() {
             RoundAction::Recover
+        } else if gate.partial_protection {
+            // **P0-03**：规则被外部删除/禁用后转 Partial，下一轮补齐。
+            RoundAction::RetryProtection
         } else {
             RoundAction::Idle
         };
@@ -768,6 +771,50 @@ fn release_uncovered_lock() {
     }
 }
 
+/// **P0-02**：是否具备解除未接入兜底封锁的资格。
+///
+/// 四个条件必须**同时**满足：
+/// 1. 本轮确实做过探测（`probed`）——跳过/未验证的一律不算；
+/// 2. 所有启用目标 `Pass`；
+/// 3. 接入路径是**可验证**的（系统代理端口可连 / TUN 有路由证据）；
+/// 4. 保护意图允许自动恢复（Armed 且未暂停，且无手动保持）。
+pub fn can_release_uncovered(report: &crate::egate_check::EgateReport) -> bool {
+    if !report.probed {
+        return false;
+    }
+    if report.overall.verdict != crate::egate::Verdict::Pass {
+        return false;
+    }
+    if !access_verified(&report.access.path) {
+        return false;
+    }
+    protection_intent() == ProtectionIntent::Armed
+        && !is_paused()
+        && !matches!(manual_hold_state(), ManualHold::Held)
+}
+
+/// **L-03**：兜底封锁给界面用的真实状态。
+///
+/// `active` 表示「有意图文件」，`verified` 表示**本轮实际核验过规则覆盖**；
+/// 只看意图文件存在会让界面在规则被外部删除后仍显示「封锁中」。
+pub fn uncovered_lock_status() -> (bool, bool) {
+    (uncovered_lock_active(), uncovered_lock_ready())
+}
+
+/// 测试用：暴露 `access_verified` 的判定（不改变生产语义）。
+#[cfg(test)]
+pub fn access_verified_for_test(path: &str) -> bool {
+    access_verified(path)
+}
+
+/// 接入路径是否有**可信证据**（而不只是标签）。
+fn access_verified(path: &str) -> bool {
+    // 系统代理：本轮探测已通过（请求确实经由该代理发出）。
+    // TUN：当前没有路由证明，一律不放行——宁可保持兜底隔离，
+    // 也不能凭「网卡 Up」就假定流量已由它接管。
+    matches!(path, "system_proxy")
+}
+
 /// 兜底封锁意图文件（与手动保持隔离分开，互不覆盖）。
 fn uncovered_lock_file() -> Result<std::path::PathBuf, String> {
     Ok(crate::paths::app_data_dir()?.join("eguard-uncovered-lock.json"))
@@ -880,12 +927,42 @@ fn run_monitor_round(
         run_uncovered_lockdown(config, &report);
     }
 
-    // **P0-C**：先按「接入是否恢复」独立处理兜底锁——它不参与 TRIP_STATE，
-    // 因此不能等 decide() 的 Recover 分支（那里要求 already_tripped）。
-    // **P0-01**：只有**已确认可用**的接入路径才允许解除兜底锁。
-    // `unknown`（无法确认）不等于「已恢复」，不能据此放行。
-    if matches!(report.access.path.as_str(), "system_proxy" | "tun") {
+    // **P0-02（v0.6.13.1）**：解除兜底封锁必须有**可验证的出口证据**，
+    // 不能只看接入路径标签。
+    //
+    // 原实现只要 path 是 system_proxy 或 tun 就解除：
+    // - 代理开着但端口不通/服务挂了 → 应用实际仍在裸连；
+    // - TUN 网卡 Up 但没有路由证明 → 流量可能仍走物理网卡。
+    // 两者都会在「已放行」的假象下留下直连窗口。
+    if can_release_uncovered(&report) {
         release_uncovered_lock();
+    }
+
+    // **P0-03（v0.6.13.1）**：已标记「完整熔断」时，本轮**重新核验**规则是否
+    // 仍然生效。外部程序/组策略/用户可能删除了规则，而内存状态还写着 tripped——
+    // 不核验就会一直相信一个已经不存在的保护。
+    if is_tripped() {
+        let agents = if config.egate_guarded_agents.is_empty() {
+            crate::egate_defaults::DEFAULT_GUARDED_AGENTS
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            config.egate_guarded_agents.clone()
+        };
+        match crate::egate_trip::verify_current_isolation(&agents) {
+            Some(true) => {}
+            Some(false) => {
+                // 覆盖不完整：降级为 Partial，下一轮由 RetryProtection 补齐。
+                mark_tripped_state(false);
+                crate::log_error("隔离覆盖已不完整（规则被删除或修改），下一轮将补齐");
+            }
+            None => {
+                // 查询失败：不能继续宣称完整保护。
+                mark_trip_state_unknown();
+                crate::log_error("无法核验隔离是否仍生效，已标记为「无法确认」");
+            }
+        }
     }
 
     match decide(gate) {
@@ -1206,5 +1283,26 @@ mod tests {
         assert!(report.agents.is_empty());
         assert!(!report.any_isolated);
         assert!(report.note.contains("没有配置"));
+    }
+
+    /// **P0-04**：停止保护意图写不进去时，恢复必须**立即中止**，不碰网络与防火墙。
+    #[test]
+    fn restore_aborts_when_disarm_fails() {
+        use crate::test_support::env_lock;
+        let _env = env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        // 让数据目录不可写：父级是普通文件 → create_dir_all 必然失败。
+        let blocker = dir.path().join(".claude-switcher");
+        std::fs::write(&blocker, b"not a dir").unwrap();
+
+        let report = crate::egate_netcut::restore_all();
+        assert!(!report.complete, "意图写不进去时不得报告完整恢复");
+        assert!(!report.intent_ok);
+        assert!(
+            report.note.contains("未执行"),
+            "应明确说明恢复未执行：{}",
+            report.note
+        );
     }
 }

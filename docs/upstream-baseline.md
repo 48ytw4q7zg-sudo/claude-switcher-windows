@@ -29,7 +29,16 @@ v0.6.6 / v0.6.7 已逐项落地：48 小时出口历史（`ip_history.rs`）、�
 | C. 出口门禁 | https://github.com/daha1216/ClaudeGuard | 受管 GUI 应用的**出网路径**（目标出口校验 + 按 exe 隔离） | Rust | [`1967377bec393bcba82199f038550d6fa5f677ec`](https://github.com/daha1216/ClaudeGuard/commit/1967377bec393bcba82199f038550d6fa5f677ec) |
 
 记录日期：2026-10-27（v0.6.0 于 2026-10-31 复核上游 `main`；基线 C 于
-v0.6.7 补充）。许可：基线 A 未声明 LICENSE；基线 B 为 MIT；基线 C 未声明 LICENSE。
+v0.6.7 补充）。
+
+**许可证状态（2026-11-05 复核，需持续跟踪）**：
+- 基线 A：本仓库固定提交处未声明 LICENSE。
+- 基线 B：**当前主分支为 AGPL-3.0**（早期版本曾是 MIT）。本仓库固定的是
+  早期提交，其授权按当时版本判断；但**继续移植基线 B 的最新代码前必须做
+  许可证兼容性审查**——AGPL-3.0 与本项目的 Apache-2.0 存在冲突风险。
+- 基线 C：MIT。
+
+本项目为 Apache-2.0。上述为事实记录，不构成法律意见。
 
 ### 1.0 基线 C（ClaudeGuard）的对应关系
 

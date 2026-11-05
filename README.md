@@ -41,8 +41,8 @@
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
 | 安装包 | **[Release v0.6.13](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.6.13)**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停），产物来源可审计 |
-| SHA256 | `0.6.13_x64-setup.exe` `22bdb49fd10647f007139c4f57e21ad86ad2534bdb7a0289940150b3305db7b4`<br>`ClaudeSwitcher-portable.zip` `e87572f5d2dfad7d4e4d524b893ddb158bcf17dde516d593ff63fccf251289d9`<br>校验：`Get-FileHash .\<文件名> -Algorithm SHA256`，与 Release 的 `SHA256SUMS.txt` 比对 |
-| 开发分支验证 | 11 月 5 日（v0.6.13）：完整 Rust 回归 **640 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。第十四轮修项见 [v0.6.13 发布说明](docs/release-v0.6.13.md)，上一轮见 [v0.6.12](docs/release-v0.6.12.md) |
+| SHA256 | 每个 Release 附 `SHA256SUMS.txt`；校验：`Get-FileHash .\<文件名> -Algorithm SHA256` 后与其比对。本版发布后此处补上已核验的具体值 |
+| 开发分支验证 | 11 月 5 日（v0.6.13.1）：完整 Rust 回归 **643 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。第十五轮修项见 [v0.6.13.1 发布说明](docs/release-v0.6.13.1.md)，上一轮见 [v0.6.13](docs/release-v0.6.13.md) |
 | 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；逐项状态与剩余差异见[功能对等记录](docs/upstream-baseline.md)与[对等核对](docs/parity-gap-final-2026-11-04.md) |
 | 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
@@ -589,6 +589,11 @@ Windows 凭据管理器：claude-switcher-store-key（32B AES-256-GCM 主密钥�
 - **应用隔离加固**（v0.6.7）：受管应用的 exe 路径改为三源合并（运行中进程 + 注册表 `App Paths`/`Uninstall` + MSIX），**未运行的已安装应用也能预先隔离**；多安装路径各自独立规则名，逐条核验「属性正确 **且** 出现在 `ActiveStore` 生效策略」，新路径生效后才清理指向旧路径的失效规则
 - **隔离状态三态**（v0.6.7）：`已隔离 / 未隔离 / 无法确认`。防火墙查询失败时界面显示「隔离状态无法确认」，启动门禁会**阻止启动并说明原因**，而不是把读不出来当成安全
 - **手动隔离独立生命周期**（v0.6.7）：手动触发的隔离记为持久化 `ManualHold`，自动巡检达标也不会替你解除；只有手动解除才清除
+- **恢复完整性**（v0.6.13.1）：全量恢复与规则统计覆盖**两个**隔离命名空间——此前紧急恢复只删常规隔离，兜底封锁规则会残留
+- **放行条件收紧**（v0.6.13.1）：解除兜底封锁要求本轮探测已执行、目标全通过、接入路径有证据；TUN 无路由证明一律不放行
+- **持续核验**（v0.6.13.1）：已熔断状态每轮复核防火墙，规则被外部删除会降级为部分并补齐，不再显示未经核验的「完整保护」
+- **恢复前置门禁**（v0.6.13.1）：停止保护意图写不进去时**不执行**任何恢复，避免「恢复后又被后台重新封锁」
+- **契约修正**（v0.6.13.1）：前端 `TripReport` 字段与 Rust 对齐（此前读 `isolated` 恒为 undefined）；CLI 检测改用严格配置读取；面板显示兜底封锁真实状态；WebView 设置 CSP
 - **保护原因分离**（v0.6.13）：兜底封锁与普通熔断使用独立规则名前缀——解除一种保护不会删掉另一种仍在需要的规则；Unknown 接入状态不再触发自动放行
 - **兜底仅出站**（v0.6.13）：未接入封锁只建出站规则，不结束进程、不加杀入站
 - **迟到任务防护**（v0.6.13）：取锁后重新核验「Armed 且未暂停」，急救完成后的后台任务不会把规则加回来
@@ -650,7 +655,7 @@ npx tsc --noEmit                            # 前端类型
 npm run tauri build                         # 出 MSI + NSIS
 ```
 
-当前源码测试状态：**640 通过、0 失败、0 ignored**（2026-11-05，v0.6.13；以 `cargo test --lib` 实际输出为准）。主密钥相关测试使用内存后端，不依赖真实凭据存储。除链接、路径、原子写入、BOM/UTF-16、进程匹配、控制器地址、加密快照和 keep 路径边界外，还覆盖更新缓存与 SemVer 比较、Claude Desktop 传统/MSIX 语言配置读取。详细验证与限制见 [更新检查记录](docs/optimization-2026-11-01.md) 和 [客户端语言记录](docs/optimization-client-language-2026-11-01.md)。
+当前源码测试状态：**643 通过、0 失败、0 ignored**（2026-11-05，v0.6.13.1；以 `cargo test --lib` 实际输出为准）。主密钥相关测试使用内存后端，不依赖真实凭据存储。除链接、路径、原子写入、BOM/UTF-16、进程匹配、控制器地址、加密快照和 keep 路径边界外，还覆盖更新缓存与 SemVer 比较、Claude Desktop 传统/MSIX 语言配置读取。详细验证与限制见 [更新检查记录](docs/optimization-2026-11-01.md) 和 [客户端语言记录](docs/optimization-client-language-2026-11-01.md)。
 
 ---
 

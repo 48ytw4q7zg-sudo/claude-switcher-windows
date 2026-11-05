@@ -985,14 +985,27 @@ pub fn restore_all() -> RecoveryReport {
     let mut pending = Vec::new();
 
     // 1. **P0-02**：停止保护意图必须先成功提交——否则后台会在下一轮重新施加。
-    let intent_ok = match crate::egate_monitor::disarm("用户执行紧急恢复") {
-        Ok(()) => true,
-        Err(error) => {
-            failures.push(format!("停止保护意图写入失败（后台可能继续保护）：{error}"));
-            pending.push("停止保护意图".to_string());
-            false
-        }
-    };
+    // **P0-04（v0.6.13.1）**：停止保护意图是**强制前置门禁**。
+    //
+    // 原实现即使写盘失败也继续恢复网络与防火墙，最后才报「未完整」。
+    // 但后台此时仍是 Armed——下一轮会立刻把刚解除的隔离重新加上，
+    // 用户看到的是「恢复了，然后又断了」的不可预测竞态。
+    // 现在：意图写不进去就**立即返回**，不做任何破坏性恢复。
+    if let Err(error) = crate::egate_monitor::disarm("用户执行紧急恢复") {
+        return RecoveryReport {
+            intent_ok: false,
+            network_ok: false,
+            isolation_ok: false,
+            env_ok: false,
+            complete: false,
+            pending_resources: vec!["停止保护意图".to_string()],
+            failures: vec![format!(
+                "停止保护意图写入失败（{error}）：为避免恢复后被后台立即重新封锁，                 本次**未执行任何**网络/隔离恢复"
+            )],
+            note: format!("恢复未执行：无法持久化「停止保护」意图（{error}）"),
+        };
+    }
+    let intent_ok = true;
 
     // 2. 恢复网络（已持锁，走无锁版本）。
     let (network_ok, network_note) = restore_locked(&guard);

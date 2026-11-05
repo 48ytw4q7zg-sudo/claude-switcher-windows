@@ -90,7 +90,17 @@ pub fn run_readonly(cmd: &CliCommand) -> i32 {
 /// 与上游 `--check` 对齐：调用方只看退出码就能做前置判断（例如「出口不对就
 /// 不启动应用」），不需要解析 JSON。
 fn run_egate_check() -> i32 {
-    let config = crate::appconfig::load();
+    // **L-02（v0.6.13.1）**：CLI 检测必须与受保护启动用**同一套严格读取**。
+    // 原实现用 `load()` 回退默认配置：配置损坏时 CLI 会拿默认目标去检测，
+    // 得出与 GUI 门禁不一致的结论。损坏就明确报错并返回非零退出码。
+    let config = match crate::appconfig::load_checked() {
+        crate::appconfig::ConfigLoad::Ok(config) => *config,
+        crate::appconfig::ConfigLoad::Fresh => crate::appconfig::AppConfig::default(),
+        crate::appconfig::ConfigLoad::Corrupt(error) => {
+            eprintln!("配置损坏，无法执行出口检查：{error}");
+            return 1;
+        }
+    };
     let targets = if config.egate_targets.is_empty() {
         crate::egate_defaults::builtin_targets()
     } else {
