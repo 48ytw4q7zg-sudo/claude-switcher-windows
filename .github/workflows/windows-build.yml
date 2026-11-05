@@ -42,19 +42,15 @@ jobs:
         run: npm ci
 
       # cs.exe 由 src/bin/cs.rs 作为本包的第二个 [[bin]] 产出；`tauri build` 会编译
-      # 全部二进制并自动把 target/release/cs.exe 打进 MSI/NSIS 安装目录（与主程序同目录，
+      # 全部二进制并自动把 target/release/cs.exe 打进 NSIS 安装目录（与主程序同目录，
       # PATH 指向该目录即可全局使用）。不再使用 bundle.externalBin：externalBin 会把同一
       # 份 cs.exe 再复制到临时目录生成第二个组件，与 cargo 二进制组件撞名触发 WiX ICE30
       # （两个组件向同一目录安装 cs.exe，破坏组件引用计数）。
       - name: Build app
         run: npm run tauri build
 
-      - name: Upload MSI installer
-        uses: actions/upload-artifact@v4
-        with:
-          name: ClaudeSwitcher-msi
-          path: src-tauri/target/release/bundle/msi/*.msi
-          if-no-files-found: error
+      # v0.6.13 起不再构建 MSI：MSI 无法接入卸载前的恢复钩子，
+      # 卸载时可能留下本产品创建的防火墙规则。详见 docs/release-v0.6.13.md。
 
       - name: Upload NSIS installer
         uses: actions/upload-artifact@v4
@@ -94,7 +90,6 @@ jobs:
         with:
           subject-path: |
             src-tauri/target/release/bundle/nsis/*.exe
-            src-tauri/target/release/bundle/msi/*.msi
             ClaudeSwitcher-portable.zip
 
       # C-8：校验和用裸文件名生成（在资产目录内 sha256sum *），
@@ -105,7 +100,6 @@ jobs:
         shell: bash
         run: |
           mkdir -p dist-release
-          cp src-tauri/target/release/bundle/msi/*.msi dist-release/
           cp src-tauri/target/release/bundle/nsis/*.exe dist-release/
           cp ClaudeSwitcher-portable.zip dist-release/
           cd dist-release
