@@ -227,6 +227,30 @@ npm run build                              通过（349.24 kB / gzip 106.61 kB�
 
 ---
 
+## 9.1 发布产物（2026-11-06 已发布）
+
+| 资产 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `ClaudeSwitcher_0.7.5_x64-setup.exe` | 8,235,609 B | `7515f615c0542e56d818e4e922bfe356fc2196e4d498a501e39e0eec2526b697` |
+| `ClaudeSwitcher-portable.zip` | 9,709,422 B | `fd1ff32dfade80beadc273450834c8466d5aece2e61e6b7ed6d9d0077f7b4487` |
+| `SHA256SUMS.txt` | 195 B | 随包分发 |
+
+- Release：<https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.7.5>
+- 哈希已用 `sha256sum -c SHA256SUMS.txt` 与独立重算**双重核对**，两者一致。
+- 构建来源证明已通过 `gh attestation verify`（含 sigstore 证书），绑定到
+  `windows-build.yml` @ `refs/tags/v0.7.5`。
+- 安装包是 **NSIS** 自解压 PE32，未代码签名（SmartScreen 提示属预期，
+  请用上述哈希或 attestation 自行核对）。
+
+> **发布后发现并修复**：CI 的「安全回归场景」步骤因为一个陈旧组名
+> `strict_oauth_mode`（v0.7.2 的测试名，本轮重写后已不存在）而失败。
+> 发布构建不受影响——它跑的是无过滤的 `cargo test --lib`。
+> 修复同时把「0 项匹配」的检测从 `running 0 tests` 改成看 `test result` 行
+> 的 passed 计数：cargo 对「过滤出 0 项」仍然返回 0，原检测会漏判。
+
+> 发布源码基线是 tag 指向的 `3d1f80b`。main 上的 `a161bf9` 是构建完成后
+> 追加的一行测试串行化加固，不影响产物。
+
 ## 10. 行为变化（升级须知）
 
 1. **配置损坏时界面不再显示默认值**，而是报错。这比「看起来正常但其实是

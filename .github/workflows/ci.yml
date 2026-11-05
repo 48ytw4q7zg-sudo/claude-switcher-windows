@@ -96,6 +96,8 @@ jobs:
       # #[ignore] 掉」不会有人发现——这里按名字过滤，少一个就会因为
       # 「0 tests filtered in」而失败（cargo 对无匹配测试返回非 0）。
       #
+      # 注意：组名必须与实际测试名**子串匹配**。改名时要同步这里，
+      # 否则 cargo 会过滤出 0 项——而 0 项本身是「看起来通过」的。
       # 覆盖：PowerShell 三态协议、TUN 双栈证据、GUI/CLI 身份、布防就绪、
       # 自动解除复核、报告语义。
       - name: Security regression scenarios
@@ -118,7 +120,6 @@ jobs:
             'unknown_reconfirm_backs_off_and_caps',
             'auto_probe_requires_proven_udp_route',
             'unsigned_updates_are_never_auto_executed',
-            'strict_oauth_mode',
             'trip_summary',
             'trip_outcome_state_policy',
             'uncovered_auto_release',
@@ -139,7 +140,14 @@ jobs:
             $output | Write-Host
             Write-Host "::endgroup::"
             if ($code -ne 0) { $failed += $g }
-            elseif ($output -match 'running 0 tests') { $failed += "$g (no tests matched)" }
+            else {
+              # cargo 对「过滤出 0 项」仍然返回 0，所以必须看 test result 行。
+              # 只匹配 "running 0 tests" 会漏掉 "test result: ok. 0 passed"。
+              $summary = ($output | Select-String '^test result:' | Select-Object -Last 1)
+              if (-not $summary -or $summary -notmatch 'ok\.\s+[1-9][0-9]*\s+passed') {
+                $failed += "$g (no tests matched)"
+              }
+            }
           }
           if ($failed.Count -gt 0) {
             throw "security regression scenarios failed or missing: $($failed -join ', ')"
