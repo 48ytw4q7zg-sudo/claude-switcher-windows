@@ -824,6 +824,13 @@ pub fn with_store<T>(f: impl FnOnce(&mut Store) -> Result<T, String>) -> Result<
     // 覆盖掉这些新改动。门禁放在这里，任何普通写路径都绕不过去。
     // 恢复专用入口走 `with_store_transaction()`，不受本门禁阻塞。
     crate::export::ensure_no_pending_migration()?;
+    // **P0-03**：未完成的 Desktop 删除同样阻断普通写入——
+    // 否则新的删除/切换会覆盖固定路径的删除账本，上一笔的恢复依据丢失。
+    if crate::desktop::has_pending_delete() {
+        return Err(
+            "存在未完成的 Desktop 快照删除事务，已暂停账号写操作；请先重启应用完成恢复".to_string(),
+        );
+    }
     let mut store_data = load_store()?;
     match f(&mut store_data) {
         Ok(value) => {

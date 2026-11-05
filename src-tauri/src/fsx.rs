@@ -95,6 +95,20 @@ pub fn write_atomically(path: &Path, contents: &str) -> io::Result<()> {
     }
     result
 }
+/// 用备份文件的内容**原子**恢复目标文件，并回读校验。
+///
+/// 用于回滚已提交的配置文件：直接 `fs::copy` 覆盖会留下截断窗口，
+/// 回读校验则能确认落盘内容与备份一致。
+pub fn write_atomically_checked(target: &Path, backup: &Path) -> Result<(), String> {
+    let contents = std::fs::read_to_string(backup)
+        .map_err(|e| format!("读取备份 {} 失败：{e}", backup.display()))?;
+    write_atomically(target, &contents).map_err(|e| format!("原子恢复失败：{e}"))?;
+    let readback = std::fs::read_to_string(target).map_err(|e| format!("恢复后回读失败：{e}"))?;
+    if readback != contents {
+        return Err("恢复后内容与备份不一致".to_string());
+    }
+    Ok(())
+}
 
 /// 若 `path` 是符号链接，返回它指向的真实路径；否则原样返回。
 /// 用 `canonicalize` 会把相对链接也解析成绝对路径，符合写入意图。

@@ -594,7 +594,23 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
             Err(error) => error,
         });
     };
-    let mut final_ledger = base_ledger.clone();
+    // **P0-02**：以**磁盘账本**为基底，而不是最初创建的 `base_ledger`。
+    // 内层可能已经写入 `snapshot_swap`（当前账号快照回存的位置信息），
+    // 用 base_ledger 覆盖会让恢复器失去「旧快照到底在哪个目录」这一唯一线索。
+    let mut final_ledger = match read_pending_switch_ledger() {
+        Ok(Some(disk)) => disk,
+        // 账本不存在：说明内层还没写过（或已被清理），用初始值。
+        Ok(None) => base_ledger.clone(),
+        // 账本损坏：**保留现场**，不拿初始阶段去猜。
+        Err(error) => {
+            return Err(format!(
+                "{error}
+切换账本无法读取，已保留全部备份与文件，请人工核对后再操作"
+            ));
+        }
+    };
+    final_ledger.transaction_id = base_ledger.transaction_id.clone();
+    final_ledger.to_id = base_ledger.to_id.clone();
     final_ledger.backup_path = transaction
         .backup_path
         .borrow()
@@ -700,12 +716,16 @@ pub fn switch_desktop_profile(id: &str) -> Result<Vec<String>, String> {
                     }
                 }
             };
-            let touched_files = matches!(
-                effective_phase,
-                DesktopSwitchPhase::BackupVerified
-                    | DesktopSwitchPhase::FilesSwitching
-                    | DesktopSwitchPhase::FilesSwitched
-            );
+            // **P0-02**：账本里存在 `snapshot_swap` 时，当前账号快照已经动过
+            // （可能已 `A → A.old`），同样必须保留账本。
+            let swap_touched = final_ledger.snapshot_swap.is_some();
+            let touched_files = swap_touched
+                || matches!(
+                    effective_phase,
+                    DesktopSwitchPhase::BackupVerified
+                        | DesktopSwitchPhase::FilesSwitching
+                        | DesktopSwitchPhase::FilesSwitched
+                );
             if !touched_files {
                 if let Err(clear_error) = clear_switch_ledger() {
                     return Err(format!(
@@ -1570,6 +1590,26 @@ fn clear_delete_journal() -> Result<(), String> {
     }
 }
 
+/// **P0-03**：是否有未完成的 Desktop 删除事务（供统一写入门禁使用）。
+///
+/// 账本损坏/不可读同样视为「有」——不能把读不出来当成没有事务。
+pub fn has_pending_delete() -> bool {
+    matches!(read_pending_delete_journal(), Ok(Some(_)) | Err(_))
+}
+
+/// **P0-03**：读取未完成的删除账本（不存在返回 `None`，损坏返回 Err）。
+fn read_pending_delete_journal() -> Result<Option<DesktopDeleteJournal>, String> {
+    let path = desktop_delete_journal_path()?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(format!("读取删除账本失败：{error}")),
+    };
+    serde_json::from_str(&crate::jsonio::decode_text(&bytes))
+        .map(Some)
+        .map_err(|e| format!("删除账本损坏，请人工核对后再操作：{e}"))
+}
+
 /// **P0-D**：启动时恢复中断的快照删除。
 ///
 /// 判据是「账号库登记 + 文件实际状态」：
@@ -1697,6 +1737,14 @@ pub fn delete_desktop_profile(id: &str, also_files: bool) -> Result<(), String> 
             store_committed: false,
             started_at: chrono::Utc::now().timestamp(),
         };
+        // **P0-03**：已有未完成的删除事务时拒绝开始新的删除——
+        // 否则固定路径账本会被覆盖，上一笔的恢复依据直接丢失。
+        if let Some(existing) = read_pending_delete_journal()? {
+            return Err(format!(
+                "存在未完成的快照删除（{}，账号 {}），请先重启应用完成恢复再删除",
+                existing.transaction_id, existing.snapshot_id
+            ));
+        }
         // **P0-D**：先落账本，再动文件。
         write_delete_journal(&journal)?;
         let renamed = if snapshot.exists() {
@@ -3250,5 +3298,77 @@ mod tests {
         let _ = heal_desktop_delete();
         assert!(!pending.exists(), "登记已删除时应清理待删目录");
         assert!(!desktop_delete_journal_path().unwrap().exists());
+    }
+
+    /// **P0-03**：前一笔删除未收尾时，不能开始第二笔删除（否则账本被覆盖）。
+    #[test]
+    fn pending_delete_blocks_second_delete() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        let accounts = dir.path().join(".claude-switcher").join("desktop-accounts");
+        std::fs::create_dir_all(accounts.join("a")).unwrap();
+        std::fs::create_dir_all(accounts.join("b")).unwrap();
+        store::with_store(|store| {
+            for id in ["a", "b"] {
+                store.desktop_profiles.push(DesktopProfile {
+                    id: id.into(),
+                    name: id.into(),
+                    notes: None,
+                    created_at: Utc::now(),
+                    updated_at: Utc::now(),
+                    last_switched_at: None,
+                    snapshot_rel: format!("desktop-accounts/{id}"),
+                    size_bytes: 0,
+                    meta: None,
+                });
+            }
+            Ok(())
+        })
+        .unwrap();
+        // 未完成的删除事务（模拟 A 恢复失败后保留的账本）。
+        write_delete_journal(&DesktopDeleteJournal {
+            transaction_id: "pending".into(),
+            snapshot_id: "a".into(),
+            original: accounts.join("a").to_string_lossy().to_string(),
+            pending: accounts
+                .join(".a.delete-pending-x")
+                .to_string_lossy()
+                .to_string(),
+            files_moved: true,
+            store_committed: false,
+            started_at: 0,
+        })
+        .unwrap();
+
+        let err = delete_desktop_profile("b", true).unwrap_err();
+        assert!(err.contains("未完成的快照删除"), "{err}");
+        // B 的快照目录必须原样保留。
+        assert!(accounts.join("b").is_dir());
+        // 账本仍是 A 的那一笔，未被覆盖。
+        let journal = read_pending_delete_journal().unwrap().unwrap();
+        assert_eq!(journal.snapshot_id, "a");
+    }
+
+    /// **P0-03**：删除账本存在时，普通账号写入被统一门禁拒绝。
+    #[test]
+    fn pending_delete_blocks_store_writes() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+        write_delete_journal(&DesktopDeleteJournal {
+            transaction_id: "pending".into(),
+            snapshot_id: "a".into(),
+            original: "x".into(),
+            pending: "y".into(),
+            files_moved: true,
+            store_committed: false,
+            started_at: 0,
+        })
+        .unwrap();
+        assert!(has_pending_delete());
+        let err = store::with_store(|_| Ok(())).unwrap_err();
+        assert!(err.contains("未完成的 Desktop 快照删除"), "{err}");
     }
 }

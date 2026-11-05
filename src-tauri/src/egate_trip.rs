@@ -73,6 +73,36 @@ pub fn is_guarded_agent(id: &str) -> bool {
     agent_spec(id).is_some()
 }
 
+/// **P0-01**：隔离的**来源**。不同来源使用不同规则名前缀，互不覆盖。
+///
+/// 原实现所有隔离共用 `ClaudeSwitcher AppIsolation` 前缀：解除「未接入兜底锁」
+/// 会把普通熔断的规则一起删掉——熔断状态还写着 tripped，防火墙却已经空了。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationReason {
+    /// 目标出口失败达阈值后的正式熔断。
+    EgressTrip,
+    /// 未接入代理时的即时兜底封锁。
+    Uncovered,
+}
+
+impl IsolationReason {
+    /// 规则名前缀：各自独立命名空间。
+    fn prefix(self) -> &'static str {
+        match self {
+            IsolationReason::EgressTrip => RULE_PREFIX,
+            IsolationReason::Uncovered => "ClaudeSwitcher UncoveredLock",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            IsolationReason::EgressTrip => "熔断",
+            IsolationReason::Uncovered => "未接入兜底封锁",
+        }
+    }
+}
+
+#[cfg(test)]
 /// 规则名：`ClaudeSwitcher AppIsolation <agent> <Out|In>`。
 ///
 /// **兼容用法**：旧版按「每应用一条」建规则，规则名不带路径后缀。
@@ -82,6 +112,7 @@ pub fn rule_name(agent: &str, direction: &str) -> String {
     format!("{RULE_PREFIX} {agent} {direction}")
 }
 
+#[cfg(test)]
 /// **P0-08**：按「应用 + 方向 + 具体可执行路径」生成规则名。
 ///
 /// 同一应用可能有多个安装路径（用户级 / 系统级 / MSIX）。若仍用
@@ -90,6 +121,7 @@ pub fn rule_name(agent: &str, direction: &str) -> String {
 /// 后缀取路径 SHA256 的前 12 位十六进制：稳定（同一路径永远同一后缀）、
 /// 短到能读、且不会因路径里的空格/斜杠污染规则名。
 pub fn rule_name_for_exe(agent: &str, direction: &str, exe: &str) -> String {
+    // 保持既有命名（熔断规则名不变），新来源走 `rule_name_for_reason`。
     use sha2::{Digest, Sha256};
     let normalized = crate::platform::imp::normalize_path(std::path::Path::new(exe));
     let digest = Sha256::digest(normalized.to_string_lossy().as_bytes());
@@ -320,26 +352,54 @@ pub struct ExpectedRule {
     pub exe: String,
 }
 
+#[cfg(test)]
 /// 为「应用 × 每个 exe × 每个方向」生成完整的预期规则集合。
 ///
 /// 这是**唯一**的规则标识来源：创建与核验都调用它，不允许任何一方自行拼接。
 pub fn expected_rules(agent: &str, exes: &[String]) -> Vec<ExpectedRule> {
+    // 熔断是完整的出站+入站隔离；只有未接入兜底才是仅出站。
+    expected_rules_for(IsolationReason::EgressTrip, agent, exes, false)
+}
+
+/// **P0-01 / QW-01**：按来源生成预期规则；`outbound_only` 只含出站方向。
+pub fn expected_rules_for(
+    reason: IsolationReason,
+    agent: &str,
+    exes: &[String],
+    outbound_only: bool,
+) -> Vec<ExpectedRule> {
     let mut out = Vec::with_capacity(exes.len() * 2);
     for exe in exes {
         out.push(ExpectedRule {
-            name: rule_name_for_exe(agent, "Out", exe),
+            name: rule_name_for_reason(reason, agent, "Out", exe),
             dir: "Out".to_string(),
             direction: "Outbound",
             exe: exe.clone(),
         });
-        out.push(ExpectedRule {
-            name: rule_name_for_exe(agent, "In", exe),
-            dir: "In".to_string(),
-            direction: "Inbound",
-            exe: exe.clone(),
-        });
+        if !outbound_only {
+            out.push(ExpectedRule {
+                name: rule_name_for_reason(reason, agent, "In", exe),
+                dir: "In".to_string(),
+                direction: "Inbound",
+                exe: exe.clone(),
+            });
+        }
     }
     out
+}
+
+/// 带来源前缀的规则名（同一应用的不同来源互不冲突）。
+pub fn rule_name_for_reason(
+    reason: IsolationReason,
+    agent: &str,
+    direction: &str,
+    exe: &str,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let normalized = crate::platform::imp::normalize_path(std::path::Path::new(exe));
+    let digest = Sha256::digest(normalized.to_string_lossy().as_bytes());
+    let suffix: String = digest.iter().take(6).map(|b| format!("{b:02x}")).collect();
+    format!("{} {agent} {direction} {suffix}", reason.prefix())
 }
 
 /// 查询某个应用在**全部已解析路径**上的规则是否完整生效。
@@ -358,8 +418,13 @@ pub fn expected_rules(agent: &str, exes: &[String]) -> Vec<ExpectedRule> {
 /// 4. **在当前生效策略下确实存在**——`Get-NetFirewallRule -PolicyStore ActiveStore`
 ///    能看到它。只查配置对象（`PersistentStore`）不等于证明阻断已生效：
 ///    组策略可能覆盖或禁用本地规则。
-fn count_rules_for(agent: &str, exes: &[String]) -> RuleVerification {
-    let expected_rules = expected_rules(agent, exes);
+fn count_rules_for_reason(
+    reason: IsolationReason,
+    agent: &str,
+    exes: &[String],
+    outbound_only: bool,
+) -> RuleVerification {
+    let expected_rules = expected_rules_for(reason, agent, exes, outbound_only);
     let expected = expected_rules.len() as u32;
     if expected_rules.is_empty() {
         return RuleVerification {
@@ -568,6 +633,17 @@ pub fn quarantine_agent(agent: &str, exe_path: Option<&str>) -> QuarantineReport
 /// **P0-C**：未接入兜底封锁只应「挡住出站」，不该在用户刚发现代理没开时
 /// 就把正在用的 Claude Desktop 杀掉——那是普通熔断（目标失败达阈值）的语义。
 pub fn quarantine_agent_with(agent: &str, exe_path: Option<&str>, kill: bool) -> QuarantineReport {
+    quarantine_agent_for(IsolationReason::EgressTrip, agent, exe_path, kill, false)
+}
+
+/// **P0-01 / QW-01**：按来源建立隔离；`outbound_only` 时只建出站规则。
+pub fn quarantine_agent_for(
+    reason: IsolationReason,
+    agent: &str,
+    exe_path: Option<&str>,
+    kill: bool,
+    outbound_only: bool,
+) -> QuarantineReport {
     let mut report = QuarantineReport {
         agent: agent.to_string(),
         rules_added: 0,
@@ -621,7 +697,7 @@ pub fn quarantine_agent_with(agent: &str, exe_path: Option<&str>, kill: bool) ->
     // 具体程序，既不会互相覆盖，也能在升级后按旧路径精确清理。
     // **P0-01**：规则名来自 [`expected_rules`]——与核验使用的是**同一份**清单。
     // 任何一方自行拼接名称都会让新建的规则永远核验不到。
-    for rule in expected_rules(agent, &exes) {
+    for rule in expected_rules_for(reason, agent, &exes, outbound_only) {
         let script = format!(
             "$ErrorActionPreference='Stop'\n\
              $existing = Get-NetFirewallRule -DisplayName {} -ErrorAction SilentlyContinue\n\
@@ -644,7 +720,7 @@ pub fn quarantine_agent_with(agent: &str, exe_path: Option<&str>, kill: bool) ->
     }
 
     // 4. 回查：规则写入返回成功不等于当前策略下真的生效。
-    let mut verification = count_rules_for(agent, &exes);
+    let mut verification = count_rules_for_reason(reason, agent, &exes, outbound_only);
     if verification.query_ok && verification.verified > 0 {
         // 规则对象存在仍不代表当前活动网络受防火墙过滤。
         match crate::platform::imp::effective_firewall_enabled() {
@@ -704,6 +780,14 @@ pub fn quarantine_agent_with(agent: &str, exe_path: Option<&str>, kill: bool) ->
     }
     report
 }
+/// **P0-04**：是否允许此刻新增隔离副作用（普通熔断与兜底封锁共用）。
+///
+/// 必须**在持有系统操作锁之后**调用：锁前读到的意图可能已经过期。
+pub fn can_apply_isolation_now() -> bool {
+    crate::egate_monitor::protection_intent() == crate::egate_monitor::ProtectionIntent::Armed
+        && !crate::egate_monitor::is_paused()
+}
+
 /// **P0-C**：未接入兜底封锁——只建出站隔离，**不结束进程**。
 ///
 /// 与 [`trip`] 共用同一套规则建立与核验逻辑（不新增第二套防火墙实现），
@@ -731,10 +815,23 @@ pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
         }
     };
     let _keep = &guard;
+    // **P0-04**：拿到锁后**重新核验**用户意图——等待锁期间用户可能刚执行急救恢复。
+    // 普通 `trip()` 早已这么做，新增的兜底路径漏了这一步，会出现
+    // 「急救刚完成，迟到的后台任务又把规则加回来」。
+    if !can_apply_isolation_now() {
+        return TripReport {
+            agents: Vec::new(),
+            any_isolated: false,
+            all_isolated: false,
+            failures: Vec::new(),
+            note: "保护已停止或已暂停（意图在等待锁期间改变），未执行兜底封锁".to_string(),
+        };
+    }
     let mut agents = Vec::new();
     let mut failures = Vec::new();
     for id in guarded_agents {
-        let report = quarantine_agent_with(id, None, false);
+        // **QW-01**：兜底封锁只建**出站**规则，不碰入站。
+        let report = quarantine_agent_for(IsolationReason::Uncovered, id, None, false, true);
         if !report.verified {
             failures.push(format!("{}：{}", report.agent, report.note.trim()));
         }
@@ -788,9 +885,7 @@ pub fn trip(guarded_agents: &[String]) -> TripReport {
     // **P0-06**：拿到锁后重新核验保护意图——等待锁期间用户可能刚执行了
     // 紧急恢复（Disarmed），或状态文件损坏（Unknown）。此时旧的「该熔断」决策
     // 已过期，绝不能继续施加隔离。
-    if crate::egate_monitor::protection_intent() != crate::egate_monitor::ProtectionIntent::Armed
-        || crate::egate_monitor::is_paused()
-    {
+    if !can_apply_isolation_now() {
         return TripReport {
             agents: Vec::new(),
             any_isolated: false,
@@ -961,6 +1056,72 @@ pub(crate) fn release_verified_locked(
     release_all_verified_locked(guard)
 }
 
+/// **P0-01**：只解除**指定来源**拥有的规则，不影响其他来源。
+///
+/// 原实现只有 `release_all_verified_locked()`：解除未接入兜底锁会把普通熔断的
+/// 规则一起删掉——熔断状态仍写着 tripped，防火墙却已放行。
+pub fn release_isolation_reason(reason: IsolationReason) -> Result<ReleaseReport, String> {
+    let guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::ReleaseIsolation)?;
+    release_isolation_reason_locked(&guard, reason)
+}
+
+fn release_isolation_reason_locked(
+    _guard: &crate::egate_lock::OperationGuard,
+    reason: IsolationReason,
+) -> Result<ReleaseReport, String> {
+    let prefix = reason.prefix();
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'
+         $rules = @(Get-NetFirewallRule -DisplayName {}* )
+         $n = $rules.Count
+         $rules | Remove-NetFirewallRule -ErrorAction SilentlyContinue
+         ConvertTo-Json @{{ removed = $n }} -Compress",
+        ps_quote(prefix)
+    );
+    let json = crate::platform::imp::run_powershell(&script)?;
+    let value: serde_json::Value =
+        serde_json::from_str(json.trim()).map_err(|e| format!("清理结果解析失败：{e}"))?;
+    let requested = value.get("removed").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+    // 回查：只统计**本来源**前缀下还剩多少条。
+    let remaining = count_rules_with_prefix(prefix);
+    match remaining {
+        Some(0) => Ok(ReleaseReport {
+            requested,
+            remaining: 0,
+            verified: true,
+            failures: Vec::new(),
+        }),
+        Some(remaining) => Ok(ReleaseReport {
+            requested,
+            remaining,
+            verified: false,
+            failures: vec![format!("{} 仍有 {remaining} 条规则残留", reason.label())],
+        }),
+        None => Ok(ReleaseReport {
+            requested,
+            remaining: 0,
+            verified: false,
+            failures: vec!["删除后无法查询规则状态，无法确认已清理".to_string()],
+        }),
+    }
+}
+
+/// 统计指定前缀下的规则数（查询失败返回 `None`）。
+fn count_rules_with_prefix(prefix: &str) -> Option<u32> {
+    let script = format!(
+        "$ErrorActionPreference='SilentlyContinue'
+         $n = @(Get-NetFirewallRule -DisplayName {}* -ErrorAction SilentlyContinue).Count
+         ConvertTo-Json @{{ total = $n }} -Compress",
+        ps_quote(prefix)
+    );
+    let json = crate::platform::imp::run_powershell(&script).ok()?;
+    let value: serde_json::Value = serde_json::from_str(json.trim()).ok()?;
+    value
+        .get("total")
+        .and_then(|v| v.as_u64())
+        .map(|n| n as u32)
+}
+
 /// **P0-01**：已持锁版本的解除隔离——内部**不再申请锁**。
 pub(crate) fn release_all_verified_locked(
     _guard: &crate::egate_lock::OperationGuard,
@@ -1074,7 +1235,7 @@ mod tests {
     /// 若解析端还在按另一个名字匹配，新建的规则永远核验不到。
     #[test]
     fn rule_verification_matches_expected_names() {
-        let exes = vec![r"C:.exe".to_string()];
+        let exes = vec!["C:/a.exe".to_string()];
         let expected = expected_rules("claude", &exes);
         assert_eq!(expected.len(), 2);
         let out_name = &expected[0].name;
@@ -1272,5 +1433,54 @@ foreach ($c in $cases) { Write-Output ($c.n + '=' + (Check $c.a $goodAf $anyPf $
         assert!(out.contains("bad-action=False|bad-action"), "{out}");
         assert!(out.contains("bad-direction=False|bad-direction"), "{out}");
         assert!(out.contains("domain-only=False|profile-limited"), "{out}");
+    }
+
+    /// **P0-01 回归**：兜底封锁与普通熔断使用**不同前缀**，
+    /// 解除其中一个不会删掉另一个的规则。
+    #[test]
+    fn isolation_reasons_use_separate_namespaces() {
+        let exes = vec!["C:/a.exe".to_string()];
+        let trip_rules = expected_rules_for(IsolationReason::EgressTrip, "claude", &exes, false);
+        let cov_rules = expected_rules_for(IsolationReason::Uncovered, "claude", &exes, true);
+        // 熔断：出站 + 入站各一条。
+        assert_eq!(trip_rules.len(), 2);
+        // 兜底：只有出站（QW-01）。
+        assert_eq!(cov_rules.len(), 1);
+        assert_eq!(cov_rules[0].direction, "Outbound");
+        // 两条命名空间互不重叠，互不包含。
+        for a in &trip_rules {
+            for b in &cov_rules {
+                assert_ne!(a.name, b.name);
+                assert!(!b.name.starts_with(IsolationReason::EgressTrip.prefix()));
+            }
+        }
+        assert!(trip_rules[0]
+            .name
+            .starts_with(IsolationReason::EgressTrip.prefix()));
+        assert!(cov_rules[0]
+            .name
+            .starts_with(IsolationReason::Uncovered.prefix()));
+    }
+
+    /// **P0-04**：暂停状态下不允许施加隔离（谓词真实行为）。
+    #[test]
+    fn isolation_blocked_while_paused() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        // 默认未暂停：允许（意图为 Armed 时）。
+        let armed = crate::egate_monitor::protection_intent()
+            == crate::egate_monitor::ProtectionIntent::Armed;
+        assert_eq!(
+            can_apply_isolation_now(),
+            armed && !crate::egate_monitor::is_paused()
+        );
+
+        // 暂停后必须拒绝，即使仍处于 Armed。
+        crate::egate_monitor::pause(60).unwrap();
+        assert!(!can_apply_isolation_now(), "暂停期间不得施加新的隔离");
+        crate::egate_monitor::resume().unwrap();
     }
 }

@@ -3290,14 +3290,21 @@ pub fn run() {
     let args: Vec<String> = std::env::args().collect();
     let cli_command = cli::parse(&args);
 
-    // 只读 CLI 子命令：附加控制台执行后直接退出，不初始化 GUI、不写账号库。
-    // **P0-E**：卸载/急救恢复必须在 GUI 初始化之前完成——
-    // 卸载时主界面可能根本起不来，恢复不能依赖窗口与托盘。
-    if let Some(cmd @ cli::CliCommand::ExitRestore) = &cli_command {
-        let code = cli::run_readonly(cmd);
-        std::process::exit(code);
-    }
-    if let Some(cmd @ (cli::CliCommand::List | cli::CliCommand::Status)) = &cli_command {
+    // 只读 / 急救 CLI 子命令：附加控制台执行后直接退出，不初始化 GUI。
+    //
+    // **P0-05**：`--egate-check` / `--egate-restore` / `--egate-status` / `--exit-restore`
+    // 必须在这里**全部**分派。原实现只分派了 ExitRestore 与 List/Status，
+    // 于是 `ClaudeSwitcher.exe --egate-restore` 会进入 GUI 流程——
+    // 而卸载钩子与故障提示恰好让用户运行的正是这条命令。
+    if let Some(
+        cmd @ (cli::CliCommand::ExitRestore
+        | cli::CliCommand::EgateRestore
+        | cli::CliCommand::EgateCheck
+        | cli::CliCommand::EgateStatus
+        | cli::CliCommand::List
+        | cli::CliCommand::Status),
+    ) = &cli_command
+    {
         let code = cli::run_readonly(cmd);
         std::process::exit(code);
     }

@@ -461,23 +461,51 @@ fn recover_full_migration_locked() -> Vec<String> {
     };
     let mut messages = Vec::new();
     if journal.store_committed && journal.snapshots_committed {
-        // 两个都提交了：导入实际已成功，只是没来得及清理。
-        let backup = journal
-            .snapshot_backup
-            .as_ref()
-            .map(std::path::PathBuf::from);
-        if let Some(backup) = backup {
-            let _ = fsx::retry_io(|| fs::remove_dir_all(&backup));
+        // 两个都提交了：导入实际已成功，只剩清理。
+        //
+        // **P1-03**：清理失败不能报成「已清理」并删账本——那会让下次启动
+        // 误以为还有未完成迁移（或反过来假报完成）。逐项检查并如实报告。
+        let mut failed: Vec<String> = Vec::new();
+        if let Some(backup) = journal.snapshot_backup.as_ref().map(PathBuf::from) {
+            if backup.exists() {
+                if let Err(error) = fsx::retry_io(|| std::fs::remove_dir_all(&backup)) {
+                    failed.push(format!("快照备份 {}（{error}）", backup.display()));
+                }
+            }
         }
-        if let Some(backup) = journal.store_backup.as_ref() {
-            let _ = fsx::retry_io(|| fs::remove_file(backup));
+        if let Some(backup) = journal.store_backup.as_ref().map(PathBuf::from) {
+            if backup.exists() {
+                if let Err(error) = fsx::retry_io(|| std::fs::remove_file(&backup)) {
+                    failed.push(format!("账号库备份 {}（{error}）", backup.display()));
+                }
+            }
         }
-        let _ = fs::remove_dir_all(&journal.staging);
-        let _ = clear_migration_journal();
-        messages.push(format!(
-            "完整迁移事务 {} 实际已完成，已清理残留备份与暂存",
-            journal.transaction_id
-        ));
+        let staging = PathBuf::from(&journal.staging);
+        if staging.exists() {
+            if let Err(error) = fsx::retry_io(|| std::fs::remove_dir_all(&staging)) {
+                failed.push(format!("暂存目录 {}（{error}）", staging.display()));
+            }
+        }
+        if failed.is_empty() {
+            match clear_migration_journal() {
+                Ok(()) => messages.push(format!(
+                    "完整迁移事务 {} 已完成，已清理残留备份与暂存",
+                    journal.transaction_id
+                )),
+                Err(error) => {
+                    messages.push(error);
+                    messages
+                        .push("迁移数据已完成，仅剩账本删除失败；下次启动会重试清理".to_string());
+                }
+            }
+        } else {
+            // 数据已完整提交，**不要**回滚；只保留账本待下次清理。
+            messages.push(format!(
+                "完整迁移事务 {} 已提交成功，但清理残留失败：{}。                 数据不受影响，账本已保留待下次启动重试",
+                journal.transaction_id,
+                failed.join("；")
+            ));
+        }
         return messages;
     }
 
@@ -957,6 +985,13 @@ pub fn import_full_migration_blocking(
                 "检测到未完成的迁移事务（{}），请先重启应用恢复",
                 pending.transaction_id
             ));
+        }
+        // **P0-03**：未完成的 Desktop 删除/切换事务存在时，拒绝完整导入——
+        // 导入会整体替换 desktop-accounts，覆盖正在等待恢复的现场。
+        if crate::desktop::has_pending_delete() {
+            return Err(
+                "存在未完成的 Desktop 快照删除事务，请先重启应用完成恢复再导入".to_string(),
+            );
         }
         ensure_store_key_allows_import()?;
         let metadata = fs::metadata(src).map_err(|e| format!("读取迁移包信息失败：{e}"))?;

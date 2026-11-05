@@ -991,42 +991,44 @@ pub fn ensure_rules() -> Result<RulesReport, String> {
         report
             .messages
             .push("置顶规则验证失败，正在回滚 Script.js...".to_string());
-        // P0-13：回滚必须检查结果，失败时不能报「已回滚」。
-        let rollback = match (&report.script_backup, existed) {
-            (Some(backup), _) => std::fs::copy(backup, &script_path).map(|_| ()),
-            (None, false) => fsx::remove_file_with_retry(&script_path),
+        // **P1-01**：Script.js 与 Merge.yaml **分别**判定，两者都恢复成功才删账本。
+        //
+        // 原实现在 Script 恢复成功后无条件 `clear_rules_transaction()`，
+        // 即使 Merge.yaml 恢复失败也把账本删了——下次启动再也没有重试依据。
+        // 同时不再用 `fs::copy` 直接覆盖正式文件，改写走原子写入 + 回读校验。
+        let script_restored: Result<(), String> = match (&report.script_backup, existed) {
+            (Some(backup), _) => {
+                fsx::write_atomically_checked(&script_path, std::path::Path::new(backup))
+            }
+            (None, false) => fsx::remove_file_with_retry(&script_path)
+                .map_err(|e| format!("删除本次创建的 Script.js 失败：{e}")),
             (None, true) => Ok(()),
         };
-        match rollback {
-            Ok(()) => {
-                // **P0-06**：同时恢复 Merge.yaml（若有改动），保证双文件一致。
-                let merge_note =
-                    match restore_merge(&merge_path, merge_original.as_deref(), merge_changed) {
-                        Ok(true) => " 与 Merge.yaml".to_string(),
-                        Ok(false) => String::new(),
-                        Err(e) => {
-                            // 回滚失败必须如实报告，不能宣称已完整回滚。
-                            report.messages.push(format!(
-                            "Merge.yaml 回滚失败（{e}）：原内容已保留在内存，请手动恢复或使用备份"
-                        ));
-                            "（Merge.yaml 回滚失败）".to_string()
-                        }
-                    };
+        let merge_restored: Result<(), String> =
+            restore_merge(&merge_path, merge_original.as_deref(), merge_changed)
+                .map(|_| ())
+                .map_err(|e| format!("Merge.yaml 回滚失败：{e}"));
+
+        match (&script_restored, &merge_restored) {
+            (Ok(()), Ok(())) => {
                 restart_clash_verge(&mut report);
                 clear_rules_transaction()?;
-                report.messages.push(format!(
-                    "置顶规则 FAIL: 验证失败，已回滚 Script.js{merge_note}，请确认 Clash Verge 已启用全局扩展脚本"
-                ));
+                report.messages.push(
+                    "置顶规则 FAIL: 验证失败，已回滚 Script.js 与 Merge.yaml，                     请确认 Clash Verge 已启用全局扩展脚本"
+                        .to_string(),
+                );
             }
-            Err(error) => {
-                // 回滚失败：保留备份路径供用户手动恢复，明确报告未回滚。
-                let backup_hint = report
-                    .script_backup
-                    .clone()
-                    .unwrap_or_else(|| "（无备份）".to_string());
-                report.messages.push(format!(
-                    "置顶规则 FAIL: 验证失败且回滚失败（{error}）；原文件备份保留在 {backup_hint}，请手动恢复"
-                ));
+            _ => {
+                // 任一侧失败：**保留账本与备份**，下次启动重试恢复。
+                if let Err(error) = &script_restored {
+                    report.messages.push(format!("Script.js 回滚失败：{error}"));
+                }
+                if let Err(error) = &merge_restored {
+                    report.messages.push(error.clone());
+                }
+                report.messages.push(
+                    "置顶规则 FAIL: 回滚未完成，事务账本已保留，下次启动将重试恢复".to_string(),
+                );
             }
         }
     } else if merge_changed {

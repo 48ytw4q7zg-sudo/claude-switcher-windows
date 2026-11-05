@@ -40,9 +40,9 @@
 | 项 | 状态 |
 | --- | --- |
 | 源码 | `main` 分支（本仓库） |
-| 安装包 | **[Release v0.6.12](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.6.12)**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（MSI + NSIS + 便携 zip），产物来源可审计 |
-| SHA256 | `0.6.12_x64-setup.exe` `37ea4b80b37b47f306443837f897cfcda3cb484b27f35ce1fa7a5792dd41f488`<br>`0.6.12_x64_zh-CN.msi` `916961a34cff7981f11b36c44f2affc266591e7fd17bae745ba706b88b0ee874`<br>`ClaudeSwitcher-portable.zip` `995387895a7c9702cd3be948b62320fca25e3879ed63370244e3c62dde2b7737`<br>校验：`Get-FileHash .\<文件名> -Algorithm SHA256`，与 Release 的 `SHA256SUMS.txt` 比对 |
-| 开发分支验证 | 11 月 5 日（v0.6.12）：完整 Rust 回归 **636 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。第十三轮修项见 [v0.6.12 发布说明](docs/release-v0.6.12.md)，上一轮见 [v0.6.11](docs/release-v0.6.11.md) |
+| 安装包 | **[Release v0.6.13](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases)**，由 `.github/workflows/windows-build.yml` 在 GitHub Actions 构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停），产物来源可审计 |
+| SHA256 | 每个 Release 附 `SHA256SUMS.txt`；校验：`Get-FileHash .\<文件名> -Algorithm SHA256` 后与其比对。本版发布后此处补上已核验的具体值 |
+| 开发分支验证 | 11 月 5 日（v0.6.13）：完整 Rust 回归 **640 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。第十四轮修项见 [v0.6.13 发布说明](docs/release-v0.6.13.md)，上一轮见 [v0.6.12](docs/release-v0.6.12.md) |
 | 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；逐项状态与剩余差异见[功能对等记录](docs/upstream-baseline.md)与[对等核对](docs/parity-gap-final-2026-11-04.md) |
 | 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |
 | 代码签名 | **未签名**，干净系统首次运行弹 SmartScreen 属预期 |
@@ -150,8 +150,8 @@ claude-switcher-windows/
 
 | 形态 | 入口 | 适用场景 |
 | --- | --- | --- |
-| **NSIS 安装版** | Release 中 `ClaudeSwitcher_<版本>_x64-setup.exe`（当前为 `0.6.12`） | 普通用户，双击安装（推荐） |
-| **MSI 安装版** | Release 中 `ClaudeSwitcher_<版本>_x64_zh-CN.msi`（当前为 `0.6.12`） | 企业分发 / 域管理 |
+| **NSIS 安装版** | Release 中 `ClaudeSwitcher_<版本>_x64-setup.exe`（当前为 `0.6.13`） | 普通用户，双击安装（推荐） |
+| **MSI 安装版** | **v0.6.13 起暂停发布**：MSI 无法接入卸载前的恢复钩子，卸载时可能留下防火墙规则。需要 MSI 部署请先联系维护者 |
 | **便携版 zip** | Release 中 `ClaudeSwitcher-portable.zip` | 解压即用，数据随 exe 目录的 `ClaudeSwitcherData` 携带 |
 | **命令行** | exe 加 `--list` / `--status` / `--switch <名称>` | 终端脚本 / 无 GUI 调用 |
 | **开发模式** | `npm run tauri dev` | 二次开发，带热更新 |
@@ -209,7 +209,7 @@ Claude Code CLI 的登录凭据、全局配置和会话历史都散落在用户�
 ## 四、安装使用教程
 
 1. **确认是 64 位系统**：设置 → 系统 → 系统信息 →「系统类型」应含 **64 位操作系统，x64**。若是 ARM64 或 32 位，本工具跑不了。
-2. **下载安装包**：打开本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases) → 最新版，下载 `ClaudeSwitcher_<版本>_x64-setup.exe`（推荐，NSIS 安装包，当前为 `0.6.12`）；也可用 `ClaudeSwitcher_<版本>_x64_zh-CN.msi`；想免安装则下载 `ClaudeSwitcher-portable.zip`。SHA256 校验值在 Release 说明与 `SHA256SUMS.txt` 里。
+2. **下载安装包**：打开本仓库 [Releases](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases) → 最新版，下载 `ClaudeSwitcher_<版本>_x64-setup.exe`（推荐，NSIS 安装包，当前为 `0.6.13`）；想免安装则下载 `ClaudeSwitcher-portable.zip`。SHA256 校验值在 Release 说明与 `SHA256SUMS.txt` 里。
 3. **双击安装包**，按提示点「下一步」直到安装完成。
 4. 若 Windows 弹出 **SmartScreen**「Windows 已保护你的电脑」，点「更多信息」→「仍要运行」。
    > 这是**未签名安装包**的正常提示。请只从本仓库 Release 下载，不要从来路不明的链接安装。
@@ -589,6 +589,12 @@ Windows 凭据管理器：claude-switcher-store-key（32B AES-256-GCM 主密钥�
 - **应用隔离加固**（v0.6.7）：受管应用的 exe 路径改为三源合并（运行中进程 + 注册表 `App Paths`/`Uninstall` + MSIX），**未运行的已安装应用也能预先隔离**；多安装路径各自独立规则名，逐条核验「属性正确 **且** 出现在 `ActiveStore` 生效策略」，新路径生效后才清理指向旧路径的失效规则
 - **隔离状态三态**（v0.6.7）：`已隔离 / 未隔离 / 无法确认`。防火墙查询失败时界面显示「隔离状态无法确认」，启动门禁会**阻止启动并说明原因**，而不是把读不出来当成安全
 - **手动隔离独立生命周期**（v0.6.7）：手动触发的隔离记为持久化 `ManualHold`，自动巡检达标也不会替你解除；只有手动解除才清除
+- **保护原因分离**（v0.6.13）：兜底封锁与普通熔断使用独立规则名前缀——解除一种保护不会删掉另一种仍在需要的规则；Unknown 接入状态不再触发自动放行
+- **兜底仅出站**（v0.6.13）：未接入封锁只建出站规则，不结束进程、不加杀入站
+- **迟到任务防护**（v0.6.13）：取锁后重新核验「Armed 且未暂停」，急救完成后的后台任务不会把规则加回来
+- **删除账本门禁**（v0.6.13）：未完成的快照删除会阻断新的删除、账号写入与完整导入
+- **急救命令分派**（v0.6.13）：`--egate-restore` / `--egate-check` / `--egate-status` 在 GUI 初始化前执行，不再依赖窗口
+- **卸载安全**（v0.6.13）：找不到恢复程序时中止卸载；MSI 暂停发布（无法接入恢复钩子）
 - **核验误判修复**（v0.6.12）：防火墙规则核验合并为单一条件链——此前端口/Profile 检查是独立链，前半段（动作/方向/程序）判错时仍可能落到「成功」
 - **Desktop 失败不再删账本**（v0.6.12）：以交易实际推进到的阶段（而非最初创建时）判断是否需要保留恢复依据
 - **未接入兜底封锁**（v0.6.12）：只建出站规则**不结束进程**；每轮重新核验补齐；接入恢复后独立解除，不依赖熔断状态
@@ -644,7 +650,7 @@ npx tsc --noEmit                            # 前端类型
 npm run tauri build                         # 出 MSI + NSIS
 ```
 
-当前源码测试状态：**636 通过、0 失败、0 ignored**（2026-11-05，v0.6.12；以 `cargo test --lib` 实际输出为准）。主密钥相关测试使用内存后端，不依赖真实凭据存储。除链接、路径、原子写入、BOM/UTF-16、进程匹配、控制器地址、加密快照和 keep 路径边界外，还覆盖更新缓存与 SemVer 比较、Claude Desktop 传统/MSIX 语言配置读取。详细验证与限制见 [更新检查记录](docs/optimization-2026-11-01.md) 和 [客户端语言记录](docs/optimization-client-language-2026-11-01.md)。
+当前源码测试状态：**640 通过、0 失败、0 ignored**（2026-11-05，v0.6.13；以 `cargo test --lib` 实际输出为准）。主密钥相关测试使用内存后端，不依赖真实凭据存储。除链接、路径、原子写入、BOM/UTF-16、进程匹配、控制器地址、加密快照和 keep 路径边界外，还覆盖更新缓存与 SemVer 比较、Claude Desktop 传统/MSIX 语言配置读取。详细验证与限制见 [更新检查记录](docs/optimization-2026-11-01.md) 和 [客户端语言记录](docs/optimization-client-language-2026-11-01.md)。
 
 ---
 

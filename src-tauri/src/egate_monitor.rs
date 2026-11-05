@@ -746,9 +746,18 @@ fn release_uncovered_lock() {
     if !uncovered_lock_active() {
         return;
     }
-    match crate::egate_trip::release_verified(crate::egate_trip::ReleaseReason::Automatic) {
+    // **P0-01**：只解除**未接入兜底**这一个来源的规则。
+    // 原实现调用 `release_verified`，按整个 `ClaudeSwitcher AppIsolation`
+    // 前缀删除——会把普通熔断的规则一起删掉，熔断状态却仍写着 tripped。
+    match crate::egate_trip::release_isolation_reason(crate::egate_trip::IsolationReason::Uncovered)
+    {
         Ok(report) if report.verified => {
-            clear_uncovered_lock();
+            if let Err(error) = clear_uncovered_lock() {
+                crate::log_error(&format!(
+                    "兜底规则已解除，但意图文件未能删除（{error}）：状态将显示为待处理"
+                ));
+                return;
+            }
             crate::log_error("接入已恢复：未接入兜底封锁已解除");
         }
         Ok(report) => crate::log_error(&format!(
@@ -798,10 +807,16 @@ fn clear_uncovered_ready() {
 }
 
 /// 接入恢复后清除兜底锁记录（规则由自动恢复统一解除）。
-pub fn clear_uncovered_lock() {
+///
+/// **QW-03**：返回 `Result`——删不掉意图文件时不能当成成功，
+/// 否则下次启动会以为兜底锁仍在（或反之），状态与实际不符。
+pub fn clear_uncovered_lock() -> Result<(), String> {
     clear_uncovered_ready();
-    if let Ok(path) = uncovered_lock_file() {
-        let _ = std::fs::remove_file(path);
+    let path = uncovered_lock_file()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("清除兜底锁意图失败：{error}")),
     }
 }
 
@@ -867,7 +882,9 @@ fn run_monitor_round(
 
     // **P0-C**：先按「接入是否恢复」独立处理兜底锁——它不参与 TRIP_STATE，
     // 因此不能等 decide() 的 Recover 分支（那里要求 already_tripped）。
-    if report.access.path != "uncovered" {
+    // **P0-01**：只有**已确认可用**的接入路径才允许解除兜底锁。
+    // `unknown`（无法确认）不等于「已恢复」，不能据此放行。
+    if matches!(report.access.path.as_str(), "system_proxy" | "tun") {
         release_uncovered_lock();
     }
 
@@ -1176,7 +1193,7 @@ mod tests {
         assert!(uncovered_lock_ready());
 
         // 清除时两者一起走。
-        clear_uncovered_lock();
+        clear_uncovered_lock().unwrap();
         assert!(!uncovered_lock_active());
         assert!(!uncovered_lock_ready());
     }
