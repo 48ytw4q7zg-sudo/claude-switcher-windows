@@ -638,6 +638,8 @@ mod tests {
     /// 挡住了 HTTP 却没挡住 DNS，真实出口照样可能从解析路径漏出去。
     #[test]
     fn tun_route_issuses_zero_dns_queries_until_trusted_channel_exists() {
+        // 串行化：DNS 计数器是进程级全局的，与其它测试并跑时断言会漂。
+        let _env = crate::test_support::env_lock();
         let target = EgateTarget {
             id: "t".to_string(),
             name: "t".to_string(),
