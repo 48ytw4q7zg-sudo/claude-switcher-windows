@@ -153,6 +153,42 @@ pub fn parse_mapped_address(packet: &[u8]) -> Option<String> {
     None
 }
 
+/// **P1-14（v0.7.3）**：STUN 探测是否允许自动执行。
+///
+/// STUN 是**主动**网络探测：它向公开服务器发送原始 UDP 包，目的正是让
+/// 对方观察到请求的真实来源。系统 HTTP 代理**管不住 UDP**——开着「系统代理」
+/// 并不能阻止这些包从物理网卡出去。
+///
+/// 因此本函数把「主动泄漏诊断」与「被动安全检查」分开：
+/// - 只有确认存在**接管 UDP** 的隧道（TUN 且路由已证实）时才自动执行；
+/// - 否则返回 `None`，由调用方给出 `Unverified` 并提示「需手动确认」。
+///
+/// 这不是删除功能，而是不再在用户不知情时把真实出口暴露给第三方
+/// STUN 服务器。
+pub fn auto_probe_allowed(tun_route_proven: bool) -> Option<StunSkip> {
+    if tun_route_proven {
+        return None;
+    }
+    Some(StunSkip::RouteNotProven)
+}
+
+/// 自动 STUN 探测被跳过的原因（界面直接展示）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StunSkip {
+    /// 没有证明 UDP 走隧道（仅系统 HTTP 代理或无 TUN）。
+    RouteNotProven,
+}
+
+impl StunSkip {
+    pub fn note(self) -> &'static str {
+        match self {
+            StunSkip::RouteNotProven => {
+                "已跳过 WebRTC/STUN 主动探测：UDP 路径未经证实，主动发包会暴露真实出口。如需检测，请在确认 TUN 已接管全部流量后手动执行"
+            }
+        }
+    }
+}
+
 /// 把大端序 u32 格式化为点分十进制 IPv4。
 fn fmt_ipv4(ip: u32) -> String {
     let b = ip.to_be_bytes();
@@ -221,6 +257,22 @@ pub fn probe_stun_leak(egress_ip: &str, timeout_ms: u64) -> StunResult {
             servers_responded,
             error: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod policy_tests {
+    use super::*;
+
+    /// **P1-14（v0.7.3）**：没有 UDP 隧道证明时，主动 STUN 探测必须被拒。
+    #[test]
+    fn auto_probe_requires_proven_udp_route() {
+        assert_eq!(auto_probe_allowed(false), Some(StunSkip::RouteNotProven));
+        assert!(auto_probe_allowed(false)
+            .unwrap()
+            .note()
+            .contains("主动探测"));
+        assert_eq!(auto_probe_allowed(true), None, "路由已证实时允许自动探测");
     }
 }
 

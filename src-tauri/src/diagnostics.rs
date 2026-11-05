@@ -655,6 +655,7 @@ mod tests {
             if_index: 0,
             ipv4: ipv4.iter().map(|s| s.to_string()).collect(),
             ipv6: Vec::new(),
+            ips_ok: true,
         }
     }
 

@@ -239,6 +239,36 @@ fn judge_dns(resolved: Result<&[String], &str>) -> (&'static str, String) {
     }
 }
 
+/// **P1-14（v0.7.3）**：UDP 是否确定走隧道。
+///
+/// 目前只有「接入是 TUN 且路由证据完整」才算——系统 HTTP 代理不接管 UDP，
+/// 所以「有代理」不构成 UDP 安全的证明。任何一项不确定都返回 `false`，
+/// 让 STUN 主动探测保持关闭。
+fn udp_route_proven() -> bool {
+    // 「看到 TUN 网卡」不等于「UDP 经过它」——后者需要真实路由证明
+    // （`egate_access::RouteEvidence`），而这里没有目标可用于取证。
+    //
+    // 因此自动检查一律按「未证明」处理：宁可报告「未验证」，
+    // 也不在用户不知情时把真实出口发给第三方 STUN 服务器。
+    // 需要主动诊断的用户可显式执行（`stun_probe_manual` 命令，带确认参数）。
+    false
+}
+
+/// **P1-14（v0.7.3）**：用户显式确认后的主动 STUN 诊断。
+///
+/// `confirmed` 必须由界面在向用户展示隐私提示后置为 true；否则拒绝执行。
+/// 这是「主动泄漏诊断」与「被动安全检查」的分界线：前者必然向外发包，
+/// 不能让它在巡检里静默发生。
+pub fn stun_probe_manual(egress_ip: &str, confirmed: bool) -> Result<stun::StunResult, String> {
+    if !confirmed {
+        return Err(
+            "主动 STUN 诊断会向第三方服务器发送原始 UDP 包，可能暴露真实出口；             需要用户明确确认后才能执行"
+                .to_string(),
+        );
+    }
+    Ok(stun::probe_stun_leak(egress_ip, 2000))
+}
+
 /// 9. WebRTC：STUN 探针结果。leaks→fail；无响应→warn（保守，不视为零暴露）。
 fn judge_webrtc(result: Option<&StunResult>) -> (&'static str, String) {
     match result {
@@ -531,7 +561,15 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
     } else {
         Err("DNS 检查已关闭".to_string())
     };
-    let stun_result = if !enabled("webrtc") {
+    // **P1-14（v0.7.3）**：STUN 是**主动**探测（发原始 UDP 给第三方服务器），
+    // 系统 HTTP 代理管不住 UDP。没有「UDP 走隧道」的证明时不自动发包。
+    let udp_route_proven = udp_route_proven();
+    let stun_skip = if enabled("webrtc") {
+        stun::auto_probe_allowed(udp_route_proven)
+    } else {
+        None
+    };
+    let stun_result = if !enabled("webrtc") || stun_skip.is_some() {
         None
     } else {
         match &egress {
@@ -632,6 +670,15 @@ pub fn run_checks_blocking() -> Vec<CheckItem> {
             "WebRTC",
             match stun_result.as_ref() {
                 Some(result) => judge_webrtc(Some(result)),
+                // **P1-14**：主动探测被策略跳过时要说清楚「为什么没测」，
+                // 而不是含糊地报「未获取出口 IP」。
+                None if stun_skip.is_some() => (
+                    "warn",
+                    stun_skip
+                        .map(|skip| skip.note())
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
                 // 出口是 IPv6：STUN 探针只解析 IPv4，比对必然不等——不能当成泄漏。
                 None if egress.as_ref().is_ok_and(|e| e.ip.contains(':')) => (
                     "warn",
@@ -933,6 +980,7 @@ mod tests {
             if_index: 0,
             ipv4: ipv4.iter().map(|s| s.to_string()).collect(),
             ipv6: vec![],
+            ips_ok: true,
         }
     }
 

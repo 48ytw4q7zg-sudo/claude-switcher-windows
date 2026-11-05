@@ -2771,12 +2771,19 @@ fn egate_disabled_checks() -> Vec<String> {
 }
 
 /// 出口门禁：开关与参数（整体更新，缺省保持原值由前端回读保证）。
-/// **P1-05**：布防就绪校验。
+/// **P1-05 / P0-05（v0.7.3）**：布防就绪校验。
 ///
-/// 区分三种情形：
-/// - 完全没有配置目标 → 使用内置默认表（它自带期望 IP/地区），视为就绪；
-/// - 配置了目标但白名单为空 → **拒绝布防**，并指出缺配置的目标名；
-/// - 全部就绪 → 允许。
+/// v0.7.2 的漏洞：`egate_targets.is_empty()` 时直接 `return Ok(())`，
+/// 理由是「内置默认表自带期望值」。但 `builtin_targets()` 实际上把
+/// `expect_ips` / `expect_regions` 全部留空——于是全新安装、没做任何配置的
+/// 用户可以直接开启门禁；第一次真的拿到出口信息时 `evaluate()` 判 `Fail`
+/// （`empty_whitelist_with_geo_fails_closed`），达到阈值后自动熔断，
+/// 把用户正在用的桌面程序结束掉。
+///
+/// 现在的规则按**实际生效的目标表**判定（用户配置为空就用内置默认表）：
+/// - `AnchorKind::Reachability` 只看可达性，不要求 IP/地区白名单；
+/// - 其余目标必须至少有一个期望 IP 或期望地区；
+/// - 任一启用目标不满足即拒绝布防，并点名是哪一个。
 fn validate_arm_readiness() -> Result<(), String> {
     let config = match appconfig::load_checked() {
         appconfig::ConfigLoad::Ok(config) => *config,
@@ -2787,24 +2794,34 @@ fn validate_arm_readiness() -> Result<(), String> {
             ))
         }
     };
-    if config.egate_targets.is_empty() {
-        return Ok(()); // 使用内置目标表
-    }
-    let unready: Vec<String> = config
-        .egate_targets
-        .iter()
-        .filter(|target| {
-            target.enabled && target.expect_ips.is_empty() && target.expect_regions.is_empty()
-        })
-        .map(|target| target.name.clone())
-        .collect();
+    // **关键**：与 `egate_check_once` / 监控线程使用**同一份**目标表。
+    let targets = if config.egate_targets.is_empty() {
+        egate_defaults::builtin_targets()
+    } else {
+        config.egate_targets.clone()
+    };
+    let unready = unready_targets(&targets);
     if unready.is_empty() {
         return Ok(());
     }
     Err(format!(
-        "以下目标尚未配置期望出口（IP 或地区），开启后会被判定为失败并触发熔断：{}。         请先在出口门禁面板补齐白名单",
+        "以下目标尚未配置期望出口（IP 或地区），开启后会被判定为失败并触发熔断：{}。\
+         请先在出口门禁面板为它们填写白名单，或先停用这些目标",
         unready.join("、")
     ))
+}
+
+/// 挑出「已启用但无法判定」的目标（纯函数，便于单测）。
+///
+/// 只有 `Reachability` 锚点可以不配白名单——它本来就不看出口 IP/地区。
+fn unready_targets(targets: &[egate::EgateTarget]) -> Vec<String> {
+    targets
+        .iter()
+        .filter(|target| target.enabled)
+        .filter(|target| target.anchor_kind != egate::AnchorKind::Reachability)
+        .filter(|target| target.expect_ips.is_empty() && target.expect_regions.is_empty())
+        .map(|target| target.name.clone())
+        .collect()
 }
 
 #[tauri::command]
@@ -2910,6 +2927,15 @@ async fn egate_env_check() -> Result<egate_env::EnvCheck, String> {
         Ok(egate_env::evaluate(&tz, &info.country))
     })
     .await
+}
+
+/// **P1-14（v0.7.3）**：用户显式确认后的主动 STUN 泄漏诊断。
+///
+/// 巡检里的 WebRTC 检查已改为**不自动发包**（UDP 路由未证实时会暴露真实出口）。
+/// 需要主动诊断时由界面在展示隐私提示后调用本命令，并显式传 `confirmed=true`。
+#[tauri::command]
+async fn stun_probe_manual(egress_ip: String, confirmed: bool) -> Result<stun::StunResult, String> {
+    blocking(move || checks::stun_probe_manual(&egress_ip, confirmed)).await
 }
 
 /// 出口门禁：把系统时区对齐到出口国家（走账本，可一键还原）。
@@ -3585,6 +3611,7 @@ pub fn run() {
             egate_launch_check,
             egate_notify_test,
             egate_env_check,
+            stun_probe_manual,
             egate_supported_regions,
             egate_set_disabled_checks,
             set_log_config,
@@ -3616,6 +3643,76 @@ pub fn run() {
         ])
         .run(tauri::generate_context!())
         .expect("error while running Claude Switcher");
+}
+
+#[cfg(test)]
+mod arm_readiness_tests {
+    use super::*;
+
+    fn target(
+        id: &str,
+        kind: egate::AnchorKind,
+        ips: &[&str],
+        regions: &[&str],
+    ) -> egate::EgateTarget {
+        egate::EgateTarget {
+            id: id.to_string(),
+            name: id.to_string(),
+            anchor_url: "https://example.invalid/trace".to_string(),
+            anchor_kind: kind,
+            expect_ips: ips.iter().map(|s| s.to_string()).collect(),
+            expect_regions: regions.iter().map(|s| s.to_string()).collect(),
+            enabled: true,
+            timeout_secs: 10,
+        }
+    }
+
+    /// **P0-05（v0.7.3）**：全新安装、直接用内置默认表布防必须被拒绝。
+    ///
+    /// 回归点：v0.7.2 在 `egate_targets.is_empty()` 时直接放行，而内置目标
+    /// 的白名单全是空——用户一开开关，第一次拿到出口信息就判 Fail，
+    /// 达到阈值后自动熔断并结束桌面程序。
+    #[test]
+    fn builtin_targets_are_not_arm_ready() {
+        let builtins = egate_defaults::builtin_targets();
+        let unready = unready_targets(&builtins);
+        assert!(
+            !unready.is_empty(),
+            "内置默认目标没有白名单，必须判定为未就绪"
+        );
+        // 内置表里确实存在需要白名单的目标（Trace / GeminiRegion 等）。
+        assert!(builtins
+            .iter()
+            .any(|t| t.anchor_kind != egate::AnchorKind::Reachability));
+    }
+
+    /// 只有可达性锚点可以不带白名单——它本来就不看出口 IP/地区。
+    #[test]
+    fn reachability_targets_do_not_need_a_whitelist() {
+        let targets = vec![target("g", egate::AnchorKind::Reachability, &[], &[])];
+        assert!(unready_targets(&targets).is_empty());
+
+        let mixed = vec![
+            target("g", egate::AnchorKind::Reachability, &[], &[]),
+            target("c", egate::AnchorKind::Trace, &["1.2.3.4"], &[]),
+            target("r", egate::AnchorKind::GeminiRegion, &[], &["US"]),
+        ];
+        assert!(unready_targets(&mixed).is_empty(), "配了 IP 或地区都算就绪");
+    }
+
+    #[test]
+    fn enabled_target_without_whitelist_blocks_arming() {
+        let targets = vec![
+            target("c", egate::AnchorKind::Trace, &[], &[]),
+            target("d", egate::AnchorKind::Trace, &["1.2.3.4"], &[]),
+        ];
+        assert_eq!(unready_targets(&targets), vec!["c".to_string()]);
+
+        // 停用的目标不阻断布防。
+        let mut disabled = target("c", egate::AnchorKind::Trace, &[], &[]);
+        disabled.enabled = false;
+        assert!(unready_targets(&[disabled]).is_empty());
+    }
 }
 
 #[cfg(test)]

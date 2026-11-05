@@ -52,8 +52,14 @@ pub struct GuardTick {
 /// （避免拔掉 TUN 后旧 198.18 地址残留导致误判存活）。
 pub fn tun_status_from_adapters(adapters: &[AdapterInfo]) -> (bool, &'static str) {
     // 198.18 假IP段优先（与 PS 一致：先查 IP 再回退网卡描述）。
+    //
+    // **P0-07（v0.7.3）**：只在 `ips_ok` 时才用地址做判断。读不到地址不等于
+    // 「没有 198.18 地址」——那种情况交给下面的网卡描述回退，而不是拿
+    // 「空地址列表」当作「确认没接管」。
     if adapters.iter().any(|a| {
-        a.status.eq_ignore_ascii_case("Up") && a.ipv4.iter().any(|ip| ip.starts_with("198.18."))
+        a.ips_ok
+            && a.status.eq_ignore_ascii_case("Up")
+            && a.ipv4.iter().any(|ip| ip.starts_with("198.18."))
     }) {
         return (true, "198.18 假IP段");
     }
@@ -517,6 +523,7 @@ mod tests {
             if_index: 0,
             ipv4: ipv4.iter().map(|s| s.to_string()).collect(),
             ipv6: vec![],
+            ips_ok: true,
         }
     }
 

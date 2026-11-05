@@ -282,6 +282,7 @@ pub struct UpdateInstallResult {
 }
 
 /// 计算 SHA256（纯函数）。
+#[allow(dead_code)]
 pub fn compute_sha256(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -368,23 +369,41 @@ pub fn download_and_install_blocking(
     if !response.status().is_success() {
         return Err(format!("下载失败（HTTP {}）", response.status()));
     }
-    // L-06: refuse absurdly large downloads instead of buffering them fully.
-    if let Some(len) = response.content_length() {
-        if len > MAX_UPDATE_BYTES {
-            return Err(format!(
-                "安装包体积异常（{len} 字节，上限 {MAX_UPDATE_BYTES}），已拒绝下载"
-            ));
+    // **P1-04 / L-11（v0.7.3）**：有界流式下载。
+    //
+    // 只检查 `content_length()` 不够：缺头、头部撒谎、chunked 传输都能绕过它，
+    // 随后 `response.bytes()` 会把任意大小的内容整体读进内存。
+    // 现在边读边写边算哈希，**接收量一旦超过上限立即中止**并删除暂存文件。
+    let actual = match stream_to_file_bounded(response, &local_path, MAX_UPDATE_BYTES) {
+        Ok(actual) => actual,
+        Err(error) => {
+            let _ = std::fs::remove_file(&local_path);
+            return Err(error);
         }
-    }
-    let bytes = response
-        .bytes()
-        .map_err(|e| format!("读取下载内容失败：{e}"))?;
-    std::fs::write(&local_path, &bytes).map_err(|e| format!("保存安装包失败：{e}"))?;
-
-    let local_bytes = std::fs::read(&local_path).map_err(|e| format!("读取安装包失败：{e}"))?;
-    let actual = compute_sha256(&local_bytes);
+    };
     if actual != sha256.trim().to_ascii_lowercase() {
+        let _ = std::fs::remove_file(&local_path);
         return Err("SHA256 校验失败，已拒绝安装".to_string());
+    }
+
+    // **L-12（v0.7.3）**：没有可信发布签名根之前，**不自动执行**下载的安装包。
+    //
+    // `sha256` 是调用方传进来的参数，不是发布者的身份证明——把它当作
+    // 「这份文件可信」的依据，等于让一个可被上游篡改的摘要决定我们执行什么。
+    // 因此这里只完成「下载 + 校验」，把文件路径交给用户，由他去官方 Release
+    // 页面确认后手动安装。
+    //
+    // 可信更新链（签名清单 + 内嵌公钥 + 发布者校验）落地后，再打开自动执行。
+    if !TRUSTED_UPDATE_CHAIN_AVAILABLE {
+        return Ok(UpdateInstallResult {
+            downloaded: true,
+            verified: true,
+            installed: false,
+            message: format!(
+                "已下载并校验安装包（SHA-256 与摘要一致）。由于本版本尚未建立可信发布签名链，                 不会自动运行安装程序。请前往官方 Release 页面核对后手动安装：{RELEASES_PAGE}"
+            ),
+            local_path: Some(local_path.to_string_lossy().to_string()),
+        });
     }
 
     // **P1-04**：下载可能耗时数分钟，期间状态可能变化——启动安装器**之前**
@@ -400,14 +419,22 @@ pub fn download_and_install_blocking(
     Ok(UpdateInstallResult {
         downloaded: true,
         verified: true,
-        // **P1-04**：仅表示安装器已启动，不表示安装完成。安装结果需要用户
-        // 在向导中确认并重启应用后由版本号核验。
         installed: false,
         message: "已下载并校验安装包，安装向导已启动。请按向导完成安装并重启应用后生效（本工具不核验安装结果）"
             .to_string(),
         local_path: Some(local_path.to_string_lossy().to_string()),
     })
 }
+
+/// **L-12（v0.7.3）**：可信更新链是否已经就绪。
+///
+/// 需要「发布端签名清单 + 客户端内嵌公钥 + 发布者校验 + 安装后版本确认收据」
+/// 四件事同时具备才算就绪。当前没有签名基础设施，因此恒为 `false`——
+/// 自动执行下载的安装包被明确关闭，而不是靠文档提醒来约束。
+const TRUSTED_UPDATE_CHAIN_AVAILABLE: bool = false;
+
+/// 官方发布页（用户在手动安装前核对制品的地方）。
+const RELEASES_PAGE: &str = "https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases";
 
 /// **P1-04**：为一次下载创建全新的随机暂存目录。
 ///
@@ -430,6 +457,60 @@ fn make_staging_dir() -> std::io::Result<std::path::PathBuf> {
         std::io::ErrorKind::AlreadyExists,
         "无法创建唯一的下载暂存目录",
     ))
+}
+
+/// **P1-04 / L-11（v0.7.3）**：有界流式落盘 + 流式计算 SHA-256。
+///
+/// 返回实际内容的十六进制 SHA-256。上限按「超过 limit 就中止」判定，
+/// 既不会把超大响应读进内存，也不会因为恰好等于上限而误判。
+fn stream_to_file_bounded(
+    response: reqwest::blocking::Response,
+    path: &std::path::Path,
+    limit: u64,
+) -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Write};
+
+    // 头部声明超限：直接拒绝，连正文都不用读。
+    if let Some(len) = response.content_length() {
+        if len > limit {
+            return Err(format!(
+                "安装包体积异常（{len} 字节，上限 {limit}），已拒绝下载"
+            ));
+        }
+    }
+    let mut file = std::fs::File::create(path).map_err(|e| format!("保存安装包失败：{e}"))?;
+    let mut response = response;
+    let mut hasher = Sha256::new();
+    let mut total: u64 = 0;
+    let mut buffer = vec![0u8; 64 * 1024];
+    loop {
+        let read = response
+            .read(&mut buffer)
+            .map_err(|e| format!("读取下载内容失败：{e}"))?;
+        if read == 0 {
+            break;
+        }
+        total = total.saturating_add(read as u64);
+        // 不超过上限一个字节就中止：这样「恰好等于上限」是允许的。
+        if total > limit {
+            return Err(format!(
+                "安装包体积超过上限（已接收 {total} 字节，上限 {limit}），已中止下载"
+            ));
+        }
+        hasher.update(&buffer[..read]);
+        file.write_all(&buffer[..read])
+            .map_err(|e| format!("写入安装包失败：{e}"))?;
+    }
+    file.flush().map_err(|e| format!("写入安装包失败：{e}"))?;
+    if total == 0 {
+        return Err("下载内容为空，已拒绝".to_string());
+    }
+    Ok(hasher
+        .finalize()
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect())
 }
 
 /// L-06 (v0.7.1): validate untrusted update parameters before touching the network
@@ -496,22 +577,20 @@ pub fn download_and_verify_blocking(
     if !response.status().is_success() {
         return Err(format!("下载失败（HTTP {}）", response.status()));
     }
-    // L-06: refuse absurdly large downloads instead of buffering them fully.
-    if let Some(len) = response.content_length() {
-        if len > MAX_UPDATE_BYTES {
-            return Err(format!(
-                "安装包体积异常（{len} 字节，上限 {MAX_UPDATE_BYTES}），已拒绝下载"
-            ));
+    // **P1-04 / L-11（v0.7.3）**：有界流式下载。
+    //
+    // 只检查 `content_length()` 不够：缺头、头部撒谎、chunked 传输都能绕过它，
+    // 随后 `response.bytes()` 会把任意大小的内容整体读进内存。
+    // 现在边读边写边算哈希，**接收量一旦超过上限立即中止**并删除暂存文件。
+    let actual = match stream_to_file_bounded(response, &local_path, MAX_UPDATE_BYTES) {
+        Ok(actual) => actual,
+        Err(error) => {
+            let _ = std::fs::remove_file(&local_path);
+            return Err(error);
         }
-    }
-    let bytes = response
-        .bytes()
-        .map_err(|e| format!("读取下载内容失败：{e}"))?;
-    std::fs::write(&local_path, &bytes).map_err(|e| format!("保存安装包失败：{e}"))?;
-
-    let local_bytes = std::fs::read(&local_path).map_err(|e| format!("读取安装包失败：{e}"))?;
-    let actual = compute_sha256(&local_bytes);
+    };
     if actual != sha256.trim().to_ascii_lowercase() {
+        let _ = std::fs::remove_file(&local_path);
         return Err("SHA256 校验失败，已拒绝安装".to_string());
     }
 
@@ -737,6 +816,25 @@ mod tests {
         assert!(version_newer("0.1.1", "0.1.0"));
         assert!(!version_newer("0.1.0", "0.1.0"));
         assert!(!version_newer("0.0.9", "0.1.0"));
+    }
+
+    /// **L-12（v0.7.3）**：没有可信签名根时不得自动执行安装包。
+    ///
+    /// 这条断言固定住「当前版本不自动运行安装程序」的策略。等签名链落地后
+    /// 把 `TRUSTED_UPDATE_CHAIN_AVAILABLE` 改成 true 时，必须同步改这个测试——
+    /// 让「打开自动执行」成为一个有意识的决定，而不是顺手改常量。
+    #[test]
+    fn unsigned_updates_are_never_auto_executed() {
+        // 常量本身就是策略：策略值通过 `allow` 直接固定在这里，
+        // 让「打开自动执行」必须同时改常量与这条断言（有意识的决定）。
+        #[allow(clippy::assertions_on_constants)]
+        {
+            assert!(
+                !TRUSTED_UPDATE_CHAIN_AVAILABLE,
+                "签名链未建立前，自动执行下载的安装包必须保持关闭"
+            );
+        }
+        assert!(RELEASES_PAGE.starts_with("https://github.com/"));
     }
 
     /// **P1-09**：历史四段版本（v0.6.13.1 时代发布过）必须仍能收到更新。

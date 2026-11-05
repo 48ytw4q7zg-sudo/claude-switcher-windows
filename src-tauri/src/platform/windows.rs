@@ -867,6 +867,12 @@ pub struct AdapterInfo {
     pub ipv4: Vec<String>,
     #[serde(default)]
     pub ipv6: Vec<String>,
+    /// **P0-07（v0.7.3）**：IP 地址查询是否成功。
+    ///
+    /// `false` 时 `ipv4`/`ipv6` 为空**不代表**网卡没有地址，只代表读不到。
+    /// 依赖地址做判断的调用方（198.18 假 IP 段识别）必须跳过而不是判否。
+    #[serde(default)]
+    pub ips_ok: bool,
 }
 
 /// 把 Rust 字符串转成 PowerShell 单引号字面量内容（单引号翻倍转义）。
@@ -1186,92 +1192,155 @@ fn parse_adapters(json: &str) -> Result<Vec<AdapterInfo>, String> {
     }
 }
 
-/// **P1-01**：采集「目标流量是否真的经过 TUN」的路由证据。
+/// **P1-01 / P0-02 / P0-03（v0.7.3）**：按**目标 × 协议族**采集 TUN 路由证据。
 ///
-/// 只做**读取**：`Find-NetRoute` 是 Windows 自带的「按目标地址查实际路由」
-/// cmdlet（Server 2012+ / Windows 8+），它返回的 `InterfaceIndex` 就是系统
-/// 此刻会用来发往该地址的接口——这才是证据；「存在一块 Up 的 TUN 网卡」不是。
+/// 与 v0.7.2 的三个关键差别：
 ///
-/// 四项分别取：
-/// 1. IPv4 目标地址的实际出接口是否等于 TUN 的 ifIndex；
-/// 2. IPv6 目标地址同上（未启用 IPv6 也是**有效结论**，不是失败）；
-/// 3. 默认路由（0.0.0.0/0）是否由 TUN 承接；
-/// 4. 任一项查询抛错 → 整份证据不可用（`error` 非空）。
+/// 1. **一次脚本、多个目标**：每个目标传入自己解析出的地址，脚本分别
+///    `Find-NetRoute`。原实现只取第一个目标的主机名，却放行所有目标。
+/// 2. **三态而非布尔**：每个协议族返回 `tun` / `bypass` / `not_available` /
+///    `unknown`，不再用 `Some(false)` 冒充「已检查通过」。
+/// 3. **IPv6 缺失是显式结论**：目标的 AAAA 记录不存在时标记为
+///    `not_available`（不存在 IPv6 旁路），而不是拿 `2001:db8::1` 占位地址
+///    去查一条与真实目标无关的路由。
 ///
-/// 任何一个「查不到」都不做乐观推断：调用方拿到 `error` 就必须按
-/// `Unverified` 处理，绝不发直连探测。
+/// 只做**读取**（`Find-NetRoute` / `Get-NetRoute` / `Get-NetAdapterBinding`），
+/// 不修改任何系统状态；不发任何网络包。
 pub fn collect_route_evidence(
     tun_if_index: u32,
-    ipv4_probe: &str,
-    ipv6_probe: &str,
-) -> crate::egate_access::RouteEvidence {
-    use crate::egate_access::RouteEvidence;
+    probes: &[(String, Option<String>, Option<String>)],
+) -> std::collections::BTreeMap<String, crate::egate_access::RouteEvidence> {
+    use crate::egate_access::{RouteEvidence, RouteVia};
+    let mut out: std::collections::BTreeMap<String, RouteEvidence> =
+        std::collections::BTreeMap::new();
+    if probes.is_empty() {
+        return out;
+    }
+    // 把「目标 ID + 选定的 IPv4/IPv6 地址」整体传进脚本：脚本不拼接用户串。
+    let spec = probes
+        .iter()
+        .map(|(id, v4, v6)| {
+            serde_json::json!({
+                "id": id,
+                "v4": v4.clone().unwrap_or_default(),
+                "v6": v6.clone().unwrap_or_default(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let spec_json = serde_json::to_string(&spec).unwrap_or_else(|_| "[]".to_string());
     let script = format!(
         "$ErrorActionPreference='Stop'
 $tun = {tun}
-$v4 = {v4}
-$v6 = {v6}
-try {{
-  $r4 = @(Find-NetRoute -RemoteIPAddress $v4 -ErrorAction Stop)
-  $r6 = @(Find-NetRoute -RemoteIPAddress $v6 -ErrorAction Stop)
-  $default = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
-               Where-Object {{ [uint32]$_.InterfaceIndex -eq $tun }})
-  $v6Enabled = @(Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction Stop |
-                 Where-Object {{ $_.Enabled }}).Count -gt 0
-  [pscustomobject]@{{
-    ipv4_via_tun = (@($r4 | Where-Object {{ [uint32]$_.InterfaceIndex -eq $tun }}).Count -gt 0)
-    default_via_tun = ($default.Count -gt 0)
-    ipv6_enabled = $v6Enabled
-    ipv6_via_tun = if ($v6Enabled) {{ @($r6 | Where-Object {{ [uint32]$_.InterfaceIndex -eq $tun }}).Count -gt 0 }} else {{ $true }}
-  }} | ConvertTo-Json -Compress
-}} catch {{
-  [pscustomobject]@{{ error = [string]$_.Exception.Message }} | ConvertTo-Json -Compress
-}}",
+$specs = {spec} | ConvertFrom-Json
+# IPv6 是否在本机可用：只有全部启用网卡都没绑定 IPv6，才能断言「不存在 IPv6 路径」。
+$v6Enabled = @(Get-NetAdapterBinding -ComponentID ms_tcpip6 -ErrorAction Stop |
+               Where-Object {{ $_.Enabled }}).Count -gt 0
+$v4Default = @(Get-NetRoute -DestinationPrefix '0.0.0.0/0' -ErrorAction Stop |
+               Where-Object {{ [uint32]$_.InterfaceIndex -eq $tun }}).Count -gt 0
+$v6Default = @(Get-NetRoute -DestinationPrefix '::/0' -ErrorAction Stop |
+               Where-Object {{ [uint32]$_.InterfaceIndex -eq $tun }}).Count -gt 0
+$results = New-Object System.Collections.ArrayList
+foreach ($s in $specs) {{
+  $entry = [ordered]@{{ id = $s.id; error = $null }}
+  try {{
+    # ---- IPv4 ----
+    if (-not $s.v4) {{
+      $entry.ipv4 = 'unknown'
+    }} else {{
+      $r4 = @(Find-NetRoute -RemoteIPAddress $s.v4 -ErrorAction Stop)
+      $viaTun = @($r4 | Where-Object {{ [uint32]$_.InterfaceIndex -eq $tun }}).Count -gt 0
+      # 「目标路由经 TUN」+「默认路由经 TUN」两个条件必须同时成立：
+      # 只有前者时，目标的其它地址族/后续连接仍可能走物理网卡。
+      $entry.ipv4 = if ($viaTun -and $v4Default) {{ 'tun' }} elseif ($viaTun) {{ 'unknown' }} else {{ 'bypass' }}
+    }}
+    # ---- IPv6 ----
+    if (-not $v6Enabled) {{
+      # 本机没有启用 IPv6：不存在 IPv6 旁路，这是**明确结论**。
+      $entry.ipv6 = 'not_available'
+    }} elseif (-not $s.v6) {{
+      # 本机有 IPv6，但该目标没有 AAAA 记录：目标层面没有 IPv6 路径。
+      # 但仍要确认默认 IPv6 路由是否被 TUN 接管——否则同一域名将来
+      # 拿到 AAAA 时会走物理网络。
+      $entry.ipv6 = if ($v6Default) {{ 'not_available' }} else {{ 'unknown' }}
+    }} else {{
+      $r6 = @(Find-NetRoute -RemoteIPAddress $s.v6 -ErrorAction Stop)
+      $viaTun6 = @($r6 | Where-Object {{ [uint32]$_.InterfaceIndex -eq $tun }}).Count -gt 0
+      $entry.ipv6 = if ($viaTun6 -and $v6Default) {{ 'tun' }} elseif ($viaTun6) {{ 'unknown' }} else {{ 'bypass' }}
+    }}
+  }} catch {{
+    $entry.ipv4 = 'unknown'
+    $entry.ipv6 = 'unknown'
+    $entry.error = [string]$_.Exception.Message
+  }}
+  [void]$results.Add([pscustomobject]$entry)
+}}
+ConvertTo-Json -InputObject @($results) -Compress -Depth 4",
         tun = tun_if_index,
-        v4 = ps_single_quote(ipv4_probe),
-        v6 = ps_single_quote(ipv6_probe)
+        spec = ps_single_quote(&spec_json)
     );
     let json = match run_ps(&script) {
         Ok(json) => json,
         Err(error) => {
-            return RouteEvidence {
-                error: Some(error),
-                ..RouteEvidence::default()
+            for (id, _, _) in probes {
+                out.insert(
+                    id.clone(),
+                    RouteEvidence::unknown(id.clone(), error.clone()),
+                );
             }
+            return out;
         }
     };
     let value: serde_json::Value = match serde_json::from_str(json.trim()) {
         Ok(value) => value,
         Err(error) => {
-            return RouteEvidence {
-                error: Some(format!("路由证据解析失败：{error}；原文：{json}")),
-                ..RouteEvidence::default()
+            let reason = format!("路由证据解析失败：{error}；原文：{json}");
+            for (id, _, _) in probes {
+                out.insert(
+                    id.clone(),
+                    RouteEvidence::unknown(id.clone(), reason.clone()),
+                );
             }
+            return out;
         }
     };
-    if let Some(error) = value.get("error").and_then(|v| v.as_str()) {
-        return RouteEvidence {
-            error: Some(error.to_string()),
-            ..RouteEvidence::default()
-        };
-    }
-    let flag = |name: &str| value.get(name).and_then(|v| v.as_bool());
-    let ipv4 = flag("ipv4_via_tun");
-    let default_route = flag("default_via_tun");
-    let ipv6_enabled = flag("ipv6_enabled");
-    let ipv6 = match (ipv6_enabled, flag("ipv6_via_tun")) {
-        // IPv6 未启用：不存在 IPv6 旁路，这是**明确**结论（true），不是未知。
-        (Some(false), _) => Some(true),
-        (_, Some(via_tun)) => Some(via_tun),
-        // 字段缺失：无法确认。
-        (_, None) => None,
+    let rows: Vec<serde_json::Value> = match value {
+        serde_json::Value::Array(rows) => rows,
+        serde_json::Value::Object(_) => vec![value],
+        _ => Vec::new(),
     };
-    RouteEvidence {
-        ipv4_via_tun: ipv4,
-        ipv6_via_tun: ipv6,
-        default_route_via_tun: default_route,
-        error: None,
+    let parse_via = |raw: Option<&str>| match raw {
+        Some("tun") => RouteVia::Tun,
+        Some("bypass") => RouteVia::Bypass,
+        Some("not_available") => RouteVia::NotAvailable,
+        _ => RouteVia::Unknown,
+    };
+    for row in rows {
+        let Some(id) = row.get("id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let error = row
+            .get("error")
+            .and_then(|v| v.as_str())
+            .filter(|e| !e.is_empty())
+            .map(str::to_string);
+        out.insert(
+            id.to_string(),
+            RouteEvidence {
+                target_id: id.to_string(),
+                ipv4: parse_via(row.get("ipv4").and_then(|v| v.as_str())),
+                ipv6: parse_via(row.get("ipv6").and_then(|v| v.as_str())),
+                // DNS 可信度由调用方（egate_check）判定并覆盖，见那里的说明。
+                dns_trusted: false,
+                error,
+            },
+        );
     }
+    // 脚本没返回的目标一律按「无法确认」，绝不留空。
+    for (id, _, _) in probes {
+        out.entry(id.clone())
+            .or_insert_with(|| RouteEvidence::unknown(id.clone(), "脚本未返回该目标的路由证据"));
+    }
+    out
 }
 
 /// ms_tcpip6（IPv6）绑定状态：(网卡名, 是否已启用)。
@@ -1646,37 +1715,105 @@ pub fn kill_processes_by_names(names: &[&str]) -> Result<Vec<String>, String> {
 /// 查杀逻辑早已按此区分，但「解析 exe 路径做防火墙规则」用的是另一套
 /// （只要进程名匹配就收）。两边标准不一致时，原生 CLI 会被写进 GUI 隔离规则。
 pub fn is_managed_gui_path(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    const CLI_MARKERS: &[&str] = &[
-        "\\node_modules\\",
-        "\\npm\\",
-        "\\nvm\\",
-        "\\fnm\\",
-        "\\volta\\",
-        "\\.bun\\",
-        "\\.deno\\",
-    ];
-    if CLI_MARKERS.iter().any(|m| lower.contains(m)) {
-        return false;
-    }
-    const GUI_MARKERS: &[&str] = &[
-        "\\anthropicclaude",
-        "\\programs\\claude",
-        "\\program files\\claude",
-        "\\windowsapps",
-        "\\programs\\chatgpt",
-        "\\program files\\chatgpt",
-        "\\antigravity",
-    ];
-    GUI_MARKERS.iter().any(|m| lower.contains(m))
+    managed_gui_identity(path) == GuiIdentity::ConfirmedGui
 }
 
-/// 过滤候选路径，只保留确认属于受管 GUI 的（**P1-06**）。
+/// **P0-04（v0.7.3）**：进程身份的**三态**判定。
+///
+/// 「不是 CLI」不等于「是 GUI」。原实现只有一个布尔：要么确认 GUI，要么
+/// 不是；调用方在「不是」时没有第三种选择，于是出现了「确认不了就宽松放回」
+/// 的回退——那正是把原生 `claude.exe` CLI 写进 GUI 规则的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GuiIdentity {
+    /// 落在受管桌面 GUI 的已知安装位置内。
+    ConfirmedGui,
+    /// 明确是 CLI 宿主（node/npm/nvm/… 目录下的同名进程）。
+    Cli,
+    /// 两者都不是：身份未知。**不得**据此建立 GUI 隔离规则。
+    Unknown,
+}
+
+/// 判定一个映像路径的身份。
+///
+/// 顺序很重要：先判 CLI（CLI 宿主可能恰好装在含 GUI 关键词的路径下，
+/// 例如 `%LOCALAPPDATA%\Programs\Claude\node_modules\...`），再判 GUI。
+pub fn managed_gui_identity(path: &str) -> GuiIdentity {
+    // 归一化分隔符与大小写：调用方可能传入 `/`、混合分隔符或任意大小写。
+    // 注意这里用 `replace('/', "\\")` 把正斜杠换成单反斜杠。
+    let lower = path.to_ascii_lowercase().replace('/', "\\");
+    // CLI 宿主的路径特征。每个特征都以单个反斜杠开头与结尾（目录边界）。
+    const CLI_MARKERS: &[&str] = &[
+        r"\node_modules\",
+        r"\npm\",
+        r"\nvm\",
+        r"\fnm\",
+        r"\volta\",
+        r"\.bun\",
+        r"\.deno\",
+        r"\appdata\roaming\npm\",
+        r"\appdata\local\pnpm\",
+        r"\.local\share\pnpm\",
+        r"\scoop\shims\",
+    ];
+    if CLI_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return GuiIdentity::Cli;
+    }
+    // 可执行文件名必须是受管 GUI 之一——只按目录判断会把同目录下的更新器、
+    // 崩溃处理程序也当成 GUI。
+    let file_name = lower.rsplit('\\').next().unwrap_or("");
+    const EXE_NAMES: &[&str] = &[
+        "claude.exe",
+        "claude desktop.exe",
+        "chatgpt.exe",
+        "antigravity.exe",
+    ];
+    if !EXE_NAMES.contains(&file_name) {
+        return GuiIdentity::Unknown;
+    }
+    const GUI_MARKERS: &[&str] = &[
+        r"\anthropicclaude\",
+        r"\programs\claude\",
+        r"\program files\claude\",
+        r"\program files (x86)\claude\",
+        r"\windowsapps\",
+        r"\programs\chatgpt\",
+        r"\program files\chatgpt\",
+        r"\program files (x86)\chatgpt\",
+        r"\antigravity\",
+        r"\programs\antigravity\",
+    ];
+    if GUI_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        GuiIdentity::ConfirmedGui
+    } else {
+        GuiIdentity::Unknown
+    }
+}
+
+/// 过滤候选路径，只保留**确认**属于受管 GUI 的（**P1-06**）。
+#[allow(dead_code)]
 pub fn filter_managed_gui_paths(paths: Vec<String>) -> Vec<String> {
     paths
         .into_iter()
         .filter(|path| is_managed_gui_path(path))
         .collect()
+}
+
+/// **P0-04（v0.7.3）**：把候选路径分成「确认 GUI」与「被拒（附原因）」。
+///
+/// 调用方必须用这个接口，而不是自己写「过滤后为空就放宽」的回退——
+/// 那类回退正是把 CLI 写进 GUI 规则的入口。
+pub fn classify_managed_gui_paths(paths: Vec<String>) -> (Vec<String>, Vec<String>) {
+    let mut confirmed = Vec::new();
+    let mut rejected = Vec::new();
+    for path in paths {
+        match managed_gui_identity(&path) {
+            GuiIdentity::ConfirmedGui => confirmed.push(path),
+            // CLI 宿主与身份未知都拒绝：规则的目标是隔离 GUI，
+            // 拿不准就不建，并让调用方把原因告诉用户。
+            GuiIdentity::Cli | GuiIdentity::Unknown => rejected.push(path),
+        }
+    }
+    (confirmed, rejected)
 }
 
 pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String> {
@@ -1688,53 +1825,125 @@ pub fn kill_desktop_app_processes(names: &[&str]) -> Result<Vec<String>, String>
         .map(|n| ps_single_quote(n))
         .collect::<Vec<_>>()
         .join(",");
-    let script = format!(
-        "$ErrorActionPreference='SilentlyContinue'
-         $killed = New-Object System.Collections.ArrayList
-         $skipped = New-Object System.Collections.ArrayList
-         $cliMarkers = @('\\node_modules\\', '\\npm\\', '\\nvm\\', '\\fnm\\', '\\volta\\', '\\.bun\\', '\\.deno\\')
-         # **P1-02**：受管桌面 GUI 的安装特征（用户级 / 系统级 / MSIX）。
-         # 只有落在这些目录里的同名进程才允许结束；其余按「身份未确认」跳过。
-         $guiPaths = @('\\anthropicclaude\\', '\\programs\\claude\\', '\\program files\\claude', '\\windowsapps\\')
-         foreach ($p in @(Get-Process -Name {names} -ErrorAction SilentlyContinue)) {{
-           $path = $p.Path
-           $pname = $p.ProcessName
-           $desc = \"$pname (PID $($p.Id))\"
-           $isCli = $false
-           if ($pname -in @('node','bun','deno','npm','npx')) {{ $isCli = $true }}
-           if ($path) {{
-             $lower = $path.ToLowerInvariant()
-             foreach ($m in $cliMarkers) {{
-               if ($lower.Contains($m)) {{ $isCli = $true }}
-             }}
-           }}
-           if ($isCli) {{
-             [void]$skipped.Add(\"$desc（CLI 宿主，只提醒不查杀）\")
-             continue
-           }}
-           if (-not $path) {{
-             [void]$skipped.Add(\"$desc（无法读取映像路径，不盲目结束）\")
-             continue
-           }}
-           # **P1-02**：只结束能确认属于受管 GUI 安装的进程。
-           # 非典型路径下的原生 CLI 与这里无法区分，按「身份未确认」跳过。
-           $lowerPath = $path.ToLowerInvariant()
-           $guiHint = $false
-           foreach ($h in $guiPaths) {{
-             if ($lowerPath.Contains($h)) {{ $guiHint = $true }}
-           }}
-           if (-not $guiHint) {{
-             [void]$skipped.Add(\"$desc（不在受管 GUI 安装路径内，身份未确认）\")
-             continue
-           }}
-           Stop-Process -Id $p.Id -Force -ErrorAction SilentlyContinue
-           [void]$killed.Add($desc)
-         }}
-         ConvertTo-Json -InputObject @($killed)",
-        names = name_list
-    );
+    // **P1-07 / P1-12（v0.7.3）**：两处语义修正。
+    //
+    // 1. 路径特征必须与 `managed_gui_identity()` **逐字一致**：原来脚本里的
+    //    `$guiPaths` 只有 Claude 的目录，ChatGPT / Antigravity 会被判「身份
+    //    未确认」而跳过——规则建了、进程没杀，用户以为已经隔离。
+    // 2. `Stop-Process -ErrorAction SilentlyContinue` 后无条件 `$killed.Add`
+    //    会在权限不足时**谎报成功**。现在逐个 PID 结束、收集异常，并在
+    //    结束后按 PID + 启动时间复核进程是否真的消失（防止 PID 复用误判）。
+    let template = r#"$ProgressPreference='SilentlyContinue'
+$ErrorActionPreference='SilentlyContinue'
+$killed = New-Object System.Collections.ArrayList
+$skipped = New-Object System.Collections.ArrayList
+$cliMarkers = @(
+  '\node_modules\', '\npm\', '\nvm\', '\fnm\', '\volta\', '\.bun\', '\.deno\',
+  '\appdata\roaming\npm\', '\appdata\local\pnpm\', '\.local\share\pnpm\', '\scoop\shims\'
+)
+# **P1-07**：与 Rust 侧 managed_gui_identity() 的 GUI_MARKERS 保持一致。
+$guiPaths = @(
+  '\anthropicclaude\', '\programs\claude\', '\program files\claude\',
+  '\program files (x86)\claude\', '\windowsapps\',
+  '\programs\chatgpt\', '\program files\chatgpt\', '\program files (x86)\chatgpt\',
+  '\antigravity\', '\programs\antigravity\'
+)
+$guiExeNames = @('claude.exe', 'claude desktop.exe', 'chatgpt.exe', 'antigravity.exe')
+foreach ($p in @(Get-Process -Name __NAMES__ -ErrorAction SilentlyContinue)) {
+  $path = $p.Path
+  $pname = $p.ProcessName
+  $procId = $p.Id
+  # 启动时间用于结束后的身份复核：PID 会被复用，只看数字会误判。
+  $startTicks = -1
+  try { $startTicks = $p.StartTime.ToUniversalTime().Ticks } catch {}
+  $desc = "$pname (PID $procId)"
+  if ($pname -in @('node','bun','deno','npm','npx')) {
+    [void]$skipped.Add("$desc（CLI 宿主，只提醒不查杀）")
+    continue
+  }
+  if (-not $path) {
+    [void]$skipped.Add("$desc（无法读取映像路径，不盲目结束）")
+    continue
+  }
+  $lowerPath = $path.ToLowerInvariant().Replace('/', '\')
+  $isCli = $false
+  foreach ($m in $cliMarkers) { if ($lowerPath.Contains($m)) { $isCli = $true } }
+  if ($isCli) {
+    [void]$skipped.Add("$desc（CLI 宿主，只提醒不查杀）")
+    continue
+  }
+  # 文件名必须是受管 GUI 的可执行文件——同目录的更新器/崩溃处理程序不算。
+  $fileName = $lowerPath.Substring($lowerPath.LastIndexOf('\') + 1)
+  if ($guiExeNames -notcontains $fileName) {
+    [void]$skipped.Add("$desc（不是受管 GUI 的可执行文件，身份未确认）")
+    continue
+  }
+  $guiHint = $false
+  foreach ($h in $guiPaths) { if ($lowerPath.Contains($h)) { $guiHint = $true } }
+  if (-not $guiHint) {
+    [void]$skipped.Add("$desc（不在受管 GUI 安装路径内，身份未确认）")
+    continue
+  }
+  # 逐个结束并收集真实结果。
+  try {
+    Stop-Process -Id $procId -Force -ErrorAction Stop
+  } catch {
+    [void]$skipped.Add("$desc（结束失败：" + $_.Exception.Message + '）')
+    continue
+  }
+  # 结束后复核：同一 PID 且启动时间一致才说明「还是那个进程」还在。
+  $still = $null
+  try { $still = Get-Process -Id $procId -ErrorAction Stop } catch {}
+  if ($still) {
+    $sameProcess = $true
+    try {
+      if ($startTicks -ge 0 -and $still.StartTime.ToUniversalTime().Ticks -ne $startTicks) {
+        $sameProcess = $false
+      }
+    } catch {}
+    if ($sameProcess) {
+      [void]$skipped.Add("$desc（结束命令已执行，但进程仍存在）")
+      continue
+    }
+    # PID 被别的进程复用了：我们那个进程确实已经退出。
+  }
+  [void]$killed.Add($desc)
+}
+ConvertTo-Json -InputObject @([pscustomobject]@{ killed = @($killed); skipped = @($skipped) })"#;
+    let script = template.replace("__NAMES__", &name_list);
     let json = run_ps(&script)?;
-    parse_killed(&json)
+    parse_kill_result(&json)
+}
+
+/// 解析「结束 + 跳过」两段结果（**P1-12**）。
+///
+/// 返回值只包含**确认已经退出**的进程；跳过/失败的原因并入同一列表，
+/// 用「（…）」标注，保持既有调用方（托盘提示、账本）不改结构。
+fn parse_kill_result(json: &str) -> Result<Vec<String>, String> {
+    let trimmed = json.trim();
+    if trimmed.is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(trimmed)
+        .map_err(|e| format!("进程结束结果解析失败: {e}; 原文: {trimmed}"))?;
+    let row = match value {
+        serde_json::Value::Array(items) => items.into_iter().next().unwrap_or_default(),
+        other => other,
+    };
+    let collect = |key: &str| -> Vec<String> {
+        match row.get(key) {
+            Some(serde_json::Value::Array(items)) => items
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .filter(|s| !s.is_empty())
+                .collect(),
+            Some(serde_json::Value::String(one)) => vec![one.clone()],
+            _ => Vec::new(),
+        }
+    };
+    let mut out = collect("killed");
+    out.extend(collect("skipped"));
+    Ok(out)
 }
 
 fn parse_killed(json: &str) -> Result<Vec<String>, String> {
@@ -2047,6 +2256,70 @@ mod tests {
         });
     }
 
+    /// **P0-04（v0.7.3）**：GUI/CLI 身份三态。
+    ///
+    /// 回归点：v0.7.2 在「一个都确认不了」时把未确认路径宽松放回隔离列表，
+    /// 且排除条件写成了 `"\node_modules\\"`（`\n` 是换行符）根本不可能命中。
+    /// 结果是原生 Claude Code CLI 会被写进 GUI 隔离规则。
+    #[test]
+    fn gui_identity_separates_cli_from_unknown() {
+        // 明确是 CLI：npm 全局安装的 claude。
+        for path in [
+            r"C:\Users\test\AppData\Roaming\npm\claude.exe",
+            r"C:\Users\test\AppData\Roaming\npm\node_modules\@anthropic-ai\claude-code\cli.js",
+            r"C:\Users\test\AppData\Roaming\npm\claude.cmd",
+            r"C:\Program Files\Claude\node_modules\foo\claude.exe",
+        ] {
+            assert_eq!(
+                managed_gui_identity(path),
+                GuiIdentity::Cli,
+                "应识别为 CLI：{path}"
+            );
+            assert!(!is_managed_gui_path(path));
+        }
+        // 明确是桌面 GUI。
+        for path in [
+            r"C:\Program Files\Claude\Claude.exe",
+            r"C:\Users\test\AppData\Local\Programs\Claude\Claude.exe",
+            r"C:\Users\test\AppData\Local\AnthropicClaude\claude.exe",
+            r"C:\Program Files\ChatGPT\ChatGPT.exe",
+            r"C:\Users\test\AppData\Local\Programs\antigravity\Antigravity.exe",
+        ] {
+            assert_eq!(
+                managed_gui_identity(path),
+                GuiIdentity::ConfirmedGui,
+                "应识别为 GUI：{path}"
+            );
+            assert!(is_managed_gui_path(path));
+        }
+        // 身份未知：不在已知 GUI 目录、也不是 CLI。
+        for path in [
+            r"D:\Tools\claude.exe",
+            r"C:\Program Files\Claude\updater.exe",
+            r"C:\Program Files\Claude\crashpad_handler.exe",
+        ] {
+            assert_eq!(
+                managed_gui_identity(path),
+                GuiIdentity::Unknown,
+                "应识别为未知：{path}"
+            );
+        }
+    }
+
+    /// **P0-04**：分类必须把「未知」与「CLI」都拒掉，绝不把未确认路径放进隔离列表。
+    #[test]
+    fn classify_rejects_cli_and_unknown_paths() {
+        let input = vec![
+            r"C:\Program Files\Claude\Claude.exe".to_string(),
+            r"C:\Users\test\AppData\Roaming\npm\claude.exe".to_string(),
+            r"D:\Tools\claude.exe".to_string(),
+        ];
+        let (confirmed, rejected) = classify_managed_gui_paths(input);
+        assert_eq!(confirmed.len(), 1);
+        assert!(confirmed[0].ends_with(r"Program Files\Claude\Claude.exe"));
+        assert_eq!(rejected.len(), 2, "CLI 与未知路径都必须被拒");
+    }
+
     #[test]
     fn run_ps_propagates_non_terminating_errors() {
         let result = run_ps("Write-Error 'synthetic probe without system changes'; 'false'");
@@ -2092,6 +2365,59 @@ mod tests {
                 }
                 other => panic!("缺少哨兵必须判为未知，实际：{other:?}"),
             }
+        }
+
+        /// **L-15（v0.7.3）**：错误输出、管道截断、异常回执的边界组合。
+        #[test]
+        fn partial_or_corrupt_results_are_never_success() {
+            // 哨兵出现在**中间**（后面还有内容）→ 不是尾部哨兵，判未知。
+            // 这种形状只会出现在输出被截断/交错时，当成成功会把半截执行
+            // 误报为完整成功。
+            let middle = classify_ps_output(
+                "__PS_OK__
+stray output",
+                "",
+                Some(0),
+            );
+            assert!(matches!(middle, PsOutcome::Unknown(_)), "{middle:?}");
+
+            // 只有 CRLF 与空白、没有哨兵 → 未知（不是「成功且空输出」）。
+            let blank = classify_ps_output(
+                "
+
+",
+                "",
+                Some(0),
+            );
+            assert!(matches!(blank, PsOutcome::Unknown(_)), "{blank:?}");
+
+            // 空输出 + 非零退出码 → 未知，并且带上退出码便于排错。
+            let empty_fail = classify_ps_output("", "boom", Some(1));
+            match empty_fail {
+                PsOutcome::Unknown(message) => {
+                    assert!(message.contains("boom"), "应带出 stderr：{message}");
+                    assert!(message.contains("1"), "应带出退出码：{message}");
+                }
+                other => panic!("应为未知，实际：{other:?}"),
+            }
+
+            // 失败哨兵 + 空 stderr → 仍然是失败，不因为没细节就转成功。
+            let fail_no_stderr = classify_ps_output(
+                "__PS_FAIL__
+",
+                "",
+                Some(0),
+            );
+            assert!(fail_no_stderr.is_failed(), "{fail_no_stderr:?}");
+
+            // 大小写/空白变体不应被误认成哨兵（哨兵是精确串）。
+            let lower = classify_ps_output(
+                "__ps_ok__
+",
+                "",
+                Some(0),
+            );
+            assert!(matches!(lower, PsOutcome::Unknown(_)), "{lower:?}");
         }
 
         #[test]

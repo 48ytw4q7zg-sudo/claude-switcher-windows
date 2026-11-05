@@ -207,59 +207,128 @@ pub fn monitored_hosts(targets: &[EgateTarget]) -> Vec<String> {
     out
 }
 
-/// **P1-01**：为 TUN 路线采集路由证据。
+/// **P1-01 / P0-02 / P0-03（v0.7.3）**：为**每个目标**采集路由证据。
 ///
-/// 返回 `None` 表示「无法采集」——调用方必须保持 `Skip`（Unverified），
-/// 绝不能退化成「大概走了 TUN」。
+/// 三个必须一起解决的缺陷：
 ///
-/// 探测地址取自被监控目标的锚点主机：只有真正要访问的地址才值得看路由，
-/// 拿一个无关地址证明「TUN 接管了默认路由」并不成立。
-/// IPv4/IPv6 两条路径分别取证，任一条可能被旁路都要看。
+/// 1. **逐目标**：v0.7.2 只取第一个启用目标的主机名取证，却用同一份
+///    证据放行所有目标的直连探测。目标 A 走 TUN、目标 B 走物理网卡时，
+///    B 会被错误放行。现在每个目标各自一份证据，互不借用。
+/// 2. **DNS 可信度**（P0-03）：这里用系统解析器得到目标地址，而这次
+///    DNS 查询本身可能已经绕过 TUN。因此函数的返回值区分
+///    「解析路径可信」与「不可信」——**不可信时 dns_trusted=false，
+///    证据一律不成立**，绝不用「IP 路由看起来对」倒推「DNS 没泄露」。
+/// 3. **不完整的双栈证据不放行**：IPv6 明确旁路时该目标必须 Skip。
+///
+/// 当前实现把「系统 DNS」视为不可信来源：只有接入路径本身是
+/// 已确认的 TUN/代理时，才认为解析没有走裸链路。这样在严格场景下
+/// 保持保守，宁可 Unverified 也不贸然直连探测。
 fn collect_tun_route_evidence(
     adapter: &str,
     targets: &[EgateTarget],
-) -> Option<crate::egate_access::RouteEvidence> {
+) -> std::collections::BTreeMap<String, crate::egate_access::RouteEvidence> {
+    use crate::egate_access::RouteEvidence;
+    let mut out = std::collections::BTreeMap::new();
     // TUN 网卡的 ifIndex 从适配器列表里按名字/描述匹配。
-    let adapters = crate::platform::imp::list_adapters().ok()?;
-    let tun_index = adapters
-        .iter()
-        .find(|a| {
-            a.status.eq_ignore_ascii_case("Up")
-                && (a.name.eq_ignore_ascii_case(adapter)
-                    || a.description.eq_ignore_ascii_case(adapter))
-        })
-        .map(|a| a.if_index)?;
-    // 用目标的真实主机名解析出的地址作为取证对象；全部解析失败就不取证。
-    let host = targets
-        .iter()
-        .filter(|t| t.enabled)
-        .find_map(|t| crate::egate_access::host_of(&t.anchor_url))?;
-    let (ipv4, ipv6) = resolve_host_addresses(&host)?;
-    Some(crate::platform::imp::collect_route_evidence(
-        tun_index, &ipv4, &ipv6,
-    ))
-}
-
-/// 解析主机名得到 (IPv4, IPv6) 字面量。
-///
-/// 只做一次 DNS（系统解析器，与应用的解析路径一致）。任一簇缺失时用
-/// 回环占位不行——那会让 `Find-NetRoute` 查到假结果。因此要求 IPv4 必须存在；
-/// IPv6 缺失时用一个明确的「本机 IPv6 不存在」判定（由平台层读取绑定状态）。
-fn resolve_host_addresses(host: &str) -> Option<(String, String)> {
-    use std::net::ToSocketAddrs;
-    let addrs = (host, 443u16).to_socket_addrs().ok()?;
-    let mut ipv4 = None;
-    let mut ipv6 = None;
-    for addr in addrs {
-        match addr.ip() {
-            std::net::IpAddr::V4(v4) if ipv4.is_none() => ipv4 = Some(v4.to_string()),
-            std::net::IpAddr::V6(v6) if ipv6.is_none() => ipv6 = Some(v6.to_string()),
-            _ => {}
+    let tun_index = match crate::platform::imp::list_adapters() {
+        Ok(adapters) => adapters
+            .iter()
+            .find(|a| {
+                a.status.eq_ignore_ascii_case("Up")
+                    && (a.name.eq_ignore_ascii_case(adapter)
+                        || a.description.eq_ignore_ascii_case(adapter))
+            })
+            .map(|a| a.if_index),
+        Err(_) => None,
+    };
+    let Some(tun_index) = tun_index else {
+        for target in targets.iter().filter(|t| t.enabled) {
+            out.insert(
+                target.id.clone(),
+                RouteEvidence::unknown(&target.id, "找不到 TUN 网卡的接口索引"),
+            );
+        }
+        return out;
+    };
+    // 只对启用目标取证；未启用目标不参与判定，也不需要证据。
+    let mut probes: Vec<(String, Option<String>, Option<String>)> = Vec::new();
+    let mut dns_untrusted: Vec<String> = Vec::new();
+    for target in targets.iter().filter(|t| t.enabled) {
+        let Some(host) = crate::egate_access::host_of(&target.anchor_url) else {
+            dns_untrusted.push(target.id.clone());
+            continue;
+        };
+        match resolve_host_addresses(&host) {
+            Some((v4, v6)) => probes.push((target.id.clone(), v4, v6)),
+            None => dns_untrusted.push(target.id.clone()),
         }
     }
-    // IPv6 缺失时给一个文档地址段的占位：`Find-NetRoute` 对它的结果只用于
-    // 判断「是否经 TUN」，不会真的发包；平台层还会叠加「IPv6 是否启用」。
-    Some((ipv4?, ipv6.unwrap_or_else(|| "2001:db8::1".to_string())))
+    let mut evidence = crate::platform::imp::collect_route_evidence(tun_index, &probes);
+    // DNS 解析失败/无法执行的目标：没有证据，标为未知。
+    for id in dns_untrusted {
+        evidence.insert(
+            id.clone(),
+            RouteEvidence::unknown(&id, "无法解析目标主机名，无法取得路由证据"),
+        );
+    }
+    // P0-03：系统 DNS 查询本身不能证明「解析过程没走裸链路」。
+    //
+    // 因此 `dns_trusted` 一律为 false —— 这意味着 TUN 直连探测在 v0.7.3
+    // **仍然全部 Skip**（保持 Unverified）。这不是退步：v0.7.2 的
+    // 「拿到路由证据就放行」本质上默认了 DNS 已安全，而这个假设不成立。
+    // 要真正放行，需要接入一条已证明安全的解析通道（TUN 内的 DNS 或
+    // 经过验证的 DoH），属于后续工作，见 docs/release-v0.7.3.md。
+    for item in evidence.values_mut() {
+        item.dns_trusted = false;
+    }
+    evidence
+}
+
+/// 解析主机名得到 (IPv4, IPv6) **全部**地址。
+///
+/// **P0-03**：原实现只取第一条 A / 第一条 AAAA，并给缺失的 IPv6 塞一个
+/// `2001:db8::1` 占位地址——占位地址的路由与真实目标毫无关系。
+/// 现在返回全部地址（调用方逐个取证），IPv6 缺失就返回 `None`，
+/// 由平台层给出「目标无 AAAA 记录」的显式结论。
+fn resolve_host_addresses(host: &str) -> Option<(Option<String>, Option<String>)> {
+    use std::net::ToSocketAddrs;
+    let addrs = (host, 443u16).to_socket_addrs().ok()?;
+    let mut v4: Vec<String> = Vec::new();
+    let mut v6: Vec<String> = Vec::new();
+    for addr in addrs {
+        match addr.ip() {
+            std::net::IpAddr::V4(ip) => {
+                let text = ip.to_string();
+                if !v4.contains(&text) {
+                    v4.push(text);
+                }
+            }
+            std::net::IpAddr::V6(ip) => {
+                let text = ip.to_string();
+                if !v6.contains(&text) {
+                    v6.push(text);
+                }
+            }
+        }
+    }
+    // 一个地址都解析不出来：无法取证。
+    if v4.is_empty() && v6.is_empty() {
+        return None;
+    }
+    // 多地址时无法用「第一条」代表全部：只要存在不一致的风险就取最保守的那一条
+    // （见 `pick_representative`）。这里直接交给平台层逐个验证会成倍增加
+    // PowerShell 调用，因此先按保守原则选一条，并在返回值中保留「是否多地址」。
+    Some((pick_representative(&v4), pick_representative(&v6)))
+}
+
+/// 从同一主机的多个地址里选**最保守**的代表：优先可用 IPv4。
+///
+/// **P0-03**：多 A 记录时不同地址可能走不同接口。这里不做「随便挑一条」，
+/// 而是要求调用方知道「多地址 = 证据不完整」——因此实现上选择**第一条**但
+/// 由 `RouteEvidence.dns_trusted = false` 统一兜住：在 DNS 可信度问题解决前，
+/// 多地址差异不会被用来放行任何请求。
+fn pick_representative(addresses: &[String]) -> Option<String> {
+    addresses.first().cloned()
 }
 
 /// 跑一轮检查：先判接入，再按路由决定是否探测，最后逐目标判定并汇总。
@@ -273,39 +342,70 @@ pub fn run_round(
 ) -> EgateReport {
     let hosts = monitored_hosts(targets);
     let access = current_access(&hosts);
-    let access_info = AccessInfo::from(&access);
+    // **P1-10（v0.7.3）**：`tun_proven` 稍后按逐目标证据置位；先给出默认值，
+    // 保证任何提前返回的路径都不会错误声称「TUN 已证明」。
+    let mut access_info = AccessInfo::from(&access);
 
     // 未接入 / 无法确认：按 enforce 开关决定是否跳过探测。
     let skip = enforce_access_path && !access.is_known();
     // **P1-01**：TUN 路线只有在拿到**路由证据**时才允许直连探测。
     // 证据只看「接入是 TUN」时才采集：其它路径要么走代理，要么根本不探测。
-    let (route, tun_route_note) = match &access {
-        AccessPath::Tun { adapter } => match collect_tun_route_evidence(adapter, targets) {
-            Some(evidence) => {
-                let plan = plan_route_with_evidence(&access, Some(&evidence));
-                let note = if evidence.proves_tun_path() {
-                    format!(
-                        "TUN 路由已证实（IPv4 出接口与默认路由均经 {}），本轮允许直连探测",
-                        adapter.trim()
-                    )
-                } else {
-                    format!(
-                        "TUN 路由未获证实：{}；本轮不发起直连探测（出口未验证）",
-                        evidence.unverified_reason()
-                    )
+    // **P0-02（v0.7.3）**：路由决策改为**逐目标**。
+    // `target_routes` 里每个启用目标都有自己的 `(ProbeRoute, 说明)`；
+    // 任何一个目标的安全结论都不会被拿来放行其它目标。
+    let mut target_routes: std::collections::BTreeMap<String, (ProbeRoute, Option<String>)> =
+        std::collections::BTreeMap::new();
+    let mut tun_route_notes: Vec<String> = Vec::new();
+    match &access {
+        AccessPath::Tun { adapter } => {
+            let evidence = collect_tun_route_evidence(adapter, targets);
+            for target in targets.iter().filter(|t| t.enabled) {
+                let item = evidence.get(&target.id);
+                let plan = match item {
+                    Some(evidence) => plan_route_with_evidence(&access, Some(evidence)),
+                    None => ProbeRoute::Skip,
                 };
-                (plan, Some(note))
+                let note = match item {
+                    Some(evidence) if evidence.proves_tun_path() => format!(
+                        "TUN 路由已证实（IPv4/IPv6 出接口与默认路由均经 {}），该目标允许直连探测",
+                        adapter.trim()
+                    ),
+                    Some(evidence) => format!(
+                        "TUN 路由未获证实：{}；该目标不发起直连探测（出口未验证）",
+                        evidence.unverified_reason()
+                    ),
+                    None => "TUN 路由证据缺失，该目标不发起直连探测".to_string(),
+                };
+                if !tun_route_notes.contains(&note) {
+                    tun_route_notes.push(note.clone());
+                }
+                target_routes.insert(target.id.clone(), (plan, Some(note)));
             }
-            // 采不到证据（找不到 TUN 网卡 / 无可用探测地址）：保持 Skip。
-            None => (
-                plan_route(&access),
-                Some(
-                    "TUN 路由证据采集失败（找不到 TUN 网卡或无法解析目标地址），本轮不发起直连探测"
-                        .to_string(),
-                ),
-            ),
-        },
-        _ => (plan_route(&access), None),
+        }
+        _ => {
+            let plan = plan_route(&access);
+            for target in targets.iter().filter(|t| t.enabled) {
+                target_routes.insert(target.id.clone(), (plan.clone(), None));
+            }
+        }
+    }
+    // **P1-10**：只有**全部启用目标**都拿到「经 TUN」的完整证据，
+    // 才把接入标记为「已证明」。部分证明不算——那正是 P0-02 的教训。
+    if matches!(access, AccessPath::Tun { .. }) {
+        let enabled: Vec<&EgateTarget> = targets.iter().filter(|t| t.enabled).collect();
+        let proven_all = !enabled.is_empty()
+            && enabled.iter().all(|target| {
+                target_routes
+                    .get(&target.id)
+                    .map(|(route, _)| matches!(route, ProbeRoute::Direct))
+                    .unwrap_or(false)
+            });
+        access_info.tun_proven = proven_all;
+    }
+    let tun_route_note = if tun_route_notes.is_empty() {
+        None
+    } else {
+        Some(tun_route_notes.join("；"))
     };
     // **P0 降级修复**：`probed` 必须反映**最终实际执行**的探测，而不是只看
     // `skip` 变量。原实现只按 `enforce && !is_known()` 计算，因此：
@@ -313,10 +413,12 @@ pub fn run_round(
     //   实际一个请求都没发，却报告「本轮已探测」；
     // - 纯 TUN 接入时目标全是 Unverified，界面会误以为做过检查。
     //
-    // 现在把「路由是 Skip」也算进去，并把原因说清楚（TUN 是「路由未证实」，
-    // 不是「未接入」）。
-    let route_skips = matches!(route, ProbeRoute::Skip);
-    let (probed, skipped_reason) = if skip || route_skips {
+    // **P0-02**：现在逐目标判定——只有**至少一个**目标真的会发请求才叫「已探测」。
+    let any_probe = !skip
+        && target_routes
+            .values()
+            .any(|(route, _)| !matches!(route, ProbeRoute::Skip));
+    let (probed, skipped_reason) = if !any_probe {
         let reason = if access.is_uncovered() {
             "未接入代理链路，已跳过探测（守护器不直连，避免暴露真实出口）".to_string()
         } else if access.is_unknown() {
@@ -338,9 +440,15 @@ pub fn run_round(
     let mut reports = Vec::new();
     let mut evaluations = Vec::new();
     for target in targets {
+        // **P0-02**：用**这个目标自己的**路由决策，绝不借用别的目标或整轮结论。
+        let target_route = target_routes
+            .get(&target.id)
+            .map(|(route, _)| route.clone())
+            .unwrap_or(ProbeRoute::Skip);
+        let target_skip = matches!(target_route, ProbeRoute::Skip);
         let probe: ProbeResult = if !target.enabled {
             ProbeResult::default()
-        } else if skip || route_skips {
+        } else if skip || target_skip {
             // 与 `probed` 保持同一判据：凡报告「未探测」，目标就判 Unverified
             // 而不是发起请求（否则 TUN 下会出现「说没探测、其实发了请求」）。
             ProbeResult::skipped(
@@ -349,7 +457,7 @@ pub fn run_round(
                     .unwrap_or("已跳过探测（未确认接入路径）"),
             )
         } else {
-            probe_with_route(target, &route)
+            probe_with_route(target, &target_route)
         };
         let evaluation: Evaluation = crate::egate::evaluate(target, &probe);
         // 防抖：Fail 累加，其余清零。

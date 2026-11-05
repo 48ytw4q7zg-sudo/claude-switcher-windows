@@ -69,7 +69,37 @@ pub struct TripReport {
     pub all_isolated: bool,
     /// 所有失败的说明（空表示全部成功）。
     pub failures: Vec<String>,
+    /// **L-13（v0.7.3）**：本次执行的**结论分类**。
+    ///
+    /// 原来调用方只能看 `all_isolated`：一次「因配置过期而主动放弃」的操作
+    /// 也会得到 `all_isolated=false`，于是被记成「部分熔断」——用户看到的
+    /// 是一个凭空出现的部分隔离状态。
+    pub outcome: TripOutcome,
     pub note: String,
+}
+
+/// 一次熔断/兜底封锁的结论（**L-13**）。
+///
+/// 「用户主动取消」与「系统操作失败」是两件事，必须分开记录。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TripOutcome {
+    /// 全部隔离生效。
+    Applied,
+    /// 部分生效（有应用失败）。
+    Partial,
+    /// 因判定过期而**主动放弃**（配置代次变化 / 保护已停止 / 已暂停）。
+    /// 这种情况**不得**污染熔断状态。
+    AbortedStale,
+    /// 完全没有生效（系统操作失败）。
+    Failed,
+}
+
+impl TripOutcome {
+    /// 是否应当更新熔断状态（`AbortedStale` 不更新）。
+    pub fn touches_state(self) -> bool {
+        !matches!(self, TripOutcome::AbortedStale)
+    }
 }
 
 /// 内置守护应用与其进程特征。
@@ -174,9 +204,20 @@ pub fn agent_pids(agents: &[String]) -> std::collections::BTreeMap<u32, String> 
             .map(|n| ps_quote(n))
             .collect::<Vec<_>>()
             .join(",");
+        // **P1-06（v0.7.3）**：直连泄露观察必须与查杀使用**同一套 GUI 身份**。
+        //
+        // 原实现只按进程名取 PID：终端里跑着 Claude Code CLI 时，它的公网连接
+        // 会被算成「受管 GUI 的直连泄露」，用户看到一条根本不存在的泄露告警。
+        // 现在把映像路径一起取回来，交给 `classify_managed_gui_paths` 判定；
+        // 读不到路径的进程同样排除（无法证明它是 GUI，就不能据此告警）。
         let script = format!(
-            "$ErrorActionPreference='SilentlyContinue'\n\
-             @(Get-Process -Name {names} | Select-Object -ExpandProperty Id) | ConvertTo-Json -Compress"
+            "$ErrorActionPreference='SilentlyContinue'
+@(Get-Process -Name {names} -ErrorAction SilentlyContinue |
+  ForEach-Object {{
+    $path = $null
+    try {{ $path = $_.Path }} catch {{}}
+    [pscustomobject]@{{ id = $_.Id; path = [string]$path }}
+  }}) | ConvertTo-Json -Compress"
         );
         let Ok(json) = crate::platform::imp::run_powershell(&script) else {
             continue;
@@ -185,15 +226,19 @@ pub fn agent_pids(agents: &[String]) -> std::collections::BTreeMap<u32, String> 
             Ok(value) => value,
             Err(_) => continue,
         };
-        let pids: Vec<u32> = match value {
-            serde_json::Value::Array(items) => items
-                .into_iter()
-                .filter_map(|v| v.as_u64().map(|n| n as u32))
-                .collect(),
-            serde_json::Value::Number(n) => n.as_u64().map(|n| vec![n as u32]).unwrap_or_default(),
+        let rows: Vec<serde_json::Value> = match value {
+            serde_json::Value::Array(items) => items,
+            serde_json::Value::Object(_) => vec![value],
             _ => Vec::new(),
         };
-        for pid in pids {
+        for row in rows {
+            let Some(pid) = row.get("id").and_then(|v| v.as_u64()).map(|n| n as u32) else {
+                continue;
+            };
+            let path = row.get("path").and_then(|v| v.as_str()).unwrap_or("");
+            if !crate::platform::imp::is_managed_gui_path(path) {
+                continue;
+            }
             out.insert(pid, agent.clone());
         }
     }
@@ -761,24 +806,28 @@ pub fn quarantine_agent_for(
                     return report;
                 }
             };
-            // **P1-06（v0.7.1）**：只保留确认属于**受管 GUI** 的路径。
-            // 原实现把进程名匹配到的一切都收进来，原生 CLI 会被写成
-            // GUI 隔离规则——查杀端早就按 GUI 身份过滤，两端标准必须一致。
-            let gui = crate::platform::imp::filter_managed_gui_paths(candidates.clone());
-            if gui.is_empty() {
-                // 一个都不能确认属于 GUI：宁可不建规则，也不误伤 CLI。
-                candidates
-                    .into_iter()
-                    .filter(|path| {
-                        // 保留传统安装路径（无明确 CLI 特征且带程序目录）作为兜底，
-                        // 但显式排除 CLI 宿主路径。
-                        !path.to_ascii_lowercase().contains("\node_modules\\")
-                            && !path.to_ascii_lowercase().contains("\npm\\")
-                    })
-                    .collect()
-            } else {
-                gui
+            // **P1-06 / P0-04（v0.7.3）**：只保留**确认**属于受管 GUI 的路径。
+            //
+            // 两个问题一起修：
+            // 1. v0.7.2 在「一个都确认不了」时会**宽松回退**，把未确认的路径
+            //    重新放进隔离列表。那等于把原生 `claude.exe` CLI 也写进 GUI
+            //    规则——而查杀端按 GUI 身份会跳过它。两端标准不一致时，
+            //    用户看到「已隔离」，CLI 却照常联网。
+            // 2. 那个回退里的 `"\node_modules\\"` 是 Rust 转义写错的产物
+            //    （`\n` 先被解析成换行符），排除条件根本不可能命中。
+            //
+            // 现在的语义：**无法确认身份 = 不建 GUI 规则**，并如实说明原因。
+            // 自定义安装目录的支持走「安装登记/包身份」这条可信路径
+            // （见 `is_managed_gui_path` 的 GUI_MARKERS），不靠关键词黑名单兜底。
+            let (confirmed, rejected) =
+                crate::platform::imp::classify_managed_gui_paths(candidates);
+            if !rejected.is_empty() {
+                report.note.push_str(&format!(
+                    "以下路径无法确认属于桌面 GUI（疑似 CLI 宿主），未建立隔离规则：{}；",
+                    rejected.join("、")
+                ));
             }
+            confirmed
         }
     };
     if exes.is_empty() {
@@ -833,12 +882,19 @@ foreach ($r in $existing) {{
 if (-not $healthy) {{
   if ($existing.Count -gt 0) {{ $existing | Remove-NetFirewallRule -ErrorAction Stop }}
   New-NetFirewallRule -DisplayName $name -Direction $wantDirection -Action Block -Program $wantProgram -Enabled True -ErrorAction Stop | Out-Null
+  'created'
+}} else {{
+  'existing'
 }}",
             name = ps_quote(&rule.name),
             direction = rule.direction,
             program = ps_quote(&rule.exe)
         );
+        // **L-14（v0.7.3）**：只有**真正新建**的规则才计入 `rules_added`。
+        // 原来无论规则是否已存在都会 +1，于是「重复隔离」的报告里
+        // 「新增 N 条」与实际动作不符，用户无法判断这次到底改了什么。
         match crate::platform::imp::run_powershell(&script) {
+            Ok(out) if out.trim() == "existing" => {}
             Ok(_) => report.rules_added += 1,
             Err(error) => report.note.push_str(&format!(
                 "添加 {} 的{}站规则失败（{error}）；",
@@ -962,6 +1018,7 @@ pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
             any_isolated: false,
             all_isolated: false,
             failures: Vec::new(),
+            outcome: TripOutcome::AbortedStale,
             note: "没有配置的守护对象，未执行任何操作".to_string(),
         };
     }
@@ -973,6 +1030,7 @@ pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
                 any_isolated: false,
                 all_isolated: false,
                 failures: vec![format!("无法获取系统操作锁：{error}")],
+                outcome: TripOutcome::Failed,
                 note: format!("兜底封锁未执行（{error}）"),
             };
         }
@@ -987,6 +1045,7 @@ pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
             any_isolated: false,
             all_isolated: false,
             failures: Vec::new(),
+            outcome: TripOutcome::AbortedStale,
             note: "保护已停止或已暂停（意图在等待锁期间改变），未执行兜底封锁".to_string(),
         };
     }
@@ -1009,6 +1068,13 @@ pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
             "未接入兜底封锁：部分生效（见失败说明）".to_string()
         } else {
             "未能确认任何兜底规则生效".to_string()
+        },
+        outcome: if all_isolated {
+            TripOutcome::Applied
+        } else if any_isolated {
+            TripOutcome::Partial
+        } else {
+            TripOutcome::Failed
         },
         agents,
         any_isolated,
@@ -1037,6 +1103,7 @@ pub fn trip_with_revision(guarded_agents: &[String], expected_revision: Option<u
             any_isolated: false,
             all_isolated: false,
             failures: Vec::new(),
+            outcome: TripOutcome::AbortedStale,
             note: "没有配置的守护对象，未执行任何操作".to_string(),
         };
     }
@@ -1049,6 +1116,7 @@ pub fn trip_with_revision(guarded_agents: &[String], expected_revision: Option<u
                 any_isolated: false,
                 all_isolated: false,
                 failures: vec![format!("无法获取系统操作锁：{error}")],
+                outcome: TripOutcome::Failed,
                 note: format!("熔断未执行（{error}）"),
             };
         }
@@ -1064,15 +1132,18 @@ pub fn trip_with_revision(guarded_agents: &[String], expected_revision: Option<u
             any_isolated: false,
             all_isolated: false,
             failures: Vec::new(),
+            outcome: TripOutcome::AbortedStale,
             note: "保护已暂停、已停止或配置已变更（判定在操作期间过期），未执行熔断".to_string(),
         };
     }
     let mut agents = Vec::new();
     let mut failures = Vec::new();
+    let mut aborted = false;
     for id in guarded_agents {
         // **P0-04**：每个应用动手前再看一次——前一个应用建立规则可能耗时数秒。
         if !can_apply_isolation_with_revision(expected_revision) {
             failures.push("配置在熔断过程中变更，剩余应用未处理".to_string());
+            aborted = true;
             break;
         }
         let report = quarantine_agent(id, None);
@@ -1083,14 +1154,28 @@ pub fn trip_with_revision(guarded_agents: &[String], expected_revision: Option<u
     }
     let any_isolated = agents.iter().any(|agent| agent.verified);
     let all_isolated = agents.iter().all(|agent| agent.coverage_complete);
+    // **L-13**：中途因配置变更而放弃、且一条规则都没建立的，按「主动取消」，
+    // 不能记成「部分熔断」——否则界面会凭空显示一个部分隔离状态。
+    let outcome = if aborted && !any_isolated {
+        TripOutcome::AbortedStale
+    } else if all_isolated {
+        TripOutcome::Applied
+    } else if any_isolated {
+        TripOutcome::Partial
+    } else {
+        TripOutcome::Failed
+    };
     TripReport {
-        note: if failures.is_empty() && all_isolated {
+        note: if outcome == TripOutcome::AbortedStale {
+            "配置在熔断过程中变更，已中止（未留下部分隔离状态）".to_string()
+        } else if failures.is_empty() && all_isolated {
             "全部守护对象已结束进程并施加防火墙隔离".to_string()
         } else if any_isolated {
             "部分守护对象已隔离，其余见失败说明".to_string()
         } else {
             "未能确认任何隔离生效".to_string()
         },
+        outcome,
         agents,
         any_isolated,
         all_isolated,
@@ -1160,8 +1245,24 @@ ConvertTo-Json @{{ removed = $removed }} -Compress"
 pub struct ReleaseReport {
     pub requested: u32,
     pub remaining: u32,
+    /// **P1-09（v0.7.3）**：系统资源是否**已核实清除**（与操作过程是否顺利分开）。
+    ///
+    /// 这两个概念原来混在一起：`verified=true` 却可能带着失败项，
+    /// 调用方无法判断「到底能不能宣布恢复完成」。现在：
+    /// - `verified` = 回查确认没有残留（资源层面）；
+    /// - `failures` = 过程中发生过的错误（操作层面，可能是可忽略的旧规则清理失败）。
+    ///
+    /// 宣布「完整恢复成功」要求**两者同时**满足：`verified && failures.is_empty()`。
     pub verified: bool,
     pub failures: Vec<String>,
+}
+
+#[allow(dead_code)]
+impl ReleaseReport {
+    /// 是否可以对外宣布「已完整解除」。
+    pub fn fully_cleared(&self) -> bool {
+        self.verified && self.failures.is_empty()
+    }
 }
 
 /// **P0-08**：清理指向**已不存在路径**的本产品隔离规则。
@@ -1254,37 +1355,82 @@ pub enum ReleaseReason {
 
 /// 自动恢复、用户手动解除和紧急恢复共用核验删除逻辑，但只有自动恢复受手动保持拦截。
 pub fn release_verified(reason: ReleaseReason) -> Result<ReleaseReport, String> {
+    release_verified_with_revision(reason, None)
+}
+
+/// **P0-06（v0.7.3）**：带上「本轮判定时的配置代次」的自动解除。
+///
+/// 竞态窗口：监控线程判定「出口已恢复」，随后等待系统操作锁；等待期间
+/// 用户可能改了配置、暂停守护、或执行了急救恢复。此时若仍按旧判定删规则，
+/// 就是「按已经过期的结论解除保护」。
+///
+/// 因此自动解除必须在**持锁之后**复核：
+/// - 保护意图仍是 Armed、未暂停；
+/// - 手动保持隔离状态仍是 None；
+/// - 配置代次未变（`expected_revision` 给定时）。
+///
+/// 紧急恢复（`ReleaseReason::Emergency`）不受此限：那是用户的显式指令。
+pub fn release_verified_with_revision(
+    reason: ReleaseReason,
+    expected_revision: Option<u64>,
+) -> Result<ReleaseReport, String> {
     let guard = crate::egate_lock::acquire(crate::egate_lock::SystemOperation::ReleaseIsolation)?;
     if reason == ReleaseReason::Automatic {
-        match crate::egate_monitor::manual_hold_state() {
-            crate::egate_monitor::ManualHold::None => {}
-            crate::egate_monitor::ManualHold::Held => {
-                return Err(
-                    "检测到用户手动保持的隔离，已放弃本次自动解除（仅手动解除可清除）".to_string(),
-                );
-            }
-            crate::egate_monitor::ManualHold::Unknown => {
-                return Err(
-                    "无法确认手动隔离意图（意图文件损坏或不可读），已放弃本次自动解除".to_string(),
-                );
-            }
-        }
+        check_automatic_release_eligible(expected_revision)?;
     }
     release_verified_locked(&guard, reason)
 }
 
-/// 已持锁的解除实现：只有自动来源检查手动保持意图。
+/// 自动解除的资格复核（**P0-06**）：已持锁、未做任何删除之前调用。
+fn check_automatic_release_eligible(expected_revision: Option<u64>) -> Result<(), String> {
+    match crate::egate_monitor::manual_hold_state() {
+        crate::egate_monitor::ManualHold::None => {}
+        crate::egate_monitor::ManualHold::Held => {
+            return Err(
+                "检测到用户手动保持的隔离，已放弃本次自动解除（仅手动解除可清除）".to_string(),
+            );
+        }
+        crate::egate_monitor::ManualHold::Unknown => {
+            return Err(
+                "无法确认手动隔离意图（意图文件损坏或不可读），已放弃本次自动解除".to_string(),
+            );
+        }
+    }
+    if crate::egate_monitor::protection_intent() != crate::egate_monitor::ProtectionIntent::Armed {
+        return Err("保护已停止或被暂停（等待锁期间状态改变），已放弃本次自动解除".to_string());
+    }
+    if crate::egate_monitor::is_paused() {
+        return Err("守护已暂停（等待锁期间状态改变），已放弃本次自动解除".to_string());
+    }
+    match (expected_revision, crate::appconfig::load_checked()) {
+        (Some(expected), crate::appconfig::ConfigLoad::Ok(config)) => {
+            if config.egate_revision != expected {
+                return Err(
+                    "门禁配置在本轮判定之后已变更，旧的恢复结论作废，已放弃本次自动解除"
+                        .to_string(),
+                );
+            }
+        }
+        // **L-05（v0.7.3）**：配置读不出来时不能当成「代次未变」。
+        // 原实现在这里回退成 `revision`，等于假设「没变」——恰恰是最危险的假设。
+        (Some(_), other) => {
+            return Err(format!(
+                "无法读取门禁配置（{other:?}），无法确认恢复结论仍然有效，已放弃本次自动解除"
+            ));
+        }
+        (None, _) => {}
+    }
+    Ok(())
+}
+
+/// 已持锁的解除实现：只有自动来源检查资格。
 pub(crate) fn release_verified_locked(
     guard: &crate::egate_lock::OperationGuard,
     reason: ReleaseReason,
 ) -> Result<ReleaseReport, String> {
     if reason == ReleaseReason::Automatic {
-        match crate::egate_monitor::manual_hold_state() {
-            crate::egate_monitor::ManualHold::Held | crate::egate_monitor::ManualHold::Unknown => {
-                return Err("手动保持隔离生效中，已放弃本次自动解除".to_string())
-            }
-            crate::egate_monitor::ManualHold::None => {}
-        }
+        // 已持锁路径同样复核（等待锁期间的状态变化在这里被拦住）。
+        check_automatic_release_eligible(None)?;
     }
     release_all_verified_locked(guard)
 }
@@ -1430,9 +1576,14 @@ pub(crate) fn release_all_verified_locked(
     // **P0-01（v0.6.13.1）**：必须清理**两个**现行命名空间 + 旧版遗留。
     // **P0-02（v0.7.1）**：每个前缀都要先用严格查询确认「有没有」，
     // 查询失败按 Unknown 处理并让最终 verified=false，绝不当成已清理。
-    let legacy = cleanup_legacy_rules().unwrap_or(0);
-    let mut requested = legacy;
+    // **L-07（v0.7.3）**：旧规则清理的错误不能再被 `unwrap_or(0)` 丢掉。
+    // 丢掉之后报告会显示「已完整解除」，而用户的旧规则其实还在防火墙里。
+    let mut requested = 0;
     let mut remove_failures: Vec<String> = Vec::new();
+    match cleanup_legacy_rules() {
+        Ok(removed) => requested += removed,
+        Err(error) => remove_failures.push(format!("旧版规则清理失败：{error}")),
+    }
     let mut unknown = false;
     for prefix in [
         IsolationReason::EgressTrip.prefix(),
@@ -1483,10 +1634,12 @@ ConvertTo-Json @{{ removed = $n }} -Compress",
         });
     }
     match inspect_isolation_inventory().map(|i| i.total()) {
+        // **P1-09**：库存清零只能证明「资源已清除」；如果过程中有失败
+        // （例如某次删除报错、旧规则清理失败），不能对外宣称「完整恢复」。
         Some(0) => Ok(ReleaseReport {
             requested,
             remaining: 0,
-            verified: true,
+            verified: failures.is_empty(),
             failures,
         }),
         Some(remaining) => {
@@ -1950,6 +2103,129 @@ foreach ($c in $cases) { Write-Output ($c.n + '=' + (Check $c.a $goodAf $anyPf $
         assert!(!crate::egate_monitor::access_verified_for_test("tun"));
         assert!(!crate::egate_monitor::access_verified_for_test("uncovered"));
         assert!(!crate::egate_monitor::access_verified_for_test("unknown"));
+    }
+
+    /// **L-13（v0.7.3）**：「主动取消」不能污染熔断状态。
+    ///
+    /// 回归点：`trip_with_revision` 因配置过期而放弃时返回
+    /// `all_isolated=false`，调用方据此写成「部分熔断」——用户没有触发熔断，
+    /// 却看到界面出现一个部分隔离状态。
+    #[test]
+    fn aborted_trip_does_not_touch_isolation_state() {
+        assert!(!TripOutcome::AbortedStale.touches_state());
+        assert!(TripOutcome::Applied.touches_state());
+        assert!(TripOutcome::Partial.touches_state());
+        assert!(TripOutcome::Failed.touches_state());
+    }
+
+    /// **P1-09 / L-08（v0.7.3）**：「已核实清除」与「过程无错误」必须分开，
+    /// 且不能出现「verified=true 却带着失败项」自相矛盾的回执。
+    #[test]
+    fn release_report_never_claims_success_with_failures() {
+        let clean = ReleaseReport {
+            requested: 3,
+            remaining: 0,
+            verified: true,
+            failures: Vec::new(),
+        };
+        assert!(clean.fully_cleared(), "无残留且无失败才能宣布完整解除");
+
+        let with_error = ReleaseReport {
+            requested: 3,
+            remaining: 0,
+            verified: false,
+            failures: vec!["旧版规则清理失败：拒绝访问".to_string()],
+        };
+        assert!(!with_error.fully_cleared(), "带着失败项时不得宣布完整解除");
+        // 有残留同样不能宣布完成。
+        let residual = ReleaseReport {
+            requested: 1,
+            remaining: 2,
+            verified: false,
+            failures: Vec::new(),
+        };
+        assert!(!residual.fully_cleared());
+    }
+
+    /// **P0-06（v0.7.3）**：自动解除必须复核「持锁之后」的状态。
+    ///
+    /// 这条测只验证复核函数本身（不动真实防火墙）：暂停 / 停止保护 /
+    /// 配置代次变化都必须让自动解除放弃。
+    #[test]
+    fn automatic_release_aborts_when_state_changed() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        crate::appconfig::update(|config| config.egate_enabled = true).unwrap();
+        crate::egate_monitor::rearm().unwrap();
+        let revision = match crate::appconfig::load_checked() {
+            crate::appconfig::ConfigLoad::Ok(config) => config.egate_revision,
+            other => panic!("配置应可读：{other:?}"),
+        };
+        assert!(check_automatic_release_eligible(Some(revision)).is_ok());
+
+        // ① 配置代次变化 → 放弃。
+        crate::appconfig::update(|config| {
+            config.egate_trip_threshold = config.egate_trip_threshold.saturating_add(1)
+        })
+        .unwrap();
+        let error = check_automatic_release_eligible(Some(revision)).unwrap_err();
+        assert!(error.contains("配置"), "{error}");
+
+        // ② 暂停 → 放弃。
+        let now = match crate::appconfig::load_checked() {
+            crate::appconfig::ConfigLoad::Ok(config) => config.egate_revision,
+            _ => revision,
+        };
+        crate::egate_monitor::pause(60).unwrap();
+        let error = check_automatic_release_eligible(Some(now)).unwrap_err();
+        assert!(error.contains("暂停"), "{error}");
+        crate::egate_monitor::resume().unwrap();
+
+        // ③ 停止保护 → 放弃。
+        crate::egate_monitor::disarm("测试").unwrap();
+        let error = check_automatic_release_eligible(None).unwrap_err();
+        assert!(
+            error.contains("保护已停止") || error.contains("状态改变"),
+            "{error}"
+        );
+
+        // ④ 手动保持隔离 → 放弃。
+        crate::egate_monitor::rearm().unwrap();
+        crate::egate_monitor::mark_manual_hold().unwrap();
+        let error = check_automatic_release_eligible(None).unwrap_err();
+        assert!(error.contains("手动"), "{error}");
+
+        // 清理。
+        crate::egate_monitor::clear_manual_hold().unwrap();
+        crate::appconfig::update(|config| config.egate_enabled = false).unwrap();
+        crate::egate_monitor::disarm("测试结束").unwrap();
+    }
+
+    /// **P1-10（v0.7.3）**：TUN 接入只有在**带路由证明**时才算有效。
+    ///
+    /// 修复前 TUN 被一律拒绝，于是「真正接回 TUN」后兜底封锁永远解不掉；
+    /// 修复后仍不能凭「网卡 Up」放行——必须逐目标证据全部成立。
+    #[test]
+    fn tun_access_counts_only_with_route_evidence() {
+        use crate::egate_monitor::{
+            access_verified_for_test, access_verified_with_evidence_for_test,
+        };
+        // 没有证据：保持隔离（避免 TUN 网卡残留时误放行）。
+        assert!(!access_verified_for_test("tun"));
+        // 有完整证据：允许解除。
+        assert!(access_verified_with_evidence_for_test("tun", true));
+        // 系统代理不受该标志影响。
+        assert!(access_verified_with_evidence_for_test(
+            "system_proxy",
+            false
+        ));
+        assert!(access_verified_with_evidence_for_test("system_proxy", true));
+        // 其它路径永远是 false。
+        assert!(!access_verified_with_evidence_for_test("uncovered", true));
+        assert!(!access_verified_with_evidence_for_test("unknown", true));
     }
 
     /// P0-01 (v0.7.1): the inventory must distinguish the two namespaces.

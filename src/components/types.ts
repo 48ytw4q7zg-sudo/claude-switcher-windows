@@ -119,7 +119,17 @@ export interface EgateTargetReport {
 
 /** 出口门禁：一轮检查的完整结果。 */
 export interface EgateReport {
-  access: { path: string; note: string };
+  access: {
+    path: string;
+    note: string;
+    /**
+     * **P1-10（v0.7.3）**：TUN 路线的安全证明是否成立。
+     *
+     * 只有 `path === 'tun'` 且该值为 `true` 时接入才算「已证明」；
+     * 「有 TUN 网卡」不等于「流量经过 TUN」。
+     */
+    tun_proven?: boolean;
+  };
   overall: { verdict: 'pass' | 'fail' | 'unverified' | 'disabled'; note: string };
   targets: EgateTargetReport[];
   probed: boolean;

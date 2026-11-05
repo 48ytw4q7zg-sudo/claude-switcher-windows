@@ -242,51 +242,122 @@ pub enum ProbeRoute {
     Skip,
 }
 
-/// **P1-01**：目标路由证据（由平台层采集，纯数据便于单测）。
+/// **P1-01 / P0-01（v0.7.3）**：单个协议族的 IPv6 状态。
 ///
-/// 语义是「目标地址的下一跳是否确定经过 TUN 接口」。任何一项读不出来
-/// 都是 **Unverified**，不是「大概走了」。
+/// 不能再用一个 `Option<bool>` 同时表达「经过 TUN」「确认旁路」「系统没有
+/// IPv6」——`Some(false).is_some()` 恒为真，会让「明确 IPv6 旁路」被当成
+/// 「可以放行」。三种状态必须分开。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum RouteVia {
+    /// 该协议族的出接口就是 TUN，且默认路由由 TUN 接管。
+    Tun,
+    /// 明确**不**经过 TUN（存在可利用的旁路）。
+    Bypass,
+    /// 系统确实没有该协议族的可用外发路径（例如 IPv6 未绑定）。
+    /// 这种情况不存在旁路，可以视为「无需检查」，但必须是**明确读到**。
+    NotAvailable,
+    /// 无法确认（**默认值**：未取证时的安全缺省）。
+    #[default]
+    Unknown,
+}
+
+impl RouteVia {
+    /// 该协议族是否可以安全地直连探测。
+    pub fn is_safe(self) -> bool {
+        matches!(self, RouteVia::Tun | RouteVia::NotAvailable)
+    }
+
+    fn label(self, family: &str) -> Option<&'static str> {
+        match self {
+            RouteVia::Tun | RouteVia::NotAvailable => None,
+            RouteVia::Bypass => Some(match family {
+                "IPv4" => "IPv4 目标路由未经 TUN（存在旁路）",
+                _ => "发现 IPv6 旁路：目标 IPv6 流量不经过 TUN",
+            }),
+            RouteVia::Unknown => Some(match family {
+                "IPv4" => "IPv4 路由状态无法确认",
+                _ => "IPv6 路由状态无法确认",
+            }),
+        }
+    }
+}
+
+/// **P1-01**：单个目标的 TUN 路由证据（由平台层采集，纯数据便于单测）。
+///
+/// **P0-02（v0.7.3）**：证据从「整轮一份」改为**每个目标一份**。
+/// 原来只拿第一个启用目标的主机名取证，却用这份证据放行**所有**目标的直连
+/// 探测——目标 A 走 TUN、目标 B 走物理网卡时会一起被放行。
+///
+/// **P0-03**：证据里同时记录「解析是否可信」。目标地址来自系统 DNS，
+/// 而 DNS 查询本身可能已经绕过了 TUN；无法确认 DNS 路径时不得声称
+/// 「路由已证明」，因为验证的地址可能与实际连接的地址不一致。
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct RouteEvidence {
-    /// 目标是否 IPv4 且其路由出接口就是 TUN 的 ifIndex。
-    pub ipv4_via_tun: Option<bool>,
-    /// 目标是否 IPv6 且其路由出接口就是 TUN 的 ifIndex。
-    pub ipv6_via_tun: Option<bool>,
-    /// TUN 是否接管了默认路由（0.0.0.0/0 或 ::/0）。
-    pub default_route_via_tun: Option<bool>,
-    /// 采集失败的原因（用于界面说明）。
+    /// 归属的目标 ID（证据不可跨目标复用）。
+    pub target_id: String,
+    /// IPv4 的出接口/默认路由判定。
+    pub ipv4: RouteVia,
+    /// IPv6 的出接口/默认路由判定。
+    pub ipv6: RouteVia,
+    /// 该目标的 DNS 解析是否走了可信路径（TUN/代理）。
+    ///
+    /// `false` 表示「解析结果不可作为安全依据」：即便 IP 路由看起来经过 TUN，
+    /// 也不能证明「解析这个域名时没有把真实出口暴露给 DNS」。
+    pub dns_trusted: bool,
+    /// 采集失败/不可信的原因（用于界面说明）。
     pub error: Option<String>,
 }
 
 impl RouteEvidence {
-    /// 是否**完整**证明目标流量经过 TUN。
-    ///
-    /// 规则刻意保守：只有 IPv4 与默认路由两项都明确为真才算证明。
-    /// IPv6 允许「系统未启用 IPv6」——那种情况下不存在 IPv6 旁路，
-    /// 但必须是**明确读到未启用**，不能是查询失败。
-    pub fn proves_tun_path(&self) -> bool {
-        self.error.is_none()
-            && self.ipv4_via_tun == Some(true)
-            && self.default_route_via_tun == Some(true)
-            && self.ipv6_via_tun.is_some()
+    /// 一个「无法证明」的证据（任何一项缺失都用它兜底，绝不乐观推断）。
+    pub fn unknown(target_id: impl Into<String>, reason: impl Into<String>) -> Self {
+        RouteEvidence {
+            target_id: target_id.into(),
+            ipv4: RouteVia::Unknown,
+            ipv6: RouteVia::Unknown,
+            dns_trusted: false,
+            error: Some(reason.into()),
+        }
     }
 
-    /// 无法证明时的人类可读原因。
+    /// 是否**完整**证明该目标流量经过 TUN。
+    ///
+    /// 四项必须同时成立：
+    /// 1. 没有采集错误；
+    /// 2. IPv4 经 TUN（或明确无 IPv4 路径——实际上不可能，故要求 Tun）；
+    /// 3. IPv6 经 TUN，或**明确**没有 IPv6（旁路一律拒绝）；
+    /// 4. DNS 解析路径可信。
+    pub fn proves_tun_path(&self) -> bool {
+        self.error.is_none()
+            && self.dns_trusted
+            && self.ipv4 == RouteVia::Tun
+            && self.ipv6.is_safe()
+    }
+
+    /// 无法证明时的人类可读原因（明确旁路必须说出「旁路」，不能返回空串）。
     pub fn unverified_reason(&self) -> String {
         if let Some(error) = &self.error {
             return format!("路由证据采集失败：{error}");
         }
         let mut parts = Vec::new();
-        if self.ipv4_via_tun != Some(true) {
-            parts.push("IPv4 目标路由未经 TUN");
+        if !self.dns_trusted {
+            parts.push("DNS 解析路径未经证实，解析结果不能作为路由依据");
         }
-        if self.default_route_via_tun != Some(true) {
-            parts.push("默认路由未由 TUN 接管");
+        for family in ["IPv4", "IPv6"] {
+            let via = if family == "IPv4" {
+                self.ipv4
+            } else {
+                self.ipv6
+            };
+            if let Some(label) = via.label(family) {
+                parts.push(label);
+            }
         }
-        if self.ipv6_via_tun.is_none() {
-            parts.push("IPv6 路由状态无法确认");
+        if parts.is_empty() {
+            "路由证据不完整".to_string()
+        } else {
+            parts.join("；")
         }
-        parts.join("；")
     }
 }
 
@@ -303,11 +374,17 @@ pub fn plan_route(path: &AccessPath) -> ProbeRoute {
 ///
 /// 只有在「接入是 TUN」且「路由证据完整证明流量经 TUN」时才 `Direct`。
 /// 其余一律 `Skip`——保持 `Unverified`，绝不冒险发直连请求。
+///
+/// **P0-01（v0.7.3）**：判据收敛到 [`RouteEvidence::proves_tun_path`] 一处，
+/// 并在这里**再查一遍** `dns_trusted`——探测入口是最后一道闸门，
+/// 不能因为上游改了什么就悄悄放行。
 pub fn plan_route_with_evidence(path: &AccessPath, evidence: Option<&RouteEvidence>) -> ProbeRoute {
     match path {
         AccessPath::SystemProxy { addr } => ProbeRoute::Proxy(format!("http://{addr}")),
         AccessPath::Tun { .. } => match evidence {
-            Some(evidence) if evidence.proves_tun_path() => ProbeRoute::Direct,
+            Some(evidence) if evidence.proves_tun_path() && evidence.dns_trusted => {
+                ProbeRoute::Direct
+            }
             _ => ProbeRoute::Skip,
         },
         AccessPath::Uncovered | AccessPath::Unknown { .. } => ProbeRoute::Skip,
@@ -512,6 +589,13 @@ pub struct AccessInfo {
     /// system_proxy | tun | uncovered | unknown。
     pub path: String,
     pub note: String,
+    /// **P1-10（v0.7.3）**：TUN 路线的安全证明是否成立。
+    ///
+    /// 只有 `path == "tun"` 且该值为 `true` 时，接入才算**被证明有效**——
+    /// 「有 TUN 网卡」不等于「流量经过 TUN」。非 TUN 路径该值为 `false`，
+    /// 判定时只看 `path`。
+    #[serde(default)]
+    pub tun_proven: bool,
 }
 
 impl From<&AccessPath> for AccessInfo {
@@ -525,6 +609,8 @@ impl From<&AccessPath> for AccessInfo {
             }
             .to_string(),
             note: path.note(),
+            // 默认不成立：调用方（run_round）在拿到逐目标证据后显式置位。
+            tun_proven: false,
         }
     }
 }
@@ -741,6 +827,136 @@ mod tests {
             ProbeRoute::Skip,
             "无法确认时也不探测（不把家宽 IP 带出机器）"
         );
+    }
+
+    /// **P0-01（v0.7.3）**：TUN 证据的判定表——审计明确要求的六种组合。
+    ///
+    /// 关键回归：v0.7.2 用 `ipv6_via_tun.is_some()` 判定，于是
+    /// `Some(false)`（**明确 IPv6 旁路**）也能通过，直接放行直连探测。
+    #[test]
+    fn tun_path_requires_both_families_and_trusted_dns() {
+        let tun = AccessPath::Tun {
+            adapter: "Mihomo".to_string(),
+        };
+        let base = RouteEvidence {
+            target_id: "claude".to_string(),
+            ipv4: RouteVia::Tun,
+            ipv6: RouteVia::Tun,
+            dns_trusted: true,
+            error: None,
+        };
+
+        // ① 双栈都经 TUN + DNS 可信 → 允许直连探测。
+        assert!(base.proves_tun_path());
+        assert_eq!(
+            plan_route_with_evidence(&tun, Some(&base)),
+            ProbeRoute::Direct
+        );
+
+        // ② IPv6 **确认旁路** → 必须拒绝（v0.7.2 会误放行）。
+        let mut bypass = base.clone();
+        bypass.ipv6 = RouteVia::Bypass;
+        assert!(!bypass.proves_tun_path());
+        assert_eq!(
+            plan_route_with_evidence(&tun, Some(&bypass)),
+            ProbeRoute::Skip,
+            "明确 IPv6 旁路时不得直连探测"
+        );
+
+        // ③ IPv6 未知 → 拒绝。
+        let mut unknown = base.clone();
+        unknown.ipv6 = RouteVia::Unknown;
+        assert!(!unknown.proves_tun_path());
+        assert_eq!(
+            plan_route_with_evidence(&tun, Some(&unknown)),
+            ProbeRoute::Skip
+        );
+
+        // ④ IPv4 未经 TUN → 拒绝。
+        let mut v4_bypass = base.clone();
+        v4_bypass.ipv4 = RouteVia::Bypass;
+        assert!(!v4_bypass.proves_tun_path());
+        assert_eq!(
+            plan_route_with_evidence(&tun, Some(&v4_bypass)),
+            ProbeRoute::Skip
+        );
+
+        // ⑤ IPv6 确认不可用（系统未启用 / 目标无 AAAA）→ 可进入下一步验证。
+        let mut v6_absent = base.clone();
+        v6_absent.ipv6 = RouteVia::NotAvailable;
+        assert!(v6_absent.proves_tun_path());
+        assert_eq!(
+            plan_route_with_evidence(&tun, Some(&v6_absent)),
+            ProbeRoute::Direct
+        );
+
+        // ⑥ DNS 路径未证实 → 一律拒绝，即使路由看起来完全正确。
+        let mut dns_untrusted = base.clone();
+        dns_untrusted.dns_trusted = false;
+        assert!(!dns_untrusted.proves_tun_path());
+        assert_eq!(
+            plan_route_with_evidence(&tun, Some(&dns_untrusted)),
+            ProbeRoute::Skip,
+            "DNS 可能已经暴露真实出口，不能凭 IP 路由倒推安全"
+        );
+
+        // ⑦ 采集错误 → 拒绝，且原因可读。
+        let broken = RouteEvidence::unknown("claude", "RPC 失败");
+        assert!(!broken.proves_tun_path());
+        assert!(broken.unverified_reason().contains("RPC 失败"));
+    }
+
+    /// **L-02（v0.7.3）**：`unverified_reason` 必须对「明确旁路」说出原因，
+    /// 而不是返回空字符串（空串会让界面显示「未获证实：」却没有下文）。
+    #[test]
+    fn unverified_reason_names_the_real_blocker() {
+        let bypass = RouteEvidence {
+            target_id: "a".to_string(),
+            ipv4: RouteVia::Tun,
+            ipv6: RouteVia::Bypass,
+            dns_trusted: true,
+            error: None,
+        };
+        let reason = bypass.unverified_reason();
+        assert!(!reason.is_empty(), "明确旁路必须有可读原因");
+        assert!(reason.contains("IPv6 旁路"), "{reason}");
+
+        let dns = RouteEvidence {
+            dns_trusted: false,
+            ..bypass.clone()
+        };
+        assert!(dns.unverified_reason().contains("DNS"));
+
+        let v4 = RouteEvidence {
+            ipv4: RouteVia::Bypass,
+            ..bypass
+        };
+        assert!(v4.unverified_reason().contains("IPv4"));
+    }
+
+    /// **P0-02（v0.7.3）**：证据必须绑定目标——不同目标的证据互不通用。
+    #[test]
+    fn route_evidence_is_bound_to_its_target() {
+        let a = RouteEvidence {
+            target_id: "target-a".to_string(),
+            ipv4: RouteVia::Tun,
+            ipv6: RouteVia::Tun,
+            dns_trusted: true,
+            error: None,
+        };
+        let b = RouteEvidence {
+            target_id: "target-b".to_string(),
+            ipv4: RouteVia::Bypass,
+            ipv6: RouteVia::Tun,
+            dns_trusted: true,
+            error: None,
+        };
+        let tun = AccessPath::Tun {
+            adapter: "Mihomo".to_string(),
+        };
+        // 同一个接入路径下，两个目标得到不同结论：A 可探测，B 不可。
+        assert_eq!(plan_route_with_evidence(&tun, Some(&a)), ProbeRoute::Direct);
+        assert_eq!(plan_route_with_evidence(&tun, Some(&b)), ProbeRoute::Skip);
     }
 
     // ── 主机名提取 ──

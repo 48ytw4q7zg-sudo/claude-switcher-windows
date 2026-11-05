@@ -90,5 +90,50 @@ jobs:
         working-directory: src-tauri
         run: cargo test --lib
 
+      # **L-16（v0.7.3）**：把本轮安全修复对应的回归场景**单独点名跑一遍**。
+      #
+      # 全量 `cargo test` 已经包含它们，但那样「某个安全测试被误删/被
+      # #[ignore] 掉」不会有人发现——这里按名字过滤，少一个就会因为
+      # 「0 tests filtered in」而失败（cargo 对无匹配测试返回非 0）。
+      #
+      # 覆盖：PowerShell 三态协议、TUN 双栈证据、GUI/CLI 身份、布防就绪、
+      # 自动解除复核、报告语义。
+      - name: Security regression scenarios
+        working-directory: src-tauri
+        shell: pwsh
+        run: |
+          $groups = @(
+            'ps_protocol',
+            'tun_path_requires_both_families_and_trusted_dns',
+            'route_evidence_is_bound_to_its_target',
+            'gui_identity_separates_cli_from_unknown',
+            'classify_rejects_cli_and_unknown_paths',
+            'arm_readiness_tests',
+            'automatic_release_aborts_when_state_changed',
+            'isolation_refuses_when_expected_revision_is_stale',
+            'release_report_never_claims_success_with_failures',
+            'aborted_trip_does_not_touch_isolation_state',
+            'legacy_cleanup_never_targets_the_global_cut_rule',
+            'tun_access_counts_only_with_route_evidence',
+            'unknown_reconfirm_backs_off_and_caps',
+            'auto_probe_requires_proven_udp_route',
+            'unsigned_updates_are_never_auto_executed',
+            'strict_oauth_mode'
+          )
+          $failed = @()
+          foreach ($g in $groups) {
+            Write-Host "::group::$g"
+            $output = & cargo test --lib $g 2>&1
+            $code = $LASTEXITCODE
+            $output | Write-Host
+            Write-Host "::endgroup::"
+            if ($code -ne 0) { $failed += $g }
+            elseif ($output -match 'running 0 tests') { $failed += "$g (no tests matched)" }
+          }
+          if ($failed.Count -gt 0) {
+            throw "security regression scenarios failed or missing: $($failed -join ', ')"
+          }
+          Write-Host "all security regression scenarios present and passing"
+
       - name: Tauri build
         run: npm run tauri build

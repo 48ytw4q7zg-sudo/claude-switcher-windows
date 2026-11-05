@@ -494,6 +494,69 @@ pub fn is_trip_state_unknown() -> bool {
         || (!TRIP_STATE_CONFIRMED.load(Ordering::SeqCst) && !is_tripped() && !is_partial())
 }
 
+/// **P1-11（v0.7.3）**：Unknown 状态的低频重确认节流器。
+///
+/// 启动时若防火墙查询失败，状态被标记为 Unknown，这是保守的正确做法；
+/// 但如果没有重新确认的路径，一次暂时性故障就会永久变成「未知」，
+/// 用户既看不到真实状态，也无法自动恢复。
+///
+/// 这里使用失败的指数退避（上限 5 分钟）：避免每轮都去打一个正在故障的
+/// 服务，同时保证故障恢复后能自行回到真实状态。
+struct UnknownRecovery {
+    last_attempt_secs: u64,
+    attempts: u32,
+}
+
+static UNKNOWN_RECOVERY: std::sync::Mutex<UnknownRecovery> =
+    std::sync::Mutex::new(UnknownRecovery {
+        last_attempt_secs: 0,
+        attempts: 0,
+    });
+
+/// 当前状态下是否应当尝试重确认（纯计算，便于单测）。
+fn should_reconfirm(now: u64, last_attempt: u64, attempts: u32) -> bool {
+    // 指数退避：失败次数越多间隔越大，上限 5 分钟。
+    let backoff = 30u64.saturating_mul(1u64 << attempts.min(4)).min(300);
+    now.saturating_sub(last_attempt) >= backoff
+}
+
+/// 若熔断状态是「未知」，按退避节奏重新向系统确认一次。
+///
+/// 只在 **Unknown** 时才动作：已知的 tripped/partial/clear 不需要重建，
+/// 重建反而可能覆盖刚由本轮判定写入的状态。
+fn reconfirm_unknown_state(now: u64) {
+    if !is_trip_state_unknown() {
+        return;
+    }
+    let mut guard = match UNKNOWN_RECOVERY.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !should_reconfirm(now, guard.last_attempt_secs, guard.attempts) {
+        return;
+    }
+    guard.last_attempt_secs = now;
+    // 重建成功（查询恢复）会清掉 Unknown，此时重置退避。
+    let before = is_trip_state_unknown();
+    rebuild_trip_state_from_system();
+    if before && !is_trip_state_unknown() {
+        guard.attempts = 0;
+        crate::log_error("防火墙查询已恢复，熔断状态按真实库存重建完成");
+    } else {
+        guard.attempts = guard.attempts.saturating_add(1);
+    }
+}
+
+/// 主动触发一次重确认（测试/手动刷新可用）。
+#[allow(dead_code)]
+pub fn reconfirm_unknown_state_now() -> bool {
+    if !is_trip_state_unknown() {
+        return false;
+    }
+    rebuild_trip_state_from_system();
+    !is_trip_state_unknown()
+}
+
 /// **P0-06**：启动时从**实际系统状态**重建熔断状态。
 ///
 /// 内存里的 TRIP_STATE 在进程重启后会归零，但 Windows 防火墙里的规则
@@ -597,6 +660,9 @@ pub fn start_monitor() {
                     continue;
                 }
             };
+            // **P1-11**：Unknown 状态要能自己恢复——按退避节奏重确认，
+            // 不依赖用户重启应用。非 Unknown 时这是一次极廉价的判断。
+            reconfirm_unknown_state(now_secs());
             if !config.egate_enabled {
                 continue;
             }
@@ -818,7 +884,10 @@ pub fn can_release_uncovered(report: &crate::egate_check::EgateReport) -> bool {
     if report.overall.verdict != crate::egate::Verdict::Pass {
         return false;
     }
-    if !access_verified(&report.access.path) {
+    // **P1-10（v0.7.3）**：TUN 路线必须**带证据**才算接入有效。
+    // `access_verified(path)` 只看标签，无法区分「有 TUN 网卡」与
+    // 「流量确实经过 TUN」——后者由 `report.access.tun_proven` 携带。
+    if !access_verified(&report.access.path, report.access.tun_proven) {
         return false;
     }
     if protection_intent() != ProtectionIntent::Armed || is_paused() {
@@ -855,15 +924,28 @@ pub fn uncovered_lock_detail() -> (bool, String) {
 /// 测试用：暴露 `access_verified` 的判定（不改变生产语义）。
 #[cfg(test)]
 pub fn access_verified_for_test(path: &str) -> bool {
-    access_verified(path)
+    access_verified(path, false)
+}
+
+/// 测试用：带上 `tun_proven` 的版本。
+#[cfg(test)]
+pub fn access_verified_with_evidence_for_test(path: &str, tun_proven: bool) -> bool {
+    access_verified(path, tun_proven)
 }
 
 /// 接入路径是否有**可信证据**（而不只是标签）。
-fn access_verified(path: &str) -> bool {
-    // 系统代理：本轮探测已通过（请求确实经由该代理发出）。
-    // TUN：当前没有路由证明，一律不放行——宁可保持兜底隔离，
-    // 也不能凭「网卡 Up」就假定流量已由它接管。
-    matches!(path, "system_proxy")
+///
+/// **P1-10（v0.7.3）**：TUN 不再一律拒绝，但也不接受「有网卡就行」——
+/// 只有 `tun_proven`（逐目标路由证据全部成立）时才认为 TUN 接入有效。
+/// 这样兜底封锁在真正接回 TUN 后能自动解除，而「网卡残留」时仍保持隔离。
+fn access_verified(path: &str, tun_proven: bool) -> bool {
+    match path {
+        // 系统代理：本轮探测已通过（请求确实经由该代理发出）。
+        "system_proxy" => true,
+        // TUN：必须携带路由证明。
+        "tun" => tun_proven,
+        _ => false,
+    }
 }
 
 /// 兜底封锁意图文件（与手动保持隔离分开，互不覆盖）。
@@ -963,6 +1045,28 @@ fn uncovered_ready_state() -> UncoveredReadyState {
     if age > UNCOVERED_READY_TTL_SECS {
         return UncoveredReadyState::Stale(format!("核验已过期（{} 分钟前）", age / 60));
     }
+    // **P1-08（v0.7.3）**：记录里写了规则数，就必须拿它跟**当前系统库存**对账。
+    //
+    // 原实现只比对代次/清单/时间：规则被外部删除后，在有效期内界面仍会显示
+    // 「兜底封锁中（已核验）」。用户看到的是过去某一刻的事实，而现在没有保护。
+    //
+    // 查询失败（`None`）同样按失效处理：读不到规则就不能宣称「已验证」。
+    match crate::egate_trip::inspect_isolation_inventory() {
+        Some(inventory) => {
+            let current = inventory.uncovered + inventory.legacy;
+            if current < ready.rules {
+                return UncoveredReadyState::Stale(format!(
+                    "实际兜底规则少于核验记录（当前 {current} 条，核验时 {} 条）",
+                    ready.rules
+                ));
+            }
+        }
+        None => {
+            return UncoveredReadyState::Stale(
+                "无法查询当前防火墙规则，核验结果不能作为当前状态".to_string(),
+            )
+        }
+    }
     UncoveredReadyState::Valid
 }
 
@@ -1030,9 +1134,18 @@ fn run_monitor_round(
     drop(streaks);
 
     // **P0-04**：代次不一致 → 丢弃本轮结果，不做任何熔断/解除动作。
+    //
+    // **L-05（v0.7.3）**：配置读不出来时**不能**回退成「代次未变」。
+    // 原实现 `_ => revision` 等于假设配置没改过——但那正是最需要谨慎的情况：
+    // 配置损坏/不可读时，我们并不知道用户此刻的意图是什么。
     let current_revision = match crate::appconfig::load_checked() {
         crate::appconfig::ConfigLoad::Ok(config) => config.egate_revision,
-        _ => revision,
+        other => {
+            crate::log_error(&format!(
+                "无法读取门禁配置（{other:?}），本轮结果作废（不熔断、不解除）"
+            ));
+            return;
+        }
     };
     if current_revision != revision {
         crate::log_error("门禁配置在本轮探测期间已变更，丢弃本轮结果");
@@ -1148,13 +1261,26 @@ fn run_monitor_round(
             // 熔断会自行放弃，不会按过期判定结束用户进程。
             let trip = crate::egate_trip::trip_with_revision(&agents, Some(revision));
             // P0-06：只有全部隔离成功才标记完整熔断；部分成功进入可重试状态。
-            mark_tripped_state(trip.all_isolated);
-            if let Some(app) = ensure_app_handle(app_handle) {
-                crate::egate_notify::notify(
-                    app,
-                    crate::egate_notify::NotifyKind::Trip,
-                    &crate::egate_notify::trip_detail(&report),
-                );
+            //
+            // **L-13（v0.7.3）**：因配置过期而「主动放弃」时**不碰状态**。
+            // 原来这种情况会走到 `mark_tripped_state(false)`，界面上凭空出现
+            // 一个「部分隔离」——用户既没有触发熔断，也没有任何规则被建立。
+            if trip.outcome.touches_state() {
+                mark_tripped_state(trip.all_isolated);
+            } else {
+                crate::log_error(&format!(
+                    "本轮熔断已取消（判定过期），不更新隔离状态：{}",
+                    trip.note
+                ));
+            }
+            if trip.outcome.touches_state() {
+                if let Some(app) = ensure_app_handle(app_handle) {
+                    crate::egate_notify::notify(
+                        app,
+                        crate::egate_notify::NotifyKind::Trip,
+                        &crate::egate_notify::trip_detail(&report),
+                    );
+                }
             }
             crate::log_error(&format!(
                 "出口门禁已熔断：{}；失败项：{}",
@@ -1190,7 +1316,12 @@ fn run_monitor_round(
         RoundAction::Recover => {
             // P0-07：出口已恢复，自动解除隔离。
             // **P0-NEW-02**：只有核验通过才清除熔断状态。
-            match crate::egate_trip::release_verified(crate::egate_trip::ReleaseReason::Automatic) {
+            // **P0-06（v0.7.3）**：把本轮判定时的配置代次带进自动解除。
+            // 持锁后若代次已变 / 已暂停 / 手动保持状态不明，解除会自行放弃。
+            match crate::egate_trip::release_verified_with_revision(
+                crate::egate_trip::ReleaseReason::Automatic,
+                Some(revision),
+            ) {
                 Ok(report) if report.verified => {
                     let removed = report.requested;
                     clear_tripped();
@@ -1413,7 +1544,27 @@ mod tests {
         );
     }
 
-    /// **P0-C**：兜底锁的意图/就绪两个状态互不混淆。
+    /// **P1-11（v0.7.3）**：Unknown 的重确认必须退避——不能每轮都去打
+    /// 一个正在故障的防火墙服务，也不能永远不重试。
+    #[test]
+    fn unknown_reconfirm_backs_off_and_caps() {
+        // attempts=0 → 30 秒后重试（首次失败前的正常节奏）。
+        assert!(!should_reconfirm(1_000 + 29, 1_000, 0));
+        assert!(should_reconfirm(1_000 + 30, 1_000, 0));
+        // 连续失败一次后 → 60 秒；两次后 → 120 秒。
+        assert!(!should_reconfirm(1_000 + 59, 1_000, 1));
+        assert!(should_reconfirm(1_000 + 60, 1_000, 1));
+        assert!(!should_reconfirm(1_000 + 119, 1_000, 2));
+        assert!(should_reconfirm(1_000 + 120, 1_000, 2));
+        // 上限 5 分钟：退避不会无限增长，故障恢复后仍能自愈。
+        assert!(!should_reconfirm(1_000 + 299, 1_000, 4));
+        assert!(should_reconfirm(1_000 + 301, 1_000, 9));
+    }
+
+    /// **P0-C / P1-08（v0.7.3）**：兜底锁的意图/就绪两个状态互不混淆。
+    ///
+    /// 注意本测试在真实 Windows 上运行：`ready` 现在还会**对账实际规则数**，
+    /// 所以「写下记录」本身不再等于「已验证」——这正是 P1-08 要的语义。
     #[test]
     fn uncovered_lock_state_files_are_independent() {
         let _env = crate::test_support::env_lock();
@@ -1429,13 +1580,24 @@ mod tests {
         assert!(uncovered_lock_active());
         assert!(!uncovered_lock_ready());
 
-        // 规则全部生效后才标记 ready。受管清单必须与当前配置一致，
-        // 否则记录本身就应被判为失效（见下面「清单变化」的断言）。
         let defaults: Vec<String> = crate::egate_defaults::DEFAULT_GUARDED_AGENTS
             .iter()
             .map(|id| id.to_string())
             .collect();
+        // **P1-08**：记录里声称 2 条规则，但系统上一条都没有 → 必须判失效。
         mark_uncovered_ready(&defaults, 2).unwrap();
+        assert!(
+            !uncovered_lock_ready(),
+            "实际规则少于核验记录时不得显示为「已核验」"
+        );
+        assert!(matches!(
+            uncovered_ready_state(),
+            UncoveredReadyState::Stale(_)
+        ));
+
+        // 记录 0 条规则 → 与当前库存一致，视为有效（这是纯逻辑测试，
+        // 不依赖真实防火墙内容）。
+        mark_uncovered_ready(&defaults, 0).unwrap();
         assert!(uncovered_lock_ready());
 
         // **L-13**：ready 必须绑定到具体核验结果——配置代次一变就失效。
@@ -1453,11 +1615,11 @@ mod tests {
         ));
 
         // 重新核验后恢复有效。
-        mark_uncovered_ready(&defaults, 2).unwrap();
+        mark_uncovered_ready(&defaults, 0).unwrap();
         assert!(uncovered_lock_ready());
 
         // **L-13**：受管应用清单变化同样立刻失效。
-        mark_uncovered_ready(&["claude".to_string()], 4).unwrap();
+        mark_uncovered_ready(&["claude".to_string()], 0).unwrap();
         assert!(
             !uncovered_lock_ready(),
             "受管清单与当前配置不一致时不得视为已核验"

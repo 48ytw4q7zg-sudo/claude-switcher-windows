@@ -425,8 +425,23 @@ export function EgatePanel() {
         </div>
         <div>
           <span>接入路径</span>
-          <strong>
+          <strong title={report?.access.note}>
             {report ? ACCESS_LABELS[report.access.path] ?? report.access.path : '未检查'}
+            {/* **P1-10（v0.7.3）**：TUN 的「有网卡」与「路由已证明」必须分开显示，
+                否则用户会把「网卡在」当成「流量已经过 TUN」。 */}
+            {report?.access.path === 'tun' && (
+              <span
+                className={report.access.tun_proven ? 'pill ok' : 'pill muted'}
+                style={{ marginLeft: 6 }}
+                title={
+                  report.access.tun_proven
+                    ? '已用逐目标路由证据证明流量经过 TUN'
+                    : '仅检测到 TUN 网卡，路由尚未证明，出口未经验证'
+                }
+              >
+                {report.access.tun_proven ? '路由已证明' : '路由未证明'}
+              </span>
+            )}
           </strong>
         </div>
         <div>

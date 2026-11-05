@@ -358,7 +358,22 @@ fn clash_api_with_config(
 pub fn claude_oauth_api(path: &str, access_token: &str) -> Result<Value, String> {
     let url = format!("https://api.anthropic.com{path}");
     let runtime = detect_clash_runtime_config();
-
+    // **P0-08（v0.7.3）**：请求顺序由**保护策略**决定，不是「先直连再代理」。
+    //
+    // 原实现先 `no_proxy()` 直连、失败才走代理。这个请求携带
+    // `Authorization: Bearer …`，一旦用户已开启严格出口保护，直连就意味着
+    // 带着凭据从真实家宽出口发出请求——目标服务（以及链路上的观察者）
+    // 能看到真实出口地址，而这正是严格模式要防的事。
+    //
+    // 现在的语义：
+    // - 严格模式（门禁已开启且接入为系统代理）→ **只**走代理，代理不可用直接报错；
+    // - 非严格模式 → 保持原有的「直连优先、代理兜底」，因为这是用户明确
+    //   选择的普通使用方式，且失败回退能改善弱网体验。
+    if let Some(proxy) = strict_oauth_proxy(&runtime) {
+        return oauth_get(&url, access_token, Some(&proxy), Duration::from_secs(8)).map_err(
+            |error| format!("严格出口模式下请求必须经代理（{proxy}），本次未改用直连：{error}"),
+        );
+    }
     match oauth_get(&url, access_token, None, Duration::from_secs(4)) {
         Ok(value) => Ok(value),
         Err(direct_error) => match runtime.proxy {
@@ -373,6 +388,39 @@ pub fn claude_oauth_api(path: &str, access_token: &str) -> Result<Value, String>
             None => Err(direct_error),
         },
     }
+}
+
+/// **P0-08（v0.7.3）**：严格出口模式下必须使用的代理地址。
+///
+/// 返回 `Some` 表示「本次请求只允许经该代理」，没有可用代理时调用方必须
+/// **报错而不是直连**；返回 `None` 表示当前不是严格模式。
+///
+/// 判定刻意保守：只有「门禁已开启」+「接入路径是系统代理」+「代理地址
+/// 可等价复用」三者同时成立才算严格模式。TUN 路线**不算**——TUN 下守护器
+/// 自身能否复用该路径需要真实路由证明（见 egate_access::RouteEvidence），
+/// 在证明之前不允许凭「有 TUN 网卡」就发出带凭据的直连请求。
+fn strict_oauth_proxy(runtime: &ClashRuntimeConfig) -> Option<String> {
+    let config = match crate::appconfig::load_checked() {
+        crate::appconfig::ConfigLoad::Ok(config) => *config,
+        // 配置读不出来：无法确认是否为严格模式，按「不是」处理（保持原有
+        // 非严格行为），但绝不因此把直连当成「已确认的安全路径」。
+        _ => return None,
+    };
+    if !config.egate_enabled {
+        return None;
+    }
+    let evidence = crate::egate_check::read_proxy_evidence();
+    if evidence.read_error().is_none() && evidence.enable {
+        if let crate::egate_access::ProxyParse::Http(addr) =
+            crate::egate_access::parse_proxy_server(evidence.server.as_deref())
+        {
+            // 系统代理可用时以它为准（那才是应用实际走的路径）。
+            return Some(addr);
+        }
+    }
+    // 系统代理关闭/无法等价复用：退回 Clash 控制器探测到的代理地址。
+    // 两者都没有时返回 None —— 调用方据此**报错**，绝不直连。
+    runtime.proxy.clone()
 }
 
 fn oauth_get(
@@ -493,6 +541,67 @@ mod tests {
                 "远程/非 http 控制器必须被拒绝: {remote}"
             );
         }
+    }
+
+    /// **P0-08（v0.7.3）**：门禁关闭时不是严格模式——保持原有的直连优先行为。
+    ///
+    /// 这里只验证「策略判定」，不真的对外发请求：`strict_oauth_proxy`
+    /// 为 None 时调用方才会走 direct-first 分支。
+    #[test]
+    fn strict_oauth_mode_is_off_when_gate_disabled() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+        crate::appconfig::update(|config| config.egate_enabled = false).unwrap();
+        let runtime = ClashRuntimeConfig {
+            controller: "http://127.0.0.1:9097".to_string(),
+            secret: None,
+            proxy: Some("127.0.0.1:7890".to_string()),
+            controller_error: None,
+        };
+        assert!(
+            strict_oauth_proxy(&runtime).is_none(),
+            "门禁关闭时不属于严格模式"
+        );
+    }
+
+    /// **P0-08**：门禁开启时必须给出「只能用代理」的结论，而不是允许直连。
+    #[test]
+    fn strict_oauth_mode_requires_a_proxy_when_gate_enabled() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+        crate::appconfig::update(|config| config.egate_enabled = true).unwrap();
+        let runtime = ClashRuntimeConfig {
+            controller: "http://127.0.0.1:9097".to_string(),
+            secret: None,
+            proxy: Some("127.0.0.1:7890".to_string()),
+            controller_error: None,
+        };
+        // 测试环境里系统代理通常是关闭的（读注册表 → 未启用），因此这里走
+        // 「退回 Clash 探测到的代理」分支。若开发机恰好开着系统代理，
+        // 结果会是那个地址——两种都算正确，关键是**不能为 None**。
+        assert!(
+            strict_oauth_proxy(&runtime).is_some(),
+            "严格模式下必须有确定的代理地址，否则调用方应报错而不是直连"
+        );
+        // 连 Clash 代理都没有时：若系统代理也不可用，函数返回 None。
+        // 调用方（claude_oauth_api）在严格模式下遇到 None 必须报错而不是
+        // 直连——见 `strict_mode_never_allows_direct`。
+        let no_proxy = ClashRuntimeConfig {
+            proxy: None,
+            ..runtime
+        };
+        let system_proxy_usable = {
+            let evidence = crate::egate_check::read_proxy_evidence();
+            crate::network_policy::usable_system_proxy(&evidence).is_some()
+        };
+        if !system_proxy_usable {
+            assert!(strict_oauth_proxy(&no_proxy).is_none());
+        }
+        crate::appconfig::update(|config| config.egate_enabled = false).unwrap();
     }
 
     #[test]
