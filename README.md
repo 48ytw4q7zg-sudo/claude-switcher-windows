@@ -40,8 +40,8 @@
 | 项 | 状态 |
 | --- | --- |
 | 源码 | `main` 分支（本仓库），当前版本 **v0.7.3**（安全修订） |
-| 安装包 | **v0.7.3**：源码就绪，安装包由 `.github/workflows/windows-build.yml` 在打 `v0.7.3` tag 时构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停）。最近一个已发布版本仍是 [v0.6.13](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.6.13) |
-| SHA256 | v0.7.3 安装包尚未构建，因此**没有可核对的哈希**（不写占位值）。构建后以 Release 里的 `SHA256SUMS.txt` 为准，本地校验：`Get-FileHash .\<文件名> -Algorithm SHA256` |
+| 安装包 | **[Release v0.7.3](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.7.3)**，由 `.github/workflows/windows-build.yml` 在打 `v0.7.3` tag 时构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停） |
+| SHA256 | `ClaudeSwitcher_0.7.3_x64-setup.exe` `0a7cdf9b451a6377927707a33000f043cad393349d8ae78049630159fe3c503b`<br>`ClaudeSwitcher-portable.zip` `c09f65b36c42d8d4cea4be3580bb880b142a72fd65f38de87b75024ae4747c7f`<br>（已用 `sha256sum -c SHA256SUMS.txt` 与独立重算双重核对）<br>校验：`Get-FileHash .\<文件名> -Algorithm SHA256`，或 `gh attestation verify <文件> -R 48ytw4q7zg-sudo/claude-switcher-windows` 验证来源证明 |
 | 开发分支验证 | 11 月 5 日（v0.7.3）：完整 Rust 回归 **678 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过。<br>**真实系统验证（管理员，本机）**：<br>① `tests/windows-integration/02-firewall-isolation.ps1`：三类测试规则 4 条 → `--exit-restore` → 退出码 **0**、规则 **4 → 0**；重复执行幂等返回 0。<br>② `tests/windows-integration/03-restore-ledger.ps1`：隔离规则 + 兜底意图 + ready 记录 → 恢复后规则 0、两个意图文件均被清除、退出码 0。<br>本轮修项见 [v0.7.3 发布说明](docs/release-v0.7.3.md) |
 | 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；逐项状态与剩余差异见[功能对等记录](docs/upstream-baseline.md)与[对等核对](docs/parity-gap-final-2026-11-04.md) |
 | 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |

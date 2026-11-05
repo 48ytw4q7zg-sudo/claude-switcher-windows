@@ -254,6 +254,21 @@ tests/windows-integration/03-restore-ledger.ps1       PASS
 
 ---
 
+## 13.1 发布产物（2026-11-05 已发布）
+
+| 资产 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `ClaudeSwitcher_0.7.3_x64-setup.exe` | 8,241,530 B | `0a7cdf9b451a6377927707a33000f043cad393349d8ae78049630159fe3c503b` |
+| `ClaudeSwitcher-portable.zip` | 9,715,678 B | `c09f65b36c42d8d4cea4be3580bb880b142a72fd65f38de87b75024ae4747c7f` |
+| `SHA256SUMS.txt` | 195 B | 随包分发 |
+
+- Release：<https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.7.3>
+- 哈希已用 `sha256sum -c SHA256SUMS.txt` 与独立重算**双重核对**，两者一致。
+- 构建来源证明已通过 `gh attestation verify`，绑定到
+  `windows-build.yml` @ `refs/tags/v0.7.3`（可用同名命令复验）。
+- 安装包是 **NSIS** 自解压 PE32，未代码签名（SmartScreen 提示属预期，
+  请用上述哈希或 attestation 自行核对）。
+
 ## 14. 行为变化（升级须知）
 
 1. **TUN 模式下出口检查仍会显示「未验证」**：证据链已经不缺逻辑，缺的是可证明
