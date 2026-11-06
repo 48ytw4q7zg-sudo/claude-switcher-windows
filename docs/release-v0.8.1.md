@@ -120,6 +120,29 @@ match &txn {
 
 ---
 
+## 5.1 发布构建过程中修掉的 NSIS 缺陷
+
+首次打 `v0.8.1` tag 时，**质量门禁全过、`Build app` 失败**：
+
+```
+Error in macro NSIS_HOOK_PREUNINSTALL on macroline 40
+Error in script "installer.nsi" on line 796 -- aborting creation process
+Error failed to bundle project: `Failed to bundle app with makensis`
+```
+
+原因：`installer-hooks.nsh` 的消息文案里用 `\\"` 内嵌引号，而 NSIS 字符串里
+这不是合法转义（应当是 `$\"`）。makensis 直接解析失败。
+
+**修复**：文案不再内嵌双引号（改用「」与裸命令行示例），从根上消除转义歧义；
+`MessageBox` 统一为单行写法，减少解析面。
+
+**验证**：本地 `npm run tauri build` 跑通，makensis 产出
+`ClaudeSwitcher_0.8.1_x64-setup.exe`（7.94 MiB）。
+
+> **教训**（已记入 `AGENTS.md` 踩坑 38）：NSIS 钩子是**唯一不被
+> `cargo test` / `clippy` 覆盖**的发布面。改 `installer-hooks.nsh` 后必须本地
+> 跑 `tauri build` 验证 makensis，不能只靠 CI 的 Build app 去试。
+
 ## 6. 必要 P2
 
 | 编号 | 状态 |
@@ -164,6 +187,24 @@ scripts/check-security-regressions.ps1     46/46 组通过
 ```
 
 ---
+
+## 8.1 发布产物（2026-11-06 已发布）
+
+| 资产 | 大小 | SHA-256 |
+| --- | --- | --- |
+| `ClaudeSwitcher_0.8.1_x64-setup.exe` | 8,337,776 B | `07c1e0a01404fef92723c417bfbf5d28c2210df72f7b3a508ec1d2d2e46d2f0c` |
+| `ClaudeSwitcher-portable.zip` | 9,792,362 B | `938d7eff4ccbc266a98fcd93e774c0b706819f760e74b155a8f4f2f2d048800b` |
+| `SHA256SUMS.txt` | 195 B | 随包分发 |
+
+- Release：<https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.8.1>
+- 哈希已用 `sha256sum -c SHA256SUMS.txt` 与独立重算**双重核对**，两者一致。
+- 构建来源证明已通过 `gh attestation verify`（含 sigstore 证书），绑定
+  `windows-build.yml` @ `refs/tags/v0.8.1`。
+- 发布工作流里 **`Security regression scenarios` 与 CI 是同一份脚本**，
+  本次构建该步骤 `success`（46/46 组）；`Build app` 亦 `success`
+  （即 §5.1 的 NSIS 修复已在发布构建中验证）。
+- 安装包是 **NSIS** 自解压 PE32，未代码签名（SmartScreen 提示属预期，
+  请用上述哈希或 attestation 自行核对）。
 
 ## 9. 行为变化（升级须知）
 

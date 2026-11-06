@@ -258,6 +258,13 @@ async fn xxx() -> Result<T, String> {
     `-File` 传参时 `--manifest-path` 这类参数会被 PS 5.1 当命名参数吞掉，
     必须用 `-Command "& '脚本' -参数 @('a','b')"` 数组形式（同坑 33 家族）。
 
+38. **NSIS 钩子是唯一不被 `cargo test` / `clippy` 覆盖的发布面**：
+    `installer-hooks.nsh` 里字符串内嵌双引号必须写 `$\"`，写 `\\"` 会让
+    makensis 报 `Error in macro ... on macroline N`，**质量门禁全过但
+    Build app 步骤失败**（v0.8.1 首次 tag 构建就是这么挂的）。改这个文件后
+    必须本地跑 `npm run tauri build` 验证 makensis，不能只等 CI 去试。
+    文案里尽量用「」代替引号，从根上消除转义歧义。
+
 ## 实机未验证项（改相关代码后优先测）
 
 - 开机自启：任务管理器禁用后点「开启」能否真的启动（`StartupApproved\Run` 已写启用值）。

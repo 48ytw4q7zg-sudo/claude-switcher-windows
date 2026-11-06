@@ -40,8 +40,8 @@
 | 项 | 状态 |
 | --- | --- |
 | 源码 | `main` 分支（本仓库），当前版本 **v0.8.1**（崩溃恢复与事务身份收口）。版本号跳过 v0.8.0，用于区分「已发布的 v0.7.7」与本地中间态 |
-| 安装包 | **v0.8.1**：源码就绪，安装包由 `.github/workflows/windows-build.yml` 在打 `v0.8.1` tag 时构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停）。最近一个已发布版本是 [v0.7.7](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.7.7) |
-| SHA256 | v0.8.1 安装包尚未构建，因此**没有可核对的哈希**（不写占位值）。构建后以 Release 里的 `SHA256SUMS.txt` 为准，本地校验：`Get-FileHash .\<文件名> -Algorithm SHA256`，或 `gh attestation verify <文件> -R 48ytw4q7zg-sudo/claude-switcher-windows` 验证来源证明 |
+| 安装包 | **[Release v0.8.1](https://github.com/48ytw4q7zg-sudo/claude-switcher-windows/releases/tag/v0.8.1)**，由 `.github/workflows/windows-build.yml` 在打 `v0.8.1` tag 时构建（NSIS + 便携 zip；MSI 自 v0.6.13 起暂停） |
+| SHA256 | `ClaudeSwitcher_0.8.1_x64-setup.exe` `07c1e0a01404fef92723c417bfbf5d28c2210df72f7b3a508ec1d2d2e46d2f0c`<br>`ClaudeSwitcher-portable.zip` `938d7eff4ccbc266a98fcd93e774c0b706819f760e74b155a8f4f2f2d048800b`<br>（已用 `sha256sum -c SHA256SUMS.txt` 与独立重算双重核对）<br>校验：`Get-FileHash .\<文件名> -Algorithm SHA256`，或 `gh attestation verify <文件> -R 48ytw4q7zg-sudo/claude-switcher-windows` 验证来源证明（已验通过） |
 | 开发分支验证 | 11 月 6 日（v0.8.1）：完整 Rust 回归 **709 passed / 0 failed / 0 ignored**，全目标 clippy **零警告**，`cargo fmt --check`、`npx tsc --noEmit` 与前端构建均通过；`scripts/check-security-regressions.ps1` **46/46 组**通过（CI 与发布共用同一份脚本）。<br>**真实系统验证（管理员，本机）**：<br>① `02-firewall-isolation.ps1`：三类规则 4 条 → `--exit-restore` → 退出码 0、规则 4 → 0，幂等。<br>② `03-restore-ledger.ps1`：真实断网账本 + 阻断规则 + 兜底意图 + ready → 全部清除。<br>③ `04-corrupt-ledger.ps1`：账本损坏时退出码 1、规则与账本均保留。<br>本轮修项见 [v0.8.1 发布说明](docs/release-v0.8.1.md) |
 | 上游功能覆盖 | 已融合 VallierDev（CLI 账号切换）、YOURSJEYO（环境安检/桌面版）与 ClaudeGuard（按目标出口校验）核心能力；逐项状态与剩余差异见[功能对等记录](docs/upstream-baseline.md)与[对等核对](docs/parity-gap-final-2026-11-04.md) |
 | 实测环境 | 当前 Windows 环境已完成本地测试与构建；真实账户、安装升级等端到端验证项见文末清单 |
