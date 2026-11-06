@@ -2519,23 +2519,19 @@ pub struct RegionLockReport {
 /// set-region：按当前出口重锁国家 / 时区 / 区域格式；`apply=true` 时立即改系统时区与区域。
 #[tauri::command]
 async fn lock_region(apply: bool) -> Result<RegionLockReport, String> {
-    // **P1-07（v0.7.6）**：改时区 / Culture / Home Location 必须持系统操作锁，
-    // 与保镖时区看门狗、急救恢复互斥，避免互相覆盖。只读查询不取锁。
-    if apply {
-        let _guard = match egate_lock::acquire(egate_lock::SystemOperation::TimezoneWrite) {
-            Ok(guard) => guard,
-            Err(error) => {
-                return Err(format!(
-                    "另一个环境修改正在进行（{error}），本次地区锁定未执行"
-                ))
-            }
-        };
-    }
+    // **P0-06（v0.7.7）**：锁必须覆盖**真正的系统修改**，不能只护住「入口」。
+    //
+    // v0.7.6 的写法是 `if apply { let _guard = acquire(...)?; }` ——`_guard`
+    // 在 `if` 块结束时就释放了，后面的 `blocking(...)` 完全不在锁内。
+    // 结果是：急救恢复拿到锁、还原环境，地区锁定却随后继续写入时区，
+    // 把恢复结果又推翻。
+    //
+    // 现在把锁放进 `blocking` 闭包里、紧挨着系统修改获取，并在持锁后
+    // 重新读配置确认操作仍然有效。只读查询（出口探测、计划推导）不占锁。
     blocking(move || {
         let info = egress::detect_egress_blocking()?;
         // 产品约束：只允许新加坡/日本/美国。先按实时出口推导计划，再用共享的
-        // 受支持地区表统一校验「国家 + 时区」组合——出口在其它国家、或推导出的
-        // 时区不属于该国时都明确拒绝，而不是把系统锁到不支持的地区。
+        // 受支持地区表统一校验「国家 + 时区」组合。
         let plan = region::plan_for_egress(&info.country, &info.iana_tz);
         let errors = regions_supported::validate(&plan.country, &plan.windows_tz);
         if !errors.is_empty() {
@@ -2559,9 +2555,40 @@ async fn lock_region(apply: bool) -> Result<RegionLockReport, String> {
         })?;
         let mut current_geo = None;
         if apply {
+            // **P0-06**：这里才取锁，并且**持锁到所有系统修改与回读结束**。
+            let _guard = egate_lock::acquire(egate_lock::SystemOperation::TimezoneWrite).map_err(
+                |error| format!("另一个环境修改正在进行（{error}），本次地区锁定未执行"),
+            )?;
+            // 持锁后再确认一次：等待锁期间配置/保护意图可能已经变了。
+            match appconfig::load_checked() {
+                appconfig::ConfigLoad::Ok(config) => {
+                    if config.tz_target.as_deref() != Some(plan.windows_tz.as_str()) {
+                        return Err("等待系统操作锁期间地区配置已变更，本次锁定已取消".to_string());
+                    }
+                }
+                other => {
+                    return Err(format!(
+                        "无法读取地区配置（{other:?}），本次锁定已取消以免按过期目标改动系统"
+                    ))
+                }
+            }
+            if egate_monitor::protection_intent() != egate_monitor::ProtectionIntent::Armed
+                && egate_monitor::is_manual_hold()
+            {
+                // 保护已停止且存在手动保持：不要在恢复流程附近改系统环境。
+                return Err("保护状态在等待锁期间改变，本次地区锁定已取消".to_string());
+            }
             platform::imp::set_timezone_id(&plan.windows_tz)?;
             platform::imp::set_culture_and_location(&plan.locale, plan.geo_id)?;
-            // 回读 Home Location 验证（best-effort，失败不阻断）。
+            // **P0-06**：回读核验也在锁内——这一步是「修改是否真的生效」的证据。
+            let after = platform::imp::current_timezone_id()
+                .map_err(|error| format!("时区写入后无法回读，无法确认本次锁定生效：{error}"))?;
+            if !after.eq_ignore_ascii_case(&plan.windows_tz) {
+                return Err(format!(
+                    "时区写入后回读为 {after}，与目标 {} 不符，本次锁定不视为成功",
+                    plan.windows_tz
+                ));
+            }
             current_geo = platform::imp::current_home_location_geo().ok();
         }
         Ok(RegionLockReport {
@@ -2569,7 +2596,7 @@ async fn lock_region(apply: bool) -> Result<RegionLockReport, String> {
             applied: apply,
             current_geo,
             message: if apply {
-                "已按出口锁定并应用时区/区域格式".to_string()
+                "已按出口锁定并应用时区/区域格式（含回读核验）".to_string()
             } else {
                 "已按出口锁定目标（未改动系统）".to_string()
             },
@@ -2577,7 +2604,6 @@ async fn lock_region(apply: bool) -> Result<RegionLockReport, String> {
     })
     .await
 }
-
 /// set-client：安装后更换代理客户端。
 #[tauri::command]
 fn set_client(mode: String) -> Result<(), String> {
@@ -2735,7 +2761,31 @@ fn egate_save_targets(targets: Vec<egate::EgateTarget>) -> Result<(), String> {
 #[tauri::command]
 fn egate_reset_targets() -> Result<Vec<egate::EgateTarget>, String> {
     let defaults = egate_defaults::builtin_targets();
-    appconfig::update(|config| config.egate_targets = defaults.clone())?;
+    // **P0-03（v0.7.7）**：「恢复默认」也必须过布防就绪校验。
+    //
+    // `builtin_targets()` 的 `expect_ips` / `expect_regions` **全是空的**，
+    // 而 Claude、Codex 默认是启用的。门禁已开时点一下「恢复默认」，就会把
+    // 配置重置成「已布防但没有有效白名单」——下一轮拿到出口信息就判 Fail，
+    // 到阈值后熔断，把用户正在用的桌面程序结束掉。
+    //
+    // `egate_save_targets()` 早就加了这层校验，这里之前漏了。
+    let mut mutate = |config: &mut appconfig::AppConfig| {
+        config.egate_targets = defaults.clone();
+    };
+    let validate = |config: &appconfig::AppConfig| -> Result<(), String> {
+        if !config.egate_enabled {
+            return Ok(());
+        }
+        let unready = unready_targets(&config.egate_targets);
+        if unready.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "门禁已开启，恢复默认会得到没有期望出口（IP 或地区）的目标：{}，             下一轮会被判定为失败并触发熔断。请先关闭门禁、补齐白名单，或使用「恢复默认并停止保护」",
+            unready.join("、")
+        ))
+    };
+    appconfig::try_update(&mut mutate, &validate)?;
     Ok(defaults)
 }
 
@@ -2950,10 +3000,40 @@ async fn egate_check_once() -> Result<egate_check::EgateReport, String> {
 /// 显式选择，因此必须由用户主动开启，默认关闭。
 #[tauri::command]
 fn egate_set_strict_leak(enabled: bool) -> Result<(), String> {
-    appconfig::try_update(
-        &mut |config: &mut appconfig::AppConfig| config.strict_leak_protection = enabled,
-        &|_| Ok(()),
-    )?;
+    // **P1-05（v0.7.7）**：开启前检查真正生效所需的前置条件。
+    //
+    // 兜底封锁要**同时**满足：门禁开启、`lockdown_on_uncovered` 开启、
+    // 未暂停、保护意图 Armed。只把 `strict_leak_protection` 置 true，
+    // 界面会显示「严格防泄漏：开」，实际保护却根本没生效——那比不显示更糟。
+    let mut mutate = |config: &mut appconfig::AppConfig| {
+        config.strict_leak_protection = enabled;
+    };
+    let validate = |config: &appconfig::AppConfig| -> Result<(), String> {
+        if !enabled {
+            return Ok(());
+        }
+        let mut missing = Vec::new();
+        if !config.egate_enabled {
+            missing.push("出口门禁未开启（egate_enabled）");
+        }
+        if !config.lockdown_on_uncovered {
+            missing.push("未接入兜底封锁未启用（lockdown_on_uncovered）");
+        }
+        if egate_monitor::is_paused() {
+            missing.push("守护当前处于暂停");
+        }
+        if egate_monitor::protection_intent() != egate_monitor::ProtectionIntent::Armed {
+            missing.push("保护意图不是 Armed（已停止或状态无法确认）");
+        }
+        if !missing.is_empty() {
+            return Err(format!(
+                "严格防泄漏开启后也不会生效，缺少：{}。请先补齐这些前置条件，或改为先保存「已配置但未生效」",
+                missing.join("；")
+            ));
+        }
+        Ok(())
+    };
+    appconfig::try_update(&mut mutate, &validate)?;
     Ok(())
 }
 
@@ -3371,7 +3451,19 @@ async fn egate_access_status() -> egate_access::AccessInfo {
 }
 
 fn egate_access_status_inner() -> egate_access::AccessInfo {
-    let config = appconfig::load();
+    // **P1-10（v0.7.7）**：接入判定要读目标表——配置损坏时不能拿默认目标充数，
+    // 否则会用「不受保护的默认目标」得出「接入正常」的结论。
+    let config = match appconfig::load_checked() {
+        appconfig::ConfigLoad::Ok(config) => *config,
+        appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+        appconfig::ConfigLoad::Corrupt(error) => {
+            return egate_access::AccessInfo {
+                path: "unknown".to_string(),
+                note: format!("应用配置损坏，无法读取受管目标表：{error}"),
+                tun_proven: false,
+            }
+        }
+    };
     let targets = if config.egate_targets.is_empty() {
         egate_defaults::builtin_targets()
     } else {
@@ -3795,6 +3887,60 @@ mod arm_readiness_tests {
         assert!(builtins
             .iter()
             .any(|t| t.anchor_kind != egate::AnchorKind::Reachability));
+    }
+
+    /// **P0-03（v0.7.7）**：门禁开启时「恢复默认目标」必须被拒绝。
+    ///
+    /// 回归点：`egate_reset_targets()` 曾直接 `appconfig::update`，而
+    /// `builtin_targets()` 的白名单**全是空的**。门禁开着时点一下「恢复默认」，
+    /// 配置就变成「已布防但没有有效白名单」，下一轮拿到出口信息即判 Fail，
+    /// 到阈值后熔断——把用户正在用的桌面程序结束掉。
+    #[test]
+    fn reset_targets_rejected_when_gate_is_armed() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        // 先配一组有效白名单并开启门禁。
+        //
+        // 目标表必须包含**全部四个内置目标**（`check_builtin_protection`
+        // 不允许删内置目标），因此从内置表出发补白名单。
+        let ready: Vec<egate::EgateTarget> = egate_defaults::builtin_targets()
+            .into_iter()
+            .map(|mut t| {
+                // Reachability（反重力出口）不需要白名单；其余补上。
+                if t.anchor_kind != egate::AnchorKind::Reachability {
+                    t.expect_ips = vec!["1.2.3.4".to_string()];
+                    t.expect_regions = vec!["US".to_string()];
+                }
+                t
+            })
+            .collect();
+        egate_save_targets(ready.clone()).unwrap();
+        egate_update_settings(true, 2, 60, true, false).unwrap();
+
+        // 「恢复默认」必须被拒绝，且原配置不变。
+        let error = egate_reset_targets().unwrap_err();
+        assert!(error.contains("门禁已开启"), "{error}");
+        match appconfig::load_checked() {
+            appconfig::ConfigLoad::Ok(config) => {
+                assert!(
+                    config
+                        .egate_targets
+                        .iter()
+                        .any(|t| !t.expect_ips.is_empty()),
+                    "被拒绝的操作不得把白名单清空"
+                );
+            }
+            other => panic!("配置应可读：{other:?}"),
+        }
+
+        // 门禁关闭时允许恢复默认。
+        egate_update_settings(false, 2, 60, true, false).unwrap();
+        assert!(egate_reset_targets().is_ok());
+
+        let _ = ready;
     }
 
     /// **P1-04（v0.7.6）**：监控间隔必须用 clamp_interval（5..=3600），

@@ -271,6 +271,14 @@ async fn xxx() -> Result<T, String> {
 - **v0.7.2 已验证**：`AppIsolation`/`UncoveredLock`/旧版 `Egate ... Out` 三类规则共存时
   `cs.exe --exit-restore` 退出码 0 且规则清零；无残留时幂等返回 0。未验证：非管理员拒绝路径、
   组策略持有规则、进程中断/输出截断注入、真实 TUN 路由证据。
+- **v0.7.7 已验证**：`tests/windows-integration/02/03/04` 在管理员实机通过；
+  `scripts/check-security-regressions.ps1` 42/42 组通过。
+  新增：规则判据统一（Test-Rule 覆盖端口/地址/Profile/ActiveStore 属性）、
+  恢复默认目标走布防校验、地区锁覆盖到回读核验、意图 UUID 事务号 +
+  Preparing 阶段保护、初始化标记三态、ready 检查活动防火墙 Profile、
+  远程代理不默认可用、严格防泄漏前置校验、计划任务三态。
+  **未验证**：ACL 级任务路径校验、环境恢复账本、非管理员路径、
+  ActiveStore 不一致、并发与进程中断注入、NSIS 回归。
 - **v0.7.6 已验证**：`tests/windows-integration/02/03/04` 在管理员实机通过；
   `scripts/check-security-regressions.ps1` 36/36 组通过（CI 与发布共用同一脚本）。
   新增：规则修复事务化（先建后删）、ready 属性级核验、自动解除复核 ProxyOverride、

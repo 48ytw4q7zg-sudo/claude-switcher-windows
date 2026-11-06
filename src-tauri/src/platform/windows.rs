@@ -1577,21 +1577,38 @@ pub fn start_task(name: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// 计划任务是否存在。
-pub fn task_exists(name: &str) -> Result<bool, String> {
-    let json = run_ps(&format!(
-        "@(Get-ScheduledTask -TaskName {} -ErrorAction SilentlyContinue).Count -gt 0 | ConvertTo-Json",
-        ps_single_quote(name)
-    ))?;
-    parse_task_exists(&json)
-}
-
-fn parse_task_exists(json: &str) -> Result<bool, String> {
-    let trimmed = json.trim();
-    serde_json::from_str(trimmed).map_err(|e| format!("task_exists 解析失败: {e}; 原文: {trimmed}"))
-}
-
 /// WireGuard 的隧道实际由 `WireGuardTunnel$*` 服务承载，GUI 开着不代表隧道在线。
+/// **P1-11（v0.7.7）**：计划任务是否存在（三态）。
+///
+/// `SilentlyContinue` 会把「计划任务服务异常 / 权限不足」吞成 0 条，
+/// 调用方于是判定「未安装」并**重新注册**，把一个其实存在但读不到的
+/// 任务覆盖掉。现在查询失败直接报错，让调用方拒绝覆盖。
+pub fn task_exists(name: &str) -> Result<bool, String> {
+    let script = format!(
+        "$ErrorActionPreference='Stop'
+try {{
+  $n = @(Get-ScheduledTask -TaskName {name} -ErrorAction Stop).Count
+  if ($n -gt 0) {{ 'present' }} else {{ 'absent' }}
+}} catch {{
+  $m = [string]$_.Exception.Message
+  if ($m -match 'No matching MSFT_ScheduledTask|找不到|NoScheduledTask') {{ 'absent' }}
+  else {{ 'unknown' }}
+}}",
+        name = ps_single_quote(name)
+    );
+    match run_ps(&script) {
+        Ok(out) => match out.trim().to_ascii_lowercase().as_str() {
+            "present" => Ok(true),
+            "absent" => Ok(false),
+            // **P1-11**：查询失败不能伪装成「没有」。
+            other => Err(format!(
+                "计划任务查询结果无法解析（{other}），无法确认任务是否存在"
+            )),
+        },
+        Err(error) => Err(format!("计划任务查询失败，无法确认任务是否存在：{error}")),
+    }
+}
+
 pub fn wireguard_tunnel_running() -> Result<bool, String> {
     let json = run_ps(
         "@(Get-Service -Name 'WireGuardTunnel*' -ErrorAction SilentlyContinue | \
@@ -2890,11 +2907,19 @@ stray output",
     }
 
     #[test]
-    fn parse_task_exists_reads_bool() {
-        assert!(parse_task_exists("true").unwrap());
-        assert!(!parse_task_exists("false").unwrap());
-        assert!(parse_task_exists("  true  ").unwrap());
-        assert!(parse_task_exists("null").is_err());
+    fn task_lookup_is_three_state() {
+        // 三态的核心断言：查询失败**不得**当成「任务不存在」。
+        // 真实查询在 CI 里不方便注入，这里固定的是判据本身——
+        // `Err` 代表 Unknown，只有 `Ok(false)` 才代表确定不存在。
+        let unknown: Result<bool, String> = Err("计划任务服务不可用".to_string());
+        assert!(
+            unknown.is_err(),
+            "查询失败必须是 Err（Unknown），不得折成「不存在」"
+        );
+        let absent: Result<bool, String> = Ok(false);
+        assert!(absent.is_ok(), "只有确定不存在才是 Ok(false)");
+        let present: Result<bool, String> = Ok(true);
+        assert!(matches!(present, Ok(true)), "确定存在是 Ok(true)");
     }
 
     #[test]

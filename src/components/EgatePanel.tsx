@@ -30,6 +30,16 @@ const VERDICT_LABELS: Record<string, { text: string; cls: string }> = {
   disabled: { text: '已停用', cls: 'pill muted' },
 };
 
+/**
+ * **L-09 / P0-07（v0.7.7）**：内置目标的锚点类型不可改。
+ *
+ * 后端 `check_builtin_protection()` 已经强校验，这里只是把选择器变成只读，
+ * 让用户**提前**看到「这个不能改」，而不是填完点保存才被拒绝。
+ * 自定义目标仍可自由选择。
+ */
+const BUILTIN_TARGET_IDS = new Set(['local', 'claude', 'codex', 'antigravity']);
+const isBuiltinTarget = (id: string) => BUILTIN_TARGET_IDS.has(id.trim().toLowerCase());
+
 /** 接入路径的中文标签。 */
 const ACCESS_LABELS: Record<string, string> = {
   system_proxy: '系统代理',
@@ -815,17 +825,26 @@ export function EgatePanel() {
                 disabled={busy}
                 style={{ flex: 1 }}
               />
-              <select
-                value={target.anchor_kind}
-                onChange={(e) => update(index, { anchor_kind: e.target.value as EgateTarget['anchor_kind'] })}
-                disabled={busy}
-              >
-                {Object.entries(ANCHOR_LABELS).map(([value, label]) => (
-                  <option key={value} value={value}>
-                    {label}
-                  </option>
-                ))}
-              </select>
+              {isBuiltinTarget(target.id) ? (
+                <span
+                  className="pill muted"
+                  title="内置目标的锚点类型不可修改。改成「仅可达性」会绕过出口白名单校验，后端已强校验拒绝。"
+                >
+                  {ANCHOR_LABELS[target.anchor_kind] ?? target.anchor_kind}
+                </span>
+              ) : (
+                <select
+                  value={target.anchor_kind}
+                  onChange={(e) => update(index, { anchor_kind: e.target.value as EgateTarget['anchor_kind'] })}
+                  disabled={busy}
+                >
+                  {Object.entries(ANCHOR_LABELS).map(([value, label]) => (
+                    <option key={value} value={value}>
+                      {label}
+                    </option>
+                  ))}
+                </select>
+              )}
               <label className="perm-check">
                 <input
                   type="checkbox"

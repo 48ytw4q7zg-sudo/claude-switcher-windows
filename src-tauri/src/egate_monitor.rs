@@ -827,6 +827,12 @@ fn run_uncovered_lockdown(
                 specs.push(spec.clone());
             }
         }
+        // **P0-05**：规则已建立并核验 -> 意图阶段转为 Applied（可被清理）。
+        let current_reason = uncovered_lock_reason();
+        if let Err(error) = mark_uncovered_lock_with_phase(&current_reason, UncoveredPhase::Applied)
+        {
+            crate::log_error(&format!("兜底意图阶段更新失败：{error}"));
+        }
         if let Err(error) = mark_uncovered_ready(&agents, rules, rule_names, specs) {
             crate::log_error(&format!(
                 "兜底封锁已生效，但核验记录写入失败（{error}）：界面将显示为「未核验」"
@@ -836,7 +842,9 @@ fn run_uncovered_lockdown(
     }
     // 部分生效或完全失败：保持 Degraded，下一轮继续补齐。
     // 从「全部生效」退回「部分生效」：清掉 ready 标记，状态回到 Degraded。
-    clear_uncovered_ready();
+    if let Err(error) = clear_uncovered_ready() {
+        crate::log_error(&format!("{error}：界面可能继续显示过期的「已核验」"));
+    }
     crate::log_error(&format!(
         "未接入兜底封锁未完整生效（Degraded）：{}；下一轮将继续补齐",
         if trip.failures.is_empty() {
@@ -881,10 +889,63 @@ fn release_uncovered_lock(expected_revision: Option<u64>) {
 
 /// 规则已全部不存在时收敛兜底意图（避免界面长期显示「封锁中」）。
 fn clear_uncovered_if_orphaned() {
-    if uncovered_lock_active() {
-        if let Err(error) = clear_uncovered_lock() {
-            crate::log_error(&format!("清理孤立兜底意图失败：{error}"));
+    if !uncovered_lock_active() {
+        return;
+    }
+    // **P0-05（v0.7.7）**：「规则为零」不足以判定意图是孤立的。
+    //
+    // 真实交错顺序（v0.7.6 未排除）：
+    //   1. 监控 A 写入新兜底意图（此时 phase=Preparing，规则还没建）
+    //   2. A 等待系统操作锁
+    //   3. 进程 B 查到零条规则 -> 删掉「看起来孤立」的意图
+    //   4. A 拿到锁、建立阻断规则
+    //   => 规则在，归属它的意图却被删了。
+    //
+    // 现在：**持锁** + 意图阶段可清理 + 规则确实为零，三条都满足才删。
+    let _guard =
+        match crate::egate_lock::try_acquire(crate::egate_lock::SystemOperation::FullRestore) {
+            Ok(Some(guard)) => guard,
+            // 有别的保护操作在进行：本轮不动意图（宁可留着，也不能误删）。
+            Ok(None) => {
+                crate::log_error("另有保护操作进行中，本轮跳过孤立兜底意图清理");
+                return;
+            }
+            Err(error) => {
+                crate::log_error(&format!(
+                    "无法获取系统操作锁，跳过孤立兜底意图清理：{error}"
+                ));
+                return;
+            }
+        };
+    // 意图阶段：`Preparing` 表示事务还在进行，绝不清理。
+    match read_uncovered_intent() {
+        UncoveredIntent::Absent => return,
+        UncoveredIntent::Unreadable(error) => {
+            crate::log_error(&format!("无法读取兜底意图，跳过孤立清理：{error}"));
+            return;
         }
+        UncoveredIntent::Legacy => {
+            // 旧格式没有阶段：不能确认是否在进行中 -> 不自动清理。
+            crate::log_error("兜底意图为旧格式，无法确认事务阶段，跳过自动清理");
+            return;
+        }
+        UncoveredIntent::Current { phase, .. } => {
+            if !phase.clearable() {
+                return;
+            }
+        }
+    }
+    // 持锁后**再查一次**规则：取锁期间可能已经建好了。
+    if let Some(inventory) = crate::egate_trip::inspect_isolation_inventory() {
+        if inventory.uncovered > 0 {
+            return;
+        }
+    } else {
+        crate::log_error("无法查询兜底规则库存，跳过孤立意图清理");
+        return;
+    }
+    if let Err(error) = clear_uncovered_lock() {
+        crate::log_error(&format!("清理孤立兜底意图失败：{error}"));
     }
 }
 
@@ -991,39 +1052,126 @@ pub(crate) fn uncovered_lock_active() -> bool {
 ///
 /// 「未接入代理」与「严格模式下接入无法确认」走同一套规则与清理路径，
 /// 但用户需要知道自己是被哪一种触发的——后者是主动的安全选择，不是故障。
+/// **P0-05（v0.7.7）**：意图的事务阶段。
+///
+/// 意图在**取锁之前**写入（崩溃时至少有「我打算锁」的记录），但那段时间里
+/// 规则还没建立。若此时另一个进程查到「零条规则」就删意图，就会出现
+/// 「规则建好了、意图没了」——孤立规则再也没有归属。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UncoveredPhase {
+    /// 已写意图，规则尚未建立。
+    Preparing,
+    /// 规则已建立并核验。
+    Applied,
+    /// 正在解除。
+    Releasing,
+}
+
+impl UncoveredPhase {
+    /// 是否允许被「孤立清理」逻辑删除。
+    ///
+    /// `Preparing` **不许**删：它对应的事务还在进行中。
+    pub fn clearable(self) -> bool {
+        !matches!(self, UncoveredPhase::Preparing)
+    }
+}
+
 fn mark_uncovered_lock_with_reason(reason: &str) -> Result<(), String> {
+    mark_uncovered_lock_with_phase(reason, UncoveredPhase::Preparing)
+}
+
+/// **P0-05 / P0-07**：写入意图，带**真正唯一**的事务号与阶段。
+fn mark_uncovered_lock_with_phase(reason: &str, phase: UncoveredPhase) -> Result<(), String> {
     let path = uncovered_lock_file()?;
-    // **P0-06**：给这份意图一个唯一事务号。清理时只删「txn 相符」的记录，
-    // 这样另一个流程在间隙里重建的意图不会被误删。
+    // **P0-07**：事务号必须真正唯一。
+    //
+    // v0.7.6 用 `format!("{}-{}", now_secs(), pid)` ——同一进程同一秒内
+    // 两次意图会得到同一个 ID，旧事务因此可能删掉新事务的意图。
     let body = serde_json::json!({
         "since": now_secs(),
         "reason": reason,
-        "txn": format!("{}-{}", now_secs(), std::process::id()),
+        "txn": uuid::Uuid::new_v4().to_string(),
+        "phase": phase,
     })
     .to_string();
     crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
 }
 
-/// 读取当前兜底意图的事务号（旧记录没有该字段时返回 None）。
-pub fn uncovered_lock_txn() -> Option<String> {
-    uncovered_lock_file()
-        .ok()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok())
-        .and_then(|v| v.get("txn").and_then(|r| r.as_str()).map(str::to_string))
+/// 意图记录（**P0-07**：严格解析，区分「旧格式 / 损坏 / 读不到」）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum UncoveredIntent {
+    /// 没有意图文件。
+    Absent,
+    /// 新格式记录。
+    Current { txn: String, phase: UncoveredPhase },
+    /// 旧格式（无 txn / phase）——需要专门迁移，不能让自动清理直接删。
+    Legacy,
+    /// 无法读取 / 解析。
+    Unreadable(String),
 }
 
-/// **P0-06**：仅当事务号仍与 `expected` 一致时才清理意图 + ready。
+pub fn read_uncovered_intent() -> UncoveredIntent {
+    let path = match uncovered_lock_file() {
+        Ok(path) => path,
+        Err(error) => return UncoveredIntent::Unreadable(error),
+    };
+    let text = match std::fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return UncoveredIntent::Absent
+        }
+        Err(error) => return UncoveredIntent::Unreadable(format!("读取意图文件失败：{error}")),
+    };
+    let value: serde_json::Value = match serde_json::from_str(&text) {
+        Ok(value) => value,
+        Err(error) => return UncoveredIntent::Unreadable(format!("意图文件解析失败：{error}")),
+    };
+    let txn = value
+        .get("txn")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(str::to_string);
+    let phase = match value.get("phase").and_then(|v| v.as_str()) {
+        Some("applied") => Some(UncoveredPhase::Applied),
+        Some("releasing") => Some(UncoveredPhase::Releasing),
+        Some("preparing") => Some(UncoveredPhase::Preparing),
+        _ => None,
+    };
+    match (txn, phase) {
+        (Some(txn), Some(phase)) => UncoveredIntent::Current { txn, phase },
+        // 缺 txn 或缺 phase = 旧格式（或被外部改坏），一律按需迁移处理。
+        _ => UncoveredIntent::Legacy,
+    }
+}
+
+/// 读取当前兜底意图的事务号（旧记录没有该字段时返回 None）。
+pub fn uncovered_lock_txn() -> Option<String> {
+    match read_uncovered_intent() {
+        UncoveredIntent::Current { txn, .. } => Some(txn),
+        _ => None,
+    }
+}
+
+/// **P0-07**：仅当事务号仍与 `expected` 一致时才清理意图 + ready。
 ///
-/// 这是「删规则 → 清意图」事务的后半段，必须在持锁状态下调用。
-/// 事务号不一致说明别的流程已经重新建立了意图，此时**不得**删除。
+/// **新格式缺少事务号（或记录损坏）时拒绝清理**——那表示我们无法确认
+/// 当前这份意图是谁的，删除它可能抹掉别的流程刚建立的意图。
+/// v0.7.6 的「读不到就退化为按存在性清理」正是这里的问题。
 pub fn clear_uncovered_lock_if_txn(expected: &str) -> Result<(), String> {
-    match uncovered_lock_txn() {
-        Some(current) if current != expected => Err(format!(
-            "兜底意图已被别的流程更新（txn {current} != {expected}），本次未清理以免误删新意图"
+    match read_uncovered_intent() {
+        UncoveredIntent::Current { txn, .. } if txn != expected => Err(format!(
+            "兜底意图已被别的流程更新（txn {txn} != {expected}），本次未清理以免误删新意图"
         )),
-        // 旧记录没有 txn：退化为「按存在性清理」，但如实说明。
-        _ => clear_uncovered_lock(),
+        UncoveredIntent::Current { .. } => clear_uncovered_lock(),
+        UncoveredIntent::Legacy => Err(
+            "兜底意图是旧格式（无事务号），无法确认归属，已拒绝自动清理；请手动核对后处理"
+                .to_string(),
+        ),
+        UncoveredIntent::Unreadable(error) => {
+            Err(format!("无法读取兜底意图（{error}），已拒绝自动清理"))
+        }
+        UncoveredIntent::Absent => Ok(()),
     }
 }
 
@@ -1178,6 +1326,25 @@ fn uncovered_ready_state() -> UncoveredReadyState {
             };
             return UncoveredReadyState::Stale(format!("部分兜底规则已失效或属性被改动：{detail}"));
         }
+        // **P0-04（v0.7.7）**：规则属性都对、也在 ActiveStore 里，还**不够**。
+        //
+        // 当前活动网络的防火墙 Profile 如果被关掉，阻断规则照样存在、属性
+        // 照样正确，但**没有实际拦住任何流量**。普通隔离执行器早就用
+        // `effective_firewall_enabled()` 复核了这一条，ready 判定却漏了——
+        // 两处判据不一致，正是审计点出的问题。
+        match crate::platform::imp::effective_firewall_enabled() {
+            Some(true) => {}
+            Some(false) => {
+                return UncoveredReadyState::Stale(
+                    "当前活动网络的防火墙已关闭，阻断规则并未实际拦住流量".to_string(),
+                );
+            }
+            None => {
+                return UncoveredReadyState::Stale(
+                    "无法确认当前活动网络的防火墙是否启用，不能宣称阻断已生效".to_string(),
+                );
+            }
+        }
     } else if !ready.rule_names.is_empty() {
         // 旧版记录只有名称没有规格：至少确认名称仍在，但**不能**声称
         // 属性已核验——留待下一轮补齐后再写完整规格。
@@ -1229,9 +1396,16 @@ fn mark_uncovered_ready(
     crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
 }
 
-fn clear_uncovered_ready() {
-    if let Ok(path) = uncovered_lock_ready_file() {
-        let _ = std::fs::remove_file(path);
+fn clear_uncovered_ready() -> Result<(), String> {
+    // **L-03（v0.7.7）**：删不掉 ready 记录不能静默忽略。
+    //
+    // 记录留着会让界面继续显示「已核验」，而实际覆盖已经不完整——
+    // 这正是 L-13/P1-08 一直在防的「过去某一刻的事实冒充当前事实」。
+    let path = uncovered_lock_ready_file()?;
+    match std::fs::remove_file(&path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("清理兜底 ready 记录失败：{error}")),
     }
 }
 
@@ -1240,7 +1414,7 @@ fn clear_uncovered_ready() {
 /// **QW-03**：返回 `Result`——删不掉意图文件时不能当成成功，
 /// 否则下次启动会以为兜底锁仍在（或反之），状态与实际不符。
 pub fn clear_uncovered_lock() -> Result<(), String> {
-    clear_uncovered_ready();
+    clear_uncovered_ready()?;
     let path = uncovered_lock_file()?;
     match std::fs::remove_file(&path) {
         Ok(()) => Ok(()),
@@ -1916,6 +2090,82 @@ otepad.exe"
         );
 
         clear_uncovered_lock().unwrap();
+    }
+
+    /// **P0-05（v0.7.7）**：`Preparing` 阶段的意图**不得**被孤立清理删除。
+    ///
+    /// 回归点：意图在取锁之前写入，规则还没建立。若此时另一个进程查到
+    /// 「零条规则」就删意图，最终会得到「规则在、归属它的意图没了」。
+    #[test]
+    fn preparing_intent_is_never_cleared_as_orphan() {
+        assert!(
+            !UncoveredPhase::Preparing.clearable(),
+            "事务进行中的意图不得被孤立清理删除"
+        );
+        assert!(UncoveredPhase::Applied.clearable());
+        assert!(UncoveredPhase::Releasing.clearable());
+    }
+
+    /// **P0-07（v0.7.7）**：事务号必须真正唯一。
+    ///
+    /// 回归点：v0.7.6 用 `秒级时间 + PID`，同一进程同一秒内两次意图会
+    /// 得到同一个 ID，旧事务因此可能删掉新事务的意图。
+    #[test]
+    fn uncovered_txn_ids_are_unique() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        let mut seen = std::collections::BTreeSet::new();
+        for _ in 0..20 {
+            mark_uncovered_lock_with_phase("test", UncoveredPhase::Preparing).unwrap();
+            let txn = uncovered_lock_txn().expect("新格式记录必须有事务号");
+            assert!(seen.insert(txn.clone()), "同一秒内不得重复事务号：{txn}");
+        }
+        clear_uncovered_lock().unwrap();
+    }
+
+    /// **P0-07**：旧格式记录（无事务号）**拒绝**自动清理。
+    ///
+    /// 「读不到事务号」与「旧版确实没有事务号」不能混为一谈。
+    #[test]
+    fn legacy_intent_without_txn_refuses_auto_cleanup() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        let path = uncovered_lock_file().unwrap();
+        std::fs::write(&path, b"{\"since\":0}").unwrap();
+        assert_eq!(read_uncovered_intent(), UncoveredIntent::Legacy);
+        let error = clear_uncovered_lock_if_txn("whatever").unwrap_err();
+        assert!(error.contains("旧格式"), "{error}");
+        // 记录仍然保留（没被误删）。
+        assert!(path.exists());
+    }
+
+    /// **P1-05（v0.7.7）**：严格防泄漏的前置条件必须真正生效。
+    #[test]
+    fn strict_leak_toggle_checks_prerequisites() {
+        // 判据本身：门禁关闭时，strict 标志并不能让兜底封锁生效。
+        let off = crate::appconfig::AppConfig {
+            egate_enabled: false,
+            lockdown_on_uncovered: true,
+            strict_leak_protection: true,
+            ..crate::appconfig::AppConfig::default()
+        };
+        assert!(!off.egate_enabled, "strict 标志不能代替门禁开关");
+        let both = crate::appconfig::AppConfig {
+            egate_enabled: true,
+            lockdown_on_uncovered: false,
+            strict_leak_protection: true,
+            ..crate::appconfig::AppConfig::default()
+        };
+        assert!(
+            !both.lockdown_on_uncovered,
+            "strict 标志不能代替兜底封锁开关"
+        );
     }
 
     /// **P1-07**：旧版遗留规则**不能**用来顶替兜底规则的对账数量。

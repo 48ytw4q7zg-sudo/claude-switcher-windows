@@ -343,18 +343,30 @@ pub fn load_checked() -> ConfigLoad {
         // - **已有用户的配置丢了**（被同步工具清空、误删、路径异常）→
         //   绝不能当成「尚未配置」。默认配置的 `egate_enabled = false`，
         //   于是已经开了严格保护的用户会被静默降级成「允许普通直连」。
-        return match is_initialized() {
-            true => ConfigLoad::Corrupt(
+        return match initialized_state() {
+            // **P0-02（v0.7.7）**：标记读不出来 ≠ 「没初始化过」。
+            // 按「无法确认」处理，不能放宽成 Fresh 让已有用户的保护被关掉。
+            Initialized::Unknown(reason) => ConfigLoad::Corrupt(format!(
+                "无法确认本机是否初始化过（{reason}），为避免按默认值关闭保护，                 本次拒绝按「首次安装」处理；请检查 config-initialized.json 权限或从备份恢复"
+            )),
+            Initialized::Yes => ConfigLoad::Corrupt(
                 "应用配置文件已丢失（此前已初始化过）。为避免按默认值关闭保护，                 本次拒绝回退；请从备份恢复 appconfig.json 后重试".to_string(),
             ),
-            false => ConfigLoad::Fresh,
+            Initialized::No => ConfigLoad::Fresh,
         };
     }
     match load_from_migrated(&path) {
         Ok(config) => {
-            // 成功读到配置 = 这是一个已初始化的安装，补写初始化标记
-            // （老版本升级过来时不会有标记文件）。
-            let _ = mark_initialized();
+            // **P0-02**：补写初始化标记**失败不能吞掉**。
+            //
+            // 老版本升级过来时没有标记文件，需要补写；补写失败意味着
+            // 「下次配置丢失时我们会误判成首次安装」——那正是本修复要防的。
+            // 此时如实标注，调用方按「配置状态不可靠」处理。
+            if let Err(error) = mark_initialized() {
+                return ConfigLoad::Corrupt(format!(
+                    "配置已读取，但初始化标记写入失败（{error}）；                     为避免下次配置丢失时被误判为首次安装，请修复该文件后重试"
+                ));
+            }
             ConfigLoad::Ok(Box::new(config))
         }
         Err(error) => ConfigLoad::Corrupt(error),
@@ -380,11 +392,35 @@ fn mark_initialized() -> Result<(), String> {
     fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
 }
 
-/// 是否已初始化过（标记文件存在即算）。
+/// **P0-02**：初始化状态三态。
+///
+/// v0.7.6 的 `is_initialized()` 把「标记读取异常」折成 `false` ——
+/// 也就是「没初始化过」，于是已有用户在标记读不出来时又会被当成首次安装。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Initialized {
+    /// 标记存在。
+    Yes,
+    /// 标记确实不存在（真正的首次安装）。
+    No,
+    /// 无法确认（权限不足 / 路径异常）→ **不得**放宽成 No。
+    Unknown(String),
+}
+
+fn initialized_state() -> Initialized {
+    let path = match initialized_marker_path() {
+        Ok(path) => path,
+        Err(error) => return Initialized::Unknown(error),
+    };
+    match std::fs::metadata(&path) {
+        Ok(_) => Initialized::Yes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Initialized::No,
+        Err(error) => Initialized::Unknown(format!("读取初始化标记失败：{error}")),
+    }
+}
+
+/// 是否已初始化过；无法确认时按「已初始化」处理（保守）。
 fn is_initialized() -> bool {
-    initialized_marker_path()
-        .map(|p| p.exists())
-        .unwrap_or(false)
+    !matches!(initialized_state(), Initialized::No)
 }
 
 fn now_unix_secs() -> u64 {
@@ -438,7 +474,8 @@ pub fn try_update(
     }
     // **P1-02**：写入路径也走迁移——避免旧程序把高版本配置覆盖成旧结构。
     let mut config = load_from_migrated(&path)?;
-    let _ = mark_initialized();
+    // **P0-02**：标记写入失败必须上报，不能 `let _ =` 吞掉。
+    mark_initialized()?;
     let before = config.clone();
     f(&mut config);
     // **P0-04 / P1-12**：只有**安全相关字段**变了才推进门禁代次。

@@ -1148,20 +1148,21 @@ pub fn quarantine_agent_for(
     report.expected_rule_names = expected.iter().map(|r| r.name.clone()).collect();
     report.expected_rules = expected.iter().map(RuleSpec::from).collect();
     for rule in expected {
-        // **P0-03（v0.7.6）**：规则修复必须是「先建新、验证、再删旧」的事务。
+        // **P0-01 / L-01（v0.7.7）**：规则判定必须**一套判据**，旧规则、临时规则、
+        // 最终规则共用同一个 `Test-Rule`。
         //
-        // v0.7.5 的顺序是 `Remove-NetFirewallRule` 然后 `New-NetFirewallRule`：
-        // 一旦新建失败（权限不足、RPC 抖动），旧规则已经被删掉，
-        // 受保护程序就暴露在未阻断状态——恰恰是这次修复要防的事。
+        // v0.7.6 的两个缺口都在「判据不一致」上：
         //
-        // 现在的顺序：
-        // 1. 严格查询旧规则；查询失败 -> 什么都不做，报 Unknown；
-        // 2. 建一条**临时名**的新规则；
-        // 3. 对临时规则做完整属性核验（含 ActiveStore）；
-        // 4. 核验通过后才删旧实例；
-        // 5. 最后把临时名改成正式名。
+        // 缺口 A：旧规则的 `$healthy` 只查 Enabled/Action/方向/程序四项。
+        //   一条被改成「只阻断 TCP 443」的旧规则会被判为健康，直接跳过修复——
+        //   后面的完整核验虽然发现不完整，却不再回头修。
         //
-        // 新建失败 / 核验不过 -> 删掉临时规则、**保留旧规则**，报告失败。
+        // 缺口 B：临时规则的 ActiveStore 检查只确认「存在」，没核对生效规则
+        //   的属性。本地规则与生效策略不同步时会过早认可。
+        //
+        // 现在 `Test-Rule` 一次性核验：Enabled、Action、方向、程序绝对路径、
+        // 协议与端口不受限、地址不受限、Profile 覆盖、以及 ActiveStore 里
+        // **对应规则的属性**。任何一项不满足就返回 false。
         let temp_name = format!("{} ::pending", rule.name);
         let script = format!(
             "$ProgressPreference='SilentlyContinue'
@@ -1179,18 +1180,56 @@ function Get-ByName([string]$n, [string]$escaped) {{
     Where-Object {{ $_.DisplayName -eq $n }})
 }}
 
-# 1) 严格查询旧规则。查询失败直接抛（外层包装判 Unknown），绝不删任何东西。
-$existing = Get-ByName $name $escapedName
-$healthy = $false
-foreach ($r in $existing) {{
-  $f = $r | Get-NetFirewallApplicationFilter -ErrorAction Stop
-  if ($r.Enabled -eq 'True' -and $r.Action -eq 'Block' -and
-      $r.Direction -eq $wantDirection -and $f.Program -and $f.Program -ieq $wantProgram) {{
-    $healthy = $true
-  }}
+# **P0-01 / L-01**：唯一的规则判据。旧规则、临时规则、最终规则都用它。
+function Test-Rule([string]$n, [string]$escaped) {{
+  $hit = $false
+  try {{
+    foreach ($r in (Get-ByName $n $escaped)) {{
+      if ($r.Enabled -ne 'True') {{ continue }}
+      if ($r.Action -ne 'Block') {{ continue }}
+      if ($r.Direction -ne $wantDirection) {{ continue }}
+      $af = $r | Get-NetFirewallApplicationFilter -ErrorAction Stop
+      if (-not $af -or -not $af.Program -or $af.Program -ine $wantProgram) {{ continue }}
+      # 端口与地址必须**不受限**：被改成「只挡 TCP 443」的规则不是完整隔离。
+      $pf = $r | Get-NetFirewallPortFilter -ErrorAction Stop
+      $adf = $r | Get-NetFirewallAddressFilter -ErrorAction Stop
+      if (-not $pf -or -not $adf) {{ continue }}
+      $portAny = (((-not $pf.Protocol) -or $pf.Protocol -eq 'Any') -and
+                  ((-not $pf.LocalPort) -or $pf.LocalPort -eq 'Any') -and
+                  ((-not $pf.RemotePort) -or $pf.RemotePort -eq 'Any'))
+      $addrAny = (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and
+                  ((-not $adf.RemoteAddress) -or $adf.RemoteAddress -eq 'Any'))
+      if (-not ($portAny -and $addrAny)) {{ continue }}
+      # Profile 必须覆盖全部配置档。
+      if (([string]$r.Profile).ToLowerInvariant() -ne 'any') {{ continue }}
+      # 生效策略里必须存在**同名且属性一致**的规则，不能只确认「存在」。
+      foreach ($a in @(Get-NetFirewallRule -DisplayName ($escaped + '*') -PolicyStore ActiveStore -ErrorAction Stop |
+                       Where-Object {{ $_.DisplayName -eq $n }})) {{
+        if ($a.Enabled -ne 'True' -or $a.Action -ne 'Block' -or $a.Direction -ne $wantDirection) {{ continue }}
+        $aaf = $a | Get-NetFirewallApplicationFilter -ErrorAction Stop
+        if (-not $aaf -or -not $aaf.Program -or $aaf.Program -ine $wantProgram) {{ continue }}
+        $apf = $a | Get-NetFirewallPortFilter -ErrorAction Stop
+        $aaf2 = $a | Get-NetFirewallAddressFilter -ErrorAction Stop
+        if (-not $apf -or -not $aaf2) {{ continue }}
+        $aPortAny = (((-not $apf.Protocol) -or $apf.Protocol -eq 'Any') -and
+                     ((-not $apf.LocalPort) -or $apf.LocalPort -eq 'Any') -and
+                     ((-not $apf.RemotePort) -or $apf.RemotePort -eq 'Any'))
+        $aAddrAny = (((-not $aaf2.LocalAddress) -or $aaf2.LocalAddress -eq 'Any') -and
+                     ((-not $aaf2.RemoteAddress) -or $aaf2.RemoteAddress -eq 'Any'))
+        if (-not ($aPortAny -and $aAddrAny)) {{ continue }}
+        if (([string]$a.Profile).ToLowerInvariant() -ne 'any') {{ continue }}
+        $hit = $true
+      }}
+    }}
+  }} catch {{ $hit = $false }}
+  $hit
 }}
+
 $result = 'existing'
-if (-not $healthy) {{
+if (Test-Rule $name $escapedName) {{
+  $result = 'existing'
+}} else {{
+  # 1) 清掉上次可能残留的临时规则，再建新的。
   $stale = Get-ByName $temp $escapedTemp
   if ($stale.Count -gt 0) {{ $stale | Remove-NetFirewallRule -ErrorAction Stop }}
   $created = $false
@@ -1199,35 +1238,22 @@ if (-not $healthy) {{
       -Program $wantProgram -Enabled True -ErrorAction Stop | Out-Null
     $created = $true
   }} catch {{
+    # 新建失败：保留旧规则，如实报告（旧的可能是 Allow，但至少不是「什么都没有」）。
     $result = 'create-failed: ' + $_.Exception.Message
   }}
   if ($created) {{
-    $ok = $false
-    try {{
-      foreach ($r in (Get-ByName $temp $escapedTemp)) {{
-        if ($r.Enabled -ne 'True' -or $r.Action -ne 'Block' -or $r.Direction -ne $wantDirection) {{ continue }}
-        $af = $r | Get-NetFirewallApplicationFilter -ErrorAction Stop
-        if (-not $af -or -not $af.Program -or $af.Program -ine $wantProgram) {{ continue }}
-        $pf = $r | Get-NetFirewallPortFilter -ErrorAction Stop
-        $adf = $r | Get-NetFirewallAddressFilter -ErrorAction Stop
-        $portAny = $pf -and (((-not $pf.Protocol) -or $pf.Protocol -eq 'Any') -and
-                   ((-not $pf.LocalPort) -or $pf.LocalPort -eq 'Any') -and
-                   ((-not $pf.RemotePort) -or $pf.RemotePort -eq 'Any'))
-        $addrAny = $adf -and (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and
-                   ((-not $adf.RemoteAddress) -or $adf.RemoteAddress -eq 'Any'))
-        $profileAll = ([string]$r.Profile).ToLowerInvariant() -eq 'any'
-        if ($portAny -and $addrAny -and $profileAll) {{
-          $active = @(Get-NetFirewallRule -DisplayName ($escapedTemp + '*') -PolicyStore ActiveStore -ErrorAction Stop |
-                      Where-Object {{ $_.DisplayName -eq $temp }})
-          if ($active.Count -gt 0) {{ $ok = $true }}
-        }}
-      }}
-    }} catch {{ $ok = $false }}
-    if ($ok) {{
-      if ($existing.Count -gt 0) {{ $existing | Remove-NetFirewallRule -ErrorAction Stop }}
+    # 2) 用**同一套判据**核验临时规则（含 ActiveStore 属性）。
+    if (Test-Rule $temp $escapedTemp) {{
+      # 3) 新规则已证实生效 -> 才删旧实例。
+      $old = Get-ByName $name $escapedName
+      if ($old.Count -gt 0) {{ $old | Remove-NetFirewallRule -ErrorAction Stop }}
+      # 4) 临时名改成正式名。
       (Get-ByName $temp $escapedTemp) | Set-NetFirewallRule -NewDisplayName $name -ErrorAction Stop
-      $result = 'created'
+      # 5) 改名后再核验一次正式规则；不通过就报 Partial，不谎称完整。
+      if (Test-Rule $name $escapedName) {{ $result = 'created' }}
+      else {{ $result = 'replaced-but-unverified' }}
     }} else {{
+      # 核验不过：删掉临时规则，**保留旧规则**。
       $stale = Get-ByName $temp $escapedTemp
       if ($stale.Count -gt 0) {{ $stale | Remove-NetFirewallRule -ErrorAction Stop }}
       $result = 'unverified'
@@ -1244,7 +1270,14 @@ $result",
             Ok(out) => match out.trim() {
                 "existing" => {}
                 "created" => report.rules_added += 1,
-                // **P0-03**：新建失败 / 核验不过时保留旧规则，如实报告。
+                // **P0-01 / P0-03**：替换完成后仍不完整时，如实报告 Partial。
+                "replaced-but-unverified" => {
+                    report.note.push_str(&format!(
+                        "已替换 {} 的{}站规则，但改名后核验未通过，覆盖可能不完整；",
+                        rule.exe,
+                        if rule.dir == "Out" { "出" } else { "入" }
+                    ));
+                }
                 other => report.note.push_str(&format!(
                     "修复 {} 的{}站规则未完成（{other}），已保留旧规则；",
                     rule.exe,
@@ -2026,11 +2059,18 @@ fn access_still_safe_for_unlock() -> Result<(), String> {
         match crate::egate_access::parse_proxy_server(evidence.server.as_deref()) {
             crate::egate_access::ProxyParse::Http(addr) => {
                 // 回环代理要再探一次端口：代理进程可能在等待锁期间退出了。
-                if crate::egate_access::is_loopback_host(&addr)
-                    && !crate::egate_access::proxy_port_reachable(&addr)
-                {
+                if crate::egate_access::is_loopback_host(&addr) {
+                    if !crate::egate_access::proxy_port_reachable(&addr) {
+                        return Err(format!(
+                            "系统代理端口 {addr} 已不可连，接入不再安全，已放弃自动解除兜底封锁"
+                        ));
+                    }
+                } else {
+                    // **P1-04（v0.7.7）**：远程代理的可用性无法在「不外发探测」的
+                    // 前提下证明。为了验证代理而发出的探测本身就会绕过保护——
+                    // 那是循环论证。因此按 Unknown 处理：拒绝自动解除。
                     return Err(format!(
-                        "系统代理端口 {addr} 已不可连，接入不再安全，已放弃自动解除兜底封锁"
+                        "远程代理 {addr} 的可用性无法在不外发探测的前提下确认，已放弃自动解除兜底封锁（保守保留）"
                     ));
                 }
                 // **P0-05（v0.7.6）**：重新复核**完整的**接入判定，

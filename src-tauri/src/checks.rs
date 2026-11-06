@@ -879,11 +879,85 @@ fn fix_launch_and_tun(mode: &str, steps: &mut Vec<FixStep>) {
 /// 「需管理员」，不吞错。
 pub fn run_fix_blocking() -> FixReport {
     let mut steps: Vec<FixStep> = Vec::new();
-    let cfg = appconfig::load();
+    // **P1-02（v0.7.7）**：一键修复必须用严格配置读取。
+    //
+    // `appconfig::load()` 在配置损坏时返回**默认配置**，默认 `tz_target`
+    // 是 `None`、`proxy_mode` 是 `clash-verge`。于是「配置坏了」的一键修复
+    // 会拿一份编造出来的目标去改系统时区/IPv6——没有任何用户意图支撑。
+    let cfg = match appconfig::load_checked() {
+        appconfig::ConfigLoad::Ok(config) => *config,
+        appconfig::ConfigLoad::Fresh => {
+            steps.push(step(
+                "配置",
+                "fail",
+                "尚未配置目标（首次安装），一键修复无可依据的期望值；请先完成配置".to_string(),
+            ));
+            return FixReport {
+                steps,
+                summary: ChecksSummary {
+                    total: 0,
+                    ok: 0,
+                    warn: 0,
+                    fail: 1,
+                    skipped: 0,
+                    passed: false,
+                },
+                checks: Vec::new(),
+            };
+        }
+        appconfig::ConfigLoad::Corrupt(error) => {
+            steps.push(step(
+                "配置",
+                "fail",
+                format!(
+                    "应用配置损坏（{error}），已拒绝按默认值修改系统环境；请先修复配置或从备份恢复"
+                ),
+            ));
+            return FixReport {
+                steps,
+                summary: ChecksSummary {
+                    total: 0,
+                    ok: 0,
+                    warn: 0,
+                    fail: 1,
+                    skipped: 0,
+                    passed: false,
+                },
+                checks: Vec::new(),
+            };
+        }
+    };
     let mode = cfg
         .proxy_mode
         .clone()
         .unwrap_or_else(|| "clash-verge".to_string());
+
+    // **P1-02**：所有系统副作用（时区、IPv6）在同一把系统操作锁内执行，
+    // 与保镖时区看门狗、急救恢复互斥；取不到锁就整体不执行，
+    // 避免留下未登记的系统修改。
+    let _guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::TimezoneWrite)
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            steps.push(step(
+                "系统操作锁",
+                "fail",
+                format!("另一个环境修改正在进行（{error}），一键修复未执行任何系统改动"),
+            ));
+            return FixReport {
+                steps,
+                summary: ChecksSummary {
+                    total: 0,
+                    ok: 0,
+                    warn: 0,
+                    fail: 1,
+                    skipped: 0,
+                    passed: false,
+                },
+                checks: Vec::new(),
+            };
+        }
+    };
 
     // A. 代理内核 + TUN
     fix_launch_and_tun(&mode, &mut steps);

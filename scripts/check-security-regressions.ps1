@@ -52,7 +52,14 @@ try {
         'genuine_first_install_is_still_fresh',
         'ready_without_rule_specs_is_never_valid',
         'monitor_interval_is_clamped_to_monitor_range_not_probe_timeout',
-        'kill_outcome_keeps_skipped_out_of_side_effects'
+        'kill_outcome_keeps_skipped_out_of_side_effects',
+        # v0.7.7 additions
+        'preparing_intent_is_never_cleared_as_orphan',
+        'uncovered_txn_ids_are_unique',
+        'legacy_intent_without_txn_refuses_auto_cleanup',
+        'strict_leak_toggle_checks_prerequisites',
+        'reset_targets_rejected_when_gate_is_armed',
+        'task_lookup_is_three_state'
     )
     $failed = @()
     foreach ($g in $groups) {

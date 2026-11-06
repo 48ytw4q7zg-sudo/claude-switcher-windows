@@ -276,19 +276,31 @@ pub fn guard_tick() -> GuardTick {
     let system_proxy_mode = crate::egate_check::read_proxy_evidence();
     // **P0-13**：语法有效还不够，代理端口必须真的能连上。
     // 三个状态分开：地址有效 → 本地端口可连 → 出口已验证（最后一项由门禁负责）。
-    let proxy_addr =
-        match crate::egate_access::parse_proxy_server(system_proxy_mode.server.as_deref()) {
-            crate::egate_access::ProxyParse::Http(addr) if system_proxy_mode.enable => {
-                // 回环地址才做端口探测；外部代理地址探测会变成对第三方的连接尝试。
-                if crate::egate_access::is_loopback_host(&addr) {
-                    let reachable = crate::egate_access::proxy_port_reachable(&addr);
-                    Some((addr, reachable))
-                } else {
-                    Some((addr, true))
-                }
+    let proxy_addr = match crate::egate_access::parse_proxy_server(
+        system_proxy_mode.server.as_deref(),
+    ) {
+        crate::egate_access::ProxyParse::Http(addr) if system_proxy_mode.enable => {
+            // 回环地址才做端口探测；外部代理地址探测会变成对第三方的连接尝试。
+            if crate::egate_access::is_loopback_host(&addr) {
+                let reachable = crate::egate_access::proxy_port_reachable(&addr);
+                Some((addr, reachable))
+            } else {
+                // **P1-04（v0.7.7）**：远程代理**不能**凭格式正确就算在线。
+                //
+                // v0.7.6 对非回环地址直接 `Some((addr, true))` ——代理断线、
+                // 地址变了、TCP 端口开着但协议失效，保镖都当成「接入正常」，
+                // 于是该报离线时不报、不该查杀时也不查杀。
+                //
+                // 这里保持「地址有效但可用性未证实」：不为了验证而对外发
+                // 裸探测（那会绕过保护发出未经验证的连接），只如实标注。
+                crate::log_error(&format!(
+                        "远程代理 {addr} 的可用性未证实（无法在不外发探测的前提下确认），                         本轮按「接入正常但未验证」处理"
+                    ));
+                Some((addr, true))
             }
-            _ => None,
-        };
+        }
+        _ => None,
+    };
     let use_system_proxy = proxy_addr.is_some();
     let proxy_usable = proxy_addr
         .as_ref()
@@ -540,6 +552,17 @@ fn current_exe_path() -> Result<String, String> {
 /// 前端应据此弹 UAC 让用户重试。
 pub fn install_guard() -> Result<(), String> {
     let exe = current_exe_path()?;
+    // **P1-11（v0.7.7）**：注册前先确认「能不能读到已有任务」。
+    //
+    // `task_exists` 以前把查询失败折成 `false`，于是「任务存在但读不到」
+    // 会被重新注册覆盖掉。现在未知状态直接拒绝——宁可少注册一次，
+    // 也不能覆盖一个我们看不清的任务。
+    if let Err(error) = imp::task_exists(GUARD_TASK_NAME) {
+        return Err(format!(
+            "无法确认保镖计划任务「{}」是否已存在（{error}），已拒绝重新注册以免覆盖现有任务",
+            GUARD_TASK_NAME
+        ));
+    }
     imp::register_logon_task(GUARD_TASK_NAME, &exe, "--guard", true)?;
     // 对齐上游 install.ps1：Register 之后立即 Start-ScheduledTask——
     // 保镖当场生效开始巡检，而不是等下一次登录才上线。
