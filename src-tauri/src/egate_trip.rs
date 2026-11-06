@@ -1148,43 +1148,50 @@ pub fn quarantine_agent_for(
     report.expected_rule_names = expected.iter().map(|r| r.name.clone()).collect();
     report.expected_rules = expected.iter().map(RuleSpec::from).collect();
     for rule in expected {
-        // **P0-01 / L-01（v0.7.7）**：规则判定必须**一套判据**，旧规则、临时规则、
-        // 最终规则共用同一个 `Test-Rule`。
+        // **P0-01 / L-10（v0.8.1）**：崩溃恢复 + 三态核验。
         //
-        // v0.7.6 的两个缺口都在「判据不一致」上：
+        // v0.7.7 的替换流程是「删掉 ::pending -> 新建 -> 核验 -> 删旧 -> 改名」。
+        // 问题：`::pending` **不一定是垃圾**。
         //
-        // 缺口 A：旧规则的 `$healthy` 只查 Enabled/Action/方向/程序四项。
-        //   一条被改成「只阻断 TCP 443」的旧规则会被判为健康，直接跳过修复——
-        //   后面的完整核验虽然发现不完整，却不再回头修。
+        // 真实崩溃序列：上次操作已建好并核验了临时阻断规则，但在「删旧规则、
+        // 改回正式名」之前进程崩了。此时临时规则是**实际生效的保护资源**。
+        // 下一轮先把它删掉、再尝试重建——新建一旦失败，就从「有保护」变成
+        // 「没保护」。
         //
-        // 缺口 B：临时规则的 ActiveStore 检查只确认「存在」，没核对生效规则
-        //   的属性。本地规则与生效策略不同步时会过早认可。
+        // 现在的顺序：
+        //   1. 正式名规则已完整有效 -> `existing`（不动任何东西）；
+        //   2. 存在**已核验**的 pending -> **继续完成上次的改名**，不删它；
+        //   3. 否则新建一个**带唯一后缀**的 pending（不碰现有的任何阻断资源），
+        //      核验通过后才删旧规则与无效 pending，最后改名；
+        //   4. 改名失败 -> 保留已验证的 pending，报告可恢复状态。
         //
-        // 现在 `Test-Rule` 一次性核验：Enabled、Action、方向、程序绝对路径、
-        // 协议与端口不受限、地址不受限、Profile 覆盖、以及 ActiveStore 里
-        // **对应规则的属性**。任何一项不满足就返回 false。
-        let temp_name = format!("{} ::pending", rule.name);
+        // `Test-Rule` 也改成三态：`ok` / `unhealthy` / `query-failed`。
+        // 「读不到旧规则属性」不是「属性不健康」，那种情况不能盲目进入替换流程。
+        let temp_prefix = format!("{} ::pending", rule.name);
         let script = format!(
             "$ProgressPreference='SilentlyContinue'
 $ErrorActionPreference='Stop'
 # 无语句级 exit/return/continue：三者都会跳过执行结果哨兵。
 $name = {name}
-$temp = {temp}
+$tempPrefix = {temp_prefix}
 $wantDirection = {direction}
 $wantProgram = {program}
 $escapedName = [WildcardPattern]::Escape($name)
-$escapedTemp = [WildcardPattern]::Escape($temp)
+$escapedTempPrefix = [WildcardPattern]::Escape($tempPrefix)
 
 function Get-ByName([string]$n, [string]$escaped) {{
   @(Get-NetFirewallRule -DisplayName ($escaped + '*') -ErrorAction Stop |
     Where-Object {{ $_.DisplayName -eq $n }})
 }}
 
-# **P0-01 / L-01**：唯一的规则判据。旧规则、临时规则、最终规则都用它。
+# **L-10**：三态判定。查询异常必须与「属性不健康」区分开。
 function Test-Rule([string]$n, [string]$escaped) {{
-  $hit = $false
   try {{
-    foreach ($r in (Get-ByName $n $escaped)) {{
+    $rules = @(Get-NetFirewallRule -DisplayName ($escaped + '*') -ErrorAction Stop |
+               Where-Object {{ $_.DisplayName -eq $n }})
+    if ($rules.Count -eq 0) {{ return 'unhealthy' }}
+    $hit = $false
+    foreach ($r in $rules) {{
       if ($r.Enabled -ne 'True') {{ continue }}
       if ($r.Action -ne 'Block') {{ continue }}
       if ($r.Direction -ne $wantDirection) {{ continue }}
@@ -1200,9 +1207,8 @@ function Test-Rule([string]$n, [string]$escaped) {{
       $addrAny = (((-not $adf.LocalAddress) -or $adf.LocalAddress -eq 'Any') -and
                   ((-not $adf.RemoteAddress) -or $adf.RemoteAddress -eq 'Any'))
       if (-not ($portAny -and $addrAny)) {{ continue }}
-      # Profile 必须覆盖全部配置档。
       if (([string]$r.Profile).ToLowerInvariant() -ne 'any') {{ continue }}
-      # 生效策略里必须存在**同名且属性一致**的规则，不能只确认「存在」。
+      # 生效策略里必须存在**同名且属性一致**的规则。
       foreach ($a in @(Get-NetFirewallRule -DisplayName ($escaped + '*') -PolicyStore ActiveStore -ErrorAction Stop |
                        Where-Object {{ $_.DisplayName -eq $n }})) {{
         if ($a.Enabled -ne 'True' -or $a.Action -ne 'Block' -or $a.Direction -ne $wantDirection) {{ continue }}
@@ -1221,48 +1227,67 @@ function Test-Rule([string]$n, [string]$escaped) {{
         $hit = $true
       }}
     }}
-  }} catch {{ $hit = $false }}
-  $hit
+    if ($hit) {{ 'ok' }} else {{ 'unhealthy' }}
+  }} catch {{
+    # **L-10**：查询失败绝不能被当成「属性不健康」，否则会盲目进入替换流程。
+    'query-failed'
+  }}
 }}
 
-$result = 'existing'
-if (Test-Rule $name $escapedName) {{
-  $result = 'existing'
+# 1) 正式名规则已完整有效 -> 不动任何东西。
+$result = Test-Rule $name $escapedName
+if ($result -eq 'query-failed') {{
+  'query-failed'
+}} elseif ($result -eq 'ok') {{
+  'existing'
 }} else {{
-  # 1) 清掉上次可能残留的临时规则，再建新的。
-  $stale = Get-ByName $temp $escapedTemp
-  if ($stale.Count -gt 0) {{ $stale | Remove-NetFirewallRule -ErrorAction Stop }}
-  $created = $false
-  try {{
-    New-NetFirewallRule -DisplayName $temp -Direction $wantDirection -Action Block `
-      -Program $wantProgram -Enabled True -ErrorAction Stop | Out-Null
-    $created = $true
-  }} catch {{
-    # 新建失败：保留旧规则，如实报告（旧的可能是 Allow，但至少不是「什么都没有」）。
-    $result = 'create-failed: ' + $_.Exception.Message
+  # 2) 有没有**已核验**的 pending？有就继续完成上次未完成的改名。
+  $resumed = $null
+  foreach ($p in @(Get-NetFirewallRule -DisplayName ($escapedTempPrefix + '*') -ErrorAction Stop |
+                   Where-Object {{ $_.DisplayName.StartsWith($tempPrefix) }})) {{
+    $escapedOne = [WildcardPattern]::Escape($p.DisplayName)
+    if ((Test-Rule $p.DisplayName $escapedOne) -eq 'ok') {{ $resumed = $p; break }}
   }}
-  if ($created) {{
-    # 2) 用**同一套判据**核验临时规则（含 ActiveStore 属性）。
-    if (Test-Rule $temp $escapedTemp) {{
-      # 3) 新规则已证实生效 -> 才删旧实例。
-      $old = Get-ByName $name $escapedName
-      if ($old.Count -gt 0) {{ $old | Remove-NetFirewallRule -ErrorAction Stop }}
-      # 4) 临时名改成正式名。
-      (Get-ByName $temp $escapedTemp) | Set-NetFirewallRule -NewDisplayName $name -ErrorAction Stop
-      # 5) 改名后再核验一次正式规则；不通过就报 Partial，不谎称完整。
-      if (Test-Rule $name $escapedName) {{ $result = 'created' }}
-      else {{ $result = 'replaced-but-unverified' }}
-    }} else {{
-      # 核验不过：删掉临时规则，**保留旧规则**。
-      $stale = Get-ByName $temp $escapedTemp
-      if ($stale.Count -gt 0) {{ $stale | Remove-NetFirewallRule -ErrorAction Stop }}
-      $result = 'unverified'
+  if ($resumed) {{
+    # 继续改名事务：先删旧正式名，再改名，最后复核。
+    $old = Get-ByName $name $escapedName
+    if ($old.Count -gt 0) {{ $old | Remove-NetFirewallRule -ErrorAction Stop }}
+    $resumed | Set-NetFirewallRule -NewDisplayName $name -ErrorAction Stop
+    if ((Test-Rule $name $escapedName) -eq 'ok') {{ 'resumed' }} else {{ 'replaced-but-unverified' }}
+  }} else {{
+    # 3) 新建一条**带唯一后缀**的 pending —— 不先删任何现有阻断资源。
+    $tempName = $tempPrefix + '-' + [Guid]::NewGuid().ToString('N')
+    $escapedTemp = [WildcardPattern]::Escape($tempName)
+    $created = $false
+    try {{
+      New-NetFirewallRule -DisplayName $tempName -Direction $wantDirection -Action Block `
+        -Program $wantProgram -Enabled True -ErrorAction Stop | Out-Null
+      $created = $true
+    }} catch {{
+      'create-failed: ' + $_.Exception.Message
+    }}
+    if ($created) {{
+      if ((Test-Rule $tempName $escapedTemp) -eq 'ok') {{
+        # 4) 新阻断已证实生效 -> 才清理旧规则与无效 pending。
+        $old = Get-ByName $name $escapedName
+        if ($old.Count -gt 0) {{ $old | Remove-NetFirewallRule -ErrorAction Stop }}
+        foreach ($p in @(Get-NetFirewallRule -DisplayName ($escapedTempPrefix + '*') -ErrorAction Stop |
+                         Where-Object {{ $_.DisplayName.StartsWith($tempPrefix) -and $_.DisplayName -ne $tempName }})) {{
+          $p | Remove-NetFirewallRule -ErrorAction Stop
+        }}
+        (Get-ByName $tempName $escapedTemp) | Set-NetFirewallRule -NewDisplayName $name -ErrorAction Stop
+        if ((Test-Rule $name $escapedName) -eq 'ok') {{ 'created' }} else {{ 'replaced-but-unverified' }}
+      }} else {{
+        # 新建的不完整：删掉它，**保留旧规则**。
+        $bad = Get-ByName $tempName $escapedTemp
+        if ($bad.Count -gt 0) {{ $bad | Remove-NetFirewallRule -ErrorAction Stop }}
+        'unverified'
+      }}
     }}
   }}
-}}
-$result",
+}}",
             name = ps_quote(&rule.name),
-            temp = ps_quote(&temp_name),
+            temp_prefix = ps_quote(&temp_prefix),
             direction = rule.direction,
             program = ps_quote(&rule.exe)
         );
@@ -1270,7 +1295,15 @@ $result",
             Ok(out) => match out.trim() {
                 "existing" => {}
                 "created" => report.rules_added += 1,
-                // **P0-01 / P0-03**：替换完成后仍不完整时，如实报告 Partial。
+                "resumed" => {
+                    // **P0-01**：沿用上次留下的已验证 pending 完成改名，
+                    // 没有新建规则，因此不计入 rules_added。
+                    report.note.push_str(&format!(
+                        "沿用上次未完成的临时阻断规则，已补完 {} 的{}站规则改名；",
+                        rule.exe,
+                        if rule.dir == "Out" { "出" } else { "入" }
+                    ));
+                }
                 "replaced-but-unverified" => {
                     report.note.push_str(&format!(
                         "已替换 {} 的{}站规则，但改名后核验未通过，覆盖可能不完整；",
@@ -1278,8 +1311,16 @@ $result",
                         if rule.dir == "Out" { "出" } else { "入" }
                     ));
                 }
+                // **L-10**：查询失败必须单独报，不能混进「规则不健康」。
+                "query-failed" => {
+                    report.note.push_str(&format!(
+                        "无法读取 {} 的{}站规则属性，本次未做替换（避免在不明状态下删掉有效阻断）；",
+                        rule.exe,
+                        if rule.dir == "Out" { "出" } else { "入" }
+                    ));
+                }
                 other => report.note.push_str(&format!(
-                    "修复 {} 的{}站规则未完成（{other}），已保留旧规则；",
+                    "修复 {} 的{}站规则未完成（{other}），已保留现有阻断；",
                     rule.exe,
                     if rule.dir == "Out" { "出" } else { "入" }
                 )),
@@ -1399,6 +1440,19 @@ pub fn can_apply_isolation_with_revision(expected_revision: Option<u64>) -> bool
 ///
 /// 与 [`trip`] 共用同一套规则建立与核验逻辑（不新增第二套防火墙实现），
 /// 但不杀进程：用户只是暂时没开代理，不应被直接踢下线。
+/// **P0-02（v0.8.1）**：已持锁版本——规则建立与**结果提交**必须在同一段锁内。
+///
+/// v0.7.7 的流程是「锁内建规则 -> 释放锁 -> 锁外写 Applied/ready」。
+/// 中间的间隙里急救恢复可以拿到锁、停保护、删规则与意图，随后旧流程
+/// 又把 `Applied` 写回去 —— 一份和真实系统状态对不上的残留记录。
+pub(crate) fn enforce_uncovered_outbound_locked(
+    _guard: &crate::egate_lock::OperationGuard,
+    guarded_agents: &[String],
+    expected_revision: Option<u64>,
+) -> TripReport {
+    enforce_uncovered_outbound_impl(guarded_agents, expected_revision)
+}
+
 #[allow(dead_code)]
 pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
     enforce_uncovered_outbound_with_revision(guarded_agents, None)
@@ -1410,6 +1464,13 @@ pub fn enforce_uncovered_outbound(guarded_agents: &[String]) -> TripReport {
 /// 监控线程生成受管应用清单之后、真正取锁之前改了清单，旧清单仍会被用来
 /// 建规则。现在每个对象动手前都会再比一次代次。
 pub fn enforce_uncovered_outbound_with_revision(
+    guarded_agents: &[String],
+    expected_revision: Option<u64>,
+) -> TripReport {
+    enforce_uncovered_outbound_impl(guarded_agents, expected_revision)
+}
+
+fn enforce_uncovered_outbound_impl(
     guarded_agents: &[String],
     expected_revision: Option<u64>,
 ) -> TripReport {
@@ -1954,13 +2015,56 @@ pub fn release_uncovered_with_evidence(
     //
     // 现在：删规则 → 回查零残留 → **在锁内**清理意图/ready，且只删
     // `txn` 与本次一致的记录（别人新建的意图不会被误删）。
-    let txn = crate::egate_monitor::uncovered_lock_txn();
+    // **P0-03（v0.8.1）**：**删规则之前**先确认意图归属。
+    //
+    // v0.7.7 的顺序是「拿 txn（可能 None）-> 删规则 -> None 分支直接清意图」。
+    // 这个 `None => clear_uncovered_lock()` 正好绕过了 `clear_uncovered_lock_if_txn`
+    // 刚立的「旧格式 / 事务不明 / 读不到一律拒绝清理」的约束。
+    //
+    // 现在：
+    // - 只接受合法的 `Current` 事务，且阶段允许清理；
+    // - `Legacy` / `Unreadable` **立即报错，一条规则都不删**；
+    // - 有意图但事务不明时走对账路径，不冒充正常自动解除。
+    let intent = crate::egate_monitor::read_uncovered_intent();
+    let txn = match &intent {
+        crate::egate_monitor::UncoveredIntent::Current { txn, phase } => {
+            if !phase.clearable() {
+                return Err(format!(
+                    "兜底意图处于 {:?} 阶段（事务进行中），已放弃本次自动解除",
+                    phase
+                ));
+            }
+            txn.clone()
+        }
+        crate::egate_monitor::UncoveredIntent::Legacy => {
+            return Err(
+                "兜底意图是旧格式（无事务号），无法确认归属，已放弃自动解除（一条规则都未删除）"
+                    .to_string(),
+            );
+        }
+        crate::egate_monitor::UncoveredIntent::Unreadable(error) => {
+            return Err(format!(
+                "无法读取兜底意图（{error}），已放弃自动解除（一条规则都未删除）"
+            ));
+        }
+        // 没有意图但可能有残留规则：那是**对账**问题，不是自动解除。
+        crate::egate_monitor::UncoveredIntent::Absent => {
+            return Err(
+                "没有兜底意图记录，残留规则应走对账/急救路径处理，不按自动解除清除".to_string(),
+            );
+        }
+    };
+    // 持锁后把阶段标为 `Releasing`（同一事务号），再删规则。
+    let reason = crate::egate_monitor::uncovered_lock_reason();
+    crate::egate_monitor::transition_uncovered_phase(
+        &txn,
+        crate::egate_monitor::UncoveredPhase::Releasing,
+        &reason,
+    )?;
     let report = release_isolation_reason_locked(&guard, IsolationReason::Uncovered)?;
     if report.fully_cleared() {
-        match &txn {
-            Some(txn) => crate::egate_monitor::clear_uncovered_lock_if_txn(txn)?,
-            None => crate::egate_monitor::clear_uncovered_lock()?,
-        }
+        // 只清理**同一个事务**的记录。
+        crate::egate_monitor::clear_uncovered_lock_if_txn(&txn)?;
     }
     Ok(report)
 }

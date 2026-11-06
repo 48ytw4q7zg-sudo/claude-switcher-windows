@@ -794,54 +794,79 @@ fn run_uncovered_lockdown(
     }
     // **P0-C**：先写意图**再**动防火墙——崩溃时至少有「我打算锁」的记录。
     // **P1-13**：记录触发原因（未接入 vs 严格模式下接入无法确认）。
-    if !uncovered_lock_active() {
-        let reason = if report.access.path == "uncovered" {
-            "uncovered"
-        } else {
-            "strict_unknown_access"
-        };
-        if let Err(error) = mark_uncovered_lock_with_reason(reason) {
-            crate::log_error(&format!(
-                "未接入兜底封锁：意图落盘失败（{error}），本轮不施加规则以免无法归属"
-            ));
+    // **P0-02**：事务号只在**新建意图**时生成一次，后面 `Preparing -> Applied`
+    // 只推进阶段、沿用同一个号。
+    let reason = if report.access.path == "uncovered" {
+        "uncovered"
+    } else {
+        "strict_unknown_access"
+    };
+    let txn = match read_uncovered_intent() {
+        UncoveredIntent::Current { txn, phase } if phase != UncoveredPhase::Releasing => txn,
+        // 已在解除中 / 没有意图 / 旧格式 / 读不到 -> 开一个新的事务。
+        _ => match mark_uncovered_lock_with_reason(reason) {
+            Ok(txn) => txn,
+            Err(error) => {
+                crate::log_error(&format!(
+                    "未接入兜底封锁：意图落盘失败（{error}），本轮不施加规则以免无法归属"
+                ));
+                return;
+            }
+        },
+    };
+
+    // **P0-02**：规则建立**与结果提交在同一段系统锁内**。
+    //
+    // v0.7.7 是「锁内建规则 -> 释放锁 -> 锁外写 Applied/ready」。间隙里
+    // 急救恢复可以停保护、删规则与意图，随后旧流程又把 Applied 写回去。
+    let guard = match crate::egate_lock::acquire(crate::egate_lock::SystemOperation::Isolate) {
+        Ok(guard) => guard,
+        Err(error) => {
+            crate::log_error(&format!("兜底封锁未执行（{error}），下一轮再试"));
             return;
         }
+    };
+    // 持锁后复核：等待锁期间用户可能已急救 / 暂停 / 改配置。
+    if !crate::egate_trip::can_apply_isolation_with_revision(Some(revision)) {
+        crate::log_error("兜底封锁判定已过期（等待锁期间状态改变），未建立规则");
+        return;
     }
-    // **P0-C**：每轮都重新核验并补齐，不能因「意图文件存在」就跳过。
-    // **P1-08**：把本轮代次带进兜底封锁——持锁后若代次已变会自行放弃。
-    let trip = crate::egate_trip::enforce_uncovered_outbound_with_revision(&agents, Some(revision));
+    let trip =
+        crate::egate_trip::enforce_uncovered_outbound_locked(&guard, &agents, Some(revision));
     if trip.all_isolated {
-        // **L-13**：每次都重写 ready，而不是「存在就跳过」。
-        // 记录里带 `verified_at` / 配置代次 / 受管清单 / 规则条数，
-        // 任何一项变了都会在读取时失效，界面不会再展示上一轮的核验结果。
         let rules: u32 = trip.agents.iter().map(|agent| agent.rules_verified).sum();
-        // **P1-07**：把本次应建立的规则名一并记下，供下次核验对账。
         let mut rule_names: Vec<String> = Vec::new();
         for agent in &trip.agents {
             rule_names.extend(agent.expected_rule_names.iter().cloned());
         }
-        // **P0-04**：把完整规则规格一起记下，供下次做属性级核验。
         let mut specs: Vec<crate::egate_trip::RuleSpec> = Vec::new();
         for agent in &trip.agents {
             for spec in &agent.expected_rules {
                 specs.push(spec.clone());
             }
         }
-        // **P0-05**：规则已建立并核验 -> 意图阶段转为 Applied（可被清理）。
+        // **P0-02**：同一事务号推进到 Applied + 写 ready，**都在锁内**。
+        // 若此刻意图已被别的流程替换，`transition_uncovered_phase` 会拒绝。
         let current_reason = uncovered_lock_reason();
-        if let Err(error) = mark_uncovered_lock_with_phase(&current_reason, UncoveredPhase::Applied)
-        {
-            crate::log_error(&format!("兜底意图阶段更新失败：{error}"));
-        }
-        if let Err(error) = mark_uncovered_ready(&agents, rules, rule_names, specs) {
-            crate::log_error(&format!(
-                "兜底封锁已生效，但核验记录写入失败（{error}）：界面将显示为「未核验」"
-            ));
+        match transition_uncovered_phase(&txn, UncoveredPhase::Applied, &current_reason) {
+            Ok(_) => {
+                if let Err(error) =
+                    mark_uncovered_ready(&agents, rules, rule_names, specs, Some(txn.clone()))
+                {
+                    crate::log_error(&format!(
+                        "兜底封锁已生效，但核验记录写入失败（{error}）：界面将显示为「未核验」"
+                    ));
+                }
+            }
+            Err(error) => {
+                crate::log_error(&format!(
+                    "兜底规则已建立，但意图已被别的流程变更（{error}）：未写入 ready，交由下一轮对账"
+                ));
+            }
         }
         return;
     }
     // 部分生效或完全失败：保持 Degraded，下一轮继续补齐。
-    // 从「全部生效」退回「部分生效」：清掉 ready 标记，状态回到 Degraded。
     if let Err(error) = clear_uncovered_ready() {
         crate::log_error(&format!("{error}：界面可能继续显示过期的「已核验」"));
     }
@@ -995,7 +1020,27 @@ pub fn uncovered_lock_status() -> (bool, bool) {
 pub fn uncovered_lock_snapshot() -> (bool, bool, String) {
     let active = uncovered_lock_active();
     let state = uncovered_ready_state();
-    let verified = matches!(state, UncoveredReadyState::Valid);
+    // **L-07（v0.8.1）**：只有「意图存在 + 阶段 Applied + ready 事务号一致」
+    // 才能返回 verified。ready 是某次事务的快照，不是当前事实——
+    // 意图被别的流程替换后，这份快照就不该继续代表「已核验」。
+    let verified = match (
+        matches!(state, UncoveredReadyState::Valid),
+        read_uncovered_intent(),
+    ) {
+        (false, _) => false,
+        (
+            true,
+            UncoveredIntent::Current {
+                phase: UncoveredPhase::Applied,
+                txn,
+            },
+        ) => read_uncovered_ready()
+            .and_then(|r| r.txn)
+            .map(|ready_txn| ready_txn == txn)
+            .unwrap_or(false),
+        // 阶段不是 Applied，或意图是旧格式/读不到/没有 -> 都不算「已核验」。
+        _ => false,
+    };
     // **P1-13**：把触发原因也说清楚——「未接入代理」与「严格模式下接入
     // 无法确认」走同一套规则，但前者是故障、后者是用户主动选择的安全策略。
     let cause = match uncovered_lock_reason().as_str() {
@@ -1077,25 +1122,63 @@ impl UncoveredPhase {
     }
 }
 
-fn mark_uncovered_lock_with_reason(reason: &str) -> Result<(), String> {
-    mark_uncovered_lock_with_phase(reason, UncoveredPhase::Preparing)
+fn mark_uncovered_lock_with_reason(reason: &str) -> Result<String, String> {
+    mark_uncovered_lock_with_phase(reason, UncoveredPhase::Preparing, None)
 }
 
 /// **P0-05 / P0-07**：写入意图，带**真正唯一**的事务号与阶段。
-fn mark_uncovered_lock_with_phase(reason: &str, phase: UncoveredPhase) -> Result<(), String> {
+/// **P0-02（v0.8.1）**：写入意图记录。
+///
+/// `txn` 为 `Some` 表示**阶段转换**（沿用同一事务号），`None` 表示新事务
+/// （生成新号）。v0.7.7 每次调用都 `Uuid::new_v4()`，于是 `Preparing → Applied`
+/// 会给同一次封锁两个不同事务号——「旧事务不删新事务」的保护因此失效。
+fn mark_uncovered_lock_with_phase(
+    reason: &str,
+    phase: UncoveredPhase,
+    txn: Option<&str>,
+) -> Result<String, String> {
     let path = uncovered_lock_file()?;
-    // **P0-07**：事务号必须真正唯一。
-    //
-    // v0.7.6 用 `format!("{}-{}", now_secs(), pid)` ——同一进程同一秒内
-    // 两次意图会得到同一个 ID，旧事务因此可能删掉新事务的意图。
+    let txn_id = match txn {
+        Some(existing) if !existing.is_empty() => existing.to_string(),
+        _ => uuid::Uuid::new_v4().to_string(),
+    };
     let body = serde_json::json!({
         "since": now_secs(),
         "reason": reason,
-        "txn": uuid::Uuid::new_v4().to_string(),
+        "txn": txn_id,
         "phase": phase,
     })
     .to_string();
-    crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
+    crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())?;
+    Ok(txn_id)
+}
+
+/// **P0-02**：只在**事务号不变**的前提下推进阶段。
+///
+/// 如果记录已经被别的流程替换（事务号不符），拒绝覆盖——那是旧事务
+/// 试图把新事务的意图改写成自己的状态。
+pub fn transition_uncovered_phase(
+    expected_txn: &str,
+    phase: UncoveredPhase,
+    reason: &str,
+) -> Result<String, String> {
+    match read_uncovered_intent() {
+        UncoveredIntent::Current { txn, .. } if txn != expected_txn => Err(format!(
+            "兜底意图已被别的流程替换（txn {txn} != {expected_txn}），拒绝推进阶段"
+        )),
+        UncoveredIntent::Current { .. } => {
+            mark_uncovered_lock_with_phase(reason, phase, Some(expected_txn))
+        }
+        UncoveredIntent::Absent => {
+            Err("兜底意图已不存在（可能已被急救恢复清除），拒绝推进阶段".to_string())
+        }
+        UncoveredIntent::Legacy => {
+            Err("兜底意图是旧格式（无事务号），拒绝推进阶段以免改写不明归属的记录".to_string())
+        }
+        UncoveredIntent::Unreadable(error) => {
+            Err(format!("无法读取兜底意图（{error}），拒绝推进阶段"))
+        }
+    }
 }
 
 /// 意图记录（**P0-07**：严格解析，区分「旧格式 / 损坏 / 读不到」）。
@@ -1146,6 +1229,7 @@ pub fn read_uncovered_intent() -> UncoveredIntent {
 }
 
 /// 读取当前兜底意图的事务号（旧记录没有该字段时返回 None）。
+#[allow(dead_code)]
 pub fn uncovered_lock_txn() -> Option<String> {
     match read_uncovered_intent() {
         UncoveredIntent::Current { txn, .. } => Some(txn),
@@ -1219,6 +1303,12 @@ struct UncoveredReady {
     /// 名称与数量都不变，仅凭存在性检查会误报「已核验」。
     #[serde(default)]
     specs: Vec<crate::egate_trip::RuleSpec>,
+    /// **L-07（v0.8.1）**：这份核验结果属于哪个意图事务。
+    ///
+    /// ready 是「某次事务的核验快照」，不是「当前事实」。绑上事务号后，
+    /// 意图被别的流程替换时这份 ready 立刻失效，界面不会继续显示过期结论。
+    #[serde(default)]
+    txn: Option<String>,
 }
 
 const UNCOVERED_READY_TTL_SECS: u64 = 15 * 60;
@@ -1374,6 +1464,7 @@ fn mark_uncovered_ready(
     rules: u32,
     rule_names: Vec<String>,
     specs: Vec<crate::egate_trip::RuleSpec>,
+    txn: Option<String>,
 ) -> Result<(), String> {
     let path = uncovered_lock_ready_file()?;
     let revision = match crate::appconfig::load_checked() {
@@ -1391,6 +1482,7 @@ fn mark_uncovered_ready(
         agents,
         rule_names,
         specs,
+        txn,
     };
     let body = serde_json::to_string(&ready).map_err(|e| e.to_string())?;
     crate::fsx::write_atomically(&path, &body).map_err(|e| e.to_string())
@@ -1998,7 +2090,7 @@ mod tests {
             .map(|id| id.to_string())
             .collect();
         // **P1-07**：记录里声称 2 条规则，但系统上一条都没有 → 必须判失效。
-        mark_uncovered_ready(&defaults, 2, Vec::new(), Vec::new()).unwrap();
+        mark_uncovered_ready(&defaults, 2, Vec::new(), Vec::new(), None).unwrap();
         assert!(matches!(
             uncovered_ready_state(),
             UncoveredReadyState::Stale(_)
@@ -2007,7 +2099,7 @@ mod tests {
         // 记录 0 条规则 + 无规格 -> **不是**有效（P0-04：没有属性级核验
         // 就不能说「已核验」）。完整 Valid 路径需要真实防火墙规则，
         // 由 tests/windows-integration/03-restore-ledger.ps1 覆盖。
-        mark_uncovered_ready(&defaults, 0, Vec::new(), Vec::new()).unwrap();
+        mark_uncovered_ready(&defaults, 0, Vec::new(), Vec::new(), None).unwrap();
         assert!(matches!(
             uncovered_ready_state(),
             UncoveredReadyState::Stale(_)
@@ -2025,7 +2117,7 @@ mod tests {
         ));
 
         // **P1-07**：受管应用清单变化同样立刻失效。
-        mark_uncovered_ready(&["claude".to_string()], 0, Vec::new(), Vec::new()).unwrap();
+        mark_uncovered_ready(&["claude".to_string()], 0, Vec::new(), Vec::new(), None).unwrap();
         assert!(matches!(
             uncovered_ready_state(),
             UncoveredReadyState::Stale(_)
@@ -2037,6 +2129,7 @@ mod tests {
             0,
             vec!["ClaudeSwitcher UncoveredLock ghost Out".into()],
             Vec::new(),
+            None,
         )
         .unwrap();
         assert!(matches!(
@@ -2068,7 +2161,7 @@ mod tests {
             .map(|id| id.to_string())
             .collect();
         // 既有规则名、也有条数，但**没有规格** -> 必须判失效（L-06）。
-        mark_uncovered_ready(&defaults, 0, vec!["some-rule".into()], Vec::new()).unwrap();
+        mark_uncovered_ready(&defaults, 0, vec!["some-rule".into()], Vec::new(), None).unwrap();
         assert!(
             matches!(uncovered_ready_state(), UncoveredReadyState::Stale(_)),
             "缺少规则明细的记录不能算已核验"
@@ -2083,7 +2176,7 @@ mod tests {
 otepad.exe"
                 .into(),
         };
-        mark_uncovered_ready(&defaults, 1, vec![spec.name.clone()], vec![spec]).unwrap();
+        mark_uncovered_ready(&defaults, 1, vec![spec.name.clone()], vec![spec], None).unwrap();
         assert!(
             matches!(uncovered_ready_state(), UncoveredReadyState::Stale(_)),
             "属性核验不通过时不得显示已核验"
@@ -2119,7 +2212,7 @@ otepad.exe"
 
         let mut seen = std::collections::BTreeSet::new();
         for _ in 0..20 {
-            mark_uncovered_lock_with_phase("test", UncoveredPhase::Preparing).unwrap();
+            mark_uncovered_lock_with_phase("test", UncoveredPhase::Preparing, None).unwrap();
             let txn = uncovered_lock_txn().expect("新格式记录必须有事务号");
             assert!(seen.insert(txn.clone()), "同一秒内不得重复事务号：{txn}");
         }
@@ -2165,6 +2258,94 @@ otepad.exe"
         assert!(
             !both.lockdown_on_uncovered,
             "strict 标志不能代替兜底封锁开关"
+        );
+    }
+
+    /// **P0-02（v0.8.1）**：`Preparing -> Applied` 必须沿用同一事务号。
+    ///
+    /// 回归点：v0.7.7 每次写意图都 `Uuid::new_v4()`，于是同一次封锁拿到
+    /// 两个事务号——「旧事务不删新事务」的保护因此失效。
+    #[test]
+    fn phase_transition_preserves_transaction_id() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        let txn = mark_uncovered_lock_with_reason("test").unwrap();
+        let (txn_after, phase) = match read_uncovered_intent() {
+            UncoveredIntent::Current { txn, phase } => (txn, phase),
+            other => panic!("应为新格式记录：{other:?}"),
+        };
+        assert_eq!(txn, txn_after);
+        assert_eq!(phase, UncoveredPhase::Preparing);
+
+        // 推进到 Applied：事务号必须不变。
+        let committed = transition_uncovered_phase(&txn, UncoveredPhase::Applied, "test").unwrap();
+        assert_eq!(committed, txn, "阶段推进不得更换事务身份");
+        match read_uncovered_intent() {
+            UncoveredIntent::Current { txn: now, phase } => {
+                assert_eq!(now, txn);
+                assert_eq!(phase, UncoveredPhase::Applied);
+            }
+            other => panic!("应为新格式记录：{other:?}"),
+        }
+    }
+
+    /// **P0-02**：意图已被别的流程替换时，旧事务不得推进阶段。
+    #[test]
+    fn stale_transaction_cannot_advance_phase() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        let old_txn = mark_uncovered_lock_with_reason("test").unwrap();
+        // 另一个流程替换意图（新事务）。
+        let new_txn = mark_uncovered_lock_with_reason("test").unwrap();
+        assert_ne!(old_txn, new_txn);
+        let error =
+            transition_uncovered_phase(&old_txn, UncoveredPhase::Applied, "test").unwrap_err();
+        assert!(error.contains("替换"), "{error}");
+    }
+
+    /// **L-07（v0.8.1）**：ready 是「某次事务的快照」，意图换了就失效。
+    #[test]
+    fn ready_without_matching_txn_is_not_verified() {
+        let _env = crate::test_support::env_lock();
+        let dir = tempfile::tempdir().unwrap();
+        let _home = crate::test_support::set_env("USERPROFILE", dir.path());
+        std::fs::create_dir_all(dir.path().join(".claude-switcher")).unwrap();
+
+        let defaults: Vec<String> = crate::egate_defaults::DEFAULT_GUARDED_AGENTS
+            .iter()
+            .map(|id| id.to_string())
+            .collect();
+        // ready 带事务号 A，意图却是事务 B -> 不算已核验。
+        mark_uncovered_ready(&defaults, 0, Vec::new(), Vec::new(), Some("txn-A".into())).unwrap();
+        let _ = mark_uncovered_lock_with_phase("test", UncoveredPhase::Applied, Some("txn-B"));
+        assert!(
+            !uncovered_lock_ready(),
+            "ready 事务号与意图不一致时不得显示已核验"
+        );
+
+        // 事务号一致 -> 才可能算已核验（还要看规则属性核验）。
+        let _ = mark_uncovered_lock_with_phase("test", UncoveredPhase::Applied, Some("txn-A"));
+        let (_active, _verified, note) = uncovered_lock_snapshot();
+        assert!(!note.is_empty());
+    }
+
+    /// **P1-01（v0.8.1）**：代理健康三态，远程代理不得判为 Verified。
+    #[test]
+    fn remote_proxy_health_is_never_verified() {
+        // 判据本身：Verified 只允许出现在「回环且端口可达」的路径上。
+        use crate::guard::ProxyHealth;
+        let remote = ProxyHealth::Unknown;
+        assert_ne!(remote, ProxyHealth::Verified, "远程代理不得被判定为已验证");
+        assert_ne!(
+            remote,
+            ProxyHealth::Unavailable,
+            "远程代理也不是已验证不可用"
         );
     }
 

@@ -90,6 +90,12 @@ export function EgatePanel() {
     /** **P1-02**：`false` 明确无管理员权限，`null` 无法确认，`undefined` 未上报。 */
     elevated?: boolean | null;
   } | null>(null);
+  /** **P1-12 / L-11**：严格防泄漏的「已配置」与「实际生效」分开显示。 */
+  const [strictLeak, setStrictLeak] = useState<{
+    configured: boolean;
+    effective: boolean;
+    blockers: string[];
+  } | null>(null);
   const [launchNote, setLaunchNote] = useState<string | null>(null);
   const [envCheck, setEnvCheck] = useState<EnvCheck | null>(null);
   const [envNote, setEnvNote] = useState<string | null>(null);
@@ -162,6 +168,11 @@ export function EgatePanel() {
     }>('egate_monitor_status')
       .then(setMonitor)
       .catch(() => setMonitor(null));
+    invoke<{ configured: boolean; effective: boolean; blockers: string[] }>(
+      'egate_strict_leak_status',
+    )
+      .then(setStrictLeak)
+      .catch(() => setStrictLeak(null));
   }, [refreshQuarantine]);
 
   /** 通过门禁启动 Claude（出口未通过会被拒绝）。 */
@@ -511,6 +522,24 @@ export function EgatePanel() {
         {/* **P1-13**：严格防泄漏模式。开启后「接入未知 / TUN 路由未证明」也会
             封锁受管应用出站（不杀进程）。这是产品安全契约上的主动选择，因此
             默认关闭，由用户自己决定。 */}
+        {/* **P1-12 / L-11**：「开关开了」不等于「保护生效」。
+            两种状态分开显示，缺项逐一列出。 */}
+        {strictLeak && (
+          <span
+            className={strictLeak.effective ? 'pill ok' : 'pill muted'}
+            title={
+              strictLeak.effective
+                ? '严格防泄漏已配置且当前实际生效'
+                : `已配置：${strictLeak.configured ? '是' : '否'}；未生效原因：${strictLeak.blockers.join('；')}`
+            }
+          >
+            {strictLeak.effective
+              ? '严格防泄漏：生效中'
+              : strictLeak.configured
+                ? '严格防泄漏：已配置未生效'
+                : '严格防泄漏：未开启'}
+          </span>
+        )}
         <button
           className={config?.strict_leak_protection ? 'ghost' : 'ghost'}
           disabled={busy}
@@ -525,6 +554,13 @@ export function EgatePanel() {
               const next = !config?.strict_leak_protection;
               await invoke('egate_set_strict_leak', { enabled: next });
               setConfig((c) => (c ? { ...c, strict_leak_protection: next } : c));
+              await invoke<{
+                configured: boolean;
+                effective: boolean;
+                blockers: string[];
+              }>('egate_strict_leak_status')
+                .then(setStrictLeak)
+                .catch(() => setStrictLeak(null));
               setNote(next ? '严格防泄漏模式已开启' : '严格防泄漏模式已关闭');
             } catch (e) {
               setError(formatError(e));

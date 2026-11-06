@@ -271,6 +271,15 @@ async fn xxx() -> Result<T, String> {
 - **v0.7.2 已验证**：`AppIsolation`/`UncoveredLock`/旧版 `Egate ... Out` 三类规则共存时
   `cs.exe --exit-restore` 退出码 0 且规则清零；无残留时幂等返回 0。未验证：非管理员拒绝路径、
   组策略持有规则、进程中断/输出截断注入、真实 TUN 路由证据。
+- **v0.8.1 已验证**：`tests/windows-integration/02/03/04` 在管理员实机通过；
+  `scripts/check-security-regressions.ps1` 46/46 组通过。
+  新增：pending 规则崩溃恢复（已验证的 pending 续用而非删除重建）、
+  意图事务号跨阶段不变 + 提交入锁、自动解除删规则前判意图归属、
+  ProxyHealth 三态、配置在取锁后写、急救清理 ManualHold、
+  初始化标记只读不重写、NSIS 任务删除严格回查、
+  strict 防泄漏「已配置 / 生效中」分离。
+  **未验证**：崩溃中断注入、并发双进程、非管理员路径、ActiveStore 不一致、
+  环境恢复账本、NSIS 任务删不掉的真实卸载。
 - **v0.7.7 已验证**：`tests/windows-integration/02/03/04` 在管理员实机通过；
   `scripts/check-security-regressions.ps1` 42/42 组通过。
   新增：规则判据统一（Test-Rule 覆盖端口/地址/Profile/ActiveStore 属性）、

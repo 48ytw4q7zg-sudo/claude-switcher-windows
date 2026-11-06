@@ -50,6 +50,20 @@ pub struct GuardTick {
 ///
 /// 必须 `status=="Up"`：Disabled/Disconnected 的网卡即使残留旧 IP 也不算在线
 /// （避免拔掉 TUN 后旧 198.18 地址残留导致误判存活）。
+/// **P1-01（v0.8.1）**：代理健康三态。
+///
+/// 一个 `bool` 无法同时表达「地址有效」与「代理可用」：远程代理只解析了
+/// 格式、没验证过可达性时，既不是 Verified 也不是 Unavailable。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProxyHealth {
+    /// 已验证可用（回环代理且端口可达）。
+    Verified,
+    /// 已验证不可用（端口连不上）。
+    Unavailable,
+    /// 无法验证（远程代理 / 证据不完整）。
+    Unknown,
+}
+
 pub fn tun_status_from_adapters(adapters: &[AdapterInfo]) -> (bool, &'static str) {
     // 198.18 假IP段优先（与 PS 一致：先查 IP 再回退网卡描述）。
     //
@@ -274,39 +288,53 @@ pub fn guard_tick() -> GuardTick {
     // 但只接受**明确有效**的代理地址：Unsupported（socks/PAC/坏端口）与
     // 缺地址都不能算「可用」，否则开着代理却仍判正常会放行不安全流量。
     let system_proxy_mode = crate::egate_check::read_proxy_evidence();
-    // **P0-13**：语法有效还不够，代理端口必须真的能连上。
-    // 三个状态分开：地址有效 → 本地端口可连 → 出口已验证（最后一项由门禁负责）。
+    // **P0-13 / P1-01（v0.8.1）**：代理健康必须是**三态**。
+    //
+    // v0.7.7 的注释写「远程代理可用性未证实」，代码却返回 `Some((addr, true))`，
+    // 下游 `proxy_usable` 据此算出「接入正常」——注释与实现相反。
+    //
+    // 一个 `bool` 同时表达「地址有效」与「代理可用」是根因：远程代理只做
+    // 格式解析、不做可达性验证时，既不能说是 Verified，也不能说 Unavailable。
     let proxy_addr = match crate::egate_access::parse_proxy_server(
         system_proxy_mode.server.as_deref(),
     ) {
         crate::egate_access::ProxyParse::Http(addr) if system_proxy_mode.enable => {
-            // 回环地址才做端口探测；外部代理地址探测会变成对第三方的连接尝试。
-            if crate::egate_access::is_loopback_host(&addr) {
-                let reachable = crate::egate_access::proxy_port_reachable(&addr);
-                Some((addr, reachable))
+            let health = if crate::egate_access::is_loopback_host(&addr) {
+                // 回环地址才做端口探测；外部地址探测会变成对第三方的连接尝试。
+                if crate::egate_access::proxy_port_reachable(&addr) {
+                    ProxyHealth::Verified
+                } else {
+                    ProxyHealth::Unavailable
+                }
             } else {
-                // **P1-04（v0.7.7）**：远程代理**不能**凭格式正确就算在线。
-                //
-                // v0.7.6 对非回环地址直接 `Some((addr, true))` ——代理断线、
-                // 地址变了、TCP 端口开着但协议失效，保镖都当成「接入正常」，
-                // 于是该报离线时不报、不该查杀时也不查杀。
-                //
-                // 这里保持「地址有效但可用性未证实」：不为了验证而对外发
-                // 裸探测（那会绕过保护发出未经验证的连接），只如实标注。
+                // **P1-01**：远程代理不外发探测的前提下无法证明可用 -> Unknown。
                 crate::log_error(&format!(
-                        "远程代理 {addr} 的可用性未证实（无法在不外发探测的前提下确认），                         本轮按「接入正常但未验证」处理"
-                    ));
-                Some((addr, true))
-            }
+                    "远程代理 {addr} 的可用性未证实（无法在不外发探测的前提下确认），本轮按「未知」处理"
+                ));
+                ProxyHealth::Unknown
+            };
+            Some((addr, health))
         }
         _ => None,
     };
-    let use_system_proxy = proxy_addr.is_some();
-    let proxy_usable = proxy_addr
-        .as_ref()
-        .map(|(_, reachable)| *reachable)
-        .unwrap_or(false);
-
+    // **P1-01**：注册表证据不完整时，代理健康一律 Unknown——不能拿一份
+    // 读不全的证据去推进离线防抖（那会把「读不到」当成「离线」）。
+    let registry_unreadable = system_proxy_mode.read_error().is_some();
+    let (use_system_proxy, proxy_usable, proxy_unknown) = match &proxy_addr {
+        Some((_, ProxyHealth::Verified)) => (true, true, false),
+        Some((_, ProxyHealth::Unavailable)) => (true, false, false),
+        Some((_, ProxyHealth::Unknown)) | None if registry_unreadable => {
+            (proxy_addr.is_some(), false, true)
+        }
+        Some((_, ProxyHealth::Unknown)) => (true, false, true),
+        None => (false, false, false),
+    };
+    if registry_unreadable {
+        crate::log_error(&format!(
+            "系统代理配置读取不完整（{:?}），本轮跳过离线防抖",
+            system_proxy_mode.read_error()
+        ));
+    }
     let alive_now = if use_system_proxy {
         // 系统代理已开启：客户端在线 **且代理端口可连** 才算接入正常（TUN 不强制）。
         client_up && proxy_usable
@@ -314,6 +342,28 @@ pub fn guard_tick() -> GuardTick {
         // TUN 模式：客户端 + TUN 都必须在线。
         tun_up && client_up
     };
+
+    // **P1-01（v0.8.1）**：代理健康未知 / 注册表证据不完整时，
+    // 本轮按 Degraded 处理——不查杀、不报健康成功，也不推进离线防抖。
+    //
+    // 这是 v0.7.7 注释与实现不一致的直接后果：远程代理被算成 `proxy_usable`，
+    // 于是「代理断了」的那一轮也被记成「接入正常」，该报离线时不报。
+    if proxy_unknown {
+        append_log(
+            "bodyguard.log",
+            &format!(
+                "{} 代理可用性未知（远程代理未验证或注册表证据不完整），本轮按 Degraded 跳过查杀与离线防抖",
+                now_timestamp()
+            ),
+        );
+        return GuardTick {
+            alive: true,
+            tun_up,
+            client_up,
+            tun_detail: "无法确认（代理可用性未知，Degraded）".to_string(),
+            killed: Vec::new(),
+        };
+    }
 
     // **P1-02（v0.7.6）**：证据不可信时**不推进**离线状态。
     //

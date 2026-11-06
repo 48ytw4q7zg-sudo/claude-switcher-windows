@@ -2547,18 +2547,32 @@ async fn lock_region(apply: bool) -> Result<RegionLockReport, String> {
                 names
             ));
         }
+        let mut current_geo = None;
+        // **P1-02（v0.8.1）**：配置写入必须在**取锁之后**。
+        //
+        // v0.7.7 是「先 appconfig::update() 保存目标 -> 再取锁 -> 再改系统」。
+        // 取锁失败时函数返回「本次地区锁定未执行」，可配置已经变了；改系统
+        // 失败时同样留下「配置已更新、系统还是旧值」的半事务——界面却看不出
+        // 这两者不是一回事。
+        //
+        // 现在 `apply=true` 先取锁、再写配置、再改系统、回读通过才算完成。
+        let _guard =
+            if apply {
+                Some(egate_lock::acquire(egate_lock::SystemOperation::TimezoneWrite).map_err(
+                |error| {
+                    format!("另一个环境修改正在进行（{error}），本次地区锁定未执行（配置未改动）")
+                },
+            )?)
+            } else {
+                None
+            };
         appconfig::update(|c| {
             c.country_target = Some(plan.country.clone());
             c.tz_target = Some(plan.windows_tz.clone());
             c.locale_target = Some(plan.locale.clone());
             c.last_egress_ip = Some(info.ip.clone());
         })?;
-        let mut current_geo = None;
         if apply {
-            // **P0-06**：这里才取锁，并且**持锁到所有系统修改与回读结束**。
-            let _guard = egate_lock::acquire(egate_lock::SystemOperation::TimezoneWrite).map_err(
-                |error| format!("另一个环境修改正在进行（{error}），本次地区锁定未执行"),
-            )?;
             // 持锁后再确认一次：等待锁期间配置/保护意图可能已经变了。
             match appconfig::load_checked() {
                 appconfig::ConfigLoad::Ok(config) => {
@@ -3035,6 +3049,57 @@ fn egate_set_strict_leak(enabled: bool) -> Result<(), String> {
     };
     appconfig::try_update(&mut mutate, &validate)?;
     Ok(())
+}
+
+/// **P1-12（v0.8.1）**：严格防泄漏的「已配置」与「实际生效」分开。
+///
+/// `strict_leak_protection = true` 只表示**用户选了**严格模式；真正施加出站
+/// 兜底封锁还要门禁开启、`lockdown_on_uncovered` 开启、未暂停、意图 Armed、
+/// 权限足够。开关保存为 true 并不保证此刻有实际阻断——把两者混成一个绿色
+/// 状态会让用户以为已经安全。
+///
+/// 返回 `configured` / `effective` / `blockers`（未生效的具体原因）。
+#[tauri::command]
+fn egate_strict_leak_status() -> serde_json::Value {
+    let config = match appconfig::load_checked() {
+        appconfig::ConfigLoad::Ok(config) => *config,
+        appconfig::ConfigLoad::Fresh => appconfig::AppConfig::default(),
+        appconfig::ConfigLoad::Corrupt(error) => {
+            return serde_json::json!({
+                "configured": false,
+                "effective": false,
+                "blockers": vec![format!("应用配置损坏，无法判定：{error}")],
+            })
+        }
+    };
+    let configured = config.strict_leak_protection;
+    let mut blockers = Vec::new();
+    if !configured {
+        blockers.push("严格防泄漏未开启（用户未选择）".to_string());
+    }
+    if !config.egate_enabled {
+        blockers.push("出口门禁未开启".to_string());
+    }
+    if !config.lockdown_on_uncovered {
+        blockers.push("未接入兜底封锁未启用".to_string());
+    }
+    if egate_monitor::is_paused() {
+        blockers.push("守护当前处于暂停".to_string());
+    }
+    if egate_monitor::protection_intent() != egate_monitor::ProtectionIntent::Armed {
+        blockers.push("保护意图不是 Armed（已停止或状态无法确认）".to_string());
+    }
+    match crate::platform::imp::is_elevated() {
+        Some(false) => blockers.push("当前非管理员权限，无法建立防火墙阻断规则".to_string()),
+        None => blockers.push("无法确认是否具备管理员权限".to_string()),
+        Some(true) => {}
+    }
+    let effective = blockers.is_empty();
+    serde_json::json!({
+        "configured": configured,
+        "effective": effective,
+        "blockers": blockers,
+    })
 }
 
 /// 出口门禁：发送一条测试通知（`--notify-test <kind>` 与界面按钮共用）。
@@ -3816,6 +3881,7 @@ pub fn run() {
             stun_probe_manual,
             egate_supported_regions,
             egate_set_strict_leak,
+            egate_strict_leak_status,
             egate_set_disabled_checks,
             set_log_config,
             download_update_verify,

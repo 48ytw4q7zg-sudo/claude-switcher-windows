@@ -361,11 +361,27 @@ pub fn load_checked() -> ConfigLoad {
             //
             // 老版本升级过来时没有标记文件，需要补写；补写失败意味着
             // 「下次配置丢失时我们会误判成首次安装」——那正是本修复要防的。
-            // 此时如实标注，调用方按「配置状态不可靠」处理。
-            if let Err(error) = mark_initialized() {
-                return ConfigLoad::Corrupt(format!(
-                    "配置已读取，但初始化标记写入失败（{error}）；                     为避免下次配置丢失时被误判为首次安装，请修复该文件后重试"
-                ));
+            //
+            // **P1-04（v0.8.1）**：标记**已经存在且有效**时只读不写。
+            //
+            // 监控、状态查询、启动检查、保镖都会频繁调用 `load_checked`，
+            // 每次都原子重写一遍标记是纯浪费；更要紧的是，一个正常的旧标记
+            // 若恰好暂时写不进去，会让**本来没事的配置**被判成 Corrupt。
+            match initialized_state() {
+                Initialized::Yes => {}
+                Initialized::Unknown(reason) => {
+                    return ConfigLoad::Corrupt(format!(
+                        "配置已读取，但初始化标记状态无法确认（{reason}）；                         为避免下次配置丢失时被误判为首次安装，请修复该文件后重试"
+                    ));
+                }
+                // 只有「确实没有标记」才创建（真实首次初始化 / 旧版迁移）。
+                Initialized::No => {
+                    if let Err(error) = mark_initialized() {
+                        return ConfigLoad::Corrupt(format!(
+                            "配置已读取，但初始化标记写入失败（{error}）；                             为避免下次配置丢失时被误判为首次安装，请修复该文件后重试"
+                        ));
+                    }
+                }
             }
             ConfigLoad::Ok(Box::new(config))
         }

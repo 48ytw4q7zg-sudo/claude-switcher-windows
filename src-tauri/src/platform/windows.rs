@@ -1556,13 +1556,39 @@ fn assert_task_target_not_user_writable(exe: &str) -> Result<(), String> {
 
 /// 删除计划任务（不存在视为成功）。
 pub fn delete_task(name: &str) -> Result<(), String> {
+    // **P1-05（v0.8.1）**：删除后必须**回查**，且查询失败不能当成「已删除」。
+    //
+    // 原实现 `SilentlyContinue` + 不回查，于是「Access Denied / 服务异常」
+    // 也会被报成成功，卸载继续进行，留下一个指向已删除程序路径的高权限任务。
     let quoted = ps_single_quote(name);
-    run_ps(&format!(
-        "if (Get-ScheduledTask -TaskName {q} -ErrorAction SilentlyContinue) {{ \
-         Unregister-ScheduledTask -TaskName {q} -Confirm:$false }}",
+    let script = format!(
+        "$ErrorActionPreference='Stop'
+$target = {q}
+$pattern = [WildcardPattern]::Escape($target)
+$found = @(Get-ScheduledTask -TaskName ($pattern + '*') -ErrorAction Stop |
+           Where-Object {{ $_.TaskName -eq $target }})
+if ($found.Count -gt 0) {{
+  $found | Unregister-ScheduledTask -Confirm:$false -ErrorAction Stop
+}}
+# Re-check: only confirmed absence counts as deleted.
+$after = @(Get-ScheduledTask -TaskName ($pattern + '*') -ErrorAction Stop |
+           Where-Object {{ $_.TaskName -eq $target }}).Count
+if ($after -eq 0) {{ 'absent' }} else {{ 'still-present' }}",
         q = quoted
-    ))?;
-    Ok(())
+    );
+    match run_ps(&script) {
+        Ok(out) => match out.trim().to_ascii_lowercase().as_str() {
+            "absent" => Ok(()),
+            "still-present" => Err(format!(
+                "计划任务「{name}」删除后仍然存在（可能被保护或权限不足）"
+            )),
+            other => Err(format!(
+                "计划任务删除结果无法解析（{other}），无法确认是否已删除"
+            )),
+        },
+        // 查询/删除异常：不能当成「已删除」。
+        Err(error) => Err(format!("计划任务「{name}」删除失败：{error}")),
+    }
 }
 
 /// 启动已注册的计划任务（对齐上游 install.ps1 的 Register + Start-ScheduledTask

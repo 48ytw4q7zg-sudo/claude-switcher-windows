@@ -1129,6 +1129,24 @@ pub fn restore_all() -> RecoveryReport {
         }
     }
 
+    // **P1-03（v0.8.1）**：完整急救也必须收敛**手动保持隔离**意图。
+    //
+    // 用户先手动隔离、再完整急救：规则恢复了，`ManualHold` 却留在磁盘上。
+    // 重新布防后自动恢复会继续受这份旧意图限制——恢复看起来「成功」，
+    // 实际上下一次该自动解除时解不掉。
+    //
+    // 只在隔离规则**确认清除**后才清；清理失败必须计入 pending，
+    // 让 `complete=false`，不能默默忽略。
+    if isolation_ok && crate::egate_monitor::is_manual_hold() {
+        match crate::egate_monitor::clear_manual_hold() {
+            Ok(()) => {}
+            Err(error) => {
+                failures.push(format!("手动保持隔离意图清理失败（{error}）"));
+                pending.push("手动保持隔离意图".to_string());
+            }
+        }
+    }
+
     // 4. 还原环境账本。
     // **P1-07**： 已持 FullRestore 锁，环境还原走无锁版本，
     // 否则会与自己争同一把锁（自我死锁）。

@@ -9,6 +9,9 @@ use std::io::Write;
 use crate::platform::imp;
 use crate::store;
 
+/// 保镖计划任务名（与 `guard.rs` 保持一致）。
+const GUARD_TASK_NAME: &str = "ClaudeBodyguard";
+
 /// 解析出的 CLI 子命令。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CliCommand {
@@ -28,6 +31,12 @@ pub enum CliCommand {
     EgateStatus,
     /// 出口门禁：发送一条测试通知，后接类别。
     EgateNotifyTest(String),
+    /// **P1-05**：保镖计划任务存在性（三态退出码）。
+    ///
+    /// 退出码 0 = 确认不存在；1 = 确认存在；2 = **无法确认**。
+    /// 专供 NSIS 卸载钩子使用：纯 `schtasks` 的退出码分不清
+    /// 「任务不存在」与「任务计划服务异常」，后者会被误判成「已清理」。
+    EgateGuardTaskState,
 }
 
 /// 从 argv 解析子命令（不假设 argv[0] 之外的位置）。无匹配返回 None。
@@ -58,6 +67,8 @@ pub fn parse(args: &[String]) -> Option<CliCommand> {
                 let kind = iter.next().cloned().unwrap_or_default();
                 return Some(CliCommand::EgateNotifyTest(kind));
             }
+            // **P1-05**：卸载钩子专用的三态计划任务查询。
+            "--egate-guard-task-state" => return Some(CliCommand::EgateGuardTaskState),
             _ => {}
         }
     }
@@ -74,6 +85,15 @@ pub fn run_readonly(cmd: &CliCommand) -> i32 {
         CliCommand::EgateRestore => run_egate_restore(),
         CliCommand::ExitRestore => run_egate_restore(),
         CliCommand::EgateStatus => run_egate_status(),
+        // **P1-05**：0 = 确认不存在 / 1 = 确认存在 / 2 = 无法确认。
+        CliCommand::EgateGuardTaskState => match imp::task_exists(GUARD_TASK_NAME) {
+            Ok(false) => 0,
+            Ok(true) => 1,
+            Err(error) => {
+                eprintln!("无法确认保镖计划任务状态：{error}");
+                2
+            }
+        },
         // 写路径/需要 GUI 上下文的命令不应走这里；保守返回参数错误码。
         CliCommand::Switch(_) | CliCommand::SwitchId(_) | CliCommand::EgateNotifyTest(_) => 2,
     };
@@ -407,6 +427,8 @@ pub fn run_console(args: &[String]) -> i32 {
         Some(CliCommand::EgateRestore) => run_readonly(&CliCommand::EgateRestore),
         Some(CliCommand::ExitRestore) => run_readonly(&CliCommand::ExitRestore),
         Some(CliCommand::EgateStatus) => run_readonly(&CliCommand::EgateStatus),
+        // **P1-05**：卸载钩子专用三态查询（0=不存在 / 1=存在 / 2=无法确认）。
+        Some(CliCommand::EgateGuardTaskState) => run_readonly(&CliCommand::EgateGuardTaskState),
         // 通知测试需要 GUI 的 AppHandle，走主程序而非 CLI 进程。
         Some(CliCommand::EgateNotifyTest(_)) => {
             print_usage();

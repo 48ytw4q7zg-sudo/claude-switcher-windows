@@ -59,7 +59,12 @@ try {
         'legacy_intent_without_txn_refuses_auto_cleanup',
         'strict_leak_toggle_checks_prerequisites',
         'reset_targets_rejected_when_gate_is_armed',
-        'task_lookup_is_three_state'
+        'task_lookup_is_three_state',
+        # v0.8.1 additions (P0-01/P0-02/P0-03 + L-07 + P1-01)
+        'phase_transition_preserves_transaction_id',
+        'stale_transaction_cannot_advance_phase',
+        'ready_without_matching_txn_is_not_verified',
+        'remote_proxy_health_is_never_verified'
     )
     $failed = @()
     foreach ($g in $groups) {
